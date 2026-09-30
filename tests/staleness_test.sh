@@ -579,6 +579,60 @@ tpl_run() {
     --allowlist "$TPL/parity-allowlist" "$@" 2>&1) || EC=$?
 }
 
+# --- THE FIXTURE MUST MEASURE WHAT THE CASES THINK IT MEASURES ---------------
+#
+# Observed, not hypothesised. On a machine at load average 160 this suite
+# failed `an absent artefact is a counted finding, not silence` while passing
+# the other 25, and the self_test control went red with it. The reporter had
+# measured 8 repositories / 96 cells where the fixture has 9 / 108 — one
+# service, twelve cells, silently not counted. The case failed on a row that
+# was not in the table, and its failure text named the reporter, which is the
+# one thing it must never do: the reporter was reading a smaller fleet, not
+# misreading a full one.
+#
+# The reporter counts a repository by its `.git` (`isRepo` in staleness.py), so
+# the obvious suspect is a service directory that exists without one. I could
+# not confirm that, because the run's log was lost before I could read it, and
+# this script runs `set -euo pipefail`, which means a failed `git init` would
+# have aborted the suite rather than skipped a repository silently. So the
+# diagnosis is open and the fix deliberately does not depend on it: assert the
+# DISCREPANCY itself. If the number of fixture repositories is not the number
+# the reporter counted, this harness is measuring something other than what its
+# cases assert on, and that is a harness failure to be named as one — which is
+# the fail-closed rule the reporter inherits, applied to the reporter's own
+# test instead of assumed below it.
+_fixture_expected="current-svc diverged-svc absent-svc halfstack-svc undeclared-svc docs-svc similar-svc pinned-svc"
+# Visibility is read from `--json`, not the printed table, and the distinction is
+# load-bearing: the table OMITS `current` cells on purpose, so a service that
+# adopted everything has no row in it at all. Asserting on the table would call
+# a fully-adopted fixture broken. The JSON carries every cell, so it answers
+# "was this service measured" without depending on what the report chooses to
+# print.
+_fixture_gone=$(
+  "$PY" - "$TPL" "$STALE" "$_fixture_expected" <<'PY'
+import json, os, subprocess, sys
+tpl, stale = sys.argv[1], sys.argv[2]
+expected = sys.argv[3].split()
+out = subprocess.run(
+    [sys.executable, stale, "--repos-dir", tpl, "--scope", "templates",
+     "--allowlist", os.path.join(tpl, "parity-allowlist"), "--json"],
+    capture_output=True, text=True)
+measured = {c["repo"] for c in json.loads(out.stdout)["cells"]}
+print(" ".join(s for s in expected if s not in measured))
+PY
+)
+if [ -n "$_fixture_gone" ]; then
+  printf 'FAIL staleness_test: the FIXTURE lost a service the cases assert on, so this is NOT a reporter result\n'
+  printf '       the reporter measured no cell for:%s\n' "$_fixture_gone"
+  printf '       A case reading a row the reporter never emitted fails for a reason\n'
+  printf '       that has nothing to do with the reporter. Observed once at load\n'
+  printf '       average 160: 8 repos / 96 cells where the fixture has 9 / 108.\n'
+  printf '       fixture: %s\n' "$TPL"
+  tpl_run
+  printf '%s\n' "$OUT" | sed 's/^/       /'
+  exit 1
+fi
+
 printf -- '\n-- staleness_test: the templates half tells current / diverged / absent apart\n'
 
 # 17. THE CONTROL. The three states appear, spelled, and never collapse into one

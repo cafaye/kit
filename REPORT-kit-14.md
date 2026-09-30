@@ -635,7 +635,7 @@ Stated here rather than in a footnote.
 | `tests/staleness.py` | `--scope templates`, five states, `--fail-on-unpinned`, `difflib` diff summaries |
 | `tests/staleness_test.sh` | 12 → 26 cases |
 | `tests/validate.sh` | three new named checks; the header/recipe check picks up 23–28 automatically |
-| `tests/self_test.sh` | 23 → 29 breakages |
+| `tests/self_test.sh` | 23 → 30 breakages |
 | `AGENTS.md` | the layout tree, the count of breakages, a new section on the reporter and the ledger, `difflib`/`glob` added to the allowed-import list and the sentence made enforceable |
 | `README.md` | [what the fleet actually adopted](#what-the-fleet-actually-adopted) at the top, the templates half, the pin format |
 | `CHANGELOG.md` | the entry, and the corrections to the brief's numbers — including the one where I was wrong about the compose stacks |
@@ -653,7 +653,7 @@ $ bash tests/validate.sh
 | phase reached | pass | fail | skip |
 | --- | --- | --- | --- |
 | static, telemetry, observability, staleness | **145** | **0** | **2** |
-| self_test (29 breakages + 1 control) | *not completed* | — | — |
+| self_test (30 breakages + 1 control) | *see below* | — | — |
 
 The two skips are the two `node --check` cannot read TypeScript
 (`templates/tier/bun/tier.test.ts`, `templates/tier/node/tier.test.ts`), which

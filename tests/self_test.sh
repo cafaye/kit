@@ -64,10 +64,9 @@
 #   23. a parity-allowlist entry naming an artefact kit does not ship -> the
 #         dead-entry check goes red. The ESLint direction, and the mutation is
 #         well-formed in every other respect, so a shape-only check passes it.
-#   24. a parity-allowlist entry naming a repository that does not exist, at the
-#         gate, where the fleet is not on disk -> the same check goes red. The
-#         OTHER direction of the same rule, and the one that is easy to get
-#         wrong: an entry for a repo that is merely out of scope is NOT dead.
+#   24. an EXPIRED parity-allowlist entry -> the same check goes red. The gate
+#         reads the clock, and this is the first time anything in kit has
+#         actually watched the ratchet fire rather than reading that it exists.
 #   25. `tests/artifacts.json` naming a `{lang}` source kit does not ship for
 #         every language -> the artefact-table check goes red. Half a language is
 #         worse than none, and the table is what says so.
@@ -81,6 +80,12 @@
 #         goes red. "Standard library only" was a sentence in AGENTS.md for the
 #         whole life of the rule and nothing checked it; a boundary nobody can
 #         cross is not a boundary.
+#   29. remove one fixture service's `.git`, so the reporter cannot see it ->
+#         staleness_test.sh goes red AND blames the FIXTURE. Observed for real at
+#         load average 160 before it was written: one case failed, 25 passed, and
+#         the failure text named the reporter when the reporter had simply been
+#         handed a smaller fleet. A red that misattributes itself is worse than
+#         no red, so this asserts the EXPLANATION, not only the exit status.
 #
 #   These are numbered 20-22 rather than 19-21 because 19 is the allowlist
 #   breakage above, from the tier work. Both packets numbered their first entry
@@ -95,12 +100,14 @@
 #   that a single mutation cannot both produce: one removes a finding, the
 #   other invents one, and a gate that can only do one of them is half a gate.
 #
-#   Eleven of them (7-10, 11, 12, 19, 20, 23-25, 28) additionally assert WHICH
+#   Twelve of them (7-10, 11, 12, 19, 20, 23-25, 28) additionally assert WHICH
 #         check went red. Every other breakage only proves the gate can fail;
 #         those prove the check written for that defect is still load-bearing,
 #         which is a different claim and the one that decays silently. 21, 22,
 #         26 and 27 assert the same thing about the two scripts that are
-#         themselves proofs.
+#         themselves proofs, and 29 asserts it about the WORDING: a red that
+#         blames the reporter when the fixture is at fault is a red that sends
+#         the next reader to the wrong file.
 #
 #   The counts here were wrong twice and both times a check caught it rather
 #   than a reader: the header said "seven" over a four-wide range, and it
@@ -229,11 +236,27 @@ expect_red_check() {
 # script goes red is the same claim expect_red_check makes — the check written
 # for this defect is still load-bearing — expressed over a script.
 expect_red_script() {
-  local label="$1" dir="$2" script="$3"
+  local label="$1" dir="$2" script="$3" want="${5:-}"
   shift 3
+  # The optional 4th argument (always pass an empty one) is where a script's own
+  # arguments go; the optional 5th is a string the output MUST contain. A proof
+  # that goes red for the wrong reason is not a proof, and the one case that
+  # needs the stronger claim is a red that would otherwise be MISREPORTED — so
+  # the name is unchanged and the pattern in validate.sh still matches, rather
+  # than a new helper that would read as an undocumented breakage.
   if (cd "$dir" && KIT_PYTHON="$PY" bash "$script" "$@" >/dev/null 2>&1); then
     printf 'FAIL self_test: %s — the proof stayed GREEN\n' "$label"
     failures=$((failures + 1))
+  elif [ -n "$want" ]; then
+    local out
+    out=$(cd "$dir" && KIT_PYTHON="$PY" bash "$script" "$@" 2>&1) || true
+    if printf '%s\n' "$out" | grep -qF "$want"; then
+      printf 'PASS self_test: %s — the proof went red, and said why\n' "$label"
+    else
+      printf 'FAIL self_test: %s — the proof went red but did NOT say %s\n' "$label" "$want"
+      printf '%s\n' "$out" | grep -E '^(FAIL|PASS)' | sed 's/^/       /'
+      failures=$((failures + 1))
+    fi
   else
     printf 'PASS self_test: %s — the proof went red\n' "$label"
   fi
@@ -690,41 +713,70 @@ expect_red_script 'breakage 22: the staleness reporter calls an undeclared pin c
 
 # 23-25. The parity allowlist and the artefact table.
 #
-#     23 and 24 are the two directions of ONE rule — an entry that matches
-#     nothing is a failure — and they are separate breakages because they fail
-#     for different reasons and a check that catches only one is half a rule.
-#     23 is the ESLint shape (the artefact is gone); 24 is the one that is easy
-#     to over-reach on (the repository is merely not on disk at gate time, which
-#     is NOT the same as gone, and treating it as gone is how a scoped run
-#     becomes a false alarm on a fleet-wide ledger).
+#     23 is the ESLint shape — an entry naming an artefact kit does not ship.
+#     24 is the ratchet firing. 25 is half a language.
 #
-#     Both entries are well-formed in every other respect. That is the point: a
-#     shape-only check passes both, and a hygiene rule in a data file is exactly
-#     the shape of a check nobody has ever seen fail.
+#     All three entries are well-formed in every OTHER respect. That is the
+#     point: a shape-only check passes all three, and a hygiene rule in a data
+#     file is exactly the shape of a check nobody has ever seen fail.
+#
+#     WHAT THE GATE CANNOT CHECK, AND THE RECIPE THAT CLAIMED IT COULD. An
+#     entry naming a repository that does not exist IS a real failure, and the
+#     REPORTER catches it — it is handed `--repos-dir` and can see what is
+#     there — and `tests/staleness_test.sh` proves it in three shapes, one of
+#     which is exactly that. The first version of this recipe asserted it
+#     against the GATE, which stayed green and the breakage failed: kit's CI has
+#     no sibling checkouts, so no gate in this repository can know which
+#     repositories exist. A recipe that asserts a check which does not exist is
+#     a proof of nothing, and the fix is to re-point it at a property the gate
+#     really has rather than to add a fleet roster to kit so the gate could
+#     answer a question it was never asked.
 PARITY='templates/parity-allowlist  (reason, owner, since, until; dead entries fail)'
 ARTTABLE='tests/artifacts.json  (every declared source exists, for every language)'
 
 # 23. An entry for an artefact kit does not ship. The realistic version is a
 #     rename: `lint/eslint.config.mjs` becomes `lint/eslint.config.ts`, the
 #     entry keeps the old id, and it is now exempting nothing.
+#
+#     The id below is checked against `tests/artifacts.json` FIRST, and the
+#     first version of this recipe used `lint/eslint.config.mjs` — a real id —
+#     so the gate stayed GREEN and the breakage proved nothing. A mutation that
+#     has silently stopped breaking the thing it names is the same defect as a
+#     stale test, and the fix is to make the recipe assert its own premise
+#     rather than to trust that the string looks like an id.
 twentythree="$(fresh_copy dead-parity-entry)"
+if grep -q 'lint/eslint.config.ts' "$twentythree/tests/artifacts.json"; then
+  echo "FAIL self_test: breakage 23's dead artefact id is REAL — the recipe no longer mutates anything" >&2
+  failures=$((failures + 1))
+fi
 cat >>"$twentythree/templates/parity-allowlist" <<'ENTRY'
-diverged billing lint/eslint.config.mjs reason="this artefact was renamed in artifacts.json, so this entry exempts nothing" owner=kit since=2026-09-30 until=2026-12-31
+diverged billing lint/eslint.config.ts reason="this artefact was renamed in artifacts.json, so this entry exempts nothing" owner=kit since=2026-09-30 until=2026-12-31
 ENTRY
 expect_red_check 'breakage 23: a parity entry naming an artefact kit does not ship' \
   "$twentythree" "$PARITY" --static-only
 
-# 24. An entry naming a repository that is not on disk. The gate has no fleet —
-#     kit's CI has no sibling checkouts — so the check that catches this is a
-#     check about the LEDGER's own consistency, and it has to be able to tell
-#     "this repo is not here" from "this repo is not in scope". A gate that
-#     cannot tell those two is a gate that reports eighty dead entries on a
-#     clean tree, which is a report nobody reads.
-twentyfour="$(fresh_copy parity-names-a-ghost)"
+# 24. AN EXPIRED ENTRY — THE RATCHER FIRING.
+#
+#     The first recipe here asserted that a parity entry naming a repository
+#     that does not exist takes the gate red. It does not, and it cannot: kit's
+#     CI has no sibling checkouts, so the gate has no way to know which
+#     repositories exist. The reporter knows (it is handed `--repos-dir`) and
+#     `tests/staleness_test.sh` proves it in three shapes, including this one;
+#     asserting it again against a check that does not exist would be a proof of
+#     nothing. So the recipe is spent on a property the gate really has and
+#     nothing has yet tried to break: **the gate reads the clock**.
+#
+#     The tier skip-allowlist has had that rule for a packet and nothing has
+#     ever watched it fire — its own header says "a gate that has never gone
+#     red is a report", and this is the first time anything in kit has actually
+#     made the statement true. The date is in the past on purpose, and the
+#     entry is well-formed in every other respect: a real artefact, a real
+#     repository, a reason, an owner and a `since`. Only the `until` is wrong.
+twentyfour="$(fresh_copy expired-parity-entry)"
 cat >>"$twentyfour/templates/parity-allowlist" <<'ENTRY'
-diverged a-repository-that-was-never-here mise.toml reason="a repository that does not exist, so this entry cannot be checked against anything" owner=kit since=2026-09-30 until=2026-12-31
+diverged billing mise.toml reason="this entry is well formed in every other respect; only the date is wrong, which is the point" owner=billing since=2020-01-01 until=2020-12-31
 ENTRY
-expect_red_check 'breakage 24: a parity entry naming a repository that does not exist' \
+expect_red_check 'breakage 24: an expired parity entry — the gate reads the clock' \
   "$twentyfour" "$PARITY" --static-only
 
 # 25. A `{lang}` source kit does not ship for one language. `bun` is the one
@@ -814,6 +866,29 @@ with open(path, "a", encoding="utf-8") as fh:
 PY
 expect_red_check 'breakage 28: one of the two programs gains a third-party import' \
   "$twentyeight" 'tests/classify.py + tests/staleness.py' --static-only
+
+# 29. A HARNESS THAT LIES ABOUT ITS OWN FLEET.
+#
+#     Observed for real before it was written here. Under load average 160 the
+#     suite failed one case and passed 25, the reporter having measured 8 repos
+#     and 96 cells where the fixture holds 9 and 108 — and the failing case's
+#     text named the reporter, which is precisely what it must not do when the
+#     reporter was reading a smaller fleet rather than misreading a full one.
+#
+#     So the fixture is now checked before any case asserts on it: every service
+#     the cases name must have a cell the reporter measured. This breakage
+#     removes one service's `.git` — the shape a transient `git init` failure
+#     leaves behind — and asserts the suite goes red AND says the failure is in
+#     the fixture rather than in the reporter. A check that only proved the
+#     script exits non-zero would pass on a suite that reported the same
+#     misleading red, so the assertion is on the message.
+twentynine="$(fresh_copy a-fixture-service-the-reporter-cannot-see)"
+edit "$twentynine/tests/staleness_test.sh" \
+  'mksvc absent-svc node' \
+  'mksvc absent-svc node
+rm -rf "$TPL/absent-svc/.git"'
+expect_red_script 'breakage 29: the suite cannot tell a broken FIXTURE from a broken reporter' \
+  "$twentynine" tests/staleness_test.sh '' 'this is NOT a reporter result'
 
 printf '\n'
 if [ "$failures" -ne 0 ]; then
