@@ -41,11 +41,6 @@
 #         without that rule a skip list is a ratchet that only turns one way,
 #         and within two quarters it contains every test in the repository.
 #
-#   Seven of them (7-12) additionally assert WHICH check went red. Every other
-#   breakage only proves the gate can fail; those prove the check written for
-#   that defect is still load-bearing, which is a different claim and the one
-#   that decays silently.
-#
 #   Breakages 2 and 4 were both REWRITTEN in kit-03, for the same reason and it
 #   is worth recording: their recipes named strings that no longer exist. 2
 #   mutated `exporters: [debug]`, which the traces pipeline stopped being when
@@ -56,22 +51,34 @@
 #   and the gate went red on that breakage and never reached the next one. A
 #   self_test whose recipe no longer applies is a self_test that has stopped
 #   testing the thing it names.
-#   19. nest `includePaths` under `git:` -> the core fan-out check goes red. The
+#   20. nest `includePaths` under `git:` -> the core fan-out check goes red. The
 #         shape reads correctly, syncs successfully, and vendors the entire
 #         upstream repository; it was run before it was written down.
-#   20. make the change classifier FAIL OPEN -> classify_test.sh goes red. This
+#   21. make the change classifier FAIL OPEN -> classify_test.sh goes red. This
 #         is the sharpest proof here: it inverts the fail-closed property and
 #         asserts the suite notices, so the property is a counterexample rather
 #         than a claim in a comment.
-#   21. report an undeclared core pin as `current` -> staleness_test.sh goes red.
+#   22. report an undeclared core pin as `current` -> staleness_test.sh goes red.
 #         Two real repositories are in that state today, which is what makes the
 #         difference between `undeclared` and `current` load-bearing.
 #
-#   7-10 and 19 additionally assert WHICH check went red. Every other breakage
-#         only proves the gate can fail; those five prove the check written for
-#         that defect is still load-bearing, which is a different claim and the
-#         one that decays silently. 20 and 21 assert the same thing about the
-#         two scripts that are themselves proofs.
+#   These are numbered 20-22 rather than 19-21 because 19 is the allowlist
+#   breakage above, from the tier work. Both packets numbered their first entry
+#   independently and the collision is only visible in the union — which is what
+#   the header/recipe check in validate.sh is for.
+#
+#   Eight of them (7-10, 11, 12, 19, 20) additionally assert WHICH check went
+#         red. Every other breakage only proves the gate can fail; those prove
+#         the check written for that defect is still load-bearing, which is a
+#         different claim and the one that decays silently. 21 and 22 assert the
+#         same thing about the two scripts that are themselves proofs.
+#
+#   The counts here were wrong twice and both times a check caught it rather
+#   than a reader: the header said "seven" over a four-wide range, and it
+#   numbered a second entry 19 while the recipes numbered it 20. A header that
+#   drifts from the recipes is not documentation, it is a second, unchecked copy
+#   of the truth — which is the entire thing validate.sh's header/recipe check
+#         exists to prevent.
 #
 # WHAT IT IS NOT
 #   This is not exhaustive mutation testing. Each implementation gets exactly one

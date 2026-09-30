@@ -3942,7 +3942,12 @@ carried = set(
         # and breakage 4's single; matching one of them would have reported a
         # disagreement that does not exist, and the fix belongs in the pattern
         # rather than in rewriting a working recipe to suit a new check.
-        r"""^expect_red(?:_check|_lang)? ['"]breakage\s+(\d+[a-z]?):""",
+        # All FOUR helpers, or the check reports a header/recipe disagreement
+        # that does not exist: breakages 21 and 22 are `expect_red_script`, and
+        # a pattern missing `_script` calls them undocumented. Same omission as
+        # the `_st_breakages` count above — one bug, two symptoms, because the
+        # helper list was written down twice.
+        r"""^expect_red(?:_check|_lang|_script)? ['"]breakage\s+(\d+[a-z]?):""",
         src,
         re.M,
     )
