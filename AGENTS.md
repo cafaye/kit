@@ -133,14 +133,17 @@ Three phases, and all three must pass:
   guard: a check that only parsed those two files would pass on a classifier
   that waves every change through. They stay runnable when static analysis is
   skipped, because a gate that skips is not green.
-- **self_test** — twenty-three breakages of a throwaway copy, asserting the gate
+- **self_test** — twenty-nine breakages of a throwaway copy, asserting the gate
   goes red each time. Six of them are a semantic mutation of one language each,
-  so **every suite is proven able to fail** rather than assumed to. Eight assert
+  so **every suite is proven able to fail** rather than assumed to. Fifteen assert
   that one *named* check reported `FAIL`, so a check written for a specific
   defect is proven still load-bearing. Two assert that a *proof* goes red: one
   inverts the classifier's fail-closed property, and one makes the staleness
   reporter call an undeclared pin `current`. A property nobody has tried to
   break is a property nobody has tested.
+- **A self-test control that is red BLOCKS the packet.** If the unbroken tree is
+  already failing, every breakage below it proves nothing, so that run is a
+  failed run even when all twenty-nine mutations went red as intended.
 - Tests are written **first** and watched fail before the artifacts exist. A
   config written from documentation instead of from the pinned image is a config
   that breaks on the first `bin/dev up`: Tempo, Loki and Mimir all reject keys
@@ -183,8 +186,10 @@ Three phases, and all three must pass:
   rubocop ran on kit's own Ruby with kit's own config. That is the only way an
   obsolete key surfaces before six repos inherit it.
 - The suite must be able to fail: `self_test` breaks a throwaway copy of the
-  tree nineteen ways and asserts the run goes red. If you change the suite, keep
-  that true.
+  tree twenty-nine ways and asserts the run goes red. If you change the suite,
+  keep that true — and add the breakage to the file's header in the same commit,
+  because `tests/validate.sh` compares the header against the recipes and will
+  say which half you forgot.
 
 ## The classifier fails closed, and that is a rule about code
 

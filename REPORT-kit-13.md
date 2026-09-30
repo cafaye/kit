@@ -105,23 +105,29 @@ is the entire point.
 `tests/fleet_check.py`'s sibling proof is `tests/fetch_test.sh`, which runs
 against a **bare repository built from this tree over `file://`** — the same
 `git fetch --depth 1 <remote> <ref>` command, no network, so CI and a laptop on
-a train get the same answer. Executed, 14 assertions:
+a train get the same answer. Executed, **17 assertions, every one run**:
 
 | # | Assertion | Result |
 |---|---|---|
-| 1 | a pinned commit resolves; **the fetched compose file is byte-identical** to the tree it was pinned to | PASS |
-| 2 | a `v<semver>` tag resolves to the same bytes a commit does | PASS |
-| 3 | `v1.0.0-rc.1` is accepted — semver's own grammar admits it, and a rule that refused it would be routed around by writing `master` | PASS |
-| 4 | `master` refused, **and the message says why** | PASS |
-| 5 | a real branch name refused, same | PASS |
-| 6 | no `kit.ref` at all refused (the fresh-clone case) | PASS |
-| 7 | a 7-char abbreviated sha refused — ambiguous across remotes | PASS |
-| 8 | **offline with a warm cache runs with the remote `mv`'d away**, and says it came from the cache | PASS |
-| 9 | **offline with a cold cache and no remote fails**, and names `KIT_STACK_DIR`, `.kit/stack` or `KIT_STACK_HOME` | PASS |
-| 10 | a **vendored** copy declaring the pinned ref is accepted, and is named as the source | PASS |
-| 11 | a vendored copy at a **different** ref is refused | PASS |
+| 1 | a pinned commit resolves, and says **where** it resolved to | PASS |
+| 2 | the fetched compose file is **byte-identical** to the tree it was pinned to | PASS |
+| 3 | the fetched tree carries the collector config and the vendor config trees | PASS |
+| 4 | a `v<semver>` tag resolves to the same bytes a commit does | PASS |
+| 5 | `v1.0.0-rc.1` is accepted — semver's own grammar admits it, and a rule that refused it would be routed around by writing `master` | PASS |
+| 6 | `master` refused, **and the message says why** | PASS |
+| 7 | a real branch name refused, same | PASS |
+| 8 | an empty ref refused (the fresh-clone case) | PASS |
+| 9 | a 7-char abbreviated sha refused — ambiguous across remotes | PASS |
+| 10 | **offline with a warm cache runs with the remote `mv`'d away**, and says it came from the cache | PASS |
+| 11 | **offline with a cold cache and no remote fails**, and names `KIT_STACK_DIR`, `.kit/stack` or `KIT_STACK_HOME` | PASS |
+| 12 | a **vendored** copy declaring the pinned ref is accepted, and is named as the source | PASS |
+| 13 | a vendored copy at a **different** ref is refused | PASS |
+| 14 | `bin/dev pin` **fetches both refs and prints a real diff from a cold cache** | PASS |
+| 15 | the sha it writes is the last line of `kit.ref` | PASS |
+| 16 | the comment header is **one `#` per line** — asserted on shape, not wording | PASS |
+| 17 | pinning to the ref already pinned is a **no-op, and says so** | PASS |
 
-The strongest of these is #8: the remote is not unset, it is **moved**, so a URL
+The strongest of these is #10: the remote is not unset, it is **moved**, so a URL
 that 404s (a different failure) cannot stand in for a URL that is not consulted.
 
 **Not verified:** `git fetch --depth 1 <https-url> <sha>` against a real GitHub
@@ -314,6 +320,13 @@ Measured, in this gate run:
 - A metric was sent, and **found in Mimir**; and the `spanmetrics` connector
   minted `cafaye_duration_count`, which is the fleet error dashboard's source.
 - A canary in ten attributes reached **neither** store.
+
+**All 15 assertions, in one gate run, with no sleeps and no retries.** That
+count matters here more than usual: the postgres healthcheck was rewritten in
+this same packet (§8.1), and a probe that is now a real `psql` query rather than
+a `pg_isready` with unused flags could easily have broken the readiness the whole
+stack waits on. It did not — `postgres` reported healthy, `--wait` returned, and
+the eight containers came up on the shipped `6 × 5s + 10s` budget.
 
 Two assertions in this file failed on my first run and both were **test** bugs,
 not stack bugs:
