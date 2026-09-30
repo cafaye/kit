@@ -1,8 +1,22 @@
-# kit's test suite needs a python with PyYAML (yaml.safe_load over every YAML)
-# and, optionally, yamllint (dogfoods lint/yamllint.yml against our own files).
+# kit's test suite needs a python with PyYAML (yaml.safe_load over every YAML),
+# yamllint (dogfoods lint/yamllint.yml against our own files) and zizmor (the
+# GitHub Actions security audit the `zizmor` job and the gate's own workflow
+# check run). gitleaks is NOT here: it is a static binary, and a binary in a
+# wheel index is a hash we computed ourselves rather than one the publisher
+# vouched for. It is bootstrapped from its signed release, like hadolint — see
+# tests/bootstrap.sh.
 # shellcheck and node are used when present on PATH; both are optional.
 #
 #   python3 -m venv .venv && .venv/bin/pip install -r tests/requirements.txt
 #
 pyyaml
 yamllint
+
+# zizmor is PINNED, and the other two are not, which looks inconsistent until
+# you ask what an unpinned entry costs in each case. PyYAML and yamllint are
+# parsers: a newer one either parses the same files or the gate says so. A
+# security auditor is neither — a new release adds findings, and a gate whose
+# result depends on when it last ran is a gate nobody can reason about. The
+# bump is therefore a deliberate diff in this file, reviewed as a change to
+# what the gate asserts.
+zizmor==1.30.1

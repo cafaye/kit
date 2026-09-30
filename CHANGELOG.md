@@ -13,6 +13,100 @@ semver contract — it is consumed by *calling*
 
 ### Added
 
+- **The secret scanner.** A `secrets` job in `ci.reusable.yml` running
+  **gitleaks 8.30.1** over the adopting repository's **full history**, with
+  `--redact`. It is the one job in the workflow with **no opt-in**: an opt-in
+  security control is not a control, and a secret scanner that only warns is a
+  report. `fetch-depth: 0` is load-bearing — the runner default is a shallow
+  clone, and a secret committed and deleted in one PR is still in the packfile
+  of anyone who cloned. **Adopting this can turn a repo's first build red**;
+  README says what to do, and the first thing to do is rotate.
+  - gitleaks rather than trufflehog: trufflehog is **AGPL-3.0**, and it is the
+    only candidate that verifies live credentials against the issuer's API,
+    which for a fleet whose CI has network access is the wrong behaviour for a
+    scanner. gitleaks is MIT, a static binary, and makes no network call.
+  - `tests/gitleaks_gate.sh` is the **one** scan, called by both the `secrets`
+    job and `tests/validate.sh`. A scanner whose CI and local invocations have
+    drifted is two scanners, and the one that goes red is whichever nobody runs.
+  - `.gitleaks.toml` — the allowlist, and **nothing else**. `extend.useDefault`
+    so the rules stay gitleaks', and every `[[allowlists]]` entry must carry a
+    `description` of at least 40 characters. An allowlist that grows and is never
+    pruned is not an allowlist, it is a deferred disclosure. A `.gitleaksignore`
+    fails the gate.
+- **A `zizmor` job** (opt-in, `zizmor: 'true'`), running the GitHub Actions
+  security audit on the adopting repo's own workflows. `tests/zizmor_gate.sh`
+  counts `unpinned-uses` and prints the count and the reason on every run, and
+  **fails on every other audit**. It is recorded, not baselined: see
+  `DECISIONS.md` (MD10a), where the pin trade is costed in three options and none
+  of them has been taken.
+- **`templates/secrets/`** — the runtime credential-leak canary. A
+  **language-neutral contract** (`templates/secrets/README.md`) and the **Go
+  adapter**, with five vectors each carrying its own red proof: log/stdout/stderr,
+  unknown serialisation fields, the whole error chain, keys present-but-empty,
+  and Go type coverage.
+  - It exists because **nothing off the shelf does this**. gosec's
+    `credentials.Match` has no `*ast.CallExpr` case, so it finds literals and not
+    a token passed to a logger. Bandit matches `ast.Constant` only. Brakeman's
+    secret check is off by default. Of 268 Semgrep taint rules, **zero** intersect
+    CWE-532.
+  - The canary is **assembled at run time**, never written as a literal, so it is
+    safe to commit and needs no allowlist entry. Two checks enforce that.
+- **Ten new checks** in `tests/validate.sh` for the above, including one that
+  asserts the scanner's **behaviour** by executing it: over a throwaway git
+  repository holding a detectable credential, the scan must find it, must name
+  the rule that fired, must not print the value, and must still find it after the
+  file is deleted.
+- **Eleven new `self_test` breakages** (13–23), each asserting that one *named*
+  check went red: a credential in history, a credential in the working tree,
+  `--redact` removed, the scan narrowed to the last commit,
+  `pull_request_target` added, the `secrets` job made `continue-on-error`, four
+  ways of breaking the canary's reference type, the canary committed as a
+  literal, and `unpinned-uses` baselined in `.github/zizmor.yml`.
+  - `self_test` is now **29 breakages**, and the count is *derived* from the
+    breakages that actually ran. It was a literal `18` in two files kept in step
+    by hand.
+- `tests/gitleaks_gate.sh` and `tests/zizmor_gate.sh`, `chmod +x` and asserted
+  executable — they are run by the reusable workflow from a service's repository,
+  so a missing executable bit is a `secrets` job that dies in thirteen repos.
+
+### Fixed
+
+- **`artipacked` (9 findings) in `ci.reusable.yml`.** Every `actions/checkout`
+  now sets `persist-credentials: false`. No job in the file pushes, so a token
+  left on disk after a checkout is a credential that outlives the job for no
+  reason — and every job here runs `upload-artifact`, which is the combination
+  the audit exists to catch. Found by zizmor, and fixed rather than baselined.
+- **`.github/zizmor.yml` is no longer walked for stray copies of the workflow.**
+  The `callable path` check reported `tests/self_test.sh` as "a second workflow
+  declaring `workflow_call`" — it names the key in a comment explaining breakage
+  8. A check that fires on the file proving it wrong is a check people delete.
+- **Fetched tools now land in `tests/.bin/`, not `.venv/bin/`.** `.venv` is
+  gitignored and `tests/self_test.sh` copies the tree twenty-nine times per run,
+  so hadolint and gitleaks were being re-downloaded once per copy. The copy
+  carries `tests/.bin`; it does not carry `.venv`.
+- **The self_test control run no longer fails on a missing executable bit.**
+  `cp -R` does not preserve mode bits on macOS, so every throwaway copy arrived
+  with `tests/*.sh` non-executable and the new handed-out-scripts check failed in
+  all of them — for a reason that had nothing to do with any breakage under test.
+
+### Changed
+
+- `tests/requirements.txt` pins **`zizmor==1.30.1`**, and an auditor is pinned
+  where a parser is not: a new release adds findings, and a gate whose result
+  depends on when it last ran is a gate nobody can reason about. zizmor comes
+  from PyPI rather than a release archive because it publishes no checksums file,
+  and pinning its archives would mean pinning hashes we computed ourselves.
+- `kit_bootstrap_binary` takes an asset-name template and an inner-path, so it
+  can install a tarball as well as a bare binary, and its sha256 table is keyed
+  by **exact asset filename**. It used to be keyed by `macos-arm64`, which forced
+  every caller's asset name to be derivable from `<name>-<os>-<arch>` — true for
+  hadolint, false for gitleaks, and the reason this function could not install a
+  second tool. There are now three spellings of the OS name in play
+  (`macos`/`darwin`/`apple-darwin`) and all three are mapped explicitly.
+- The `callable path` check's copy-walk skips `.bin` and shell scripts.
+
+### Earlier
+
 - A **`callable path` check** in `tests/validate.sh`: the reusable workflow
   exists at the path callers are documented to use, it declares
   `on: workflow_call`, every real `uses:` that names kit — in `README.md`,
