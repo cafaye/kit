@@ -31,6 +31,9 @@ kit/
 │   ├── compose/                          # postgres + nats + redis + collector + LGTM
 │   │   ├── grafana/provisioning/         # datasources, dashboards, alert rules (files)
 │   ├── otel/<lang>/                      # W3C traceparent: codec, suite, snippet
+│   ├── tier/<lang>/                      # the DECLARED tier, per language
+│   ├── tier/skip-allowlist               # one file for the fleet; four hygiene rules
+│   ├── tier/README.md                    # the format, the rules, and the limits
 │   ├── mise.toml                         # toolchain pin template
 │   └── AGENTS.md                         # skeleton for a service repo
 └── tests/validate.sh                     # THE gate
@@ -102,8 +105,12 @@ Three phases, and all three must pass:
   schemas** and compared both ways, redaction before every exporter, no literal
   URL, every `${env:...}` the collector reads actually passed into the
   container, every published port a `${KIT_*:default}` inside kit's claimed
-  15000-15999 block, telemetry in nobody's readiness path, and every language
-  with all four artifacts.
+  15000-15999 block, telemetry in nobody's readiness path, every language with
+  all four artifacts, and every language with a **declared tier** plus a
+  documented collector. The skip allowlist's four hygiene rules are enforced
+  here too, and **an entry matching nothing is a failure** — modelled on
+  ESLint's `reportUnusedDisableDirectives`, because without that rule an
+  allowlist is a ratchet that only turns one way.
 - **telemetry** — the six W3C traceparent suites are **executed**, one per
   language. Stdlib only and offline on purpose. If they ever need the network,
   a template has grown a dependency and kit has stopped being config-only.
@@ -113,9 +120,9 @@ Three phases, and all three must pass:
   survives), and a service starts, serves and reports healthy with the collector
   killed. Both need a real collector, so both SKIP loudly without docker —
   never pass silently.
-- **self_test** — nineteen breakages of a throwaway copy, asserting the gate goes
+- **self_test** — twenty breakages of a throwaway copy, asserting the gate goes
   red each time. Six of them are a semantic mutation of one language each, so
-  **every suite is proven able to fail** rather than assumed to. Six assert
+  **every suite is proven able to fail** rather than assumed to. Seven assert
   that one *named* check reported `FAIL`, so a check written for a specific
   defect is proven still load-bearing.
 
@@ -151,7 +158,10 @@ Three phases, and all three must pass:
   language, and the extension kit gives it must not stop you checking. This is
   not hypothetical: `rack_middleware.rb.snippet` shipped with
   `c.use_all, :auto_instrumentation`, which is not Ruby, and nothing noticed
-  because the artifact table only asked whether the file existed.
+  because the artifact table only asked whether the file existed. The tier
+  templates are parsed the same way — and the tier Go files shipped
+  un-gofmt'ed until this packet's own second pass ran `gofmt` over them, which
+  is the shape of the same defect one layer down.
 - **Run the config against your own files.** Both `Naming/PredicateName` (an
   obsolete RuboCop key that applies nothing) and a duplicate
   `Metrics/MethodLength` block in `lint/rubocop.yml` were invisible until
@@ -206,6 +216,28 @@ an `option` with no `job` is a green build that ran nothing.
   enforced and why, so it is relaxed deliberately or not at all.
 - **Never weaken a check to make the gate green.** If a check is wrong, fix
   the check and say so in the commit message.
+- **A check that a comment can satisfy is not a check.** The `-count=1`
+  assertion was a plain substring test, the go step's own comment block names
+  the flag twice while explaining why it is mandatory, and deleting the flag
+  from the command left the check green. `strip_shell_comments` exists because
+  of it. Any check that greps a `run:` body strips comments first.
+- **kit ships the convention; `caf` ships the checker.** The declared tier per
+  language, the normalised result format, the skip allowlist and its four rules,
+  and the `REQUIRED_<TIER>` demand are kit's. The per-language collector
+  adapters, the inventory-vs-run set difference, and the production of the
+  normalised format are `caf gate`'s — runtime code, in a runtime repo. If you
+  find yourself writing a collector here, you have left your scope.
+- **A test count is not a tier gate, and a floor is not a tier gate.** The
+  machinery can prove "41 tests ran"; only an assertion *inside* the test
+  proves "41 tests hit Postgres". A pass-count floor is a decrease detector: it
+  is satisfied by any N tests, including the wrong N, and nothing in it knows
+  which tier a test belongs to.
+- **Never cache a test report.** `restore-keys` matches by PREFIX and the
+  default branch's cache is documented as available to other branches, so a key
+  built from a lockfile hash restores a report written by a run that *had* the
+  dependency into a run that did not. A witness from a different run is not a
+  witness. Cache build products — `target/`, `$GOCACHE`, `node_modules`,
+  `vendor/bundle` — and never a witness.
 - **Never copy code from `moon/refs/`** into this repo or into any cafaye
   repo. Those trees are behavioral references; every line here is ours.
 - **Pins are placeholders.** `templates/mise.toml` and the Dockerfiles carry

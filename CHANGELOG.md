@@ -11,7 +11,89 @@ semver contract — it is consumed by *calling*
 
 ## Unreleased
 
+### Added
+
+- **kit-07 — the declared tier, and the allowlist that is supposed to shrink.**
+  A tier is a class of test that needs a real dependency. The failure this
+  exists to prevent has already happened in this fleet: a green run in which the
+  whole database tier never executed once, because the suite printed `ok`.
+
+  - **`templates/tier/<lang>/` — the declaration, per language, for all seven.**
+    Declared in the test source and read by the runner's own collector, never
+    grepped for a sentinel. A sentinel fails *open*: a test reaching Postgres
+    through a helper two files away does not match Identity's
+    `dbtest.Pool|Schema|EnvVar|TEST_DATABASE_URL`, so its package never enters
+    the required list and the run is never required to contain it. Rust
+    (`#[ignore = "cafaye:tier=db reason=…"]`), Go (`//go:build tier_db`) and
+    Python (`@pytest.mark.tier_db`) have a collector that already exists. Ruby
+    gets a `tier :db` macro, Elixir a `@tier :db` attribute, and Node and Bun an
+    exported `TIER` const — each a **no-op at runtime**, so the collector is a
+    ~15-line adapter rather than a parser.
+  - **Two collector claims measured, and both corrected the prior claim.**
+    `cargo test -- --list --format json` is **nightly-only** (`-Z
+    unstable-options`, rustc 1.95.0) — on stable, `--list` includes ignored
+    tests and `--list --ignored` gives the ignored subset, which between them
+    carry everything the JSON would have. `--list --include-ignored` lists
+    *everything* and filters nothing. And `bun test --reporter=junit` **does**
+    emit a full inventory: a filtered-out test is still a `<testcase>`, so the
+    absent-testcase failure mode does not occur there. What bun lacks is a
+    declared *reason* — `test.skip` takes none.
+  - **`templates/tier/README.md` — the normalised result format**, the three-way
+    `ran` / `skipped` / `filtered` distinction JUnit XML cannot express, the
+    allowlist rules, and **what a tier gate cannot catch**. A package filtered
+    out of the run entirely is the sharpest: the test asserting the tier ran
+    lives *inside* the tier and cannot observe its own absence. Only the
+    inventory-vs-run set difference catches it, and that is `caf gate`'s.
+  - **`templates/tier/skip-allowlist` — one file for the fleet**, with four
+    hygiene rules: every entry names a **reason**, an **owner**, a `since` and a
+    `until`; and **an entry matching nothing is a failure**. That last rule is
+    modelled on ESLint's `reportUnusedDisableDirectives`, which reports a
+    disable comment that no longer suppresses anything. Without it an allowlist is
+    a ratchet that only turns one way, and within two quarters it contains every
+    test in the repository. The **total is printed on every run, green included**
+    — individual entries look justified; the aggregate is the problem.
+  - **`required-tier` on the reusable workflow.** Demanded, not inferred: the
+    caller names the gate variable (`REQUIRED_DB`) and the workflow exports it
+    as `1` on every language job's test step — guard's `GUARD_REDIS_REQUIRED`
+    pattern, which fails at *tier-invocation* time, before a report exists. A
+    `tier demand` step then fails **naming the variable** if the run produced no
+    `ran` line, because a gate variable that is set while a tier runs zero tests
+    is a green build that verified nothing. Opt-in: the default is `''`.
+  - **`-count=1` mandated on the Go job.** Go keys its test cache on the
+    environment a test reads, so a gated and an ungated run already have
+    different cache keys — genuinely good news — but mandating the flag removes
+    the question rather than reasoning about it, and it costs nothing.
+  - **Never cache a test report**, documented in README with the reasoning:
+    `restore-keys` matches by **prefix**, and the default branch's cache is
+    documented as available to other branches, so a key built from
+    `hashFiles('**/lockfile')` restores a report written by a run that *had* the
+    database into a run that did not. **A witness from a different run is not a
+    witness.** Also stated: fork PRs get read-only cache access, which is a
+    cross-trust-boundary path into the gate in any workflow using
+    `actions/cache` today.
+  - **Floors are relabelled as decrease detectors.** Identity's
+    `1254/1166`-style floors are kept and are cheap at catching deletion, but a
+    floor is satisfied by *any* 1254 tests including the wrong 1254. Calling one
+    a tier gate is worse than having none.
+
 ### Fixed
+
+- **A check that a comment could satisfy.** The `-count=1` assertion was a plain
+  substring test over the go step's `run:` body, and that body's own comment
+  block names the flag twice while explaining why removing it would be a
+  mistake — so deleting the flag from the command left the check green. Found by
+  deliberately breaking the tree, not by reading it. `strip_shell_comments`
+  now removes comments while preserving `#` inside quotes, and it is applied
+  wherever a check greps a `run:` body.
+- **`templates/tier/go/*.go` was never gofmt'ed, and nothing checked it.** The
+  gofmt check covered `templates/otel/go/*.go` only, so the new tree shipped
+  with doc headings Go 1.19 would rewrite. It is checked now, over both trees.
+- **`python3 -m py_compile` wrote `__pycache__/` into the template tree**, and
+  the two checks that walk `templates/tier/<lang>/` then died with
+  `IsADirectoryError` — a gate that went red on its own artefacts. The parse is
+  now `compile()`, which is the same check with no filesystem side effect, and
+  both checks skip non-files and *report* a stray directory rather than
+  crashing on it.
 
 - **kit-03 rebased onto a master that moved nine commits underneath it.** The
   branch point was `badcc2a`; master gained the move of the reusable workflow to
