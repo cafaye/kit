@@ -1,0 +1,177 @@
+---
+# courier — the reference deployment.
+#
+#   SERVICE_NAME=courier \
+#   KIT_DEPLOY_IMAGE=cafaye-kit16/courier:35c6a27 \
+#   KIT_DEPLOY_PORT=16800 \
+#     templates/bin/deploy up --service courier --file <this file> --secrets-fd 3
+#
+# WHY courier IS THE REFERENCE, SAID UP FRONT
+#
+#   courier is Elixir/Phoenix, its gate is green and declared in `gate.yml`
+#   (535 tests at 35c6a27), and it already has the two things a reference
+#   deployment needs and that none of the other eight have: a release build
+#   with its own start and migrate binaries, and a readiness endpoint that
+#   really checks its database rather than reporting that its HTTP server is
+#   up. Choosing it means the template is written against the language with
+#   the best existing story, which is what keeps the template from being
+#   misleading — a template shaped by the weakest story in the fleet would be
+#   a template that misleads eight services instead of eight copies of itself.
+#
+#   `caf` was considered and rejected on purpose, and not for style reasons.
+#   caf is the platform's own resource-reclamation service, so a bug in its
+#   deploy path has the authority to destroy shared Docker state on a machine
+#   where other people and other projects have containers running. Proving
+#   the pattern on the service that is least able to survive a bad deploy
+#   would be a strange choice even if caf were a good candidate.
+#
+# WHAT IS DIFFERENT FROM templates/deploy/compose.deploy.yml
+#
+#   Exactly three things, and all three are courier's facts rather than
+#   generalities:
+#
+#     1. Three secrets, not two. `config/runtime.exs` raises without
+#        DATABASE_URL, SECRET_KEY_BASE and COURIER_SECRET_BOX_KEY, so a
+#        deploy that omits any of them does not start. That is the service
+#        correctly refusing to run with a default key.
+#     2. `PHX_SERVER=true` and `PHX_HOST`. The release starts an HTTP server
+#        only when PHX_SERVER is set, and config/prod.exs builds its URLs
+#        from PHX_HOST.
+#     3. The migrate command is `/app/bin/migrate`, the overlay script that
+#        runs `Courier.Release.migrate/0`. Rails would say `bin/rails
+#        db:migrate`, Django `manage.py migrate`, and a Go service would have
+#        no migrations at all.
+#
+#   Nothing else differs, and that is the point: this file is the template
+#   with a service's values in it.
+#
+name: kit-deploy-${SERVICE_NAME:-courier}
+
+services:
+  db:
+    image: postgres:17
+    restart: unless-stopped
+
+    entrypoint: ["/bin/sh", "/kit/entrypoint.sh"]
+    environment:
+      KIT_APP_CMD: "docker-entrypoint.sh postgres"
+      # POSTGRES_PASSWORD_FILE is deliberately NOT set, and the reason is a
+      # run rather than a principle. The official postgres entrypoint refuses
+      # outright when both it and POSTGRES_PASSWORD are present:
+      #
+      #   both POSTGRES_PASSWORD and POSTGRES_PASSWORD_FILE are set
+      #   (but are exclusive)
+      #
+      # and the gate EXPORTS POSTGRES_PASSWORD from the injected file, so
+      # setting the _FILE variant as well makes the database die on boot. The
+      # gate already delivers the value into the process environment without
+      # it ever being in the container's config, which is the property that
+      # matters; the _FILE indirection is a second route to the same value and
+      # this particular route is mutually exclusive with the first.
+      POSTGRES_USER: courier
+      POSTGRES_DB: courier
+      PGDATA: /var/lib/postgresql/data/pgdata
+
+    tmpfs:
+      - /run/secrets:rw,noexec,nosuid,size=1m,mode=0755
+    volumes:
+      - ../entrypoint.sh:/kit/entrypoint.sh:ro
+      - pgdata:/var/lib/postgresql/data
+
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U courier -d courier"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+    labels:
+      kit.deploy/secrets: "POSTGRES_PASSWORD"
+      kit.deploy/restart-policy: "unless-stopped"
+
+  app:
+    image: ${KIT_DEPLOY_IMAGE:?the deploy tool sets KIT_DEPLOY_IMAGE}
+    restart: unless-stopped
+
+    entrypoint: ["/bin/sh", "/kit/entrypoint.sh"]
+    environment:
+      KIT_APP_CMD: "/app/bin/server"
+      # Operator configuration, not credentials. Safe in this file, and it
+      # belongs here where somebody can read it and change it.
+      #
+      # PHX_SERVER is deliberately ABSENT, even though the Phoenix release
+      # normally needs it. `rel/overlays/bin/server` already does
+      # `PHX_SERVER=true exec ./courier start` itself, and putting the variable
+      # in the environment instead makes `bin/migrate` start the endpoint too
+      # — `bin/migrate` runs `courier eval`, which boots the application, and
+      # it would then fail to bind port 4000 because the real server already
+      # holds it. The deploy would fail on a migration for a reason that has
+      # nothing to do with migrations.
+      #
+      # PORT and POOL_SIZE are safe to leave in the environment: both the
+      # server and the migration read them, and neither binds a port because
+      # of them.
+      PORT: "4000"
+      POOL_SIZE: "10"
+      PHX_HOST: ${KIT_DEPLOY_HOST:-localhost}
+      # There is deliberately no DATABASE_URL here and no DATABASE_URL_FILE
+      # either. courier's config/runtime.exs reads `System.get_env("DATABASE_URL")`
+      # and nothing else, so a *_FILE convention here would be a line the
+      # service ignores — it would read as though the credential were being
+      # read from a file when in fact the deploy tool's gate exports it into
+      # the container's environment once the barrier opens.
+      #
+      # That is the honest position, and it is worth being precise about what
+      # it does and does not buy:
+      #
+      #   * NOT in `docker inspect`, NOT in `docker compose config`, NOT on
+      #     disk, NOT in the deploy log, NOT in the image. The container's
+      #     configuration contains no credential at all.
+      #   * Present in `/run/secrets/DATABASE_URL`, which is RAM, and in the
+      #     environment of the running processes, which a process inside the
+      #     container could read from /proc.
+      #
+      # A service that wants the stronger property — a credential that exists
+      # only as a file and is never in any process's environment — reads
+      # /run/secrets/itself. That is a one-line change in the service's own
+      # config, it is not kit's to make on courier's behalf, and it is written
+      # up in templates/deploy/README.md rather than faked here.
+
+    tmpfs:
+      - /run/secrets:rw,noexec,nosuid,size=1m,mode=0755
+    volumes:
+      - ../entrypoint.sh:/kit/entrypoint.sh:ro
+
+    ports:
+      # 127.0.0.1 only. On a real target this line is replaced by a proxy or
+      # a load-balancer target and the port is not published at all.
+      - "127.0.0.1:${KIT_DEPLOY_PORT:-16800}:4000"
+
+    depends_on:
+      db:
+        condition: service_healthy
+
+    healthcheck:
+      # `/readyz`, not `/healthz`, and the difference is the whole point:
+      # /healthz answers 200 whenever the VM can dispatch, and /readyz runs
+      # `SELECT 1` and answers 503 when the database does. The deploy gate
+      # must be the one that can go red.
+      #
+      # The Dockerfile already declares this same check as a HEALTHCHECK; it
+      # is repeated here because the deploy gate reads the COMPOSE health,
+      # and having one place that decides is worth more than the duplication.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:4000/readyz || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      start_period: 30s
+
+    labels:
+      kit.deploy/migrate: "/app/bin/migrate"
+      kit.deploy/probe-url: "http://127.0.0.1:${KIT_DEPLOY_PORT:-16800}/readyz"
+      kit.deploy/restart-policy: "unless-stopped"
+      # All three, or runtime.exs raises and the service does not start.
+      kit.deploy/secrets: "DATABASE_URL SECRET_KEY_BASE COURIER_SECRET_BOX_KEY"
+
+volumes:
+  pgdata:
