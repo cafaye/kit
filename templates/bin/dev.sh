@@ -3,6 +3,8 @@
 # kit template — the local developer loop. Copy to bin/dev in the service repo.
 #
 #   bin/dev            # compose up --wait, migrate, seed an admin, print URLs
+#   bin/dev stack      # resolve the pinned kit ref and print where it landed
+#   bin/dev pin <ref>  # DELIBERATELY move to another kit ref, and say what moved
 #   bin/dev down       # stop the stack, keep the volumes
 #   bin/dev nuke       # stop the stack and DELETE the volumes
 #   bin/dev status     # what is running, and its health
@@ -16,6 +18,32 @@
 #   is nonzero, and the failing step is named. It never leaves a half-started
 #   stack behind silently: if a step fails, the message says which one and what
 #   to run, and the stack it started is stopped.
+#
+# THE STACK IS FETCHED, NOT COPIED
+#   There is no `docker-compose.yml` of kit's in this repository, and there is no
+#   `otel-collector.yml`, no `tempo/`, no `loki/`, no `mimir/`, no `grafana/`.
+#   `bin/dev` fetches kit at the ref named by `KIT_STACK_REF` and runs
+#   `templates/compose/docker-compose.yml` from that tree BESIDE your own
+#   `docker-compose.yml`:
+#
+#     docker compose --project-directory . \
+#       -f <fetched>/templates/compose/docker-compose.yml \
+#       -f ./docker-compose.yml up -d --wait
+#
+#   Your file is the SECOND one, so it is an override: what is in it wins, and
+#   everything you did not mention still comes from kit. That is the whole
+#   contract, and it is why nine services stopped each carrying its own copy of
+#   the same 400 lines.
+#
+#   `KIT_STACK_REF` MUST BE A PIN. A 40-character commit sha, or a `v<semver>`
+#   tag. A branch name is refused, loudly, before any network call — because a
+#   moving reference is a gate that changes under you, and by the time a fetch
+#   has returned it has already changed. `bin/dev pin <ref>` is how you move,
+#   deliberately, and it prints the stack diff between the two refs.
+#
+#   The service's own `docker-compose.yml` is OPTIONAL. A service with nothing
+#   to add — one that only needs a database and a collector — needs no compose
+#   file at all, and `bin/dev` runs the stack without one.
 #
 # STRICTNESS NOTES — READ BEFORE EDITING
 #   - `docker compose up -d --wait`, never bare `up -d`. `--wait` blocks until
@@ -32,8 +60,8 @@
 #   - `nuke` is the only destructive step and it is the only one that is not the
 #     default. It is spelled out rather than aliased, and it asks nothing — a
 #     prompt here is a prompt someone will pipe `yes` into.
-#   - Nothing is written to git. `.env` is created from `.env.example` if absent
-#     and is git-ignored by every adopting repo.
+#   - Nothing is written to git. `.env` is created from the FETCHED
+#     `.env.example` if absent, and is git-ignored by every adopting repo.
 #   - Connection URLs are printed, never written anywhere else. A developer
 #     pasting one into a ticket is the developer's choice, not this script's.
 #   - The observability profile comes UP, and this is the load-bearing decision
@@ -53,6 +81,11 @@
 #     teaches people to switch telemetry off, which is the opposite of the
 #     intent. `tests/no_telemetry_in_readiness.sh` in kit proves the underlying
 #     property against a real collector.
+#   - A FETCH IS NOT A MIGRATION. `git fetch --depth 1 <url> <ref>` is one
+#     command against one remote and one immutable ref; there is no branch
+#     tracking, no merge and no rebase, so there is no state to get into and
+#     nothing to clean up. The ref is validated BEFORE the fetch, so the failure
+#     mode is a message rather than a checkout at the wrong commit.
 
 set -euo pipefail
 
@@ -88,6 +121,39 @@ STACK_TIMEOUT="${KIT_DEV_TIMEOUT:-180}"
 # send, and a dead endpoint with no retry costs spans rather than availability.
 KIT_DEV_PROFILES="${KIT_DEV_PROFILES-observability}"
 
+# --------------------------------------------------------------------------
+# the kit ref
+# --------------------------------------------------------------------------
+# Everything below is about ONE question: which bytes of kit is this developer
+# running? A compose file cannot be `uses:`-ed, so this script is the only
+# callable path there is, and the ref is the only thing standing between "always
+# current" and "changes under you between two runs of the same command".
+
+# Where kit comes from. Overridable because a self-hoster mirrors it, and
+# because the test builds a local `file://` remote and needs the same code path
+# rather than a mock of it.
+#
+# READ LAZILY by `stack_setting`, and not assigned once at the top of the file.
+# The first version read these from the process environment only, so a `.env`
+# naming a mirror was silently ignored and the fetch went to github anyway — from
+# a service that had written down somewhere else. Ignoring a value a developer
+# typed is worse than not having read the variable at all.
+stack_url() { stack_setting KIT_STACK_URL "https://github.com/cafaye/kit.git"; }
+
+# The cache. Outside the repository on purpose: a cache inside a working tree is
+# a copy, and this whole packet is about the copies. One directory per ref, so
+# two services on two refs cannot fight over one checkout, and an upgrade is a
+# new directory rather than a mutation of the old one.
+stack_home() { stack_setting KIT_STACK_HOME "${XDG_CACHE_HOME:-$HOME/.cache}/cafaye/kit"; }
+
+# The vendored copy, for a machine with no network. See `resolve_stack` for why
+# it has to DECLARE its ref rather than merely exist.
+vendor_dir() { stack_setting KIT_VENDOR_DIR ".kit/stack"; }
+
+# Set by `resolve_stack`, read by everything after it. Empty means "not resolved
+# yet", and every consumer treats that as a bug rather than a default.
+STACK_DIR=""
+
 step() { printf '\n\033[1m== %s\033[0m\n' "$1"; }
 info() { printf '   %s\n' "$1"; }
 die() {
@@ -95,7 +161,352 @@ die() {
   exit "${2:-1}"
 }
 
-usage() { sed -n '2,28p' "$SELF"; }
+usage() { sed -n '2,68p' "$SELF"; }
+
+# --------------------------------------------------------------------------
+# the pin
+# --------------------------------------------------------------------------
+#
+# A PINNED REF IS A 40-CHARACTER COMMIT SHA, OR A v<semver> TAG.
+#
+# Not a branch, and not "whatever master is today". The reason is not
+# fastidiousness: this is a GATE. `bin/dev` decides whether a redaction
+# allowlist derived from core's schemas is in force, and a service whose gate
+# resolves to a different allowlist on Tuesday than on Monday is a service
+# whose telemetry boundary is not a property anyone can state. So the two moving
+# forms are refused BEFORE the fetch, not corrected after it — a fetch of
+# `master` succeeds, it just succeeds at something nobody chose.
+#
+# A tag is accepted because cutting one is a deliberate act by a person, and a
+# tag that has been cut resolves to an immutable commit. An abbreviated sha is
+# refused because it is a moving reference wearing a sha costume: `git fetch`
+# resolves it happily and it is ambiguous across remotes.
+#
+# The check is `case`, not a regex, on purpose: this runs before any tooling
+# beyond POSIX shell has been located, and a dependency on `grep -E` at this
+# point would be a dependency in the one code path that must not have one.
+validate_ref() {
+  local ref="$1"
+  case "$ref" in
+    [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]*) ;;
+  esac
+  # The glob above matches a PREFIX, so a 7-char sha passes it. Length is
+  # checked separately and exactly, which is the whole point.
+  if [ "${#ref}" -eq 40 ]; then
+    case "$ref" in
+      *[!0-9a-f]*)
+        die "KIT_STACK_REF='$ref' is 40 characters but is not a commit sha (lowercase hex)."
+        ;;
+    esac
+    return 0
+  fi
+  case "$ref" in
+    v[0-9]*.[0-9]*.[0-9]*)
+      # Semver's own grammar, including the optional pre-release and build
+      # suffixes. `v1.0.0-rc.1` is a tag real projects cut, and a pin rule that
+      # refused it would be routed around — a developer told "that is not a pin"
+      # writes `master`, which is the failure this whole function exists to
+      # prevent. Rejecting the suffix would make the rule worse, not stricter.
+      local version="${ref#v}"
+      # Drop `-pre` and `+build` before counting the dots, so `v1.0.0-rc.1` does
+      # not read as a four-component version.
+      local numeric="${version%%+*}"
+      numeric="${numeric%%-*}"
+      local major minor patch
+      case "$numeric" in
+        *.*.*)
+          major="${numeric%%.*}"
+          # `minor` and `patch` are each cut on BOTH delimiters. Cutting only the
+          # leading one leaves `minor` as "0.0" for a `v0.0.0` tag, which then
+          # fails the digit check below — so `v0.0.0` was refused while `v1.2.3`
+          # was accepted, which is the worst possible shape for a validation
+          # rule: it looks right on the examples everybody tries first.
+          minor="${numeric#*.}"
+          minor="${minor%%.*}"
+          patch="${minor#*.}"
+          patch="${patch%%.*}"
+          ;;
+        *)
+          die "KIT_STACK_REF='$ref' is not a v<MAJOR>.<MINOR>.<PATCH> tag."
+          ;;
+      esac
+      # Each component must be digits and nothing else. A `case` and not a
+      # `[[ =~ ]]`: this function is the one code path that has to run before any
+      # tooling beyond POSIX shell has been located, and an extended-regex
+      # dependency there is a dependency in the one place that must not have one.
+      for part in "$major" "$minor" "$patch"; do
+        case "$part" in
+          '' | *[!0-9]*)
+            die "KIT_STACK_REF='$ref' is not a v<MAJOR>.<MINOR>.<PATCH> tag with numeric parts."
+            ;;
+        esac
+      done
+      # The suffix, if any, is semver's own: alphanumerics, dots and hyphens.
+      local suffix="${version#"$numeric"}"
+      case "$suffix" in
+        *[!0-9A-Za-z.+-]*)
+          die "KIT_STACK_REF='$ref' is not a v<MAJOR>.<MINOR>.<PATCH> tag; a pre-release or
+   build suffix may contain only letters, digits, dots and hyphens."
+          ;;
+      esac
+      return 0
+      ;;
+  esac
+  if [ -z "$ref" ]; then
+    die "KIT_STACK_REF is empty. Set it in .env to a 40-character kit commit sha, or to a v<semver> tag.
+   It is a PIN, and a pin is what makes 'one command, always current' mean something:
+   an unpinned ref is a gate that changes between two runs of the same command.
+   To move deliberately:  bin/dev pin <ref>"
+  fi
+  die "KIT_STACK_REF='$ref' is not a pin.
+   Accepted: a 40-character commit sha (lowercase hex), or a v<MAJOR>.<MINOR>.<PATCH> tag.
+   Refused: branch names — 'master', 'main', anything without a ref suffix — because a
+   branch is a MOVING reference. \`bin/dev\` would fetch whatever it points at today, and
+   the stack you get on Tuesday would not be the stack you reviewed on Monday.
+   To move deliberately:  bin/dev pin <ref>"
+}
+
+# --------------------------------------------------------------------------
+# resolving the stack
+# --------------------------------------------------------------------------
+#
+# FOUR SOURCES, IN THIS ORDER, AND THE ORDER IS THE ARGUMENT.
+#
+#   1. KIT_STACK_DIR   an explicit directory. Highest precedence because it is
+#                      the only one a person typed on this run.
+#   2. the cache       <KIT_STACK_HOME>/<ref>, with the ref recorded inside it.
+#   3. the vendored    .kit/stack, ALSO with the ref recorded inside it.
+#      copy
+#   4. a fetch         the only one that touches the network, and the only one
+#                      that can fail because of the network.
+#
+# 2 and 3 both carry a recorded ref, and that is the load-bearing detail. A
+# directory that merely CONTAINS `templates/compose/` is not a kit checkout at
+# the right version; it is a directory. Accepting one silently is precisely how
+# an offline loop stops matching what the team runs, so a mismatched record is
+# a refusal and a missing record is a refusal, and only a matching one is used.
+#
+# OFFLINE IS REAL, NOT A SENTENCE. `KIT_STACK_OFFLINE=1` skips step 4 and fails
+# if 1-3 all miss, naming each one. The alternative — falling back to whatever
+# is in the working directory — is the one behaviour that cannot be allowed,
+# because it makes `bin/dev` report success while running a stack nobody pinned.
+
+# read_stack_ref <dir> — the ref a tree records, or empty if it records none.
+# A single line, read with `head -1`, so a multi-line or binary file cannot
+# become a ref by accident.
+read_stack_ref() {
+  [ -f "$1/.kit-stack-ref" ] || return 1
+  head -1 "$1/.kit-stack-ref" 2>/dev/null | tr -d ' \t\r\n'
+}
+
+# stack_is_usable <dir> <ref> — does this tree look like kit, at that ref?
+# Both halves. A tree at the wrong ref is refused, and so is a tree that is
+# missing the files `up` mounts, because a fetch that succeeded and produced an
+# unusable tree is a `bin/dev up` that dies four containers later on a bind-mount
+# error naming a path the developer has never heard of.
+stack_is_usable() {
+  local dir="$1" ref="$2" have
+  [ -d "$dir" ] || return 1
+  have="$(read_stack_ref "$dir")" || return 1
+  [ "$have" = "$ref" ] || return 1
+  [ -f "$dir/templates/compose/docker-compose.yml" ] &&
+    [ -f "$dir/templates/compose/otel-collector.yml" ] &&
+    [ -d "$dir/templates/compose/tempo" ] &&
+    [ -d "$dir/templates/compose/loki" ] &&
+    [ -d "$dir/templates/compose/mimir" ] &&
+    [ -d "$dir/templates/compose/grafana/provisioning" ]
+}
+
+fetch_stack() {
+  # `git init` + `fetch --depth 1` + `checkout --detach FETCH_HEAD`, not
+  # `git clone --branch`. Three reasons, and the third is the one that matters:
+  #
+  #   - `--branch` takes a BRANCH OR A TAG, and cannot take a commit sha, so
+  #     cloning cannot express the stricter of the two pin forms.
+  #   - a clone of a bare remote at a sha needs the remote to have `uploadpack`
+  #     configured to serve it; a fetch of a sha is one request.
+  #   - fetching into a directory keyed by the ref means the checkout is
+  #     disposable. Delete it and the next run rebuilds it; nothing is ever
+  #     half-updated, because nothing is ever updated in place.
+  #
+  # `--depth 1` on a repository that is mostly YAML is a few hundred KB, and it
+  # is the difference between a first `bin/dev` that feels instant and one that
+  # clones a history nobody reads.
+  command -v git >/dev/null 2>&1 ||
+    die "git is not installed, and this script needs it to fetch kit from $(stack_url)."
+
+  local ref="$1" dest="$2" tmp
+  tmp="$dest.tmp.$$"
+  rm -rf "$tmp"
+  mkdir -p "$tmp"
+  # `git init -q` and then a remote, rather than `git clone`, for the reason in
+  # the comment above. `-c advice.detachedHead=false` because a detached
+  # checkout is the intended end state here and the advice is noise on every
+  # first run.
+  git -C "$tmp" init -q
+  git -C "$tmp" remote add origin "$(stack_url)"
+  if ! git -C "$tmp" fetch --quiet --depth 1 origin "$ref" 2>"$tmp/.fetch-error"; then
+    local why
+    why="$(tail -3 "$tmp/.fetch-error" | tr '\n' ' ')"
+    rm -rf "$tmp"
+    die "could not fetch kit@$ref from $(stack_url).
+   $why
+   Check the ref exists:  git ls-remote $(stack_url) '$ref'
+   To use a ref you already have on disk, point KIT_STACK_DIR at a kit checkout,
+   or vendor one:  git clone --depth 1 $(stack_url) $(vendor_dir)
+                        git -C $(vendor_dir) checkout $ref
+                        git -C $(vendor_dir) rev-parse HEAD > $(vendor_dir)/.kit-stack-ref"
+  fi
+  git -C "$tmp" -c advice.detachedHead=false checkout --quiet --detach FETCH_HEAD
+  # The ref is RECORDED, and this file is what makes a cached or vendored tree
+  # acceptable later. A tree without it is a directory.
+  printf '%s\n' "$ref" >"$tmp/.kit-stack-ref"
+  # Built beside the destination and moved into place, so a second `bin/dev` in
+  # another terminal never sees a half-populated cache directory. `mv` within a
+  # filesystem is atomic; a `cp -R` into place is not, and the failure it causes
+  # is a bind-mount error about a file that was about to exist.
+  rm -rf "$dest"
+  mv "$tmp" "$dest"
+}
+
+resolve_stack() {
+  local ref
+  ref="$(env_value KIT_STACK_REF)"
+  validate_ref "$ref"
+
+  # 1. An explicit directory. Read through `stack_setting`, so a `KIT_STACK_DIR`
+  #    in `.env` counts — the first version read `${KIT_STACK_DIR:-}` from the
+  #    process environment only, so the documented offline escape hatch, written
+  #    in the file a developer is told to write it in, was silently ignored and
+  #    the script went to the network instead. A documented escape hatch that
+  #    only works when you remember to also pass it on the command line is not an
+  #    escape hatch.
+  #
+  #    Not checked against the ref: naming a directory is a person saying "this
+  #    one", and re-litigating it with a ref check would make the override
+  #    useless for exactly the case it exists for — a kit worktree with local
+  #    changes, which is what a kit contributor runs.
+  local named
+  named="$(stack_setting KIT_STACK_DIR "")"
+  if [ -n "$named" ]; then
+    [ -d "$named" ] ||
+      die "KIT_STACK_DIR='$named' is not a directory."
+    [ -f "$named/templates/compose/docker-compose.yml" ] ||
+      die "KIT_STACK_DIR='$named' has no templates/compose/docker-compose.yml.
+   It must be the ROOT of a kit checkout, not its templates/ directory."
+    STACK_DIR="$named"
+    info "stack: $STACK_DIR (KIT_STACK_DIR — named explicitly, ref not checked)"
+    return 0
+  fi
+
+  # 2. The cache, keyed by the ref.
+  local cached
+  cached="$(stack_home)/$ref"
+  if stack_is_usable "$cached" "$ref"; then
+    STACK_DIR="$cached"
+    info "stack: $STACK_DIR (cache)"
+    return 0
+  fi
+
+  # 3. The vendored copy. Checked against the ref, and the check is the feature:
+  # this is the offline path, and an offline path that cannot tell you which
+  # version it is running is worse than no offline path.
+  local vendor
+  vendor="$(vendor_dir)"
+  if [ -e "$vendor" ]; then
+    local vendored_ref=""
+    vendored_ref="$(read_stack_ref "$vendor" || true)"
+    if [ -z "$vendored_ref" ]; then
+      die "$vendor exists but records no ref, so there is no way to know what it is.
+   A directory that contains a compose file is not a kit checkout at a known version,
+   and using one is how an offline loop stops matching what the team runs. Either
+   remove it, or record what it is:
+     git -C $vendor rev-parse HEAD > $vendor/.kit-stack-ref"
+    fi
+    if [ "$vendored_ref" != "$ref" ]; then
+      die "$vendor is vendored at $vendored_ref, and KIT_STACK_REF is $ref.
+   Using it anyway would run a stack you did not pin. Move the pin deliberately —
+   bin/dev pin $vendored_ref — or update the vendored copy to $ref."
+    fi
+    if ! stack_is_usable "$vendor" "$ref"; then
+      die "$vendor records $ref but is missing files the stack mounts
+   (templates/compose/{docker-compose,otel-collector}.yml, tempo/, loki/, mimir/,
+   grafana/provisioning/). Re-vendor it rather than starting a stack that will die
+   four containers later on a bind mount."
+    fi
+    STACK_DIR="$vendor"
+    info "stack: $STACK_DIR (vendored, and it declares the pinned ref)"
+    return 0
+  fi
+
+  # 4. The network.
+  if [ "$(stack_setting KIT_STACK_OFFLINE 0)" = "1" ]; then
+    die "offline (KIT_STACK_OFFLINE=1) and kit@$ref is not available locally.
+   Tried, in order:
+     KIT_STACK_DIR          not set
+     $cached
+                          not present, or not at this ref
+     $vendor        not present
+   Fix it with any one of:
+     bin/dev pin <ref>                              # on a machine with the network, first
+     git clone --depth 1 $(stack_url) $vendor
+     git -C $vendor checkout $ref
+     git -C $vendor rev-parse HEAD > $vendor/.kit-stack-ref
+     KIT_STACK_DIR=/path/to/a/kit/checkout bin/dev   # a checkout you already have"
+  fi
+  info "fetching kit@$ref from $(stack_url) (first run only)"
+  fetch_stack "$ref" "$cached"
+  STACK_DIR="$cached"
+  info "stack: $STACK_DIR (fetched)"
+}
+
+# env_value <NAME> — read one variable out of .env without sourcing the file.
+#
+# `set -a; . ./.env` is how print_urls reads the ports, and there it is right:
+# the file is this repository's own and every line in it is a developer who ran
+# the gate on a machine like this one. It is NOT right here, because this runs
+# BEFORE the ref is known and the value it produces decides whether anything is
+# fetched at all — a `.env` with one stray unquoted line in it would then fail
+# the fetch instead of failing the stack. Sourcing a config file to read one
+# variable is how a value gets to execute code; grep does not.
+env_value() {
+  # `${2:-.env}` and NOT `local file="$2"` in the same `local`: under `set -u` a
+  # positional parameter that was never passed is an error the moment it is
+  # expanded, and `local` expands all of its arguments before it assigns any of
+  # them. The first version read `$2` unconditionally and died with
+  # `line 423: $2: unbound variable` on the very first call — which is every
+  # call, since the file argument is optional by design.
+  local name="$1"
+  local file="${2:-.env}"
+  local line value
+  [ -f "$file" ] || return 0
+  line="$(grep -E "^[[:space:]]*(export[[:space:]]+)?$name=" "$file" | tail -1 || true)"
+  [ -n "$line" ] || return 0
+  value="${line#*=}"
+  # Strip one layer of matching quotes and nothing else. `sed` rather than bash
+  # parameter expansion because the expansion to strip a leading and a trailing
+  # quote independently would accept `"foo'` — two different mistakes that look
+  # like one.
+  value="$(printf '%s' "$value" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//' -e 's/^"\(.*\)"$/\1/' -e "s/^'\(.*\)'\$/\1/")"
+  printf '%s' "$value"
+}
+
+# stack_setting <NAME> <default> — the process environment, then `.env`, then the
+# default. In that order, and the order is the contract: `KIT_STACK_DIR=… bin/dev`
+# is a person overriding for one run, and `.env` is a developer recording a
+# decision. A value set in the shell that `.env` also names must not be silently
+# replaced by the file, or a one-shot override would be a no-op.
+stack_setting() {
+  local name="$1" fallback="${2:-}" value
+  value="$(eval "printf '%s' \"\${$name:-}\"")"
+  [ -n "$value" ] && {
+    printf '%s' "$value"
+    return 0
+  }
+  value="$(env_value "$name")"
+  [ -n "$value" ] || value="$fallback"
+  printf '%s' "$value"
+}
 
 # --------------------------------------------------------------------------
 # preflight
@@ -123,42 +534,45 @@ compose() {
   # which is a spectacularly bad way to find out that a documented flag does not
   # work. The conditional expansion below is the portable form: on bash 4.4+ it
   # is identical to "${a[@]}" and on 3.2 it yields nothing.
+  # `--project-directory .` is NOT optional and not tidiness. `docker compose`
+  # resolves a relative path in a `-f` file against the FIRST file's directory,
+  # and the first file is now kit's, fetched into a cache directory outside this
+  # repository. Without this flag the service's own `build: context: .` would
+  # point at kit's templates directory and the service image would be built from
+  # the wrong tree — a failure that produces an image, so nothing complains.
+  #
+  # `KIT_COMPOSE_DIR` is exported so the base file's own `${KIT_COMPOSE_DIR:-.}`
+  # mount prefixes resolve back to the fetched tree, whichever directory compose
+  # runs from. The default `.` in the template is what keeps a hand-copied stack
+  # working, and this is the line that stops that default from being wrong in the
+  # fetched case.
+  local -a base=()
+  base=(--project-directory . -f "$STACK_DIR/templates/compose/docker-compose.yml")
+  [ -f docker-compose.yml ] && base+=(-f ./docker-compose.yml)
+  # The COMPOSE directory, not the kit root: that is what the base file's
+  # `${KIT_COMPOSE_DIR:-.}` prefixes mean, and `.` is the directory the file
+  # itself lives in. Setting it to the kit root instead resolves the mounts to
+  # `<kit>/grafana/provisioning`, which does not exist, and Docker's answer to a
+  # missing bind source is to create a directory — so the failure arrives four
+  # containers later as `read /etc/tempo/tempo.yaml: is a directory`.
+  export KIT_COMPOSE_DIR="$STACK_DIR/templates/compose"
+
   if [ -n "$KIT_DEV_PROFILES" ]; then
     if docker compose version >/dev/null 2>&1; then
-      docker compose --profile "$KIT_DEV_PROFILES" "$@"
+      docker compose "${base[@]}" --profile "$KIT_DEV_PROFILES" "$@"
     elif command -v docker-compose >/dev/null 2>&1; then
-      docker-compose --profile "$KIT_DEV_PROFILES" "$@"
+      docker-compose "${base[@]}" --profile "$KIT_DEV_PROFILES" "$@"
     else
       die "neither 'docker compose' (v2) nor 'docker-compose' is installed" 127
     fi
   else
     if docker compose version >/dev/null 2>&1; then
-      docker compose "$@"
+      docker compose "${base[@]}" "$@"
     elif command -v docker-compose >/dev/null 2>&1; then
-      docker-compose "$@"
+      docker-compose "${base[@]}" "$@"
     else
       die "neither 'docker compose' (v2) nor 'docker-compose' is installed" 127
     fi
-  fi
-}
-
-require_files() {
-  local missing=()
-  local f
-  for f in "$@"; do
-    [ -e "$f" ] || missing+=("$f")
-  done
-  if [ "${#missing[@]}" -ne 0 ]; then
-    printf 'bin/dev: missing %s\n' "${missing[*]}" >&2
-    printf '\nFrom a fresh kit checkout:\n' >&2
-    printf '  cp <kit>/templates/compose/docker-compose.yml ./docker-compose.yml\n' >&2
-    printf '  cp <kit>/templates/compose/otel-collector.yml  ./otel-collector.yml\n' >&2
-    printf '  cp -R <kit>/templates/compose/grafana ./grafana\n' >&2
-    printf '  cp -R <kit>/templates/compose/tempo  ./tempo\n' >&2
-    printf '  cp -R <kit>/templates/compose/loki   ./loki\n' >&2
-    printf '  cp -R <kit>/templates/compose/mimir  ./mimir\n' >&2
-    printf '  cp <kit>/templates/compose/.env.example        ./.env\n' >&2
-    exit 1
   fi
 }
 
@@ -168,13 +582,56 @@ require_files() {
 
 ensure_env() {
   [ -f .env ] && return 0
-  [ -f .env.example ] || die "no .env and no .env.example to copy one from"
 
-  # Copied, never written from scratch: a .env assembled here would drift from
-  # the .env.example a teammate has in git, and the two disagreeing is exactly
-  # the failure this avoids.
-  cp .env.example .env
-  info "created .env from .env.example — edit it if a port collides"
+  # The template comes from the FETCHED tree, not from this repository. That is
+  # the point: a service carries no copy of it, so a new `${KIT_*}` in a kit
+  # release reaches a service that has not been touched, instead of a service
+  # whose committed `.env.example` is nine releases behind. A service's own
+  # `.env` — git-ignored, and the only file a developer edits — is where its
+  # port overrides and its own variables live.
+  #
+  # A service that already committed a `.env.example` still wins: `cp` refuses
+  # to overwrite, and the explicit branch below says so, because a developer's
+  # committed example is a deliberate thing and silently replacing it on a
+  # first `bin/dev` would be a surprise with a merge conflict behind it.
+  if [ -f "$STACK_DIR/templates/compose/.env.example" ]; then
+    cp "$STACK_DIR/templates/compose/.env.example" .env
+    info "created .env from the pinned kit ref's .env.example — edit it if a port collides"
+    return 0
+  fi
+  # Only reachable if the pinned ref has no template, which is a broken kit rather
+  # than a broken service. Said as such, because the alternative — silently
+  # writing a three-line .env and letting every variable default — is a stack
+  # that comes up and is not the one anybody reviewed.
+  die "the pinned kit ref ($STACK_DIR) has no templates/compose/.env.example.
+   That is a defect in kit, not in this service: bin/dev has no template to
+   create .env from. Check out the ref and see:
+     git -C '$STACK_DIR' ls templates/compose/.env.example"
+}
+
+# --------------------------------------------------------------------------
+# the leftover .env.example
+# --------------------------------------------------------------------------
+#
+# A service that adopted the copy-then-edit model has a committed
+# `.env.example` beside its `.env`. `ensure_env` above no longer reads it — the
+# fetched template wins — so that file is now DEAD, and a dead file in a
+# repository is worse than a missing one: it looks authoritative and it is nine
+# releases out of date.
+#
+# The first version of this check reported every unset `KIT_*` as drift. That is
+# wrong now, and the reason is the packet itself: a fresh service's `.env`
+# SHOULD contain almost nothing, because every unset variable resolves to kit's
+# default and that default is the documented, reviewed one. Flagging it told
+# nine developers their stack was wrong when it was exactly right.
+warn_stale_env_example() {
+  [ -f .env.example ] || return 0
+  step "a .env.example here is no longer read"
+  info "bin/dev takes every KIT_* default from the pinned kit ref, and composes fall"
+  info "back to those defaults for anything your .env does not set. So this file is"
+  info "now dead weight that will read as authoritative and will not be."
+  info "  git rm .env.example"
+  info "Keep .env itself: it is where your overrides and your KIT_STACK_REF live."
 }
 
 # --------------------------------------------------------------------------
@@ -182,7 +639,17 @@ ensure_env() {
 # --------------------------------------------------------------------------
 
 up() {
-  step "starting the stack (deadline: ${STACK_TIMEOUT}s)"
+  # Resolve FIRST, before `ensure_env`. The order is not cosmetic:
+  # `ensure_env` copies the `.env.example` out of the FETCHED tree, so it cannot
+  # run until the tree is fetched, and a ref is only known once the ref
+  # variable has been read. Doing it the other way round is how a `.env` ends up
+  # seeded from whatever stale copy happened to be in the working directory.
+  step "resolving kit"
+  resolve_stack
+  ensure_env
+  warn_stale_env_example
+
+  step "starting the stack from kit@$(env_value KIT_STACK_REF) (deadline: ${STACK_TIMEOUT}s)"
   # The wall-clock is measured here and printed at the end, because "the dev
   # loop is slow" is a claim everyone makes and nobody measures, and the whole
   # point of shipping five more containers is that it is not slow. A number in
@@ -302,10 +769,12 @@ URLS
 
 status() {
   step "stack status"
+  resolve_stack
   compose ps
 }
 
 logs() {
+  resolve_stack
   if [ "${1:-}" = "" ]; then
     compose logs -f
   else
@@ -315,6 +784,7 @@ logs() {
 
 down() {
   step "stopping the stack (volumes kept)"
+  resolve_stack
   # `down` without -v on purpose: your local data is the thing you are not
   # throwing away by typing `bin/dev down`.
   compose down
@@ -323,8 +793,122 @@ down() {
 nuke() {
   # The only destructive step. Spelled out, never the default, never aliased.
   step "stopping the stack and DELETING its volumes"
+  resolve_stack
   info "postgres, nats and redis data in this stack are gone after this."
   compose down --volumes --remove-orphans
+}
+
+# --------------------------------------------------------------------------
+# stack: resolve, and say where it landed
+# --------------------------------------------------------------------------
+
+# This exists because the whole packet turns on "which bytes of kit is this",
+# and a fact that only exists inside a function that also brings up eight
+# containers cannot be checked. `bin/dev stack` is the same resolution with no
+# side effects, and `tests/fetch_test.sh` drives it rather than `up` — the
+# fetch path is then provable without docker in the loop.
+#
+# The `resolved: <path>` line is an INTERFACE, not progress output. It is the
+# first machine-readable line the script emits, and the test parses it, so a
+# reformatting of the human-facing `step`/`info` lines cannot silently break the
+# check. Printed to stdout, with the human lines above it.
+stack_cmd() {
+  step "resolving kit"
+  resolve_stack
+  printf 'resolved: %s\n' "$STACK_DIR"
+  printf 'ref: %s\n' "$(env_value KIT_STACK_REF)"
+  printf 'compose files:\n'
+  printf '  %s (kit, pinned)\n' "$STACK_DIR/templates/compose/docker-compose.yml"
+  [ -f docker-compose.yml ] &&
+    printf '  %s (this service — an override, not a fork)\n' "$PWD/docker-compose.yml"
+  if [ -f docker-compose.yml ]; then
+    step "merged by docker compose"
+    # Rendered, not described. This is the check the packet asks for — a compose
+    # file that has never been `docker compose config`-validated is a YAML file —
+    # and it is here so a developer sees what the two files actually became
+    # rather than trusting the prose above.
+    compose config 2>&1 | sed 's/^/  /' || true
+  else
+    info "this service adds no compose file; the pinned stack is the whole thing"
+  fi
+}
+
+# --------------------------------------------------------------------------
+# pin: the deliberate upgrade
+# --------------------------------------------------------------------------
+#
+# THE UPGRADE IS A COMMAND, NOT AN EDIT, and the reason is the diff.
+#
+# Moving `KIT_STACK_REF` is the one edit in a service repository that changes
+# every container it starts, so the interesting question is never "can I write
+# this sha" — it is "what changes if I do". `bin/dev pin` prints the stack
+# diff between the old ref and the new one, and refuses to write anything until
+# it has.
+#
+# It writes the pin and nothing else. It does not touch `.env` beyond that one
+# line, does not run compose, and does not upgrade the images: the containers
+# that come up next are a separate, visible step, and folding them in would make
+# "what changed" answerable only after it had already happened.
+pin_cmd() {
+  local new="${1:-}"
+  [ -n "$new" ] || die "bin/dev pin needs a ref:  bin/dev pin v0.4.0   |   bin/dev pin <40-char sha>"
+  validate_ref "$new"
+
+  local old
+  old="$(env_value KIT_STACK_REF)"
+
+  local old_dir="" new_dir
+  new_dir="$(stack_home)/$new"
+  local old_cache
+  old_cache="$(stack_home)/$old"
+  if stack_is_usable "$old_cache" "$old"; then
+    old_dir="$old_cache"
+  elif [ -n "$(stack_setting KIT_STACK_DIR "")" ] && [ -d "$(stack_setting KIT_STACK_DIR "")" ]; then
+    old_dir="$(stack_setting KIT_STACK_DIR "")"
+  fi
+
+  step "what changes between $old and $new"
+  if [ -z "$old_dir" ]; then
+    info "the current ref ($old) is not on this machine, so the diff cannot be computed here."
+    info "Run it on a machine with the cache warm, or fetch the old ref first:"
+    info "  git -C $(stack_home) init $old_dir 2>/dev/null || true"
+  elif [ "$old" = "$new" ]; then
+    info "same ref — nothing to do."
+    return 0
+  else
+    # The old tree is already on disk and the new one is fetched into a
+    # directory keyed by its ref, so this is two real directories and `diff -r`
+    # on the one subtree that is the stack. A diff of the whole repository would
+    # be the classifier's job, not this script's.
+    [ -d "$new_dir" ] || {
+      fetch_stack "$new" "$new_dir"
+    }
+    local changed
+    changed="$(diff -rq "$old_dir/templates/compose" "$new_dir/templates/compose" 2>/dev/null || true)"
+    if [ -z "$changed" ]; then
+      info "the compose stack is IDENTICAL between the two refs."
+    else
+      info "changed under templates/compose:"
+      printf '%s\n' "$changed" | sed 's/^/    /'
+    fi
+  fi
+
+  step "writing the pin"
+  # Appended if absent, replaced in place if present. `sed -i` differs between
+  # GNU and BSD, so a temporary file and a `mv` is the portable form — and the
+  # `mv` is atomic, so a crashed `bin/dev pin` cannot leave a half-written .env.
+  local tmp
+  tmp="$(mktemp "${TMPDIR:-/tmp}/kit-dev-env.XXXXXX")"
+  if [ -f .env ] && grep -qE '^[[:space:]]*(export[[:space:]]+)?KIT_STACK_REF=' .env; then
+    sed -E "s|^([[:space:]]*(export[[:space:]]+)?KIT_STACK_REF=).*|\\1$new|" .env >"$tmp"
+  else
+    [ -f .env ] && cat .env >"$tmp"
+    printf 'KIT_STACK_REF=%s\n' "$new" >>"$tmp"
+  fi
+  chmod --reference=.env "$tmp" 2>/dev/null || mv .env "$tmp" 2>/dev/null || true
+  mv "$tmp" .env
+  info ".env now pins KIT_STACK_REF=$new"
+  info "Nothing has been started. Run \`bin/dev\` to bring the stack up on the new ref."
 }
 
 # --------------------------------------------------------------------------
@@ -332,18 +916,30 @@ nuke() {
 main() {
   case "${1:-up}" in
     up)
-      # The vendor config trees are required alongside the compose file. They
-      # are mounted read-only and they are the reason the four stores start, so
-      # a missing `tempo/` is a `bin/dev up` that dies four containers later
-      # with a bind-mount error naming a path the developer has never heard of.
-      require_files docker-compose.yml otel-collector.yml grafana tempo loki mimir
-      ensure_env
+      # The stack is resolved inside `up`, and `require_files` is GONE: the six
+      # files it demanded — docker-compose.yml of kit's, otel-collector.yml,
+      # grafana, tempo, loki, mimir — are exactly the copy this packet removes.
+      # Requiring them would require the drift back.
+      #
+      # `ensure_env` is inside `up` for the same reason: it copies the fetched
+      # tree's `.env.example`, so it runs after the fetch.
+      #
+      # A service's own `docker-compose.yml` is optional, and `compose` already
+      # omits it when absent.
       up
+      ;;
+    stack) stack_cmd ;;
+    pin)
+      shift
+      pin_cmd "${1:-}"
       ;;
     down) down ;;
     nuke) nuke ;;
     status) status ;;
-    logs) shift; logs "${1:-}" ;;
+    logs)
+      shift
+      logs "${1:-}"
+      ;;
     migrate) migrate ;;
     seed) seed ;;
     -h | --help | help) usage ;;

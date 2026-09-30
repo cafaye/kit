@@ -1,9 +1,17 @@
 ---
 # kit template — the local infrastructure every cafaye service joins.
 #
-#   cp <kit>/templates/compose/docker-compose.yml ./docker-compose.yml
-#   cp <kit>/templates/compose/.env.example               ./.env   # then edit
-#   cp <kit>/templates/bin/dev.sh                         ./bin/dev && chmod +x bin/dev
+#   IT IS NOT COPIED. `bin/dev` fetches this file, and the rest of this
+#   directory, from a PINNED kit ref, and runs it beside the service's own
+#   `docker-compose.yml`:
+#
+#     docker compose -f <kit>/templates/compose/docker-compose.yml \
+#                    -f ./docker-compose.yml up -d --wait
+#
+#   The second file is an OVERRIDE, not a fork. What the service owns — its own
+#   image, its own port, its own database name — is the only thing in it. See
+#   "WHAT A SERVICE MAY OVERRIDE" below, and the gate in kit's tests/validate.sh
+#   that holds both halves of it.
 #
 # WHAT THIS IS
 #   Postgres, NATS with JetStream, Redis, the OpenTelemetry collector, and the
@@ -58,6 +66,42 @@
 #     probes an OTLP port. The gate fails on both. The live half of the proof
 #     is tests/no_telemetry_in_readiness.sh, which kills the collector and
 #     shows a service still serving.
+#
+# WHAT A SERVICE MAY OVERRIDE, AND WHAT IT MAY NOT
+#   Two files, merged by `docker compose -f kit -f yours`. The merge is per-key
+#   and it is NOT symmetric, so the rules below are measured against
+#   `docker compose config`, not assumed. Each was run; the surprises are called
+#   out because the unsurprising ones are the ones that bite.
+#
+#   MAY — set `image:` on a service (wholesale, and a different tag is a
+#         different postgres major, which is a real thing a service needs).
+#   MAY — add keys to `environment:` (a per-service database name is the case
+#         that matters; kit's `POSTGRES_USER` survives).
+#   MAY — add a `depends_on` with `condition: service_healthy`, and declare a
+#         new service of your own.
+#   MAY — change a published port, BUT ONLY BY CHANGING THE VARIABLE in `.env`.
+#         This is the sharp one. A `ports:` list in the second file APPENDS to
+#         the first rather than replacing it, so a service that writes
+#         `ports: ["15433:5432"]` gets postgres listening on 15500 *and* 15433.
+#         Measured, not assumed. `KIT_POSTGRES_PORT=15433` in `.env` is the only
+#         way to move it, and the gate fails on a `ports:` entry in a service
+#         file for that reason.
+#   MAY NOT — touch `otel-collector`. Not its `image:`, not its `command:`, and
+#         above all not the `volumes:` entry that mounts `otel-collector.yml`.
+#         That file carries the redaction allowlist, which is DERIVED from core's
+#         schemas; a service that overrides the mount is shipping a telemetry
+#         boundary nobody derived, and prompt content leaves the process inside
+#         it. The gate fails on any of the three.
+#   MAY NOT — override the four AGPL backends. `grafana/*` images unmodified is
+#         the licence condition, and a `build:` or a retag is a fork.
+#   MAY NOT — set `allow_all_keys`, or add an exporter, by any route. Same
+#         reason, and it is the same check that already fails on kit's own file.
+#
+# WHAT STAYS IN THE SERVICE
+#   A service's own `docker-compose.yml` after this change is its own image, its
+#   own port, its own environment, its own volume, and its own service entry.
+#   Measured on `muse`, the largest adopter: 86 lines to 27, and the 59 that
+#   went are postgres, a healthcheck and a volume that kit already ships.
 #
 # THE PORT BLOCK: 15000-15999
 #   kit claims this range for the whole stack, one hundred per service, and
@@ -238,7 +282,26 @@ services:
       # compose network, which is why the compose port check ignores values in
       # an `environment:` block.
     volumes:
-      - ./otel-collector.yml:/etc/otel/otel-collector.yml:ro
+      # `${KIT_COMPOSE_DIR:-.}` and not `./`. This file is no longer copied into
+      # the service, so a bare `./` is no longer the service's root — it is
+      # whatever `bin/dev` was told to run compose from, and `bin/dev` runs it
+      # from the service root so the service's own `build: context: .` resolves.
+      # The collector's config would then be looked for in the service, where it
+      # no longer is, and Docker creates an empty DIRECTORY at a missing bind
+      # source. The collector then exits with
+      #   failed to read configFile /etc/tempo/tempo.yaml: is a directory
+      # which names a file type and not the thing that is wrong. Found by
+      # RUNNING the stack; `docker compose config` renders the same project and
+      # every check in kit's gate was green.
+      #
+      # The default `.` is the directory holding THIS file, which is what it has
+      # always meant, and is what keeps a hand-copied stack working unchanged.
+      # `bin/dev` sets it to the fetched tree's compose directory. It is the
+      # COMPOSE directory and not the kit root, deliberately: naming it after the
+      # thing it points at rather than after the repository it came from is what
+      # makes the default and the fetched case the same path with a different
+      # prefix, rather than two different shapes.
+      - ${KIT_COMPOSE_DIR:-.}/otel-collector.yml:/etc/otel/otel-collector.yml:ro
     # Bounded, and the number is one a laptop can spare. The collector is the
     # one process every service's telemetry passes through, so an unbounded
     # one is a process that takes the whole dev machine with it and gets
@@ -304,7 +367,7 @@ services:
     # NOT in depends_on for anything, and never in anyone's readiness path.
     command: ["-config.file=/etc/tempo/tempo.yaml"]
     volumes:
-      - ./tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - ${KIT_COMPOSE_DIR:-.}/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
       - tempo-data:/var/tempo
     ports:
       # The HTTP/OTLP port, so a developer can open Tempo directly and read a
@@ -329,7 +392,7 @@ services:
     image: grafana/loki:${KIT_LOKI_TAG:-3.2.1}
     command: ["-config.file=/etc/loki/loki-config.yaml"]
     volumes:
-      - ./loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - ${KIT_COMPOSE_DIR:-.}/loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
       - loki-data:/loki
     ports:
       - "${KIT_LOKI_PORT:-15901}:3100"
@@ -364,7 +427,7 @@ services:
       - "-ingester.ring.replication-factor=1"
       - "-config.file=/etc/mimir/mimir.yaml"
     volumes:
-      - ./mimir/mimir.yaml:/etc/mimir/mimir.yaml:ro
+      - ${KIT_COMPOSE_DIR:-.}/mimir/mimir.yaml:/etc/mimir/mimir.yaml:ro
       - mimir-data:/mimir
     ports:
       - "${KIT_MIMIR_PORT:-15902}:8080"
@@ -417,8 +480,30 @@ services:
       GF_ANALYTICS_REPORTING_ENABLED: "false"
       GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
       GF_NEWS_NEWS_FEED_ENABLED: "false"
+      # Grafana 11.3 ships `[plugins] preinstall = grafana-lokiexplore-app` and
+      # installs it on FIRST BOOT, which means the dev stack downloads a plugin
+      # zip from the internet before it is usable. Measured, on a cold volume:
+      # 20 seconds once, and over 180 seconds another time, because the install
+      # holds the same sqlite lock Grafana's own migrations want — the log shows
+      # a 19-second gap with no line in it, between "Update plugin_setting table
+      # charset" and "create server_lock table".
+      #
+      # So the slowest thing in this stack was a network call nobody asked for,
+      # and it made the cold-start time unpredictable rather than merely slow. An
+      # air-gapped developer — which `bin/dev`'s offline mode exists to serve —
+      # could not start this at all.
+      #
+      # Nothing kit ships uses it. Both provisioned dashboards read Loki through
+      # the provisioned `loki` datasource, and the alert rules are PromQL. The
+      # LogQL Explore app is a UI convenience in the Grafana UI, not a data path.
+      #
+      # This is CONFIGURATION, not modification: it is an env var the vendor
+      # documents for exactly this, and the AGPL condition this file already
+      # argues is about not building a `grafana/*` image. See the note above on
+      # `build:`.
+      GF_INSTALL_PLUGINS_PREINSTALL_DISABLED: "true"
     volumes:
-      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ${KIT_COMPOSE_DIR:-.}/grafana/provisioning:/etc/grafana/provisioning:ro
       - grafana-data:/var/lib/grafana
     ports:
       - "${KIT_GRAFANA_PORT:-15000}:3000"
@@ -427,6 +512,26 @@ services:
       test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/api/health || exit 1"]
       interval: 10s
       timeout: 5s
+      # 6 × 10s plus a 5s start period, and MEASURED rather than guessed — the
+      # same discipline as the Tempo and Loki budgets above. The number is
+      # defensible because the cause of the slowness was removed rather than
+      # budgeted for: see `GF_INSTALL_PLUGINS_PREINSTALL_DISABLED` above. Grafana's
+      # first boot was downloading a plugin over the network and holding the
+      # sqlite lock while it did, which made this service take anywhere from 20s
+      # to over 180s to answer `/api/health` on a cold volume.
+      #
+      # With that gone, measured cold on a cold volume with all eight containers
+      # starting together, the endpoint first answers at ~26s, and the whole stack
+      # is up and healthy in 76s. Comfortably inside this 65s budget, so the
+      # budget is left exactly as it was.
+      #
+      # Worth recording because the wrong fix was available and looked entirely
+      # reasonable. A cold start failing against a 65s budget reads exactly like a
+      # flake, and the obvious response is to raise the retries. That would have
+      # hidden a network call inside the dev loop and left the loop unusable
+      # offline — which is the one thing this packet exists to make true. Found by
+      # RUNNING the fetched stack (tests/stack_live_test.sh); `docker compose
+      # config` renders the same project and every static check was green.
       retries: 6
       start_period: 5s
     profiles: [observability]
