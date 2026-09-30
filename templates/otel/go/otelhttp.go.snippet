@@ -1,0 +1,154 @@
+// kit template — wire W3C trace propagation into a Go service with the
+// upstream OpenTelemetry SDK, instead of the hand-rolled codec.
+//
+// THIS IS THE SUPPORTED PATH FOR A NEW SERVICE. `traceparent.go` exists for the
+// cases the SDK does not cover: a NATS consumer with no HTTP server, a webhook
+// signer, a test that asserts propagation without standing up a tracer. If you
+// are writing an HTTP service or making HTTP calls, use this file.
+//
+// This is a SNIPPET, not a file to copy verbatim: the import paths and the
+// constructor names are the ones as of the versions pinned in pins.md, and
+// `go get` is how you take the dependency. kit vendors nothing.
+//
+// WHAT IT DOES FOR YOU
+//   - Reads an inbound `traceparent` and continues it (the SDK's propagator is
+//     W3C TraceContext by default; this is stated explicitly rather than assumed,
+//     because a service that constructs its own propagator can silently get the
+//     B3 one).
+//   - Writes `traceparent` and `tracestate` on every outbound request.
+//   - Never rejects a request over a malformed header. The SDK's error handler is
+//     set to log-and-continue, because §3.2.2.3 says to ignore the header, not to
+//     fail the request.
+//
+// SPEC: W3C Trace Context, W3C Recommendation 23 November 2021
+//       https://www.w3.org/TR/trace-context/
+// The SDK implements these sections; see traceparent.go for the section-by-
+// section list if you need to know which rules your version covers.
+//
+// ---------------------------------------------------------------------------
+// go get go.opentelemetry.io/otel@v1.34.0
+// go get go.opentelemetry.io/otel/sdk@v1.34.0
+// go get go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc@v1.34.0
+// go get go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp@v0.59.0
+// ---------------------------------------------------------------------------
+
+package telemetry
+
+import (
+	"context"
+	"fmt"
+	"net/http"
+
+	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
+	"go.opentelemetry.io/otel"
+	"go.opentelemetry.io/otel/attribute"
+	"go.opentelemetry.io/otel/codes"
+	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/propagation"
+	sdktrace "go.opentelemetry.io/otel/sdk/trace"
+	"go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/noop"
+)
+
+// NewTracerProvider returns a provider that exports OTLP over gRPC, or a no-op
+// provider when OTEL_EXPORTER_OTLP_ENDPOINT is unset.
+//
+// NO EXPORTER BY DEFAULT, and that is the load-bearing part. A developer who
+// clones this service and runs it locally must not have their spans leave the
+// machine: OTEL_EXPORTER_OTLP_ENDPOINT is opt-in, and without it we return a
+// no-op provider rather than a default endpoint pointed at a vendor. Set the
+// variable to export. This is the same privacy boundary the compose template
+// enforces, applied in code because a Go process can be started without compose.
+//
+// The error return is the caller's to handle. A provider that failed to
+// initialise and a provider that is not configured look the same from inside the
+// service, and the second is not an error worth failing startup over.
+func NewTracerProvider(ctx context.Context, serviceName, serviceVersion string) (*sdktrace.TracerProvider, error) {
+	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
+	if endpoint == "" {
+		// Not a warning: this is the expected local-development path.
+		return noop.NewTracerProvider(), nil
+	}
+
+	exporter, err := otlptracegrpc.New(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("otlp exporter: %w", err)
+	}
+
+	// A sampler that respects the caller's decision rather than re-deciding per
+	// hop. `ParentBased(AlwaysSample)` is the combination that matters: a
+	// service that samples independently produces traces with holes, which are
+	// worse to debug than no traces at all.
+	return sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(exporter),
+		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.AlwaysSample())),
+		sdktrace.WithResource(sdktrace.NewResource(
+			attribute.String("service.name", serviceName),
+			attribute.String("service.version", serviceVersion),
+		)),
+	), nil
+}
+
+// Install sets the global propagator and tracer provider.
+//
+// W3CTraceContext is named explicitly rather than left to the default. The
+// default IS W3C today, but a service that depends on a default it never wrote
+// down is a service that breaks silently when an upstream changes it — and
+// otel.SetTextMapPropagator is called by several libraries that may not mean
+// what you do.
+func Install(ctx context.Context, serviceName, serviceVersion string) (func(context.Context) error, error) {
+	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
+		propagation.TraceContext{}, // W3C traceparent + tracestate
+		propagation.Baggage{},      // W3C baggage; a separate header, same spec
+	))
+
+	provider, err := NewTracerProvider(ctx, serviceName, serviceVersion)
+	if err != nil {
+		return nil, err
+	}
+	otel.SetTracerProvider(provider)
+	return provider.Shutdown, nil
+}
+
+// Handler wraps an http.Handler so inbound requests continue their trace and
+// outbound requests carry it.
+//
+// `otelhttp.NewHandler` does both halves. The important part is that it reads
+// the inbound header for you: a handler that starts a fresh span per request
+// without extracting the caller's context is the single most common way a Go
+// service ends up with 4000 one-hop traces instead of 200 four-hop ones.
+func Handler(name string, next http.Handler) http.Handler {
+	return otelhttp.NewHandler(next, name)
+}
+
+// Client is an http.Client that injects the current trace into every request.
+//
+// Use this rather than http.DefaultClient for service-to-service calls. A
+// request made with a bare client breaks the trace at that hop, silently and
+// permanently, with no error anywhere to grep for.
+func Client() *http.Client {
+	return &http.Client{Transport: otelhttp.NewTransport(http.DefaultTransport)}
+}
+
+// StartServerSpan begins a span for an inbound request that is not going through
+// an http.Handler — a gRPC method, a queue consumer, a cron tick.
+//
+// spanID and traceID are the caller's to generate. `traceparent.go`'s
+// `ServerHopFrom` is the stdlib alternative when you want the header handling
+// without an SDK.
+func StartServerSpan(ctx context.Context, tracer trace.Tracer, name string, headers map[string]string) (context.Context, trace.Span) {
+	// The propagator does the extracting; the carrier is the header map the
+	// framework gave you. On a malformed header this returns the original ctx
+	// unchanged and a nil remote span, which is exactly §3.2.2.3's "ignore the
+	// header" — not an error.
+	ctx = otel.GetTextMapPropagator().Extract(ctx, propagation.MapCarrier(headers))
+	return tracer.Start(ctx, name)
+}
+
+// RecordError marks a span failed. OTel's error status is a convention every
+// backend understands; without it a failed request and a successful one look
+// identical in a trace view.
+func RecordError(span trace.Span, err error) {
+	span.RecordError(err)
+	span.SetStatus(codes.Error, err.Error())
+}

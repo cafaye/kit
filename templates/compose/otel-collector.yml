@@ -1,0 +1,88 @@
+---
+# kit template — the OpenTelemetry collector for a local cafaye stack.
+#
+#   cp <kit>/templates/compose/otel-collector.yml ./otel-collector.yml
+#   cp <kit>/templates/compose/.env.example ./.env   # then edit
+#
+# WHAT THIS DOES
+#   Receives OTLP from every service on the compose network, batches the spans,
+#   and writes them to the collector's own stdout. That is the whole point: a
+#   local developer sees their spans, and nothing leaves the machine.
+#
+# STRICTNESS NOTES — READ BEFORE ENABLING AN EXPORTER
+#   - NO EXPORTER SENDS ANYWHERE BY DEFAULT. This is a privacy boundary, not a
+#     preference: traces carry request paths, user identifiers in span names,
+#     and occasionally a token in a span attribute. A collector that silently
+#     started shipping those from a laptop is an incident.
+#   - The only exporter wired into the pipeline is `debug`, which writes to the
+#     collector's stdout on the machine already running it. It cannot reach the
+#     network.
+#   - To ship spans to a backend you add an exporter block yourself and point
+#     the pipeline at it. Every endpoint MUST come from an environment variable
+#     (the collector's own env-substitution syntax); a literal endpoint in this
+#     file fails the gate, so it can never reach a repo by accident.
+#   - The `debug` exporter is intentionally verbose and NOT sampled. It is a
+#     development affordance, not observability. Real sampling belongs in a
+#     backend the platform picks deliberately.
+#   - No sampling processor here. W3C traceparent's sampled flag is honoured by
+#     the services (they preserve what the caller set), and a head sampler that
+#     disagrees with it would break traces at exactly the boundary that is
+#     hardest to debug.
+
+receivers:
+  # OTLP over gRPC and HTTP. Both endpoints bind on all interfaces *inside the
+  # compose network only*; the compose file publishes nothing for the collector,
+  # so there is no host port to collide with.
+  otlp:
+    protocols:
+      grpc:
+        endpoint: ${env:KIT_OTEL_GRPC_ENDPOINT}
+      http:
+        endpoint: ${env:KIT_OTEL_HTTP_ENDPOINT}
+
+processors:
+  # Must come first: it sheds load before the batcher allocates. Without a
+  # memory limiter, one service in a runaway loop takes the collector down with
+  # it and every other service loses its traces at the same moment.
+  memory_limiter:
+    # A fraction of the container's limit, not an absolute: the compose file
+    # caps the collector, and this reads from that cap rather than duplicating
+    # the number in two places where they could disagree.
+    check_interval: 1s
+    limit_percentage: ${env:KIT_OTEL_MEMORY_LIMIT_PERCENTAGE}
+    spike_limit_percentage: ${env:KIT_OTEL_MEMORY_SPIKE_PERCENTAGE}
+  # Batching is what makes a collector worth running: one export per N spans
+  # instead of one per span.
+  batch:
+    timeout: ${env:KIT_OTEL_BATCH_TIMEOUT}
+    send_batch_size: ${env:KIT_OTEL_BATCH_SIZE}
+
+exporters:
+  # stdout only. See STRICTNESS NOTES above before adding anything here.
+  debug:
+    # `pretty` is a human; this is a laptop terminal. `json` is the same spans in
+    # one line each, which is what a grep or a `docker compose logs` pipeline
+    # can actually consume.
+    verbosity: ${env:KIT_OTEL_DEBUG_VERBOSITY}
+
+extensions:
+  # A no-op health check extension so the collector reports healthy as soon as
+  # the pipeline is wired. Without it the compose healthcheck below is guessing.
+  health_check:
+    endpoint: ${env:KIT_OTEL_HEALTH_ENDPOINT}
+
+service:
+  extensions: [health_check]
+  telemetry:
+    # The collector logs its own problems at info; `basic` is enough to see a
+    # failed export and no more. Raising `detailed` here is how a local stack
+    # turns into an unreadable terminal.
+    logs:
+      level: ${env:KIT_OTEL_LOG_LEVEL}
+  pipelines:
+    traces:
+      receivers: [otlp]
+      processors: [memory_limiter, batch]
+      # Nothing ships. To add a backend exporter, define it above and append it
+      # here — with an env-substituted endpoint, never a literal one.
+      exporters: [debug]

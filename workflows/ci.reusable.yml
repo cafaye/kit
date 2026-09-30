@@ -44,6 +44,7 @@ on:
           - elixir
           - python
           - node
+          - bun
           - rust
       # Descriptions are folded, not quoted: a long description that is reflowed
       # to fit line-length is unreadable, and Actions has no width limit on
@@ -70,6 +71,22 @@ on:
         required: false
         type: string
         default: '0'
+      # Opt-in by construction. A kit change that breaks every consumer's CI is
+      # a kit change that does not ship, so a new job cannot start running in
+      # 13 repos the day it lands — the repo has to ask for it by name.
+      #
+      # A string, not a boolean: `inputs.telemetry == 'true'` reads the way a
+      # caller writes it, and GitHub coerces the bare word `false` to a boolean
+      # in some positions, which makes `if: inputs.telemetry` a trap. Compare
+      # to the string and there is no coercion to reason about.
+      telemetry:
+        description: >-
+          'Run the W3C traceparent conformance job as well: "true" or "false".
+          Off by default so adopting kit never turns a green repo red. Turn it
+          on in a repo that has copied templates/otel/<lang>/ into its tree.'
+        required: false
+        type: string
+        default: 'false'
 permissions:
   contents: read
 concurrency:
@@ -293,3 +310,140 @@ jobs:
           name: coverage-node
           path: ${{ inputs.working-dir }}/coverage
           if-no-files-found: ignore
+
+  # ------------------------------------------------------------------- bun
+  # The job guard's own CI hand-rolled, because kit had none. guard ships
+  # bun.lock and no package-lock.json, so the `node` job above would have died
+  # on `npm ci` on day one and the whole file would have stayed bespoke.
+  #
+  # It is a separate job rather than a flag on the node one because the two
+  # differ in ways a flag hides: a different package manager, a different
+  # lockfile name, and a different frozen-install contract.
+  bun:
+    name: bun
+    if: ${{ inputs.language == 'bun' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: ${{ fromJSON(inputs.versions).bun || '1.3.12' }}
+      - name: install
+        working-directory: ${{ inputs.working-dir }}
+        # Frozen: installs exactly bun.lock and FAILS when the lock and the
+        # manifest disagree. Plain `bun install` here would let a lockfile drift
+        # reach master unnoticed, which is the entire reason the lockfile exists.
+        run: bun install --frozen-lockfile
+      - name: typecheck
+        # `tsc --noEmit`. --noEmit matters: without it this step publishes
+        # .js files next to the .ts sources, and the next step then tests files
+        # the compiler invented rather than the ones in the commit.
+        working-directory: ${{ inputs.working-dir }}
+        run: bun run typecheck
+      - name: test
+        working-directory: ${{ inputs.working-dir }}
+        run: bun test
+      # --if-present for the same reason as the node job above: day-one adoption
+      # must not be blocked by a coverage script that does not exist yet. Drop
+      # it once `coverage` is in package.json, or this step is a report.
+      - name: coverage
+        working-directory: ${{ inputs.working-dir }}
+        run: bun run --if-present coverage
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        with:
+          name: coverage-bun
+          path: ${{ inputs.working-dir }}/coverage
+          if-no-files-found: ignore
+
+  # ----------------------------------------------------------------- telemetry
+  # Opt-in (see the `telemetry` input). A repo that has copied
+  # templates/otel/<lang>/ into its tree runs the W3C traceparent conformance
+  # suite for its language on every push, so "we propagate traces" stops being a
+  # claim in a README and becomes a red build.
+  #
+  # A matrix, not six jobs: this is the one place a matrix is right. It runs
+  # only when a repo opts in, it is a small stdlib-only suite, and a per-language
+  # job here would mean six near-identical blocks to keep in sync. The six
+  # language jobs above stay ungated-by-matrix because each one installs a
+  # different toolchain, which is the thing a matrix cannot share.
+  telemetry:
+    name: telemetry (${{ matrix.language }})
+    if: ${{ inputs.telemetry == 'true' }}
+    runs-on: ubuntu-latest
+    strategy:
+      # One language at a time. Six runners for six stdlib suites costs more
+      # than it returns, and a failure is easier to read from a serial log.
+      max-parallel: 2
+      fail-fast: false
+      matrix:
+        language:
+          - go
+          - ruby
+          - elixir
+          - python
+          - node
+          - rust
+    steps:
+      - uses: actions/checkout@v7
+      # The toolchain comes from the matrix, so a bun-only repo does not install
+      # an entire Go toolchain to run one test file. Each entry is the setup
+      # action the language's own job uses, deliberately the same action and the
+      # same version default, so the two paths cannot drift.
+      - name: install go
+        if: ${{ matrix.language == 'go' }}
+        uses: actions/setup-go@v7
+        with:
+          go-version: ${{ fromJSON(inputs.versions).go || 'stable' }}
+      - name: install ruby
+        if: ${{ matrix.language == 'ruby' }}
+        uses: ruby/setup-ruby@v1
+      - name: install elixir
+        if: ${{ matrix.language == 'elixir' }}
+        uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ fromJSON(inputs.versions).elixir || '1.18' }}
+          otp-version: ${{ fromJSON(inputs.versions).erlang || '27' }}
+      - name: install python
+        if: ${{ matrix.language == 'python' }}
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ fromJSON(inputs.versions).python || '3.13' }}
+      - name: install node
+        if: ${{ matrix.language == 'node' }}
+        uses: actions/setup-node@v7
+        with:
+          node-version: ${{ fromJSON(inputs.versions).node || '22' }}
+      - name: install rust
+        if: ${{ matrix.language == 'rust' }}
+        uses: dtolnay/rust-toolchain@stable
+      - name: conformance suite
+        # The suite the repo copied, not the one in kit: a service that has
+        # patched its own middleware runs its own tests. Falls back to kit's
+        # copy when the repo has not adopted the template yet, so turning the
+        # input on is never a red build for want of a file.
+        working-directory: ${{ inputs.working-dir }}
+        env:
+          KIT_TELEMETRY_DIR: ${{ inputs.working-dir }}/templates/otel/${{ matrix.language }}
+        run: |
+          set -euo pipefail
+          dir="$KIT_TELEMETRY_DIR"
+          if [ ! -d "$dir" ]; then
+            echo "::notice::no $dir in this repo; running kit's own copy of the suite"
+            dir="${GITHUB_ACTION_PATH}/templates/otel/${KIT_TELEMETRY_LANG:-${{ matrix.language }}}"
+          fi
+          case "${{ matrix.language }}" in
+            go)
+              GOFLAGS=-mod=mod GOPROXY=off GOTOOLCHAIN=local go test "$dir/..." ;;
+            ruby)
+              ruby "$dir/test_traceparent.rb" ;;
+            elixir)
+              elixir -r "$dir/traceparent.ex" "$dir/test_traceparent.exs" ;;
+            python)
+              python3 "$dir/test_traceparent.py" ;;
+            node)
+              node --test "$dir/traceparent.test.mjs" ;;
+            rust)
+              rustc --test --edition 2021 -o "$RUNNER_TEMP/kit-telemetry" "$dir/traceparent.rs"
+              "$RUNNER_TEMP/kit-telemetry" ;;
+          esac

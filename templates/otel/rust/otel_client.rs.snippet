@@ -1,0 +1,172 @@
+// kit template — W3C trace propagation in a Rust service, with the upstream
+// OpenTelemetry SDK, instead of the hand-rolled codec.
+//
+// THIS IS THE SUPPORTED PATH FOR A NEW SERVICE. `traceparent.rs` is the
+// stdlib-only alternative for a NATS consumer, a webhook signer, or a test that
+// asserts propagation without standing up a tracer. Use this file for a service
+// that has an SDK.
+//
+// This is a SNIPPET, not a file to copy verbatim. Versions are in pins.md; kit
+// vendors nothing and `cargo add` is how you take the dependency.
+//
+// WHAT IT DOES FOR YOU
+//   - Reads an inbound `traceparent` and continues it, starting a new trace when
+//     it is absent or malformed.
+//   - Injects `traceparent` and `tracestate` on every outbound reqwest request.
+//   - Records the error status OTel backends expect, so a failed request and a
+//     successful one are distinguishable in a trace view.
+//
+// NEVER ERRORS OVER A MALFORMED HEADER. §3.2.2.3 says to ignore it, and §4.2
+// says a missing traceparent is not an error. `TraceContextExtractor::extract`
+// returns the input context unchanged for a header it cannot read, so the
+// `unwrap_or_else` below is a fallback, not an error path.
+//
+// SPEC: W3C Trace Context, W3C Recommendation 23 November 2021
+//       https://www.w3.org/TR/trace-context/
+//
+// ---------------------------------------------------------------------------
+// cargo add opentelemetry@0.27
+// cargo add opentelemetry_sdk@0.27
+// cargo add opentelemetry-otlp@0.27
+// cargo   add opentelemetry-semantic-conventions@0.27
+// cargo add opentelemetry-http@0.27
+// cargo add reqwest@0.12 --features trace
+// ---------------------------------------------------------------------------
+
+use std::collections::HashMap;
+
+use opentelemetry::global;
+use opentelemetry::propagation::TextMapPropagator;
+use opentelemetry::trace::{Span, Status, Tracer, TracerProvider};
+use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_sdk::propagation::TraceContextPropagator;
+use opentelemetry_sdk::trace::{self as sdktrace, Sampler, TracerProvider as _};
+use opentelemetry_sdk::Resource;
+
+/// NO EXPORTER BY DEFAULT, and this is the load-bearing part.
+///
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` is opt-in: `None` means the provider installs
+/// no exporter at all, and we never fall back to a vendor's default endpoint. A
+/// developer who clones this service and runs it locally must not have their
+/// spans leave their machine — the same privacy boundary
+/// `templates/compose/otel-collector.yml` enforces, applied in code because a
+/// Rust service can start without compose.
+pub fn init_tracing(service_name: &'static str, version: &'static str) -> Option<sdktrace::TracerProvider> {
+    let resource = Resource::builder()
+        .with_service_name(service_name)
+        .with_attribute(opentelemetry::KeyValue::new("service.version", version))
+        .build();
+
+    let provider = sdktrace::SdkTracerProvider::builder()
+        .with_resource(resource)
+        // A sampler that respects the caller's decision rather than re-deciding
+        // per hop. `ParentBased` is the part that matters: a service that samples
+        // independently produces traces with holes, which are worse to debug
+        // than no traces at all.
+        .with_sampler(Sampler::ParentBased(Box::new(Sampler::AlwaysOn)))
+        .build();
+
+    match std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
+        Ok(endpoint) => {
+            // Batch, not simple: one export per span makes the collector the
+            // bottleneck and drops spans on a slow network.
+            let exporter = opentelemetry_otlp::SpanExporter::builder()
+                .with_tonic()
+                .with_endpoint(endpoint)
+                .build()
+                .expect("OTLP exporter config");
+            let provider = provider.with_batch_exporter(exporter);
+            let _ = provider.force_flush();
+            global::set_tracer_provider(provider.clone());
+            Some(provider)
+        }
+        Err(_) => {
+            // No exporter. Spans are still created and still propagate; they
+            // just go nowhere, which is exactly what a developer on a laptop
+            // wants and exactly what production must not have.
+            global::set_tracer_provider(provider.clone());
+            Some(provider)
+        }
+    }
+}
+
+/// Install the W3C propagator globally.
+///
+/// Named explicitly. The default global propagator IS W3C today, but any
+/// library that calls `set_global_textmap` can replace it, and a service that
+/// depends on a default it never wrote down breaks silently when one does.
+pub fn init_propagation() {
+    global::set_text_map_propagator(TraceContextPropagator::new());
+}
+
+/// A `reqwest` client that injects the current trace into every request.
+///
+/// Use this instead of a bare `reqwest::Client` for service-to-service calls. A
+/// bare client breaks the trace at that hop, silently and permanently, with no
+/// error anywhere to grep for.
+pub fn traced_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .trace(true) // reqwest's `trace` feature wires the propagator in
+        .build()
+        .expect("reqwest client")
+}
+
+/// Continue the caller's trace for an inbound request, or start a new one.
+///
+/// `extract` on a header it cannot read returns the input context unchanged and
+/// a null remote span — a new trace, with no error. That is §3.2.2.3's required
+/// response, which is why this function has no error return.
+pub fn start_server_span(
+    tracer: &dyn Tracer,
+    name: &'static str,
+    headers: &HashMap<String, String>,
+) -> opentelemetry::Context {
+    // The carrier is the header map the framework already built; extracting from
+    // it is the whole integration. Nothing is fetched and nothing is parsed here
+    // — that is the propagator's job, which is why this function cannot fail.
+    let parent_cx = global::get_text_map_propagator(|prop| {
+        prop.extract(&HashMapCarrier(headers.clone()))
+    });
+
+    // A parent-based start is what makes this a continuation rather than a new
+    // trace: with no valid parent the SDK starts a root span, which is correct.
+    tracer.start_with_context(name, parent_cx)
+}
+
+/// Record an error on a span.
+///
+/// OTel's error status is a convention every backend understands. Without it a
+/// failed request and a successful one look identical in a trace view.
+pub fn record_error(span: &mut dyn Span, err: &anyhow::Error) {
+    span.record_error(err.to_string());
+    span.set_status(Status::error(err.to_string()));
+}
+
+/// Flush before the process exits, or the last spans are lost.
+///
+/// Dropping a provider does flush in recent versions, but an explicit shutdown
+/// in `main` is unambiguous and costs one line.
+pub fn shutdown(provider: Option<sdktrace::TracerProvider>) {
+    if let Some(provider) = provider {
+        let _ = provider.shutdown();
+    }
+}
+
+/// A `HashMap` as an OTel `Extractor` / `Injector`.
+struct HashMapCarrier(HashMap<String, String>);
+
+impl opentelemetry::propagation::Extractor for HashMapCarrier {
+    fn get(&self, key: &str) -> Option<&str> {
+        self.0.get(key).map(String::as_str)
+    }
+
+    fn keys(&self) -> Vec<&str> {
+        self.0.keys().map(String::as_str).collect()
+    }
+}
+
+impl opentelemetry::propagation::Injector for HashMapCarrier {
+    fn set(&mut self, key: &str, value: String) {
+        self.0.insert(key.to_owned(), value);
+    }
+}
