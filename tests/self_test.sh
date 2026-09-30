@@ -968,14 +968,20 @@ RB
   edit "$thirty/tests/validate.sh" \
     'if [ "$lang" = ruby ] && ! toolchain_floor_ruby; then' \
     'if false; then'
+  # PATH is exported rather than prefixed onto the call, because a prefixed call
+  # reads `PATH=… expect_red_check` — the first token is no longer `expect_red`,
+  # so the count would miss this recipe. Both counts now allow indentation, so
+  # the call itself may sit inside the `if`.
+  thirty_old_path="$PATH"
+  PATH="$thirty/kit14-oldruby:$PATH"
+  export PATH
+  expect_red_check 'breakage 30: the toolchain floor is defined but never consulted' \
+    "$thirty" 'templates/otel/ruby  (ruby test suite)' --language=ruby --no-self-test
+  PATH="$thirty_old_path"
+  export PATH
 else
   printf 'SKIP self_test: breakage 30: the toolchain floor is defined but never consulted — ruby not installed\n'
   skips=$((skips + 1))
-fi
-if [ "$thirty_ready" -eq 1 ]; then
-  PATH="$thirty/kit14-oldruby:$PATH" expect_red_check \
-    'breakage 30: the toolchain floor is defined but never consulted' \
-    "$thirty" 'templates/otel/ruby  (ruby test suite)' --language=ruby --no-self-test
 fi
 
 printf '\n'
@@ -993,5 +999,17 @@ fi
 # way a hardcoded "all N breakages" does — and the header's list is checked
 # against it by `tests/validate.sh`, so a breakage added without a header entry
 # (or a header entry with no recipe) is a red gate rather than a doc that lies.
-counted=$(grep -cE '^expect_red(_check|_lang|_script)? ' "$0" || true)
+#
+# `^\s*`, matching `tests/validate.sh`'s count, and it has to. Breakage 30 is
+# guarded by a `command -v ruby` test, so its recipe is indented. The two counts
+# disagreed: this one said 30 and validate.sh's said 31 for the same file, and
+# the summary line is the one a human reads. A count that is right in one place
+# and wrong in the other is worse than no count, because the two are printed side
+# by side and either can be believed.
+#
+# Still anchored on `expect_red` as the first token, so the
+# `printf 'SKIP self_test: breakage 30 …'` line in the same branch is not counted
+# as a recipe — a looser pattern would double-count 30 and hide the very skip the
+# guard exists to surface.
+counted=$(grep -cE '^ *expect_red(_check|_lang|_script)? ' "$0" || true)
 echo "PASS: self_test — all $counted breakages went red, and the unbroken tree is green."
