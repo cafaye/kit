@@ -186,16 +186,37 @@ expect_red_check() {
   shift 3
   local out ec=0
   out=$(cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" 2>&1) || ec=$?
-  if printf '%s\n' "$out" | grep -qF "FAIL $want"; then
-    printf 'PASS self_test: %s — caught by `%s`\n' "$label" "$want"
-  elif [ "$ec" -eq 0 ]; then
-    printf 'FAIL self_test: %s — the gate stayed GREEN\n' "$label"
-    failures=$((failures + 1))
-  else
-    printf 'FAIL self_test: %s — the gate went red, but NOT via `%s`\n' "$label" "$want"
-    printf '%s\n' "$out" | grep '^FAIL' | sed 's/^/       /'
-    failures=$((failures + 1))
-  fi
+  # A shell pattern, not `printf … | grep -qF`.
+  #
+  # `grep -q` exits the instant it matches, so a large `$out` gives `printf`
+  # SIGPIPE while it is still writing. `set -o pipefail` — which this file sets
+  # — then reports 141 for a pipeline that SUCCEEDED, and a passing breakage
+  # reads as "the gate went red, but NOT via <the named check>".
+  #
+  # It hit breakage 25, whose check emits several hundred lines of report and
+  # therefore the first output in this file big enough to overflow the 64K pipe
+  # buffer. Breakages 7-24 all pass on a small enough output, which is the worst
+  # shape a latent defect has: it looks like a failure of the thing under test
+  # and is actually a failure of the harness reading it.
+  #
+  # Measured, not reasoned about: 2000 lines of output still returns 0 and 5000
+  # returns 141, on the same match and the same grep. The threshold is a property
+  # of the pipe buffer, so it would move with the machine — which is why the fix
+  # is to stop piping rather than to bound the output.
+  case "$out" in
+    *"FAIL $want"*)
+      printf 'PASS self_test: %s — caught by `%s`\n' "$label" "$want"
+      ;;
+    *)
+      if [ "$ec" -eq 0 ]; then
+        printf 'FAIL self_test: %s — the gate stayed GREEN\n' "$label"
+      else
+        printf 'FAIL self_test: %s — the gate went red, but NOT via `%s`\n' "$label" "$want"
+        printf '%s\n' "$out" | grep '^FAIL' | sed 's/^/       /'
+      fi
+      failures=$((failures + 1))
+      ;;
+  esac
 }
 
 # expect_red_script <label> <dir> <script> <args...>

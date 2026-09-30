@@ -44,7 +44,9 @@ kit/
 └── tests/
     ├── validate.sh                       # THE gate
     ├── classify.py  rules.json           # the change classifier, failing closed
-    └── staleness.py                      # the fleet staleness reporter
+    ├── staleness.py                      # the fleet staleness reporter
+    ├── core_fanout_check.py              # structural checks on core/vendir, core/renovate
+    └── gate_declaration_check.py         # no adopter carries a D12/D13 workaround
 ```
 
 Flat on purpose. `grep -r` finds everything; there is no plugin system to
@@ -133,14 +135,43 @@ Three phases, and all three must pass:
   guard: a check that only parsed those two files would pass on a classifier
   that waves every change through. They stay runnable when static analysis is
   skipped, because a gate that skips is not green.
-- **self_test** — twenty-three breakages of a throwaway copy, asserting the gate
+- **self_test** — twenty-five breakages of a throwaway copy, asserting the gate
   goes red each time. Six of them are a semantic mutation of one language each,
-  so **every suite is proven able to fail** rather than assumed to. Eight assert
+  so **every suite is proven able to fail** rather than assumed to. Eleven assert
   that one *named* check reported `FAIL`, so a check written for a specific
   defect is proven still load-bearing. Two assert that a *proof* goes red: one
   inverts the classifier's fail-closed property, and one makes the staleness
   reporter call an undeclared pin `current`. A property nobody has tried to
   break is a property nobody has tested.
+- **No adopter carries a workaround for a fixed core defect.** `core`'s gate
+  checker had two defects that forced adopting repositories into local
+  workarounds — D12 (`RUN_KEY` could not see a one-line `run:`, core `63fd319`)
+  and D13 (a proof matched against bytes still carrying ANSI colour, core
+  `c63af27`). Both are fixed, so a workaround for either is a second, local,
+  unversioned copy of a decision that now lives in core, and D13's is *weaker*
+  than the declaration it replaced. `tests/gate_declaration_check.py` sweeps the
+  adopting repositories for the three shapes those workarounds actually take and
+  is wired into the gate as `adopting repositories (no workaround for a fixed
+  core defect)`.
+  - **Every one of its three rules is structural, and that is the lesson.** The
+    first version was a keyword scan over comments — `cannot see`, `only
+    matches`, `D12` — and against the real fleet it reported 4 repositories and
+    24 findings, nearly all false: `core/gate.yml` for "That is MD12's
+    collect-then-run machinery" (`D12` is a substring of `MD12`), and `caf`'s
+    declaration for comments arguing a workaround is now *unnecessary*. A check
+    that fires on correct work teaches the reader to ignore it, and it had
+    taught on the first repository scanned. When a check over this fleet is
+    noisy, the fix is to make it measure something.
+  - It does **not** prescribe a `run:` spelling. It would be a second copy of a
+    decision core owns, and `courier`'s block scalar is correct for three real
+    reasons. `core`'s own `gate.ci-disagrees` checks invocation; this checks
+    duplication.
+  - The fleet root is discovered beside the repository, with a **reported SKIP**
+    when there is none. `../..` is deliberately NOT searched: it found a fleet
+    once, in a leftover copy of a cafaye repository in a shared temp directory
+    whose branch still carried the retired workaround, and the gate went red on
+    a tree with nothing wrong with it. A sweep that reaches further than it owns
+    is worse than no sweep.
 - Tests are written **first** and watched fail before the artifacts exist. A
   config written from documentation instead of from the pinned image is a config
   that breaks on the first `bin/dev up`: Tempo, Loki and Mimir all reject keys
@@ -257,6 +288,15 @@ an `option` with no `job` is a green build that ran nothing.
     output**, because a committed report is the "generated output" this rule
     forbids and the kind of file that rots. If a third program is proposed, the
     default answer is no.
+  - **`tests/gate_declaration_check.py` and `tests/core_fanout_check.py` are the
+    same carve-out, used twice, and a fourth is still a fourth.** They are
+    real parsers over real file types, and inlining either into the 4,000-line
+    `validate.sh` would bury the failure modes. The boundary they hold to is the
+    classifier's: nothing imports them, and neither is installable. The one
+    thing that changed is that they import PyYAML, which `tests/requirements.txt`
+    already carries and the gate already bootstraps — so this is the existing
+    carve-out rather than a widened one. A **third** parser in `tests/` is the
+    case the rule above still refuses.
 - **Callers override, they never fork.** Anything that differs per service —
   versions, thresholds, names — is an input or a build arg, never a copy of a
   file. Six repos each holding their own workflow is the drift this repo

@@ -86,6 +86,46 @@ are programs rather than configuration, and they are the reason the standard is
 enforceable. Both are standard-library only and neither is imported by anything.
 Their conventions are in [`AGENTS.md`](AGENTS.md#the-classifier-fails-closed-and-that-is-a-rule-about-code).
 
+## The gate declaration, and the two workarounds that are now illegal
+
+`core` publishes a gate declaration format (`gate.yml` against
+`schemas/gate.schema.json`) and a checker for it. Nine repositories adopt it.
+The checker had two defects that pushed adopters into local workarounds, and
+**both are fixed**:
+
+| defect | what it was | fixed in |
+| --- | --- | --- |
+| **D12** | `RUN_KEY` only matched a `run: \|` block, so `run: ./bin/prime` on one line was invisible to `gate.ci-disagrees`. The step that runs the gate stopped counting as one. | core `63fd319` |
+| **D13** | A proof was matched against raw bytes, which carry whatever ANSI colour the gate's own tools emit, so a pattern written by reading a terminal failed on a machine whose tools colourise. | core `c63af27` — core now strips ANSI in exactly one place, before matching |
+
+**A workaround for a fixed defect is not neutral.** It is a second, local,
+unpolicied copy of a decision that now lives in `core`, and it is the kind that
+rots: a `gate.yml` carrying a hand-rolled escape-tolerant regex is *weaker* than
+one without it, because the escape runs absorb characters a stricter pattern
+would have rejected.
+
+So the rule is enforced rather than written down, in
+[`tests/gate_declaration_check.py`](tests/gate_declaration_check.py):
+
+```sh
+python3 tests/gate_declaration_check.py ../cafaye
+```
+
+It looks for three shapes — an escape token in a `proof[].match`, a `run:` block
+scalar whose whole body is the declared argv, and a comment citing a checker
+term while claiming a `run:` spelling the checker cannot see — and it runs as
+part of `bash tests/validate.sh` against whatever fleet is found beside the
+repository. It does **not** prescribe a `run:` spelling: that would be a second
+copy of a decision `core` owns, and `courier`'s block scalar is correct for
+three real reasons.
+
+Its first version was a keyword scan and it reported 4 repositories and 24
+findings against the real fleet, nearly all false — including `core/gate.yml`
+for the sentence "That is MD12's collect-then-run machinery", because `D12` is a
+substring of `MD12`. All three rules are structural as a result. A check that
+fires on correct work teaches the reader to ignore it, and it had taught on the
+first repository scanned.
+
 ## The local stack — `templates/compose/`
 
 Postgres, NATS with JetStream, Redis, the OpenTelemetry collector, and the four
@@ -705,19 +745,27 @@ no `npm ci`, no `cargo fetch`. If these ever need the network, a template has
 grown a dependency and kit has stopped being config-only.
 
 **self_test** — `tests/self_test.sh` breaks a throwaway copy of this tree
-**twenty** ways and asserts the gate goes red each time. Fourteen breakages are
-for the static checks; one is a semantic mutation of each of the six language
-implementations, so **every suite is proven able to fail** rather than assumed
-to. A skip fails the run — a self_test that skips half its proofs and exits 0 is
-the "0 passed, 14 ignored" shape that verifies nothing. Seven of the static
-ones go further and assert that one *named* check reported `FAIL`, so the check
-written for a given defect is proven still load-bearing rather than being one
-of fifty checks that could have gone red for an unrelated reason.
+**twenty-six** ways and asserts the gate goes red each time. Sixteen breakages
+are for the static checks; one is a semantic mutation of each of the six
+language implementations, so **every suite is proven able to fail** rather than
+assumed to. A skip fails the run — a self_test that skips half its proofs and
+exits 0 is the "0 passed, 14 ignored" shape that verifies nothing. Eleven of the
+static ones go further and assert that one *named* check reported `FAIL`, so the
+check written for a given defect is proven still load-bearing rather than being
+one of fifty checks that could have gone red for an unrelated reason.
 
 Breakage 19 is the allowlist one: an entry naming a test that does not exist,
 well-formed in every other respect. It is the rule most able to be decorative —
 a hygiene rule in a data file is exactly the shape of a check nobody has ever
 seen fail.
+
+Breakages 23-25 are the three shapes a **workaround for a fixed core defect**
+takes: a gate step written as a `run:` block scalar with a comment saying the
+one-liner is invisible (D12, core `63fd319`), the same comment on an otherwise
+correct step, and a proof pattern carrying escape tolerance (D13, core
+`c63af27`). They mutate a *synthetic fleet* built in the work directory, since
+kit is one repository and the fleet is fifteen — which also makes the control
+this file's positive case for the check.
 
 Any `FAIL` exits 1. A `SKIP` is always reported in the summary, never hidden.
 PyYAML, yamllint and hadolint are required and are **bootstrapped by the gate
