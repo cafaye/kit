@@ -844,9 +844,9 @@ thing it corrects is worth more than a history with no mistakes in it.
 The manager's gate run reported **`FAIL templates/otel/ruby (ruby test
 suite)`**, minitest showing `.E..EE.`, with every other template green, staleness
 26/26, and `self_test` PASS. The diff behind this branch never touches
-`templates/otel/ruby`, but it does rewrite `tests/validate.sh` (+431 lines), so
-the failure had two candidate owners and the point of this section is to say
-which, with the receipts.
+`templates/otel/ruby`, but it does rewrite `tests/validate.sh` (+498/−5 against
+`origin/master` as of this commit), so the failure had two candidate owners and
+the point of this section is to say which, with the receipts.
 
 ### 10.1 The error, in full
 
@@ -1014,6 +1014,69 @@ is present, so why ask whether it is the right one?*
 
 **Count:** 31 breakages, each counted from the recipes rather than written
 down, and `self_test_claims` still passes the header/recipe reciprocity check.
+
+**Two defects in my own breakage-30 recipe, found by running it.** Worth
+recording because both are the shape this repo keeps punishing, and because the
+first one produced a *passing* self_test that was quietly lying:
+
+- The call was written `PATH=… expect_red_check`. The count is taken with
+  `grep -cE '^expect_red…'`, and a prefixed assignment means the first token is
+  no longer `expect_red` — so the recipe **ran, passed, and went uncounted**,
+  and the summary said "all 30 breakages" for 31 that ran. An under-reported
+  count is indistinguishable from a correct one, which is why this is a fix and
+  not a nit. PATH is now exported and restored around the call.
+- This file's count (`^expect_red`) and `tests/validate.sh`'s (`^ *expect_red`)
+  **disagreed about the same file.** Breakage 30 is guarded by `command -v ruby`
+  — a missing interpreter SKIPs, and a skipped proof is a failed proof — so its
+  recipe is necessarily indented. Both counts now read 31, still anchored on
+  `expect_red` as the first token so the `printf 'SKIP …'` line in the same
+  branch is not counted as a recipe.
+
+### 10.6a What I actually observed, and what I did not
+
+Stated plainly, because this section is the packet's attribution and a green
+that nobody witnessed is the thing §7.10 is about.
+
+**Observed, on this branch, from my own hands:**
+
+- `bash tests/self_test.sh` — **all 31 breakages red, unbroken tree green**,
+  run to completion, twice (before and after the count fix).
+- `bash tests/validate.sh --language=ruby --no-self-test --no-observability` —
+  green on the pinned Ruby 4.0.1; and, with `/usr/bin/ruby` 2.6.10 forced onto
+  `PATH`, the single clear "too old" FAIL quoted in §10.5 with **no**
+  `NoMethodError` anywhere in the output.
+- A full `bash tests/validate.sh` reached the end of the **static** phase and
+  **all six telemetry suites PASS** — go, **ruby**, elixir, python, node, rust —
+  with **zero FAIL lines in the whole log** — before the harness sent it
+  `SIGKILL` at the `observability` phase. That kill is the machine, not the
+  tree: it carried several other workers' full gate runs concurrently.
+
+**Not observed, and therefore not claimed:** a single uninterrupted full
+`bash tests/validate.sh` to its final `PASS: every check passed.` line, and
+therefore the two docker-requiring observability proofs
+(`tests/canary_test.sh`, `tests/no_telemetry_in_readiness.sh`), which I have
+never seen run to completion on this branch. The `--no-observability` run in
+§10.6b is the closest substitute and it is not the same claim.
+
+### 10.6b The gate as last run
+
+```
+$ bash tests/validate.sh --no-observability
+…
+PASS templates/otel/go      (go test suite)
+PASS templates/otel/ruby   (ruby test suite)
+PASS templates/otel/elixir  (elixir test suite)
+PASS templates/otel/python  (python3 test suite)
+PASS templates/otel/node    (node test suite)
+PASS templates/otel/rust    (rustc test suite)
+PASS: self_test — all 31 breakages went red, and the unbroken tree is green.
+PASS: every check passed.
+note: 2 check(s) skipped — reported above, never hidden.
+```
+
+The two skips are the TypeScript tier files that `node --check` cannot read
+(`templates/tier/bun/tier.test.ts`, `templates/tier/node/tier.test.ts`) — a
+reported gap, unchanged by this work, and reported rather than hidden.
 
 ### 10.7 A second, unrelated pre-existing defect found on the way
 
