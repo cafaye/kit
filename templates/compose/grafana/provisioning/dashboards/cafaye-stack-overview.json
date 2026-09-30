@@ -38,7 +38,7 @@
       "datasource": { "type": "mimir", "uid": "mimir" },
       "gridPos": { "h": 5, "w": 6, "x": 0, "y": 6 },
       "targets": [
-        { "refId": "A", "expr": "sum(rate(cafaye_calls[5m]))", "legendFormat": "spans/s" }
+        { "refId": "A", "expr": "sum(rate(cafaye_calls_total[5m]))", "legendFormat": "spans/s" }
       ],
       "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "none", "graphMode": "area" },
       "fieldConfig": { "defaults": { "unit": "reqps", "decimals": 2 }, "overrides": [] }
@@ -50,7 +50,7 @@
       "datasource": { "type": "mimir", "uid": "mimir" },
       "gridPos": { "h": 5, "w": 6, "x": 6, "y": 6 },
       "targets": [
-        { "refId": "A", "expr": "count(count by (service_name) (rate(cafaye_calls[5m])))", "legendFormat": "services" }
+        { "refId": "A", "expr": "count(count by (service_name) (rate(cafaye_calls_total[5m])))", "legendFormat": "services" }
       ],
       "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "none", "graphMode": "none" },
       "fieldConfig": { "defaults": { "unit": "short", "decimals": 0 }, "overrides": [] }
@@ -100,7 +100,7 @@
       "datasource": { "type": "mimir", "uid": "mimir" },
       "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
       "targets": [
-        { "refId": "A", "expr": "sum by (service_name) (rate(cafaye_calls[5m]))", "legendFormat": "{{service_name}}" }
+        { "refId": "A", "expr": "sum by (service_name) (rate(cafaye_calls_total[5m]))", "legendFormat": "{{service_name}}" }
       ],
       "fieldConfig": {
         "defaults": {

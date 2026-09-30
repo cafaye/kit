@@ -18,7 +18,7 @@
         "label": "Service",
         "type": "query",
         "datasource": { "type": "mimir", "uid": "mimir" },
-        "query": "label_values(cafaye_calls, service_name)",
+        "query": "label_values(cafaye_calls_total, service_name)",
         "refresh": 1,
         "includeAll": true,
         "multi": true,
@@ -29,7 +29,7 @@
         "label": "Error class",
         "type": "query",
         "datasource": { "type": "mimir", "uid": "mimir" },
-        "query": { "query": "label_values(cafaye_calls{error_type=~\"$service\"}, error_type)", "refId": "A" },
+        "query": { "query": "label_values(cafaye_calls_total{error_type=~\"$service\"}, error_type)", "refId": "A" },
         "refresh": 1,
         "includeAll": true,
         "multi": true,
@@ -56,7 +56,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(cafaye_calls{service_name=~\"$service\", otel.status_code=\"ERROR\"}[5m])) / clamp_min(sum(rate(cafaye_calls{service_name=~\"$service\"}[5m])), 0.0001)",
+          "expr": "sum(rate(cafaye_calls_total{service_name=~\"$service\", otel.status_code=\"ERROR\"}[5m])) / clamp_min(sum(rate(cafaye_calls_total{service_name=~\"$service\"}[5m])), 0.0001)",
           "legendFormat": "fleet"
         }
       ],
@@ -84,7 +84,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum(rate(cafaye_calls{service_name=~\"$service\"}[5m]))",
+          "expr": "sum(rate(cafaye_calls_total{service_name=~\"$service\"}[5m]))",
           "legendFormat": "rps"
         }
       ],
@@ -126,7 +126,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "count(count by (service_name) (rate(cafaye_calls[5m])))",
+          "expr": "count(count by (service_name) (rate(cafaye_calls_total[5m])))",
           "legendFormat": "services"
         }
       ],
@@ -155,7 +155,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "sum by (service_name) (rate(cafaye_calls{service_name=~\"$service\", otel.status_code=\"ERROR\"}[5m]))",
+          "expr": "sum by (service_name) (rate(cafaye_calls_total{service_name=~\"$service\", otel.status_code=\"ERROR\"}[5m]))",
           "legendFormat": "{{service_name}}"
         }
       ],
@@ -179,7 +179,7 @@
       "targets": [
         {
           "refId": "A",
-          "expr": "topk(15, sum by (error_type) (rate(cafaye_calls{service_name=~\"$service\", otel.status_code=\"ERROR\", error_type=~\"$error_class\"}[5m])))",
+          "expr": "topk(15, sum by (error_type) (rate(cafaye_calls_total{service_name=~\"$service\", otel.status_code=\"ERROR\", error_type=~\"$error_class\"}[5m])))",
           "legendFormat": "{{error_type}}",
           "format": "table",
           "instant": true

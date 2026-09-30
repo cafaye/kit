@@ -314,7 +314,7 @@ processors:
       - messaging.system
       - error.type
       # `otel.status_code`, put back by `transform/cafaye_metrics` from the
-      # connector's `status_code` and NOT by any decision to widen this list.
+      # connector's `status.code` and NOT by any decision to widen this list.
       # core's metrics schema does not name it, which is a gap in core and a
       # DECISION NEEDED in kit's report; core's TRACES schema does allow it, and
       # dropping it is what took the error predicate out of the metrics.
@@ -491,14 +491,54 @@ processors:
     metric_statements:
       - context: datapoint
         statements:
-          - 'set(attributes["otel.status_code"], attributes["status_code"]) where attributes["status_code"] != nil'
-          - 'delete_key(attributes, "status_code")'
-          # The redaction processor's own diagnostic attributes. They are
-          # deliberate, useful, and they MUST NOT become metric dimensions: a
-          # `redaction.redacted.count` label is a cardinality axis nobody
-          # queries, and it changes value whenever an allowlist is edited, so a
-          # dashboard's history breaks on a config change. Observed doing exactly
-          # that in the first end-to-end run.
+          # `status.code`, DOTTED — which is what the connector actually emits,
+          # verified by capturing its output through a `file` exporter rather
+          # than by reading its README. The first version of this transform
+          # looked for `status_code`, matched nothing, and the error view stayed
+          # empty: a transform that silently does nothing is the same shape of
+          # failure as a redaction processor that silently does too much.
+          - 'set(attributes["otel.status_code"], attributes["status.code"]) where attributes["status.code"] != nil'
+          - 'delete_key(attributes, "status.code")'
+
+  # THE REDACTION PROCESSOR'S OWN DIAGNOSTIC ATTRIBUTES, removed AFTER it runs.
+  #
+  # The processor adds `redaction.redacted.count`, `redaction.redacted.keys` and
+  # `redaction.ignored.count` as a receipt for what it removed. They are useful
+  # and deliberate — `KIT_OTEL_REDACTION_SUMMARY=debug` is how the canary test
+  # proves removal happened — and they MUST NOT become metric dimensions:
+  #
+  #   * a `redaction_redacted_count` label is a cardinality axis nobody queries;
+  #   * it changes value whenever an allowlist is edited, so every dashboard's
+  #     history breaks on a config change.
+  #
+  # Observed in the first end-to-end run, on every series in Mimir.
+  #
+  # AFTER, and that is the whole point. These attributes are created BY the
+  # redaction processor, so deleting them before it runs deletes nothing — the
+  # first version of this config put these three statements in the
+  # pre-redaction transform and the labels came through unchanged, which is
+  # exactly the kind of thing a comment can prevent and a test cannot.
+  transform/cafaye_metrics_labels:
+    error_mode: ignore
+    metric_statements:
+      # THE `_total` SUFFIX, and its absence is a warning on every panel.
+      #
+      # Mimir's OTLP ingestion stores the metric under the name the producer
+      # sent it, with no `_total` added, so a `rate()` over it returns a correct
+      # number and a PromQL warning: "metric might not be a counter, name does
+      # not end in _total". Every panel in Grafana carries that warning banner,
+      # and a fleet that learns to ignore the warning banner is a fleet that
+      # ignores the one that matters.
+      #
+      # The match is on the trailing `calls`, not on a hardcoded name, so the
+      # rule survives a namespace change in .env: a metric called
+      # `<namespace>.calls` is a counter, and `_total` is what Prometheus
+      # reserves for counters.
+      - context: metric
+        statements:
+          - 'set(name, Concat([name, "_total"], ":")) where IsMatch(name, "\\.calls$")'
+      - context: datapoint
+        statements:
           - 'delete_key(attributes, "redaction.redacted.count")'
           - 'delete_key(attributes, "redaction.redacted.keys")'
           - 'delete_key(attributes, "redaction.ignored.count")'
@@ -711,6 +751,7 @@ service:
         - transform/cafaye_metrics
         - transform/cafaye_resource_stash
         - redaction/cafaye_metrics
+        - transform/cafaye_metrics_labels
         - transform/cafaye_resource_restore
         - batch
       exporters: [otlphttp/mimir]

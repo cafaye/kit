@@ -130,12 +130,32 @@ PY="${KIT_PYTHON:-$ROOT/.venv/bin/python}"
 }
 
 "$PY" - "$ROOT" "$WORK" <<'PY'
+import re
 import sys
 
 import yaml
 
 root, work = sys.argv[1], sys.argv[2]
-source = open(f"{root}/templates/compose/otel-collector.yml", encoding="utf-8").read()
+path = f"{root}/templates/compose/otel-collector.yml"
+source = open(path, encoding="utf-8").read()
+
+# WHICH EXPORTERS TO REPLACE IS DISCOVERED, NOT LISTED. This block was written
+# with `("otlp/tempo", "otlp/loki", "otlp/mimir")` hardcoded, and it died the
+# moment the shipped config corrected Loki and Mimir to `otlphttp/` — which it
+# had to, because those two backends have no gRPC OTLP listener at all. A test
+# that fails on a rename is a test that will be "fixed" by renaming the thing it
+# was asserting about, so the names come from the parsed document and a rename
+# costs nothing here.
+shipped = yaml.safe_load(source)
+BACKENDS = {"tempo", "loki", "mimir"}
+targets = [
+    name
+    for name in (shipped.get("exporters") or {})
+    if name.partition("/")[2] in BACKENDS and name.partition("/")[0] in ("otlp", "otlphttp")
+]
+if not targets:
+    sys.exit("canary: no backend exporters found; the shipped config changed shape")
+
 
 def drop_exporter(body, name):
     """Remove one exporter block, by indentation rather than by regex.
@@ -175,16 +195,32 @@ def drop_exporter(body, name):
     return "".join(lines[:start] + lines[end:])
 
 
-for name in ("otlp/tempo", "otlp/loki", "otlp/mimir"):
+for name in targets:
     source = drop_exporter(source, name)
+
+# ...and the pipeline exporter LISTS are rewritten by structure too, not by the
+# three literal strings this used to replace. Those strings encoded both the
+# exporter names AND the exact list formatting of each pipeline, so a fourth
+# pipeline, or a reordering, would have silently stopped matching and left the
+# test asserting against a config that still pointed at a dead Tempo.
+source = re.sub(
+    r"(?m)^(      exporters: \[)([^\]]*)(\])",
+    lambda m: m.group(1)
+    + ", ".join(
+        "file/capture" if part.strip() in targets else part.strip()
+        for part in m.group(2).split(",")
+    )
+    + m.group(3),
+    source,
+)
 
 source = source.replace(
     "  debug:\n    verbosity: ${env:KIT_OTEL_DEBUG_VERBOSITY}",
-    "  # The capture. Stands in for otlp/tempo, otlp/loki and otlp/mimir and\n"
-    "  # writes the exact bytes each of them would have been handed. A `file`\n"
-    "  # exporter is a real exporter from the same binary, so what lands here is\n"
-    "  # what a backend would have received — not a re-serialisation of the\n"
-    "  # pipeline's intentions.\n"
+    "  # The capture. Stands in for tempo, loki and mimir and writes the exact\n"
+    "  # bytes each of them would have been handed. A `file` exporter is a real\n"
+    "  # exporter from the same binary, so what lands here is what a backend\n"
+    "  # would have received — not a re-serialisation of the pipeline's\n"
+    "  # intentions.\n"
     "  #\n"
     "  # `file/capture`, not `capture`: the part before the slash is the COMPONENT\n"
     "  # TYPE and the collector looks it up in its factory registry. A key with no\n"
@@ -198,9 +234,6 @@ source = source.replace(
     "      max_days: 1\n"
     "  debug:\n    verbosity: ${env:KIT_OTEL_DEBUG_VERBOSITY}",
 )
-source = source.replace("otlp/tempo, debug]", "file/capture, debug]")
-source = source.replace("exporters: [otlp/mimir]", "exporters: [file/capture]")
-source = source.replace("exporters: [otlp/loki]", "exporters: [file/capture]")
 
 # Both checks are hard failures, and they are here rather than discovered as a
 # confusing "no such exporter" from the collector. A test that quietly measures a
@@ -212,8 +245,6 @@ source = source.replace("exporters: [otlp/loki]", "exporters: [file/capture]")
 # exporters while explaining what they are standing in for. A substring search
 # over a file that documents itself is a check that fails on its own
 # documentation — the same trap the traceparent snippets hit.
-import yaml
-
 doc = yaml.safe_load(source)
 if set(doc.get("exporters") or {}) - {"file/capture", "debug"}:
     sys.exit(
@@ -254,7 +285,18 @@ services:
       # canary and stripped it — as opposed to the canary being absent because
       # the sender never sent it, which is what "no canary found" means on its
       # own.
+      #
+      # BOTH switches are needed and only setting one of them is the same as
+      # setting neither. `KIT_OTEL_REDACTION_SUMMARY: debug` tells the PROCESSOR
+      # to log at debug verbosity; `KIT_OTEL_LOG_LEVEL: debug` tells the
+      # COLLECTOR to emit debug records at all. The shipped compose sets the
+      # collector's level to `info`, so a summary of `debug` produces nothing —
+      # and this test ran green for a full packet with the receipt silently
+      # unreachable, printing a NOTE about it rather than asking why. Two
+      # variables that look like one setting are why "removal is asserted by
+      # absence only" appeared at all.
       KIT_OTEL_REDACTION_SUMMARY: debug
+      KIT_OTEL_LOG_LEVEL: debug
       KIT_OTEL_BATCH_TIMEOUT: 1s
       KIT_OTEL_BATCH_SIZE: 8
       KIT_OTEL_METRIC_NAMESPACE: cafaye
@@ -266,7 +308,12 @@ services:
       KIT_OTEL_EXPORT_TIMEOUT: 1s
       KIT_OTEL_DEBUG_VERBOSITY: basic
       KIT_OTEL_HEALTH_ENDPOINT: 0.0.0.0:13133
-      KIT_OTEL_LOG_LEVEL: info
+      # NB: no second KIT_OTEL_LOG_LEVEL here. It was, at `info`, eleven lines
+      # above the `debug` that makes the receipt observable — and a duplicated
+      # YAML key resolves to the LAST one, so the collector ran at `info` and
+      # the redaction summary was filtered out anyway. A test that sets the
+      # thing it needs and then quietly overwrites it is worse than one that
+      # never set it, because the variable is present in the file.
     healthcheck:
       test: ["CMD", "/otelcol-contrib", "validate", "--config=/etc/otel/otel-collector.yml"]
       interval: 2s
