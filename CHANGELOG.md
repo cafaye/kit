@@ -54,6 +54,9 @@ and by *copying* files out of `lint/`, `docker/`, and `templates/`.
   listening on a developer's machine — and `bin/dev` is the first command a new
   person runs. The gate asserts membership of the block and no reuse, as a RANGE
   rather than a list, so adding a service does not mean editing a check.
+  **Unverified against the rest of the fleet**: the block is claimed
+  fleet-wide and nothing coordinates it across repos. A sibling repo's scratch
+  container was observed holding 15500 during kit-03's own verification.
 - **`templates/compose/otel-collector.yml` no longer ships `debug` only.** It
   fans out to three backends now, so the privacy boundary is restated as what it
   can actually be: every endpoint a `${env:}`, the exporter set exactly those
@@ -100,6 +103,51 @@ and by *copying* files out of `lint/`, `docker/`, and `templates/`.
 
 ### Fixed
 
+- **`tenant_id` was silently stripped from every trace and log resource.** The
+  `redaction/cafaye_metrics` processor listed the private stash names
+  (`cafaye.stashed.tenant_id`, `cafaye.stashed.account_id`) in its
+  `ignored_keys`; `redaction/cafaye_traces` and `redaction/cafaye_logs` did not.
+  The redaction processor deletes every attribute it does not exempt, so on
+  traces and logs it deleted the carrier the restore was about to read, and the
+  restore put `tenant_id` back from an empty source. Per-tenant metric totals
+  worked; per-tenant trace and log identity did not, with no error anywhere.
+  **Every static check passed on the broken tree** — being *stashed* and being
+  *exempted* are different questions and only the second survives contact with a
+  running collector. Two assertions added: every private stash name must be
+  exempted in all three processors, and the three `ignored_keys` lists must be
+  equal.
+- **The collector's `_total` rename never fired, so every dashboard panel
+  rendered "No data".** `transform/cafaye_metrics_labels` matched
+  `IsMatch(name, "\\.calls$")` inside a YAML *single-quoted* scalar, where a
+  backslash is not an escape — so OTTL received a regex requiring a literal
+  backslash and it matched no metric, ever. The processor was wired in and
+  documented at length. The pattern now avoids escapes entirely.
+- **Every Grafana panel had `"datasource": null`**, which Grafana resolves to the
+  *default* datasource — Mimir. All LogQL panels and the TraceQL panel were being
+  sent to a Prometheus API and rejected (`parse error: unexpected character:
+  '|'`); 12 of 15 panel queries were invalid. The alert rules grouped on
+  `otel.status_code`, which is a parse error in PromQL because OTLP ingestion
+  mangles dots in label names to underscores. Both fixed, and a check now holds
+  it: every query must name the backend that can answer it, and every PromQL
+  expr must use the underscored spelling.
+- **`tests/self_test.sh` had two breakages whose recipes no longer applied.**
+  `edit` correctly refuses a stale pattern, so the gate went red on breakage 2
+  and never reached 3, and then again on 4. Both recipes rewritten against the
+  shipped config; a twelfth breakage added covering a *missing* backend
+  exporter, which the set-difference check could never have seen.
+- **`tests/no_telemetry_in_readiness.sh` proved less than it claimed.** It passed
+  bare `host:port` to the `otlphttp` exporters, which made the collector exit(1)
+  with `endpoint must be a valid URL` — indistinguishable from the bug the test
+  exists to catch. Its stand-in service was `traefik/whoami`, which ships no
+  `wget` (so the probe never ran) and answers every path with 200 (so its
+  `/readyz` could never fail). Replaced with a real two-service stack whose
+  `/readyz` is proven to go 503 before the "still serving" claim means anything.
+- **The canary's redaction receipt was flaky, 1 pass in 3.**
+  `docker logs ... | grep -qi` under `set -o pipefail` is a SIGPIPE race: `grep -q`
+  exits at the first match, so `docker logs` dies with 141 whenever the log is
+  large enough to still be writing. The log is now captured to a file. The
+  spanmetrics assertion had the same shape — the connector flushes on its own
+  interval — and is now polled with a deadline. Both are PASSes, not NOTEs.
 - **The local compose stack could not start.** `otel-collector.yml` resolves its
   values from the collector's own process environment, and Docker Compose does
   not inject the `.env` values it substitutes into containers. Every one resolved

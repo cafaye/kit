@@ -121,6 +121,24 @@ still gets the whole stack. The collector is deliberately NOT in that profile: i
 is the default value of the endpoint variable, and a service with nothing
 switched on needs somewhere to send.
 
+**Cold `bin/dev up` on a laptop: ~50 seconds**, eight containers, volumes
+deleted. Measured, not estimated, and `bin/dev` prints the wall-clock itself so
+"the dev loop is slow" is a number in the output rather than a feeling.
+
+**If a port in that block is already taken — by another repo's scratch
+container, say — move it in `.env`, not in the template.** That is what `.env` is
+for, `bin/dev` prints the URLs it read from `.env` rather than hardcoded ones,
+and this is the documented escape hatch rather than a workaround:
+
+```sh
+sed -i '' 's/^KIT_POSTGRES_PORT=15500/KIT_POSTGRES_PORT=15501/' .env
+bin/dev up
+```
+
+Note the block is claimed *fleet-wide*, and nothing coordinates it across repos.
+Six services each running their own stack need six of these blocks. See the DECISION
+NEEDED in kit-03's report before a second repo adopts it.
+
 ### The licence, stated plainly
 
 **Grafana, Loki, Tempo and Mimir are AGPL-3.0, and kit ships them UNMODIFIED.**
@@ -154,9 +172,40 @@ telemetry at all. So:
 `tests/no_telemetry_in_readiness.sh` proves it against a real collector: it
 starts the collector with Tempo, Loki and Mimir all refusing connections and
 checks it is still healthy, has not restarted, and has not entered a retry loop;
-then it brings up a service with `*_OTEL_ENDPOINT` pointed at a collector that
-does not exist and checks that service comes up healthy, keeps serving, and does
-not restart.
+then it stands up a service whose `/readyz` **really** checks a dependency, stops
+that dependency, confirms `/readyz` has gone 503 — so the probe is known to be
+capable of failing — and only then checks the service is still serving, with a
+dead dependency and an OTLP endpoint that does not exist. A readiness test
+whose `/readyz` cannot fail is not a readiness test.
+
+### If you edit a provisioned dashboard
+
+The shipped dashboards were correct on arrival and were not correct on the first
+attempt, in three ways that are all invisible until you look at the backend. The
+gate now holds all of them, but the rules are worth stating because the next
+person to add a panel will hit them:
+
+- **Name the datasource on every panel.** A panel with `"datasource": null` goes
+  to Grafana's *default* datasource, which is Mimir. That is how a LogQL panel
+  ends up asking a Prometheus API for `{service_name=~"..."} |= "error"` and
+  getting `parse error: unexpected character: '|'`. The panel renders red, not
+  empty, and every datasource still shows green.
+- **Label names lose their dots.** OTLP ingestion mangles `.` in a label name to
+  `_`, so the collector's `otel.status_code` reaches Prometheus as
+  `otel_status_code`. A matcher on the dotted spelling is a *parse error*, and an
+  alert rule that cannot be parsed never fires and never says so.
+- **The counter carries `_total` because the collector adds it.**
+  `transform/cafaye_metrics_labels` renames a metric whose name ends in `calls`
+  to `calls_total`, which is what Prometheus reserves for counters and what stops
+  a `rate()` warning banner on every panel. Query `cafaye_calls_total`, not
+  `cafaye.calls` and not `cafaye_calls`.
+
+**Where `tenant_id` is visible.** It is a *resource* attribute, so it arrives on
+`target_info` and on the resource of every span and log record — and never as a
+label on a measurement, which is what keeps core's 2000-combination cap
+meaningful. Per-tenant metric totals are a `group by (tenant_id)` **joined
+against `target_info`**, not a label on the series. See the DECISION NEEDED in
+kit-03's report.
 
 ### The redaction boundary, derived from core and proved by canary
 
