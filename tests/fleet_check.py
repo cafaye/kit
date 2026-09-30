@@ -550,8 +550,15 @@ def main(argv: list) -> int:
 
     if not names:
         if args.no_fleet:
-            print("no fleet under "
-                  f"{repos_dir}; nothing to check (this is a clone of kit with no siblings)")
+            # A MACHINE-READABLE marker, and the reason it is one. `validate.sh`
+            # has to decide between PASS, FAIL and SKIP from this exit code, and
+            # "no fleet was found" is a third answer that is neither of the
+            # first two. Deciding it here — in the one place that knows what a
+            # repository is — rather than in the caller means there is no second
+            # discovery predicate to keep in step. The first version had one in
+            # each, and they disagreed: the caller asked "are there any files
+            # here?", which is true of a self-test's throwaway directory.
+            print(f"FLEET-ABSENT: no cafaye repository under {repos_dir}")
             return 0
         raise SystemExit(
             f"fleet_check.py: no cafaye repositories under {repos_dir}. "

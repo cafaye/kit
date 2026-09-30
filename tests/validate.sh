@@ -2479,12 +2479,25 @@ PY
   # is where the trap bites; a stub `docker` on PATH keeps the test hermetic and
   # fast, because what is under test is the shell, not compose.
   dev_escape_hatch_check() {
-    local stub sandbox out ec=0
+    local stub sandbox out ec=0 kitcheck
     stub="$TMP/dev-hatch-stub"
     sandbox="$TMP/dev-hatch"
-    rm -rf "$stub" "$sandbox"
-    mkdir -p "$stub" "$sandbox/bin" "$sandbox/grafana" "$sandbox/tempo" \
-      "$sandbox/loki" "$sandbox/mimir"
+    # The stub KIT TREE, as a separate directory. The sandbox below is a service
+    # repository, and after this packet a service repository holds NONE of the
+    # stack: no docker-compose.yml of kit's, no otel-collector.yml, no vendor
+    # config directories. Everything `bin/dev` mounts comes from the tree it
+    # fetches, so the fixture has to have one — pointed at with `KIT_STACK_DIR`,
+    # which is a checkout a person named rather than one that was fetched.
+    kitcheck="$TMP/dev-hatch-kit"
+    rm -rf "$stub" "$sandbox" "$kitcheck"
+    mkdir -p "$stub" "$sandbox/bin"
+    mkdir -p "$kitcheck/templates/compose" "$kitcheck/templates/compose/tempo" \
+      "$kitcheck/templates/compose/loki" "$kitcheck/templates/compose/mimir" \
+      "$kitcheck/templates/compose/grafana/provisioning"
+    : >"$kitcheck/templates/compose/docker-compose.yml"
+    : >"$kitcheck/templates/compose/otel-collector.yml"
+    : >"$kitcheck/templates/compose/.env.example"
+    printf '%s\n' "0000000000000000000000000000000000000000" >"$sandbox/kit.ref"
     cat >"$stub/docker" <<'STUB'
 #!/usr/bin/env bash
 # Reports readiness so `bin/dev up` believes the stack came up, and does
@@ -2498,24 +2511,33 @@ esac
 exit 0
 STUB
     chmod +x "$stub/docker"
-    # A compose file and the vendor config trees, so `require_files` passes and
-    # the run reaches `up`, which is where the trap fires. They are empty files
-    # on purpose: nothing here parses them.
-    : >"$sandbox/docker-compose.yml"
-    : >"$sandbox/otel-collector.yml"
-    : >"$sandbox/.env.example"
+    # The sandbox is a service repository and NOTHING ELSE: no compose file of
+    # kit's, no collector config, no `.env`. That is the shape this packet leaves
+    # behind, and the fixture has to be the shape or the check proves a world
+    # that no longer exists — the first version of this sandbox carried five
+    # empty files that `require_files` demanded, and the moment `require_files`
+    # went away the fixture stopped reaching `up` at all.
+    #
+    # `KIT_STACK_DIR` is how the escape hatch is exercised without a network: it
+    # is a checkout a person named on this run, which is source 1 of the four in
+    # `resolve_stack` and the only one that skips git entirely.
     cp "$ROOT/templates/bin/dev.sh" "$sandbox/bin/dev"
 
     # `KIT_DEV_PROFILES=''` and not `KIT_DEV_PROFILES=`: shellcheck reads the
     # latter as a typo, and it is right to.
-    out="$(cd "$sandbox" && KIT_DEV_PROFILES='' PATH="$stub:$PATH" \
-      bash ./bin/dev up 2>&1)" || ec=$?
+    out="$(cd "$sandbox" && KIT_DEV_PROFILES='' KIT_STACK_DIR="$kitcheck" \
+      PATH="$stub:$PATH" bash ./bin/dev up 2>&1)" || ec=$?
     case "$out" in
       *"unbound variable"*)
         echo "the documented escape hatch KIT_DEV_PROFILES= is broken:"
         printf '%s\n' "$out" | head -3
         return 1
         ;;
+      # Both halves are asserted, and the second is not decoration. Reaching the
+      # migration step proves the profile expansion survived; that the run got
+      # all the way there on a sandbox with NO `.env` and no stack of its own
+      # proves the fetch path does not require either. A fixture that wrote a
+      # `.env` would pass the first and silently not be testing the second.
       *"no migration command found"*) return 0 ;;
       *)
         echo "bin/dev with KIT_DEV_PROFILES= exited $ec without reaching the"
@@ -2526,6 +2548,250 @@ STUB
     esac
   }
   check 'templates/bin/dev.sh  (KIT_DEV_PROFILES= escape hatch actually runs)' dev_escape_hatch_check
+
+  # -------------------------------------------------------------------------
+  # THE FLEET GATE, and it is RED on master. That is the point, and the shape is
+  # the same as D4: three repositories that do not spell the same gate the same
+  # way is invisible to any check that reads only one of them, so kit's gate
+  # reads the OTHER repositories rather than trusting that they adopted it.
+  #
+  # Four failure modes, one check each, in tests/fleet_check.py:
+  #   - a service carrying a copy of the shared infrastructure
+  #   - a service that weakened the redaction boundary
+  #   - an otel-collector.yml that exists but that nothing ever starts
+  #   - a pin that is unpinned, or points at a branch
+  #
+  # IT SKIPS LOUDLY WHEN THERE IS NO FLEET, and that is not a detail. A clone of
+  # kit on CI has no siblings, and "no fleet was found" is not "the fleet is
+  # clean" — the same `unknown` vs `current` confusion tests/staleness.py exists
+  # to avoid. A gate that reports the second when it means the first is a gate
+  # that gets muted, and this one is going to be red a lot on purpose.
+  #
+  # `KIT_FLEET` is the seam, and it exists so self_test.sh can point the check at
+  # a FIXTURE fleet. Without it every breakage below would depend on the real
+  # fleet being present and dirty, which is a proof that passes when the fleet is
+  # absent — the exact shape this repository keeps warning about.
+  #
+  # The SKIP decision is `fleet_check.py`'s, not this file's, and the reason is a
+  # disagreement that was real. The first version guarded the call with its own
+  # "are there any sibling entries?" test — `ls -A ..` minus kit's own worktrees.
+  # A self-test's throwaway directory HAS sibling entries (one per breakage) and
+  # none of them is a repository, so the guard said "there is a fleet", ran the
+  # check, and the check exited 2 with "no cafaye repositories". The self-test's
+  # CONTROL would have gone red, which D13 treats as blocking the packet, for a
+  # reason that has nothing to do with the packet.
+  #
+  # So there is exactly one predicate for "is there a fleet", it lives beside the
+  # code that knows what a repository is, and it answers with a machine-readable
+  # marker. `check` cannot express three outcomes, which is why this is written
+  # out rather than delegated: a SKIP is not a PASS that happened quietly.
+  section 'static: the fleet adopts the stack rather than copying it'
+  fleet_out='' fleet_ec=0
+  fleet_out="$("$PY" "$ROOT/tests/fleet_check.py" --kit "$ROOT" \
+    --repos-dir "${KIT_FLEET:-$ROOT/..}" --no-fleet 2>&1)" || fleet_ec=$?
+  case "$fleet_out" in
+    *FLEET-ABSENT:*)
+      report SKIP 'fleet adoption (no cafaye repository on this machine — set KIT_FLEET=<dir>)'
+      ;;
+    *)
+      if [ "$fleet_ec" -eq 0 ]; then
+        report PASS 'fleet  (no stale copy, no weakened boundary, no dead config, every ref pinned)'
+        printf '%s\n' "$fleet_out" | sed 's/^/       /'
+      else
+        report FAIL 'fleet  (no stale copy, no weakened boundary, no dead config, every ref pinned)'
+        printf '%s\n' "$fleet_out" | sed 's/^/       /'
+      fi
+      ;;
+  esac
+
+  # -------------------------------------------------------------------------
+  # THE COLLECTOR CONFIG IS MOUNTED FROM THE TREE `bin/dev` FETCHED, and this is
+  # the check for a defect that ONLY RUNNING THE STACK could find.
+  #
+  # `templates/compose/otel-collector.yml` carries the redaction allowlist. Once
+  # the file is no longer copied into the service, the compose file must mount it
+  # from `${KIT_COMPOSE_DIR:-.}`, and `bin/dev` must set that variable to the
+  # FETCHED tree. Get either half wrong and nothing above notices: the compose
+  # file parses, `docker compose config` renders the same project either way, and
+  # every static check in this file stays green — because the value of the
+  # variable is not a property of the YAML.
+  #
+  # What it actually does when it is wrong: the mount resolves to a path that does
+  # not exist, and Docker's answer to a missing bind source is to CREATE A
+  # DIRECTORY. The collector then exits naming a file type:
+  #
+  #   failed to read configFile /etc/tempo/tempo.yaml: is a directory
+  #
+  # which says nothing about the thing that is wrong, and arrives four containers
+  # after a stack that was supposed to come up. `tests/stack_live_test.sh` is what
+  # found it, by bringing the fetched stack up and reading the collector's own
+  # mount back with `docker inspect`. This check is the static half of the same
+  # property, so the defect cannot be re-introduced between one live run and the
+  # next.
+  #
+  # It asserts BOTH halves. Checking the compose file alone would pass on a
+  # `bin/dev` that stopped exporting `KIT_COMPOSE_DIR`; checking `bin/dev` alone
+  # would pass on a compose file that stopped using the variable. The defect is
+  # in their AGREEMENT, so the check is over their agreement.
+  stack_mount_check() {
+    "$PY" - "$ROOT" <<'PY'
+import re
+import sys
+
+root = sys.argv[1]
+compose = open(f"{root}/templates/compose/docker-compose.yml", encoding="utf-8").read()
+dev = open(f"{root}/templates/bin/dev.sh", encoding="utf-8").read()
+
+problems = []
+
+# 1. Every vendor config kit hands out is mounted through the variable, and none
+#    of them through a bare `./`. A bare `./` was correct when the file sat in the
+#    service and is wrong now that it does not, and nothing else in the tree would
+#    notice the difference.
+VENDOR_MOUNTS = {
+    "otel-collector.yml": "/etc/otel/otel-collector.yml",
+    "tempo/tempo.yaml": "/etc/tempo/tempo.yaml",
+    "loki/loki-config.yaml": "/etc/loki/loki-config.yaml",
+    "mimir/mimir.yaml": "/etc/mimir/mimir.yaml",
+    "grafana/provisioning": "/etc/grafana/provisioning",
+}
+for source, destination in VENDOR_MOUNTS.items():
+    mounted = [ln for ln in compose.splitlines()
+               if source in ln and destination in ln]
+    if not mounted:
+        problems.append(
+            f"docker-compose.yml does not mount {source} into {destination} at all"
+        )
+        continue
+    if not any("${KIT_COMPOSE_DIR:-.}" in ln for ln in mounted):
+        problems.append(
+            f"docker-compose.yml mounts {source} without ${KIT_COMPOSE_DIR:-.}. "
+            f"That path is relative to wherever compose runs, and `bin/dev` runs it "
+            f"from the service root - where this file no longer is. Docker creates a "
+            f"DIRECTORY at a missing bind source and the collector exits naming a "
+            f"file type instead of the mount that is wrong."
+        )
+
+# 2. `bin/dev` sets it, to the FETCHED compose directory and not the kit root.
+#    The kit root resolves every mount to `<kit>/grafana/provisioning`, which does
+#    not exist - the same failure, one directory up.
+if "KIT_COMPOSE_DIR=" not in dev:
+    problems.append(
+        "bin/dev never sets KIT_COMPOSE_DIR, so every vendor config mount falls "
+        "back to `.` and resolves against the service root"
+    )
+else:
+    exports = re.findall(
+        r"(?:export\s+)?KIT_COMPOSE_DIR=(?:\"([^\"]*)\"|'([^']*)'|([^\s#]*))", dev
+    )
+    values = [next(g for g in m if g) for m in exports if any(m)]
+    if not values:
+        problems.append("bin/dev mentions KIT_COMPOSE_DIR but never assigns it")
+    else:
+        bad = [v for v in values if "templates/compose" not in v]
+        if bad:
+            problems.append(
+                f"bin/dev assigns KIT_COMPOSE_DIR={bad[0]!r}, which is not the "
+                f"tree's templates/compose directory. Naming it after the thing it "
+                f"points at rather than after the repository it came from is what "
+                f"keeps the hand-copied case and the fetched case the same path with "
+                f"a different prefix, rather than two different shapes."
+            )
+
+# 3. The two files must agree on the DEFAULT too. `.` in the compose file means
+#    "the directory holding this file", which is right for a hand-copied stack and
+#    is the value `bin/dev` overrides. If the default were ever changed to the kit
+#    root, the hand-copied case would silently break instead of the fetched one.
+if "${KIT_COMPOSE_DIR:-.}" not in compose:
+    problems.append(
+        "docker-compose.yml no longer documents the `.` default for "
+        "KIT_COMPOSE_DIR, so the hand-copied stack has no path left to fall back to"
+    )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check 'templates/compose/ + bin/dev  (every vendor config mounts from the fetched tree)' \
+    stack_mount_check
+
+  # -------------------------------------------------------------------------
+  # THE PIN IS `kit.ref`, AND THREE FILES AGREE ON THAT SPELLING.
+  #
+  # `bin/dev` reads the pin, `tests/fleet_check.py` audits it, and
+  # `templates/compose/.env.example` documents where it is NOT. Three files, one
+  # fact, and the failure mode if they disagree is invisible: the fleet gate
+  # reports "kit.ref: ABSENT" on a repository whose `bin/dev` reads `.env`, and
+  # reads it as a broken repository rather than as two kit files that stopped
+  # agreeing — which is what it is, and which only kit can fix.
+  #
+  # This is the same SHAPE as the `callable path` check further down, and it is
+  # here for the same reason: a documented string that stops being true while
+  # every behavioural check stays green. `tests/fetch_test.sh` proves `bin/dev`
+  # honours the pin; this proves `bin/dev` and the gate are talking about the same
+  # one, which no execution of either can show.
+  pin_contract_check() {
+    "$PY" - "$ROOT" <<'PY'
+import re
+import sys
+
+root = sys.argv[1]
+dev = open(f"{root}/templates/bin/dev.sh", encoding="utf-8").read()
+fleet = open(f"{root}/tests/fleet_check.py", encoding="utf-8").read()
+example = open(f"{root}/templates/compose/.env.example", encoding="utf-8").read()
+
+problems = []
+
+# 1. `bin/dev` must actually read a file for the pin, and it must be named the
+#    same way `fleet_check.py` names it.
+assigned = re.search(r'^REF_FILE="([^"]+)"', dev, re.M)
+if not assigned:
+    problems.append(
+        "bin/dev has no REF_FILE assignment, so there is no committed pin file and "
+        "the gate's 'kit.ref: ABSENT' finding would be about a file bin/dev never "
+        "reads"
+    )
+else:
+    ref_file = assigned.group(1)
+    if "kit.ref" not in fleet:
+        problems.append(
+            f"bin/dev reads the pin from {ref_file!r} and fleet_check.py does not "
+            f"mention it, so the fleet gate audits a file nothing reads"
+        )
+    if ref_file not in dev:
+        problems.append(f"REF_FILE is {ref_file!r} but bin/dev never opens it")
+
+# 2. `.env.example` must NOT carry the pin. This is the assertion with teeth: the
+#    file becomes `.env`, `.env` is git-ignored, and a pin there exists on one
+#    machine and on no CI runner. Shipping a `KIT_STACK_REF=` line in the template
+#    is how that state gets reintroduced - and it would look like the pin is
+#    configured, which is worse than its absence.
+for line in example.splitlines():
+    m = re.match(r"^([A-Z_][A-Z0-9_]*)=", line)
+    if m and m.group(1) == "KIT_STACK_REF":
+        problems.append(
+            ".env.example sets KIT_STACK_REF. `.env` is git-ignored, so a pin there "
+            "exists on one machine and on no CI runner; the pin is `kit.ref`, "
+            "committed. Remove the line."
+        )
+        break
+
+# 3. `.env.example` must still TELL a developer where the pin lives. Removing the
+#    line without documenting the alternative leaves the ref undiscoverable, and
+#    the first `bin/dev` on a fresh clone fails with a message about a file
+#    nothing mentions.
+if "kit.ref" not in example:
+    problems.append(
+        ".env.example never mentions kit.ref, so a developer whose `.env` has no "
+        "pin is never told which committed file is supposed to hold one"
+    )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check 'templates/bin/dev.sh + .env.example  (the pin is kit.ref, and the gate reads the same file)' \
+    pin_contract_check
   # ------------------------------------------------------------------ core
   # The fan-out standard: vendir templates, the shared Renovate policy, and the
   # two runnable pieces (the change classifier and the staleness reporter).
@@ -3848,6 +4114,15 @@ if [ "$RUN_OBSERVABILITY" -eq 1 ]; then
       bash "$ROOT/tests/canary_test.sh"
     check 'tests/no_telemetry_in_readiness.sh  (collector killed, service still serves)' \
       bash "$ROOT/tests/no_telemetry_in_readiness.sh"
+    # THE STACK, RUN. Every claim in this file about the observability platform
+    # being usable is a claim about YAML until this one runs: that the FETCHED
+    # stack comes up healthy, that a trace arrives in Tempo, that a metric
+    # arrives in Mimir, and that a canary planted in ten attributes reaches
+    # neither. `docker compose config` proved a stack that could not start, twice,
+    # in this repository's own history — once because the collector's environment
+    # block was missing and once because Mimir's healthcheck named a directory.
+    check 'tests/stack_live_test.sh  (the fetched stack runs; a trace and a metric land)' \
+      bash "$ROOT/tests/stack_live_test.sh"
   fi
 fi
 # phase: classifier + staleness — the two runnable pieces, executed
@@ -3868,6 +4143,20 @@ fi
   # skip silently drop the fail-closed proof. A gate that skips is not green.
 check 'tests/classify_test.sh  (19 cases, incl. the fail-closed property)' \
   bash "$ROOT/tests/classify_test.sh"
+
+# The fetch is a claim about a REAL SUBPROCESS talking to a REAL REMOTE, and it is
+# the only proof that `bin/dev` can obtain the stack it runs at all. A check that
+# parsed bin/dev would pass on a script that fetches nothing, which is why this is
+# executed and why its remote is a local bare repository rather than github.com: a
+# gate that goes red when the network is down is a gate people learn to re-run
+# with --no-observability, and then it is not a gate.
+#
+# Deliberately OUTSIDE the `RUN_STATIC` guard, for the reason the classifier and
+# the staleness reporter are: these are the PROPERTY rather than the shape, and a
+# gate that skips is not green.
+section 'fetch: the pinned kit ref resolves, and a moving one is refused'
+check 'tests/fetch_test.sh  (a pin fetches, a branch is refused, offline is real)' \
+  bash "$ROOT/tests/fetch_test.sh"
 
 section 'staleness: the fleet reporter tells the states apart'
 check 'tests/staleness_test.sh  (12 cases, incl. the red proof)' \

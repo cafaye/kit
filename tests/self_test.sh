@@ -61,32 +61,39 @@
 #   22. report an undeclared core pin as `current` -> staleness_test.sh goes red.
 #         Two real repositories are in that state today, which is what makes the
 #         difference between `undeclared` and `current` load-bearing.
+#   23-26. THE FLEET GATE, one breakage per failure mode, each against a FIXTURE
+#         fleet rather than the real one. A fixture fleet is what makes these
+#         mean anything: the real fleet is red on master BY DESIGN, so "the gate
+#         went red" there is satisfied by two clean repositories.
+#           23. a service carrying its own copy of the shared stack (a second
+#               postgres) -> the stale-copy check goes red. Five of the six
+#               repositories that declare local infrastructure are in exactly
+#               this state today, and the mutation is their real shape rather
+#               than a toy.
+#           24. a service that overrides the collector's config mount -> the
+#               weakened-boundary check goes red. The mount is where the
+#               redaction allowlist lives, so this is the failure that leaks
+#               prompt content rather than the one that looks untidy.
+#           25. an `otel-collector.yml` nothing ever starts -> the dead-config
+#               check goes red. Inert is the worst of the four: the file looks
+#               authoritative, every edit to it changes nothing, and a
+#               developer has no way to find out.
+#           26. a `kit.ref` holding `master` -> the pin check goes red.
+#   27-28. the two kit-side halves of the same packet -> the named check goes red.
+#           27. a vendor config mount that stopped resolving from the fetched
+#               tree. Found by RUNNING the stack; `docker compose config`
+#               renders the same project and every other check stays green.
+#           28. the pin moved back into `.env`, where it is git-ignored and so
+#               exists on exactly one machine.
 #
-#   These are numbered 20-22 rather than 19-21 because 19 is the allowlist
-#   breakage above, from the tier work. Both packets numbered their first entry
-#   independently and the collision is only visible in the union — which is what
-#   the header/recipe check in validate.sh is for.
+#   Nine of them (7-10, 11, 12, 19, 20, 27, 28) additionally assert WHICH check
+#         went red. Every other breakage only proves the gate can fail; those
+#         prove the check written for that defect is still load-bearing, which is
+#         a different claim and the one that decays silently. 21 and 22 assert
+#         the same thing about the two scripts that are themselves proofs, and
+#         23-26 assert it over a fixture fleet rather than over the tree — see
+#         `break_fleet` below for why that helper exists at all.
 #
-#   Eight of them (7-10, 11, 12, 19, 20) additionally assert WHICH check went
-#         red. Every other breakage only proves the gate can fail; those prove
-#         the check written for that defect is still load-bearing, which is a
-#         different claim and the one that decays silently. 21 and 22 assert the
-#         same thing about the two scripts that are themselves proofs.
-#
-#   The counts here were wrong twice and both times a check caught it rather
-#   than a reader: the header said "seven" over a four-wide range, and it
-#   numbered a second entry 19 while the recipes numbered it 20. A header that
-#   drifts from the recipes is not documentation, it is a second, unchecked copy
-#   of the truth — which is the entire thing validate.sh's header/recipe check
-#         exists to prevent.
-#
-# WHAT IT IS NOT
-#   This is not exhaustive mutation testing. Each implementation gets exactly one
-#   mutant, chosen to be the bug a reviewer would not see: a dropped bit mask, an
-#   alphabet that quietly grows a second case, a limit raised until it never
-#   fires. One mutant per language proves the suite bites; it does not prove the
-#   suite is complete, and nothing here should be read as claiming that is.
-
 set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -315,6 +322,62 @@ expect_red_lang() {
   else
     printf 'PASS self_test: %s\n' "$label"
   fi
+}
+
+# fixture_fleet <name> — a throwaway FLEET for the four breakages below.
+#
+# WHY A FIXTURE AND NOT THE REAL ONE. The fleet gate is red on master, by design
+# and on purpose. If these breakages ran against the real sibling checkouts, every
+# one of them would be red before it started — and `expect_red_check` answers
+# "did THAT NAMED check go red", so a tree that is red for an unrelated reason
+# makes the proof meaningless in the one direction that matters. A fixture is
+# green, so a red can only have come from the breakage.
+#
+# It is also what makes the proofs hermetic. They need a fleet-shaped directory
+# with two repositories in it, and building two is cheaper and more predictable
+# than depending on whoever is checked out next to kit on the machine.
+#
+# FIXTURE SHAPE, and each part is load-bearing:
+#   alpha/  a service that has adopted the stack: a `kit.ref` with a real pin,
+#           a compose file that is a genuine OVERRIDE (its own service, no
+#           `ports:`, nothing kit ships), and no collector config of its own.
+#   beta/   the same, so a breakage aimed at alpha cannot be masked by beta and a
+#           check that only ever looks at the first repository is caught.
+#
+# `.git` is a directory, not a worktree marker file, because fleet_check.py skips
+# worktrees — a fixture that looked like a worktree would be skipped and every
+# breakage below would pass vacuously.
+fixture_fleet() {
+  # Two `local`s and not one. `local name="$1" root="$WORK/fleet-$name"` reads
+  # `name` while it is still being assigned, so `root` is built from whatever
+  # `name` happened to be — empty on the first call, so every fixture would be
+  # written to `$WORK/fleet-` and the four breakages would share one directory
+  # and mask each other. shellcheck says so (SC2318), and the symptom is four
+  # proofs that all pass or all fail together.
+  local name="$1"
+  local root="$WORK/fleet-$name"
+  rm -rf "$root"
+  mkdir -p "$root/alpha" "$root/beta"
+  local svc
+  for svc in alpha beta; do
+    mkdir -p "$root/$svc/.git"
+    printf '# %s: the kit this service runs.\n41f8bcb919e34b14e7c809cbb22e24b74ec25099\n' \
+      "$svc" >"$root/$svc/kit.ref"
+    cat >"$root/$svc/docker-compose.yml" <<'YAML'
+# This service's own file, as an OVERRIDE beside the fetched stack. It owns its
+# image and its own database name, and nothing that kit already ships.
+services:
+  alpha:
+    image: cafaye/alpha:dev
+    environment:
+      POSTGRES_DB: alpha
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [platform]
+YAML
+  done
+  printf '%s' "$root"
 }
 
 printf -- '-- self_test: a gate that cannot fail is not a gate\n'
@@ -654,6 +717,207 @@ twentytwo="$(fresh_copy undeclared-reads-current)"
 edit "$twentytwo/tests/staleness.py" '    return UNDECLARED' '    return CURRENT'
 expect_red_script 'breakage 22: the staleness reporter calls an undeclared pin current' \
   "$twentytwo" tests/staleness_test.sh
+
+# 23-26. THE FLEET GATE, one breakage per failure mode. Four, because the claim
+#        is four separate claims and a check that only proves one of them is a
+#        check that has proved nothing about the other three.
+#
+#        Every one asserts the NAMED check, not merely "the gate went red". The
+#        fleet gate is red on master for the whole fleet, so "the gate went red"
+#        is the WEAKEST possible assertion here: it would be satisfied by a
+#        fixture fleet of two perfectly clean repositories. `expect_red_check`
+#        against a green fixture is the only form of this proof that says
+#        anything.
+FLEETCHECK='fleet  (no stale copy, no weakened boundary, no dead config, every ref pinned)'
+
+# 23. A STALE FULL COPY OF THE STACK. The realistic shape, and the one the packet
+#     was written about: a service running its own `postgres` rather than joining
+#     kit's. Five of the twelve repositories do exactly this today.
+#
+#     The mutation is a real service file, not a toy — the same `db:` service with
+#     the same `image: postgres:17` that billing, courier, darkroom and identity
+#     carry. A fixture that used a name kit does not ship would test a rule nobody
+#     broke, which is precisely the bug in the check's first version: five of the
+#     six repositories in scope call their database `db`, so a check that matched
+#     on the NAME found nothing in any of them.
+twentythree_fixture="$(fixture_fleet stale-copy)"
+"$PY" - "$twentythree_fixture/alpha/docker-compose.yml" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+body = open(path, encoding="utf-8").read()
+body = body.replace(
+    "  alpha:\n    image: cafaye/alpha:dev",
+    "  db:\n    image: postgres:17\n    environment:\n      POSTGRES_USER: alpha\n"
+    "      POSTGRES_DB: alpha\n    ports:\n      - \"15500:5432\"\n"
+    "    volumes:\n      - alpha-pg:/var/lib/postgresql/data\n    healthcheck:\n"
+    "      test: [\"CMD\", \"pg_isready\", \"-U\", \"alpha\"]\n"
+    "      interval: 10s\n      timeout: 5s\n      retries: 5\n"
+    "  alpha:\n    image: cafaye/alpha:dev",
+    1,
+)
+body = "volumes:\n  alpha-pg:\n" + body
+open(path, "w", encoding="utf-8").write(body)
+PYEOF
+export KIT_FLEET="$twentythree_fixture"
+expect_red_check 'breakage 23: a service carries its own copy of the shared stack' \
+  "$base" "$FLEETCHECK" --static-only
+
+# 24. A WEAKENED REDACTION BOUNDARY. The service re-points the collector's config
+#     mount at its own `otel-collector.yml` — which is the whole attack: the
+#     allowlist is derived from core's schemas by kit's gate, and a service that
+#     owns the file owns a boundary nobody derived.
+twentyfour_fixture="$(fixture_fleet weakened-boundary)"
+cat >"$twentyfour_fixture/alpha/otel-collector.yml" <<'YAML'
+# A copy of kit's collector config, with the redaction allowlist thrown away. The
+# whole point of the file is that it is DERIVED; a local copy is a boundary
+# nobody keeps in step with core.
+receivers:
+  otlp:
+    protocols:
+      http:
+exporters:
+  debug:
+    verbosity: detailed
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [debug]
+YAML
+"$PY" - "$twentyfour_fixture/alpha/docker-compose.yml" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+body = open(path, encoding="utf-8").read()
+body = body.replace(
+    "services:\n  alpha:",
+    "services:\n  otel-collector:\n"
+    "    volumes:\n"
+    "      - ./otel-collector.yml:/etc/otel/otel-collector.yml:ro\n"
+    "  alpha:",
+    1,
+)
+open(path, "w", encoding="utf-8").write(body)
+PYEOF
+export KIT_FLEET="$twentyfour_fixture"
+expect_red_check 'breakage 24: a service re-points the collector config mount' \
+  "$base" "$FLEETCHECK" --static-only
+
+# 25. A COLLECTOR CONFIG NOTHING STARTS. The file is present, plausible, and
+#     inert: nothing mounts it, so the collector that actually runs is reading the
+#     pinned ref's copy. A developer edits this file and nothing changes at all,
+#     which is strictly worse than the file being absent.
+twentyfive_fixture="$(fixture_fleet dead-collector-config)"
+cp "$ROOT/templates/compose/otel-collector.yml" \
+  "$twentyfive_fixture/alpha/otel-collector.yml"
+export KIT_FLEET="$twentyfive_fixture"
+expect_red_check 'breakage 25: an otel-collector.yml that no compose file ever mounts' \
+  "$base" "$FLEETCHECK" --static-only
+
+# 26. AN UNPINNED REF. `master`, in the committed `kit.ref` — the shape that is
+#     one `sed` away from correct and that a gate is the only thing stopping.
+#
+#     The brief calls this out separately from 23-25 and it earns its own entry:
+#     the other three are about a service carrying something it should not, and
+#     this one is about the fleet as a whole running a stack that changes between
+#     Tuesday and Monday. A gate that proved the first three and this one would
+#     still be missing the one that makes "one command, always current" mean
+#     something.
+twentysix_fixture="$(fixture_fleet unpinned-ref)"
+printf '# deliberately unpinned\nmaster\n' >"$twentysix_fixture/alpha/kit.ref"
+export KIT_FLEET="$twentysix_fixture"
+expect_red_check 'breakage 26: a service pins a BRANCH rather than a ref' \
+  "$base" "$FLEETCHECK" --static-only
+
+# 27. A VENDOR CONFIG MOUNT THAT STOPPED RESOLVING FROM THE FETCHED TREE.
+#      This is the defect `tests/stack_live_test.sh` found by RUNNING the stack,
+#      and it is the one this packet's own static checks had nothing to say about:
+#      `docker compose config` renders the same project either way, because the
+#      variable's VALUE is not a property of the YAML. At run time the mount
+#      resolves to a path that does not exist, Docker creates a DIRECTORY there,
+#      and the collector exits naming a file type:
+#
+#        failed to read configFile /etc/tempo/tempo.yaml: is a directory
+#
+#      which says nothing about the mount that is wrong. Re-introducing it must
+#      not be possible between one live run and the next, which is what the check
+#      is for.
+MOUNTCHECK='templates/compose/ + bin/dev  (every vendor config mounts from the fetched tree)'
+
+twentyseven="$(fresh_copy mount-not-fetched)"
+edit "$twentyseven/templates/compose/docker-compose.yml" \
+  '${KIT_COMPOSE_DIR:-.}/otel-collector.yml:/etc/otel/otel-collector.yml:ro' \
+  './otel-collector.yml:/etc/otel/otel-collector.yml:ro'
+expect_red_check 'breakage 27: a vendor config mount stopped resolving from the fetched tree' \
+  "$twentyseven" "$MOUNTCHECK" --static-only
+
+# 28. THE PIN MOVED BACK INTO `.env`. The subtle one, because it looks like an
+#      improvement: a template that ships the ref means a fresh clone works with
+#      no setup. It also means the ref lives in a git-ignored file, so it exists on
+#      the laptop of whoever ran `bin/dev` last and on no CI runner and no
+#      teammate's checkout — and "one command, always current" quietly becomes
+#      "one command, whatever this checkout last fetched".
+#
+#      Broken with a BRANCH rather than a sha, so the breakage would also fail the
+#      runtime validator: a check that only notices the shape of the value would
+#      pass on a file whose value is the one thing it must never be.
+PINCHECK='templates/bin/dev.sh + .env.example  (the pin is kit.ref, and the gate reads the same file)'
+
+twentyeight="$(fresh_copy pin-back-in-env)"
+edit "$twentyeight/templates/compose/.env.example" \
+  'KIT_STACK_URL=https://github.com/cafaye/kit.git' \
+  'KIT_STACK_REF=master
+KIT_STACK_URL=https://github.com/cafaye/kit.git'
+expect_red_check 'breakage 28: the pin is back in `.env`, where it is git-ignored' \
+  "$twentyeight" "$PINCHECK" --static-only
+
+# Cleared, because `export` is not scoped to a command the way `VAR=v cmd` is,
+# and every breakage after this one would otherwise run against the last
+# fixture. The alternative — a `VAR=v` prefix per call — puts `expect_red_check`
+# at column 30, where the breakage counter and validate.sh's header/recipe check
+# (both `grep -cE '^expect_red...'`) stop being able to see it, and a breakage the
+# counter cannot see is a breakage the header is not proved against.
+unset KIT_FLEET
+
+# 27-28. THE TWO KIT-SIDE HALVES OF THE SAME PACKET. The four above are about the
+#         fleet; these are about kit's own tree, and they are the halves that make
+#         the fleet half mean anything. A gate that only checks its callers is
+#         checking that they call it correctly and not that it works.
+#
+# 27. A VENDOR CONFIG MOUNT THAT STOPPED RESOLVING FROM THE FETCHED TREE. One
+#     `${KIT_COMPOSE_DIR:-.}` prefix dropped from one mount. The stack still
+#     parses, `docker compose config` still renders the same project, and the
+#     variable's value is not a property of the YAML — so nothing above it in the
+#     gate can see it. What it does is resolve the mount to a path that does not
+#     exist, and Docker's answer to that is to CREATE A DIRECTORY, so the failure
+#     arrives four containers later as
+#     `read /etc/tempo/tempo.yaml: is a directory`. Found by running the stack.
+MOUNTCHECK='templates/compose/ + bin/dev  (every vendor config mounts from the fetched tree)'
+
+twentyseven="$(fresh_copy mount-not-anchored)"
+edit "$twentyseven/templates/compose/docker-compose.yml" \
+  '      - ${KIT_COMPOSE_DIR:-.}/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro' \
+  '      - ./tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro'
+expect_red_check 'breakage 27: a vendor config mount stopped resolving from the fetched tree' \
+  "$twentyseven" "$MOUNTCHECK" --static-only
+
+# 28. THE PIN MOVED BACK INTO `.env`, where it is git-ignored. The shape is
+#     subtler than "the pin is wrong": `kit.ref` is deleted and
+#     `KIT_STACK_REF=` is added to `.env.example`, which reads correctly, passes
+#     review, and decides nothing at run time — because `bin/dev` reads
+#     KIT_STACK_REF from the ENVIRONMENT only, as a one-run override. A gate that
+#     checked "is the pin pinned?" would still be green; it has to check WHERE the
+#     pin lives, which is a different question and a different check.
+PINCHECK='templates/bin/dev.sh + .env.example  (the pin is kit.ref, and the gate reads the same file)'
+
+twentyeight="$(fresh_copy pin-back-in-env)"
+rm -f "$twentyeight/kit.ref"
+cat >>"$twentyeight/templates/compose/.env.example" <<'ENTRY'
+KIT_STACK_REF=0000000000000000000000000000000000000000
+ENTRY
+expect_red_check 'breakage 28: the pin is back in .env, where nothing reads it' \
+  "$twentyeight" "$PINCHECK" --static-only
 
 printf '\n'
 if [ "$failures" -ne 0 ]; then
