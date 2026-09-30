@@ -76,9 +76,19 @@ having the file here at all:
 test suite — kit has no other tests, because kit has no code.
 
 ```sh
-python3 -m venv .venv && .venv/bin/pip install -r tests/requirements.txt
 bash tests/validate.sh
 ```
+
+**One command, on a clean clone, is the whole procedure.** The gate installs its
+own dependencies into the gitignored `.venv/` on first run and prints a `note:`
+line saying so. There is no prerequisite step, and a prerequisite step that is
+documented rather than automated is a prerequisite that gets skipped by exactly
+the machine you most wanted to hear from — a CI runner, or anyone who cloned
+without reading this file.
+
+That was the second time this bit. It used to exit 1 with `no python with
+PyYAML` because it preferred `.venv/bin/python`, fell back to `python3`, and
+`.venv` is gitignored, so **every fresh clone and every CI runner** hit it.
 
 Three phases, and all three must pass:
 
@@ -97,9 +107,18 @@ Three phases, and all three must pass:
   defect is proven still load-bearing.
 
 - Tests are written **first** and watched fail before the artifacts exist.
-- `shellcheck` and `node` run when installed and are skipped when not; PyYAML
-  is required. A skip is reported in the summary, never hidden — and a *skip in
-  self_test* fails the run, because a proof nobody ran is not a proof.
+- `shellcheck` and `node` run when installed and are skipped when not. A skip is
+  reported in the summary, never hidden — and a *skip in self_test* fails the
+  run, because a proof nobody ran is not a proof.
+- **PyYAML and yamllint are required and are bootstrapped, not required of
+  you.** `tests/bootstrap.sh` resolves an interpreter, builds `.venv` and pip
+  installs `tests/requirements.txt` when nothing usable is present. Resolve
+  order: `$KIT_PYTHON` (an override is a promise — if it cannot import yaml
+  the gate says so rather than silently substituting a different one), then
+  `.venv`, then any `python3` on PATH that already has PyYAML, then bootstrap.
+  A required check whose tool path is hardcoded to a directory the resolver may
+  have skipped is a gate that fails on arrival; that is a bug this file has
+  already had once.
 - When adding an artifact, add the check that would catch its absence. A
   validator nobody extends is a validator that quietly rots.
 - **Parse what you hand out.** A file a service copies has to parse in its own

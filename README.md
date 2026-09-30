@@ -317,9 +317,19 @@ These are the rules that keep kit from becoming the thing it exists to prevent.
 ## Working on kit
 
 ```sh
-python3 -m venv .venv && .venv/bin/pip install -r tests/requirements.txt
 bash tests/validate.sh
 ```
+
+That is the entire procedure on a clean clone. The gate installs its own
+dependencies — PyYAML and yamllint — into the gitignored `.venv/` on first run
+and prints a `note:` line saying so. There is no prerequisite step, because a
+prerequisite that is documented rather than automated is one that gets skipped
+by exactly the machine you most wanted to hear from.
+
+This bit twice. It used to exit 1 with `no python with PyYAML` because it
+preferred `.venv/bin/python` and fell back to `python3`, and `.venv` is
+gitignored — so **every fresh clone and every CI runner** hit it, including the
+CI job this repository now runs on itself.
 
 `tests/validate.sh` runs in three phases and prints one line per check.
 
@@ -327,7 +337,12 @@ bash tests/validate.sh
 we wrote them down to be:
 
 - `.sh` → `bash -n`, plus `shellcheck -S warning` when shellcheck is installed
-- `.yml` / `.yaml` → `python3` `yaml.safe_load`, plus `yamllint -c lint/yamllint.yml`
+- `.yml` / `.yaml` → `python` `yaml.safe_load`
+- **every** `.yml` / `.yaml` in the tree → `yamllint -c lint/yamllint.yml`,
+  enumerated by `git ls-files` rather than a hand-kept list. Required, not
+  optional: a repo that copies `lint/yamllint.yml` lints its own CI against it
+  on day one, so a YAML that breaks the config greets the first adopter with a
+  failure nobody authored
 - `.mjs` → `node --check`
 - handed-out scripts → must be executable
 - every language in the CI workflow must have a Dockerfile, a `bin/prime` and a
@@ -364,5 +379,6 @@ written for a given defect is proven still load-bearing rather than being one
 of forty checks that could have gone red for an unrelated reason.
 
 Any `FAIL` exits 1. A `SKIP` is always reported in the summary, never hidden.
-PyYAML and yamllint are required (`tests/requirements.txt`); the six language
-toolchains and `shellcheck` run when present.
+PyYAML and yamllint are required and are bootstrapped by the gate itself
+(`tests/requirements.txt`); the six language toolchains and `shellcheck` run when
+present.

@@ -24,6 +24,25 @@ semver contract — it is consumed by *calling*
   nothing, and **every check in the suite was green throughout**. A layout bug
   and a documentation bug that agree with each other are invisible to any check
   that reads only one of them.
+- `tests/bootstrap.sh` — the gate now installs its own dependencies.
+  `bash tests/validate.sh` is the **whole procedure on a clean clone**: it
+  resolves an interpreter, builds `.venv` and pip installs
+  `tests/requirements.txt` on first run, printing a `note:` line. `AGENTS.md`
+  and the README no longer instruct anyone to run a two-line step first.
+
+  This was the second time the gate failed on arrival. It exited 1 with
+  `no python with PyYAML: pip install -r tests/requirements.txt` on every fresh
+  clone and every CI runner, because it preferred the gitignored `.venv` and
+  fell back to a `python3` that has no PyYAML. The prerequisite was documented,
+  which is exactly why it got skipped: by every runner, and by anyone who
+  cloned without reading the file first.
+- `yamllint` now lints **every** YAML in the tree, enumerated by `git ls-files`
+  rather than a hand-kept list of the two compose templates, and a missing
+  yamllint is a `FAIL` instead of a `SKIP`. kit ships the config and a repo
+  that copies it lints its own CI against it on day one, so a YAML that breaks
+  the config greets the first adopting repo with a failure nobody authored. A
+  skip here would hide a broken config behind a missing tool on precisely the
+  machine that had not run the gate before.
 - `expect_red_check` in `tests/self_test.sh`, which asserts that one *named*
   check reported `FAIL` rather than merely that the gate went red. Breakages
   7-10 use it, so the check written for each layout/documentation drift is
