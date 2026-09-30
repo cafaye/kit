@@ -22,6 +22,9 @@ kit/
 ├── docker/                       # Dockerfile.<lang> templates
 ├── templates/
 │   ├── bin-prime/<lang>.sh       # the worktree primer
+│   ├── bin/dev.sh                # the local developer loop
+│   ├── compose/                  # postgres + nats + redis + otel collector
+│   ├── otel/<lang>/              # W3C traceparent: codec, suite, snippet
 │   ├── mise.toml                 # toolchain pin template
 │   └── AGENTS.md                 # skeleton for a service repo
 └── tests/validate.sh             # THE gate
@@ -40,28 +43,61 @@ python3 -m venv .venv && .venv/bin/pip install -r tests/requirements.txt
 bash tests/validate.sh
 ```
 
+Three phases, and all three must pass:
+
+- **static** — every artifact parses, and the strictness decisions are still
+  what we wrote them down to be. A parse is the weakest check; the rest are
+  semantic: no collector exporter but `debug`, no literal URL, every
+  `${env:...}` the collector reads actually passed into the container, every
+  published port a `${KIT_*:default}`, every language with all four artifacts.
+- **telemetry** — the six W3C traceparent suites are **executed**, one per
+  language. Stdlib only and offline on purpose. If they ever need the network,
+  a template has grown a dependency and kit has stopped being config-only.
+- **self_test** — eleven breakages of a throwaway copy, asserting the gate goes
+  red each time. Six of them are a semantic mutation of one language each, so
+  **every suite is proven able to fail** rather than assumed to.
+
 - Tests are written **first** and watched fail before the artifacts exist.
 - `shellcheck` and `node` run when installed and are skipped when not; PyYAML
-  is required. A skip is reported in the summary, never hidden.
+  is required. A skip is reported in the summary, never hidden — and a *skip in
+  self_test* fails the run, because a proof nobody ran is not a proof.
 - When adding an artifact, add the check that would catch its absence. A
   validator nobody extends is a validator that quietly rots.
+- **Parse what you hand out.** A file a service copies has to parse in its own
+  language, and the extension kit gives it must not stop you checking. This is
+  not hypothetical: `rack_middleware.rb.snippet` shipped with
+  `c.use_all, :auto_instrumentation`, which is not Ruby, and nothing noticed
+  because the artifact table only asked whether the file existed.
+- **Run the config against your own files.** Both `Naming/PredicateName` (an
+  obsolete RuboCop key that applies nothing) and a duplicate
+  `Metrics/MethodLength` block in `lint/rubocop.yml` were invisible until
+  rubocop ran on kit's own Ruby with kit's own config. That is the only way an
+  obsolete key surfaces before six repos inherit it.
 - The suite must be able to fail: `self_test` breaks a throwaway copy of the
-  tree three ways and asserts the run goes red. If you change the suite, keep
+  tree eleven ways and asserts the run goes red. If you change the suite, keep
   that true.
 
 ## Adding a language
 
-1. Add the language to `LANGUAGES` in `tests/validate.sh` **first** and watch
-   the suite go red.
-2. Add all four artifacts: `workflows/ci.reusable.yml` (a job guarded by
-   `inputs.language == '<lang>'`), `docker/Dockerfile.<lang>`, a
+1. Add `<lang>` to the `language` input's `options` in
+   `workflows/ci.reusable.yml` **first**, and watch the suite go red. That one
+   edit is the whole trigger: `validate.sh` reads the options out of the
+   workflow and, for each one, requires a Dockerfile, a `bin/prime` and a
+   `[tools]` pin. There is no second list to keep in step — that is the point.
+2. Add the job: `workflows/ci.reusable.yml`, guarded by
+   `if: ${{ inputs.language == '<lang>' }}`.
+3. Add the other three artifacts: `docker/Dockerfile.<lang>`,
    `templates/bin-prime/<lang>.sh`, and a `[tools]` entry in
    `templates/mise.toml`.
-3. Add the language to the README's adoption table and checklist.
-4. Re-run the gate until green.
+4. Add the language to the README's adoption table and checklist.
+5. Re-run the gate until green.
 
-Half a language is worse than none: the whole point of kit is that six repos
-get the same thing.
+`bun` is the worked example: it was added because `guard` carried a standing
+note that it hand-rolled a whole workflow for want of a `bun` job. All four
+artifacts landed with it, in one commit.
+
+Half a language is worse than none: the whole point of kit is that every repo
+that adopts it gets the same thing.
 
 ## Rules
 
