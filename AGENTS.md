@@ -241,6 +241,34 @@ structurally excluded from using it. If you add a job for a new option, the
 `ci_check` block in `tests/validate.sh` must know about it in the same commit:
 an `option` with no `job` is a green build that ran nothing.
 
+## The stack is FETCHED, and the pin is the only thing that decides what it is
+
+`templates/compose/` is not copied into a service. `bin/dev` fetches it from the
+ref named in the service's committed **`kit.ref`** and runs it beside the service's
+own `docker-compose.yml`, which is an **override**. A compose file cannot be
+`uses:`-ed, so `bin/dev` is the callable path and the pin is what makes it one.
+
+Three rules follow, and each is a thing that has to be true rather than a thing
+that is usually true:
+
+- **A pin is a 40-character commit sha or a `v<semver>` tag.** Never a branch.
+  The ref decides which redaction allowlist, port block and dashboards a
+  developer's loop runs, and on a branch those change between two runs of the
+  same command.
+- **The pin is `kit.ref`, not `.env`.** `.env` is git-ignored, so a pin there
+  exists on one machine and on no CI runner — which turns "one command, always
+  current" into "one command, whatever this checkout last fetched".
+- **`tests/fleet_check.py` reads the CALLERS, not this repository.** A defect in
+  the standard is invisible to a gate that only reads the standard, which is the
+  same argument as D4. It is **red against the current fleet on purpose**: five
+  repositories carry their own copy of the shared stack and six have no pin. Do
+  not soften it to make this repository green; report it and name the
+  repositories.
+
+`README.md` carries the override rules, and one of them is a trap worth knowing
+before you write a service compose file: **a second file's `ports:` list is
+appended, not substituted.** Move a port in `.env`; never in the override.
+
 ## Rules
 
 - **Config only.** No runtime code, no dependencies, no generated output. If

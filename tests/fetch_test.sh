@@ -84,9 +84,14 @@ REMOTE="$WORK/kit-remote.git"
 # comparison mean anything.
 SEED="$WORK/seed"
 mkdir -p "$SEED"
-# `git ls-files` rather than `cp -R`: it is the set a clone would receive, and it
-# leaves `.git`, `.venv` and the throwaway copies out of the remote.
-(cd "$ROOT" && git ls-files -z | tar --null -T - -cf -) | (cd "$SEED" && tar -xf -)
+# `tar` over the tree and NOT `git ls-files`, because this has to work in a
+# directory that is not a git repository — which is exactly what
+# `self_test.sh`'s throwaway copies are. It was `git ls-files`, and the
+# consequence was the sharpest failure mode this file could have: the self-test
+# CONTROL went red, because a break of nothing at all was reported as a broken
+# gate. A control that is red is not a control.
+(cd "$ROOT" && tar -cf - --exclude=./.git --exclude=./.venv --exclude=./__pycache__ .) |
+  (cd "$SEED" && tar -xf -)
 git -C "$SEED" init -q
 git -C "$SEED" add -A
 git -C "$SEED" -c user.email=t@example.invalid -c user.name=kit13 commit -q -m "seed"

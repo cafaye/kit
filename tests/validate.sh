@@ -3584,6 +3584,12 @@ for path in (
     "templates/compose/mimir",
     "tests/canary_test.sh",
     "tests/no_telemetry_in_readiness.sh",
+    # The three the fetched-stack packet added. A README that documents the stack
+    # without documenting how it is OBTAINED describes a copy, and this packet's
+    # whole claim is that the copy is gone.
+    "tests/fetch_test.sh",
+    "tests/stack_live_test.sh",
+    "tests/fleet_check.py",
 ):
     if path not in readme:
         problems.append(f"README.md never mentions {path}")
@@ -3602,6 +3608,28 @@ for phrase, why in (
 ):
     if phrase.lower() not in readme.lower():
         problems.append(f"README.md does not state {why} (looked for {phrase!r})")
+
+# `kit.ref` IS NAME-ONLY, deliberately, and it is the one entry in the list above
+# that cannot also be an existence check. kit is the repository being pinned, so
+# it has no `kit.ref` of its own — requiring one would make this repository fail a
+# check about the repositories that consume it, which is the confusion the whole
+# split between "kit's own artifacts" and "the fleet" exists to prevent.
+#
+# It is read by two programs — `bin/dev` at run time and `tests/fleet_check.py`
+# at gate time — so a README that lists it in a table of files without saying what
+# it is has documented a file, not a contract.
+if not re.search(r"`?kit\.ref`?", readme):
+    problems.append(
+        "README.md never names kit.ref, so a reader cannot find where the pin "
+        "lives — and the pin is the one thing in this packet that decides which "
+        "bytes of kit a developer's machine runs."
+    )
+if not re.search(r"(?i)pin", readme):
+    problems.append(
+        "README.md never uses the word `pin`, so kit.ref reads as a filename "
+        "rather than as the thing it is. A reader who does not know it is a pin "
+        "will edit it to `master`."
+    )
 
 # The escape hatch, and the ports. A self-hoster reads the README and not the
 # code, so the variable name has to be in the README and so does the block.
