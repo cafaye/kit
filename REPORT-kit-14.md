@@ -746,6 +746,14 @@ ran and passed all 18 of its assertions, and the collector-kill proof ran too.
 The skip count is the same either way, which is exactly why a misattributed skip
 is worth correcting: the number survived, the meaning did not.
 
+**"30 of 30 breakages" and the gate's own "(31 breakages, 31 reds)" label are
+both right, and the difference is not a rounding error.** There are 31 *recipes*
+and 30 *breakage numbers*, because `2b` is a second recipe for breakage 2 and
+sorts as its own entry. `self_test.sh` counts numbers, the gate's label counts
+recipes, and the header/recipe reciprocity check is what proves the two agree —
+31 documented, 31 carried. A reader who sees the two numbers and assumes one of
+them is a lie has learned nothing and will "fix" one of them.
+
 The three checks this packet added, on a green run, printing what they verified:
 
 ```
