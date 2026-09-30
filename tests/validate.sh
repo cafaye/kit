@@ -972,6 +972,62 @@ for signal in ("traces", "metrics", "logs"):
             f"about is how a prohibited identifier gets back onto a measurement."
         )
 
+    # THE CARRIER HAS TO SURVIVE THE PROCESSOR THAT READS IT, and this is the
+    # check that says so. Being *stashed* is not the same as being *exempted*:
+    # the stash writes `cafaye.stashed.tenant_id`, the redaction processor
+    # deletes every attribute it does not exempt, and the restore then reads a
+    # name that no longer exists. The pipeline runs, the trace arrives, the
+    # dashboard renders — and every trace is missing the tenant_id on its
+    # resource, which is per-tenant totals core's metrics schema exists to
+    # produce.
+    #
+    # The three processors are one idea written out three times, and they had
+    # drifted: metrics carried the private names and traces and logs did not.
+    # The consequence was that the metric view had per-tenant totals and the
+    # trace and log views silently did not. Found by running the stack and
+    # reading a span back out of Tempo — every other check passed, because from
+    # the config alone `tenant_id` genuinely is stashed.
+    unexempted = sorted(private_stash - ignored)
+    if unexempted:
+        problems.append(
+            f"{proc}: ignored_keys is missing {', '.join(unexempted)}, which is "
+            f"the carrier the stash writes and the restore reads. The redaction "
+            f"processor DELETES every attribute it does not exempt, so the stash "
+            f"is undone before the restore can act on it: tenant_id and "
+            f"account_id arrive on no resource at all, silently, while the "
+            f"pipeline reports success."
+        )
+
+# ...and the three lists must agree, because three hand-copied lists are three
+# places for one of them to drift. Equality across all three, reported against
+# the union so the message names what is missing and what is extra without
+# having to first work out which of the three is the odd one out — and without
+# that subtlety, since picking a reference list to compare against is exactly
+# how a check like this comes to ignore the very case it was added for.
+_ignored_by_signal = {
+    signal: set(
+        ((col.get("processors") or {}).get(f"redaction/cafaye_{signal}") or {}).get(
+            "ignored_keys"
+        )
+        or []
+    )
+    for signal in ("traces", "metrics", "logs")
+}
+_union = set().union(*_ignored_by_signal.values())
+_intersection = set.intersection(*_ignored_by_signal.values())
+if _union != _intersection:
+    detail = "; ".join(
+        f"{signal} {'lacks' + repr(sorted(_union - keys)) if _union - keys else 'extras' + repr(sorted(keys - _union))}"
+        for signal, keys in sorted(_ignored_by_signal.items())
+        if keys != _union
+    )
+    problems.append(
+        f"the three redaction processors disagree on ignored_keys: {detail}. All "
+        "three signals get the same resource exemption; one of them drifting is "
+        "how a signal ends up quietly partitioned differently from the other two, "
+        "which is the bug this assertion was added for."
+    )
+
 # The stash and the restore must bracket the redaction processor in EVERY
 # pipeline, in that order. Checked positionally, because a pipeline that
 # restores first is a pipeline that exports the private name.

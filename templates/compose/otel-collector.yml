@@ -169,11 +169,31 @@ processors:
     # the exporter, and a data-point `tenant_id` does not. That pair is the
     # reason this is written down — the canary test found the gap by failing,
     # and the first version of this config had no `ignored_keys` at all.
+    #
+    # `cafaye.stashed.*` MUST be here, and this line is load-bearing in a way
+    # that is invisible until a trace is read back. Those two names are the
+    # carrier the stash writes and the restore reads; a name this processor
+    # does not exempt is a name it DELETES. So with the stash running and the
+    # redaction processor omitting this pair, the sequence is: stash writes
+    # `cafaye.stashed.tenant_id` — redaction deletes it — restore reads nothing
+    # and puts `tenant_id` back from an empty source. Every trace then arrives
+    # with no `tenant_id` and no `account_id` on its resource, silently, while
+    # the metrics pipeline keeps both, because the metrics processor is the one
+    # that had the entry.
+    #
+    # That is not hypothetical: it is what this packet shipped. The three
+    # processors are copies of one idea, and the metrics copy had the entry
+    # while the traces and logs copies did not — so the fleet's per-tenant
+    # trace and log views were empty and only the metric view worked. Found by
+    # running the stack and reading a span back out of Tempo, not by reading
+    # this file. `tests/validate.sh` now asserts the three agree.
     ignored_keys:
       - service.name
       - service.version
       - service.instance.id
       - deployment.environment
+      - cafaye.stashed.tenant_id
+      - cafaye.stashed.account_id
     allowed_keys:
       - http.request.method
       - http.response.status_code
@@ -222,11 +242,18 @@ processors:
     # `account_id` go through the stash/restore pair for the same reason as on
     # traces: one flat `ignored_keys` list cannot exempt a resource without also
     # exempting the measurement.
+    #
+    # `cafaye.stashed.*` here for the same reason as on traces, and the failure
+    # mode is the same: without them the redaction processor deletes the
+    # carrier the restore is about to read, so no log record arrives with
+    # `tenant_id` on its resource and the per-tenant log view is empty.
     ignored_keys:
       - service.name
       - service.version
       - service.instance.id
       - deployment.environment
+      - cafaye.stashed.tenant_id
+      - cafaye.stashed.account_id
     allowed_keys:
       - log.severity
       - service.name
