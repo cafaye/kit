@@ -1,21 +1,19 @@
 # REPORT — kit-14: the staleness reporter, pointed at `templates/`
 
-**Worktree:** `worker/kit-14-stale` · **Base:** `41f8bcb` (master, not rebased — see
+**Worktree:** `worker/kit-14-stale` · **Base:** `41f8bcb` (master — already current,
 §7.12) · **Date:** 2026-09-30
 
-> **Read §9 before trusting anything here. The self-test control went RED on
-> this branch, and that blocks the packet.** This work was interrupted by an OOM
-> restart, so the code arrived as a `recover(...)` commit whose own message says
-> its conclusions are void. I re-measured rather than re-read, and **four of the
-> recovered report's numbers were false** — all four in the direction that made
-> the reporter look better than it is. They are corrected throughout, with the
-> wrong version quoted beside the correction. A later run then took the
-> **self-test control red**: the reporter had been handed a smaller fleet than
-> the fixture holds, one case failed, and its text blamed the reporter. The
-> harness now says `this is NOT a reporter result` and names the service it lost
-> (§9, breakage 29). **I have still not observed a completed 30-breakage
-> `self_test`** — the machine ran at load 90–160 with four other workers
-> building and my runs were killed. §9 says exactly what I did and did not see.
+> **Read §9 before trusting anything here.** The gate is **green** on a run
+> watched to completion: 30 of 30 breakages red, the unbroken tree green, **0
+> failed, 2 skipped** (master's known-correct pair). It was not green for most of
+> this packet's life, and §9 keeps the whole sequence — three separate reds,
+> none of them the reporter.
+>
+> This work was interrupted by an OOM restart, so the code arrived as a
+> `recover(...)` commit whose own message says its conclusions are void. Four of
+> the recovered report's numbers were **false** — all four in the direction that
+> made the reporter look better than it is. They are corrected throughout, with
+> the wrong version quoted beside the correction.
 
 **The three things the packet asked for, and where they are:**
 
@@ -643,13 +641,18 @@ Stated here rather than in a footnote.
     `+N -M` and the member breakdown and stops. **The prose around the
     measurement was the unreliable part**, which is worth knowing precisely
     because it is the part a reader trusts most.
-12. **I did not rebase onto master, deliberately.** The packet's `base:` line
-    says "REBASE onto master before you finish", and the dispatch that sent me
-    here says another worker is finishing the kit-04 merge on master's behalf
-    and that I must not merge or rebase master myself. I followed the dispatch,
-    because rebasing onto a master that is mid-merge is how a worker ends up
-    resolving someone else's conflict. This branch is based on `41f8bcb` and
-    nothing has been pushed.
+12. **Rebase status: nothing to do, and here is the check.** The packet says
+    "REBASE onto master before you finish". `master` and `origin/master` are
+    both still `41f8bcb`, and `git merge-base master worker/kit-14-stale` is
+    `41f8bcb` — so this branch is already on current master and a rebase would
+    be a no-op that could only introduce risk. Nothing has been pushed and
+    nothing has been merged. **If master moves before this is read, the rebase
+    is genuinely outstanding** and `git rebase master` on this branch is the
+    whole of it; the one conflict to expect is `tests/self_test.sh` and
+    `tests/validate.sh`, which the last three packets have all extended.
+    An earlier draft of this item said the rebase was deliberately skipped
+    because a dispatch forbade it; the dispatch is not in evidence and the
+    measurement is, so the measurement is what is written down.
 13. **I ran the fleet's `bin/prime` scripts by mistake, and verified I left no
     trace.** Trying to characterise the primers I executed them instead of
     reading them, which is more than reading and is not what the brief permits.
@@ -717,7 +720,9 @@ Stated here rather than in a footnote.
 
 ## 9. The gate
 
-**Stated as measured, and the honest version is not a clean green.**
+**Green, on a run I watched to completion.** The blocker that was open when this
+section was last written is closed, and the whole history of how it got there is
+kept below rather than deleted.
 
 ```
 $ bash tests/validate.sh
@@ -725,78 +730,104 @@ $ bash tests/validate.sh
 
 **pass and skip counts, separately, as the house rules require:**
 
-| phase reached | pass | fail | skip |
-| --- | --- | --- | --- |
-| static, telemetry, observability, staleness | **145** | **0** | **2** |
-| self_test (31 breakages + 1 control) | *see below* | — | — |
+| | |
+| --- | --- |
+| checks failed | **0** |
+| checks skipped | **2** |
+| self-test breakages | **30 of 30 went red**, and the unbroken tree is green |
+| `staleness_test.sh` | 26 cases, including the red proof and the absent case |
 
 The two skips are the two `node --check` cannot read TypeScript
 (`templates/tier/bun/tier.test.ts`, `templates/tier/node/tier.test.ts`), which
-are master's known-correct pair. **An earlier draft of this report attributed
-them to the Docker-dependent observability proofs instead; that was wrong** —
-docker was available on this machine, `canary_test.sh` ran and passed all 18 of
-its assertions, and the collector-kill proof ran too. The skip count is the same
-either way, which is exactly why a misattributed skip is worth correcting: the
-number survived, the meaning did not.
+are master's known-correct pair — the same two master reports. **An earlier
+draft of this report attributed them to the Docker-dependent observability proofs
+instead; that was wrong** — docker was available on this machine, `canary_test.sh`
+ran and passed all 18 of its assertions, and the collector-kill proof ran too.
+The skip count is the same either way, which is exactly why a misattributed skip
+is worth correcting: the number survived, the meaning did not.
 
-**THE CONTROL WENT RED. Stated here, at the top, because D13 is the whole
-reason this section exists.** A later run did reach `self_test`, and it reported:
+The three checks this packet added, on a green run, printing what they verified:
+
+```
+PASS templates/parity-allowlist  (reason, owner, since, until; dead entries fail)
+       parity allowlist: 80 entries across 9 repositories, every artefact id in
+       artifacts.json, none expired, none dead. THE TOTAL IS THE MEASUREMENT: …
+PASS tests/artifacts.json  (every declared source exists, for every language)
+       artefact table: 12 artefact(s), every source present in this tree, and
+       every {lang} source resolving for all 7 languages the workflow offers
+PASS tests/classify.py + tests/staleness.py  (stdlib only; the carve-out, enforced)
+       carve-out boundary: 2 programs, 10 distinct imports (…, glob, …), all
+       standard library, all named in AGENTS.md.
+```
+
+### The control DID go red, and what it turned out to be
+
+Stated here rather than deleted, because the sequence is the useful part and a
+report that only kept the last run would be the dishonest shape.
+
+**The symptom.** A run reached `self_test` and reported:
 
 ```
 FAIL self_test: unbroken tree — the gate is RED on an unbroken tree
 FAIL: staleness_test — 1 case(s) failed, 25 passed.
 ```
 
-**Diagnosis, as far as I could get it.** The reporter had measured **8
-repositories and 96 cells** where the fixture holds **9 and 108** — one service,
-twelve cells, silently not counted. Exactly one case failed and 25 passed,
-because the cases read a table row for a service the reporter never emitted. The
-failing case's text named **the reporter**, which is the one thing it must not do
-when the reporter was handed a smaller fleet rather than misreading a full one.
+**The first diagnosis was partly right and left the cause open.** The reporter
+had measured **8 repositories and 96 cells** where the fixture holds **9 and
+108** — one service, twelve cells, silently not counted. Exactly one case failed
+and 25 passed, and the failing case's text named **the reporter**, which is the
+one thing it must not do when the reporter was handed a smaller fleet rather
+than misreading a full one. The reporter fails closed about artefacts and **the
+harness was failing open about its own inputs** — the same defect one layer
+down, and the layer nobody checks. `staleness_test.sh` now verifies, before any
+case asserts on it, that every service the cases names has a cell the reporter
+actually measured, and exits with `this is NOT a reporter result` naming the
+missing service. Breakage 29 proves that check load-bearing, asserting the
+*wording* as well as the exit status, because a red that blames the wrong file
+sends the next reader to the wrong place.
 
-So the reporter fails closed about artefacts and **the harness was failing open
-about its own inputs** — the same defect one layer down, and the layer nobody
-checks. `staleness_test.sh` now verifies, before any case asserts on it, that
-every service the cases name has a cell the reporter actually measured, and exits
-with `this is NOT a reporter result` naming the missing service. Breakage 29
-proves that check load-bearing, asserting the *wording* as well as the exit
-status, because a red that blames the wrong file sends the next reader to the
-wrong place.
+**The cause, found later: a SIGPIPE race in the test harness itself.**
 
-**What I could not confirm: the underlying cause.** The run's log was deleted out
-from under the process before I could read it, and `staleness_test.sh` runs
-`set -euo pipefail`, so a failed `git init` would have *aborted* the suite rather
-than skipping a repository silently — which rules out the obvious suspect and
-leaves the cause open. The fix deliberately does not depend on the diagnosis: it
-asserts the discrepancy, so the next occurrence is named rather than
-misattributed. **A second, subtler possibility I also cannot exclude is that the
-machine was simply failing under load** (90–162 across these runs) in a way that
-cost one fixture repository; that is a property of the machine, not of this
-packet, but I did not prove it and am not claiming it.
+```
+tests/staleness_test.sh: line 731: printf: write error: Broken pipe
+```
 
-**Why self_test is still not reported as green.** I have not observed a
-completed 30-breakage `self_test` on this branch. The runs that reached it were
-killed by the harness with the machine at load average 90–160 and at least four
-other workers running full gates concurrently; one of those runs lost its log
-file entirely. What I did verify, and can be checked without a quiet machine:
-the static phase is **135 pass / 0 fail / 2 skip**; `staleness_test.sh` passes
-**26 cases** including this packet's red proof, on a good tree and inside a
-`self_test`-style copy; the new fixture check **fires** when a fixture service is
-made invisible and names exactly the right service; and the header/recipe
-reciprocity check reports **30 documented / 30 recipes**. **Re-run
-`bash tests/validate.sh` on a machine with room before trusting this packet** —
-and read this section as a blocker that is open, not as a caveat.
+`printf '%s\n' "$OUT" | grep -qE '…'` is a race. `grep -q` exits at the first
+match and closes the pipe; `printf` takes SIGPIPE and dies 141 — but only if it
+has not already finished writing. Under `set -o pipefail` a **successful** match
+then yields a non-zero pipeline, the `if` reads that as "assertion failed", and
+the case goes red **naming the reporter for a reporter that was correct**.
+
+It is size-dependent, which is why it read as machine load: the templates table
+is ~60 rows for 9 fixture services, so `printf` has not finished writing when
+`grep -q` exits, and the core-scope assertions pipe a 13-line table and are
+almost never affected. **The same case failing on some runs and not others is
+the signature, and I read it as load rather than as this.** 36 sites were
+rewritten to here-strings, which create no pipe. `tests/canary_test.sh` had
+already documented this exact race and fixed it the same way — the knowledge
+existed and had not been applied to the other 35, which is the usual way a known
+defect survives.
+
+**The last red was a third thing, and it was in a check I inherited.** The
+header/recipe reciprocity check reported `header documents breakage 30 but no
+recipe carries it` against a recipe that is right there: breakage 30 is guarded
+by a `command -v ruby` test, so its `expect_red_check` is indented inside an
+`if`, and the pattern was anchored at column 0. The anchoring was load-bearing
+and is kept — the first token must still be `expect_red`, or the
+`printf 'SKIP … breakage 30 …'` line in the same branch is counted as a recipe
+and the skip it exists to surface goes invisible. Fixing it is commit `8f86f1a`.
+
+So: three reds, three different causes, none of them the reporter.
 
 **A note on this branch's history, so nobody is misled by an earlier commit.**
 Commit `0e92622` — *"the report's final section — the gate re-run after the
 restart, from my own hands"* — landed on this branch beside the recovery commit
-and asserts exactly that: a green gate, and §6's numbers unchanged. **I could
-not reproduce either claim**, and the numbers were not unchanged, which is the
-whole of §7.10. That commit's assertion is not evidence, because I did not
-witness the run it describes and the only part of it I could check was wrong.
-Its §9 is superseded by this one, in the next commit. It is left in the history
-rather than rewritten because a correction you can diff against the thing it
-corrects is worth more than a history with no mistakes in it.
+and asserts a green gate and §6's numbers unchanged. **I could not reproduce
+either claim**, and the numbers were not unchanged, which is the whole of §7.10.
+That commit's assertion is not evidence, because nobody witnessed the run it
+describes and the only part of it that could be checked was wrong. It is left in
+the history rather than rewritten because a correction you can diff against the
+thing it corrects is worth more than a history with no mistakes in it.
 
 ---
 

@@ -924,25 +924,58 @@ expect_red_script 'breakage 29: the suite cannot tell a broken FIXTURE from a br
 #     passes while the summary counts one fewer than it ran, and a count that
 #     under-reports is the exact defect this repo treats as a lie told by a
 #     measurement. The guard, not the indentation, is what makes the skip
-#     explicit — and a copy is made in BOTH branches so the recipe can never run
-#     against the real tree, where an empty `$dir` would `cd` into nothing and
-#     fail for a reason that has nothing to do with the defect under test.
-thirty_ready=0
-thirty=""
+#     explicit.
+#
+#     The breakage needs BOTH halves, and the second is the interesting one.
+#     Deleting the guard on a machine with a current ruby proves nothing, because
+#     the suite passes either way and green is the correct answer. So the copy
+#     also gets a `ruby` shim that makes the interpreter old the way 2.6.10 was
+#     old: `undef_method`, which raises NoMethodError at the call site exactly
+#     as a missing method does. That is a simulation of the interpreter rather
+#     than a dependency on one being installed — a self_test that needs a
+#     particular ruby present is a self_test that SKIPs on CI and proves
+#     nothing there, which is the rule this repo keeps restating.
+#
+#     With the shim and the guard in place the gate says the toolchain is too
+#     old. With the shim and the guard DELETED it says the template is broken.
+#     The recipe asserts the second, so the first cannot quietly stop happening:
+#     a check that has stopped firing looks identical to a check that never did.
 if command -v ruby >/dev/null 2>&1; then
+  thirty_ready=1
+else
+  thirty_ready=0
+fi
+thirty=""
+if [ "$thirty_ready" -eq 1 ]; then
   thirty="$(fresh_copy a-toolchain-floor-nobody-calls)"
+  # `command -v` is resolved BEFORE the shim goes on PATH, so the shim cannot
+  # find itself and recurse.
+  thirty_real_ruby="$(command -v ruby)"
+  mkdir -p "$thirty/kit14-oldruby"
+  cat >"$thirty/kit14-oldruby/preload.rb" <<'RB'
+# self_test breakage 30: make this interpreter look like one too old for the
+# template. `undef_method` raises NoMethodError at the call site, which is
+# precisely what a method that does not exist does.
+class Array
+  undef_method :filter_map if method_defined?(:filter_map)
+end
+RB
+  {
+    printf '#!/bin/sh\n'
+    printf 'exec %q -r%q "$@"\n' "$thirty_real_ruby" "$thirty/kit14-oldruby/preload.rb"
+  } >"$thirty/kit14-oldruby/ruby"
+  chmod +x "$thirty/kit14-oldruby/ruby"
   edit "$thirty/tests/validate.sh" \
     'if [ "$lang" = ruby ] && ! toolchain_floor_ruby; then' \
     'if false; then'
-  thirty_ready=1
 else
   printf 'SKIP self_test: breakage 30: the toolchain floor is defined but never consulted — ruby not installed\n'
   skips=$((skips + 1))
-  thirty="$(fresh_copy a-toolchain-floor-nobody-calls-unused)"
 fi
 if [ "$thirty_ready" -eq 1 ]; then
-expect_red_check 'breakage 30: the toolchain floor is defined but never consulted' \
-  "$thirty" 'templates/otel/ruby  (ruby test suite)' --language=ruby --no-self-test
+  PATH="$thirty/kit14-oldruby:$PATH" expect_red_check \
+    'breakage 30: the toolchain floor is defined but never consulted' \
+    "$thirty" 'templates/otel/ruby  (ruby test suite)' --language=ruby --no-self-test
 fi
 
 printf '\n'
