@@ -1864,6 +1864,158 @@ PY
   }
   check 'grafana dashboards  (status is the predicate, error.type is a drill-down)' error_predicate_check
 
+  # -------------------------------------------------------------------------
+  # EVERY PANEL NAMES THE BACKEND IT QUERIES, and the name is the one it means.
+  #
+  # Both dashboards shipped with `"datasource": null` on all 15 query targets.
+  # A null datasource in Grafana means "use the DEFAULT datasource", and the
+  # default is Mimir — so every LogQL panel and the TraceQL panel were being
+  # sent to a Prometheus API:
+  #
+  #     Mimir, given {service_name=~"$service"} |= `log.severity` |~ "..."
+  #       parse error: unexpected character: '|'
+  #
+  # The panels provision, the dashboards render, the datasource health checks
+  # are green, and the crash layer — the panel the user explicitly asked for —
+  # is structurally incapable of drawing anything. Found by sending each panel's
+  # query to the backend it was actually bound to and reading the replies; 12 of
+  # 15 were rejected. No static check in this file could have seen it, because
+  # the JSON is perfectly valid and every datasource really was reachable.
+  #
+  # The language is classified from the query's own grammar, not the panel's
+  # title: PromQL never opens an expression with a bare `{`, and Grafana's own
+  # `queryType` hint says `range` for a log query and `nativeSearch` for a trace
+  # search.
+  datasource_binding_check() {
+    "$PY" - "$ROOT" <<'PY'
+import json
+import os
+import re
+import sys
+
+import yaml
+
+root = sys.argv[1]
+base = f"{root}/templates/compose/grafana/provisioning"
+
+# Read the uids and types from the PROVISIONING FILE rather than repeating them,
+# so renaming a uid in one file does not leave this check asserting against a
+# name nothing uses.
+with open(f"{base}/datasources/datasources.yml", encoding="utf-8") as fh:
+    provisioned = {
+        d["uid"]: d["type"]
+        for d in (yaml.safe_load(fh).get("datasources") or [])
+        if isinstance(d, dict) and d.get("uid")
+    }
+
+# Which query language each backend can serve, and which of those Grafana type
+# strings mean what. Kept as a table so an unlisted backend is a FAILURE rather
+# than a panel nobody has an opinion about.
+LANGUAGES = {
+    "prometheus": {"lang": "promql", "grafana_type": "prometheus"},
+    "loki": {"lang": "logql", "grafana_type": "loki"},
+    "tempo": {"lang": "traceql", "grafana_type": "tempo"},
+}
+
+problems = []
+dash_dir = f"{base}/dashboards"
+
+
+def classify(target):
+    """The query language a target's text is, by its own grammar."""
+    kind = str(target.get("queryType") or "").lower()
+    if kind in ("range", "instant"):
+        return "logql"
+    if kind == "nativesearch":
+        return "traceql"
+    text = target.get("expr") or target.get("query") or ""
+    if isinstance(text, str) and text.strip().startswith("{"):
+        return "logql"
+    return "promql"
+
+
+def walk(node):
+    """Yield (panel_title, target) for every panel, at any nesting depth."""
+    if isinstance(node, dict):
+        for panel in node.get("panels") or []:
+            for target in panel.get("targets") or []:
+                yield panel.get("title", "(row)"), target
+            yield from walk(panel)
+    elif isinstance(node, list):
+        for item in node:
+            yield from walk(item)
+
+
+for entry in sorted(os.listdir(dash_dir)):
+    if not entry.endswith(".json"):
+        continue
+    with open(f"{dash_dir}/{entry}", encoding="utf-8") as fh:
+        doc = json.load(fh)
+    for title, target in walk(doc):
+        text = target.get("expr") or target.get("query") or ""
+        if not isinstance(text, str) or not text.strip():
+            continue
+        ds = target.get("datasource")
+        want = classify(target)
+
+        if not ds or not isinstance(ds, dict) or not ds.get("uid"):
+            problems.append(
+                f"{entry} / {title}: the query has no datasource, so Grafana sends "
+                f"it to the DEFAULT one — which is Mimir. This is a {want} query; "
+                f"bound to a Prometheus API it returns a parse error, which is a "
+                f"red panel rather than an empty one. Name the uid explicitly."
+            )
+            continue
+
+        uid = ds["uid"]
+        if uid not in provisioned:
+            problems.append(
+                f"{entry} / {title}: datasource uid {uid!r} is not in "
+                f"datasources.yml ({', '.join(sorted(provisioned)) or 'none'}), so "
+                f"the panel renders with no data and no error"
+            )
+            continue
+        if ds.get("type") != provisioned[uid]:
+            problems.append(
+                f"{entry} / {title}: says type={ds.get('type')!r} for uid {uid!r}, "
+                f"but datasources.yml provisions it as {provisioned[uid]!r}"
+            )
+        if uid not in LANGUAGES:
+            problems.append(
+                f"{entry} / {title}: uid {uid!r} is not a backend this check "
+                f"knows how to route ({', '.join(sorted(LANGUAGES))})"
+            )
+            continue
+        if LANGUAGES[uid]["lang"] != want:
+            problems.append(
+                f"{entry} / {title}: a {want} query bound to {uid!r}, which "
+                f"serves {LANGUAGES[uid]['lang']}. Bound to the wrong backend this "
+                f"is a parse error, not an empty result."
+            )
+
+# The alert rules are dashboards with a different trigger, and they carried the
+# same class of mistake: the status predicate grouped on `otel.status_code`,
+# which is a PARSE ERROR in PromQL because OTLP ingestion mangles the dot to an
+# underscore. A rule that cannot be parsed never fires and never reports that it
+# cannot be parsed.
+with open(f"{base}/alerting/rules.yml", encoding="utf-8") as fh:
+    rules = yaml.safe_load(fh) or {}
+blob = json.dumps(rules)
+for dotted in set(re.findall(r"\b(otel|error|http|service|span)\.[a-z_]+", blob)):
+    problems.append(
+        f"alerting/rules.yml references {dotted!r}. OTLP ingestion mangles a dot "
+        f"in a label name to an underscore, so what a Prometheus backend holds is "
+        f"'{dotted.replace('.', '_')}'. A matcher on the dotted spelling is a "
+        f"parse error, and an alert that cannot be parsed never fires."
+    )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check 'grafana panels  (every query names the backend that can answer it)' \
+    datasource_binding_check
+
   # The wiring check that YAML parsing cannot do, and the one that caught a real
   # bug. otel-collector.yml interpolates ${env:NAME}, which the collector
   # resolves from ITS OWN process environment. Docker Compose reads .env to

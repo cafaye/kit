@@ -54,7 +54,7 @@ groups:
             datasourceUid: mimir
             model:
               refId: A
-              expr: sum by (otel.status_code) (rate(cafaye_calls_total[5m]))
+              expr: sum by (otel_status_code) (rate(cafaye_calls_total[5m]))
               instant: false
               intervalMs: 15000
               maxDataPoints: 20000
@@ -65,7 +65,7 @@ groups:
             datasourceUid: mimir
             model:
               refId: B
-              expr: sum by (otel.status_code) (rate(cafaye_calls_total[5m]))
+              expr: sum by (otel_status_code) (rate(cafaye_calls_total[5m]))
               instant: false
               intervalMs: 15000
               maxDataPoints: 20000
