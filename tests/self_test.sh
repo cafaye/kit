@@ -61,6 +61,13 @@
 #   22. report an undeclared core pin as `current` -> staleness_test.sh goes red.
 #         Two real repositories are in that state today, which is what makes the
 #         difference between `undeclared` and `current` load-bearing.
+#   23-25. the shapes a workaround for a FIXED core defect takes -> the fleet
+#         check goes red. Two are D12 (core 63fd319: `RUN_KEY` could not see a
+#         one-line `run:`) and one is D13 (core c63af27: a proof matched against
+#         bytes still carrying ANSI colour). Both defects are fixed, so a
+#         workaround for either is a second, unversioned copy of a decision that
+#         now lives in core, and 25's escape runs make the declaration WEAKER
+#         than the same declaration written without them.
 #
 #   These are numbered 20-22 rather than 19-21 because 19 is the allowlist
 #   breakage above, from the tier work. Both packets numbered their first entry
@@ -71,7 +78,10 @@
 #         red. Every other breakage only proves the gate can fail; those prove
 #         the check written for that defect is still load-bearing, which is a
 #         different claim and the one that decays silently. 21 and 22 assert the
-#         same thing about the two scripts that are themselves proofs.
+#         same thing about the two scripts that are themselves proofs, and
+#         23-25 do it for the fleet check: a sweep can go red for a dozen
+#         unrelated reasons, so "the gate went red" would not prove the
+#         workaround rule is what rejected it.
 #
 #   The counts here were wrong twice and both times a check caught it rather
 #   than a reader: the header said "seven" over a four-wide range, and it
@@ -318,6 +328,83 @@ expect_red_lang() {
 }
 
 printf -- '-- self_test: a gate that cannot fail is not a gate\n'
+
+# --------------------------------------------------------------------------
+# THE SYNTHETIC FLEET
+# --------------------------------------------------------------------------
+#
+# `tests/gate_declaration_check.py` sweeps a directory of adopting
+# repositories — `gate.yml` plus the workflow it names. There is no such
+# directory inside kit, for the same reason `tests/staleness_test.sh` builds its
+# own: kit is one repository and the fleet is fifteen, and a check that read the
+# real working directory would be green on Tuesday and red on Wednesday for a
+# reason that has nothing to do with what it checks.
+#
+# So a clean one is built here, once, and `KIT_FLEET` points every run of
+# `validate.sh` in this script at it. Two consequences, both wanted:
+#
+#   * the control below becomes the fleet check's POSITIVE case. A sweep that
+#     only ever runs on a red fleet has proved it can fail and nothing about
+#     whether it is right;
+#   * a breakage mutates its OWN copy of the fleet and nothing else, so
+#     breakages cannot mask each other, exactly as `fresh_copy` guarantees for
+#     the rest of this file.
+#
+# It is a two-file repository on purpose. Both are the real spellings: a
+# one-line `run:` in the workflow, and a proof pattern with no escape token —
+# which is the state every repository in this fleet is supposed to be in.
+FLEET="$WORK/fleet"
+
+synthetic_repo() {
+  local root="$FLEET/$1"
+  mkdir -p "$root/.github/workflows"
+  cat > "$root/gate.yml" <<'YAML'
+# gate.yml — the clean shape. One line per proof, no escape tolerance, and a
+# `ci` block naming the workflow below.
+version: 1
+name: synthetic
+
+gate:
+  command: [bin/prime]
+  entrypoint: bin/prime
+  proof:
+    - id: suite
+      match: '^([0-9]+)/[0-9]+ passed$'
+      minimum: 12
+
+external:
+  selfContained: true
+  requirements: []
+
+ci:
+  workflow: .github/workflows/ci.yml
+  invokes: [bin/prime]
+YAML
+  cat > "$root/.github/workflows/ci.yml" <<'YAML'
+name: ci
+on: [push]
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bin/prime
+        run: ./bin/prime
+YAML
+}
+
+# A second, differently-named repository, so the sweep has to enumerate rather
+# than read one hardcoded path — and so a check that only ever saw one name
+# could not pass.
+synthetic_repo clean
+synthetic_repo second-clean
+
+# Exported once, so every `validate.sh` invocation below sweeps THIS fleet
+# rather than whatever happens to sit beside the throwaway copy. A prefix
+# assignment on a function call would not do: in bash an assignment preceding a
+# FUNCTION call persists after it returns, so breakage 23 would silently
+# redirect breakage 24's sweep.
+export KIT_FLEET="$FLEET"
 
 # The control. If the unbroken tree is already red, the breakages below
 # prove nothing, so this runs first and the run is meaningless without it.
@@ -654,6 +741,84 @@ twentytwo="$(fresh_copy undeclared-reads-current)"
 edit "$twentytwo/tests/staleness.py" '    return UNDECLARED' '    return CURRENT'
 expect_red_script 'breakage 22: the staleness reporter calls an undeclared pin current' \
   "$twentytwo" tests/staleness_test.sh
+
+# 23-25. THE D12/D13 WORKAROUNDS, in the three shapes they actually took.
+#
+# `core` shipped two checker defects that forced adopters into local
+# workarounds, and both are now fixed: D12 (`RUN_KEY` could not see a one-line
+# `run:`) in 63fd319, and D13 (proofs matched against bytes carrying ANSI
+# colour) in c63af27. A rule about those lives in `tests/validate.sh` now rather
+# than in a report, and these three are that rule's proof.
+#
+# All three mutate the SYNTHETIC FLEET, not a throwaway copy of the tree: the
+# check reads a directory of adopting repositories and kit is not one. Each
+# takes its own `fresh_fleet` so one cannot mask the next, which is the same
+# discipline `fresh_copy` provides for everything else here.
+#
+# 23 is the shape `cafaye-rb` shipped for six weeks — a step written `run: |`
+# whose entire body is the gate command, plus a comment above it saying the
+# one-liner would be invisible. It is the most important of the three because it
+# is the only one that is BOTH detectable structurally and invisible in
+# behaviour: core reads the step either way, so nothing else in the fleet
+# notices.
+FLEETWORKAROUND='adopting repositories  (no workaround for a fixed core defect)'
+
+# fresh_fleet <name> — the synthetic fleet, rebuilt clean, with one repository
+# added. Not `fresh_copy`, because the unit here is a two-file REPOSITORY inside
+# a directory rather than a copy of this tree. A stale repository would make a
+# later breakage pass for the wrong reason, so each one starts from clean.
+fresh_fleet() {
+  rm -rf "$FLEET"
+  synthetic_repo clean
+  synthetic_repo second-clean
+  synthetic_repo "$1"
+}
+
+# 23. D12, the block-scalar spelling plus its justification.
+fresh_fleet d12-block-scalar
+edit "$FLEET/d12-block-scalar/.github/workflows/ci.yml" \
+  '        run: ./bin/prime
+' \
+  '        run: |
+          ./bin/prime
+'
+edit "$FLEET/d12-block-scalar/.github/workflows/ci.yml" \
+  '      - name: bin/prime
+' \
+  '      # A block scalar rather than `run: ./bin/prime` on one line. The `run:`
+      # key above is invisible to `gate.ci-disagrees` without it.
+      - name: bin/prime
+'
+expect_red_check 'breakage 23: D12 — the gate step is a block scalar, justified' \
+  "$base" "$FLEETWORKAROUND" --static-only
+
+# 24. D12 again, and the half that is a false SENTENCE rather than a shape. The
+#     step is already correct here; only the comment is wrong. A check that
+#     looked for the shape would pass this, and the comment would survive — which
+#     is the part that rots, because the next reader cannot tell it is obsolete.
+fresh_fleet d12-stale-comment
+edit "$FLEET/d12-stale-comment/.github/workflows/ci.yml" \
+  '      - name: bin/prime
+' \
+  '      # `run: ./bin/prime` is invisible to `gate.ci-disagrees`, so this step
+      # must be a block scalar. See REPORT-core-10.md.
+      - name: bin/prime
+'
+expect_red_check 'breakage 24: D12 — a correct step with a justification for a fixed defect' \
+  "$base" "$FLEETWORKAROUND" --static-only
+
+# 25. D13, and the one that makes a declaration WEAKER rather than merely
+#     redundant. The escape runs absorb characters a stricter pattern would
+#     reject, so this is not a harmless local convenience: it is a proof that
+#     matches lines the author's own gate did not intend to accept. Core strips
+#     the escapes in exactly one place (c63af27), so nothing else in the fleet
+#     would ever see it.
+fresh_fleet d13-escape-tolerant
+edit "$FLEET/d13-escape-tolerant/gate.yml" \
+  "      match: '^([0-9]+)/[0-9]+ passed$'" \
+  "      match: '^(?:[ ]|\\x1b\\[[0-9;]*m)*([0-9]+)/[0-9]+ passed$'"
+expect_red_check 'breakage 25: D13 — a proof pattern carries escape tolerance' \
+  "$base" "$FLEETWORKAROUND" --static-only
 
 printf '\n'
 if [ "$failures" -ne 0 ]; then
