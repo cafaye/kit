@@ -81,6 +81,39 @@ on:
         required: false
         type: string
         default: '0'
+      # The tier a service DEMANDS, by gate-variable name: `REQUIRED_DB`, not
+      # `db`. Demanded rather than inferred, on purpose.
+      #
+      # Inference is the failure this replaces. Identity derives its database
+      # tier by grepping the tree for `dbtest.Pool|Schema|EnvVar|TEST_DATABASE_URL`,
+      # and that fails OPEN: a test that reaches Postgres through a helper two
+      # files away, or through a fixture, does not match, so its package never
+      # enters the required list and the run is never required to contain it.
+      # The test is written. It is not gated. Nobody finds out.
+      #
+      # So the caller NAMES the variable and this workflow exports it as `1` on
+      # the test step of every language job, which is guard's
+      # GUARD_REDIS_REQUIRED pattern: it fails at tier-invocation time, before a
+      # report exists, so nothing downstream can misreport the run.
+      #
+      # Setting it commits the repo to the normalised result format
+      # (templates/tier/README.md): the `tier demand` step below reads a `ran`
+      # line out of the run log and fails NAMING THIS VARIABLE when the tier ran
+      # zero tests. A gate variable that is set, and a tier that ran nothing, is
+      # a green build that verified nothing.
+      #
+      # A string, empty by default. Adoption cannot turn a green repo red,
+      # because an unset variable demands nothing and the `tier demand` step
+      # exits 0 without reading a log.
+      required-tier:
+        description: >-
+          Gate variable that demands a tier, e.g. 'REQUIRED_DB'. Exported as
+          '1' on the test step, and a tier that then runs zero tests fails the
+          build naming this variable. Empty (the default) demands nothing.
+          Adopting this also commits the repo to the normalised result format.
+        required: false
+        type: string
+        default: ''
       # Opt-in by construction. A kit change that breaks every consumer's CI is
       # a kit change that does not ship, so a new job cannot start running in
       # 13 repos the day it lands — the repo has to ask for it by name.
@@ -110,6 +143,24 @@ env:
   COVERAGE_FAIL_UNDER: ${{ inputs.coverage-fail-under }}
   # Deterministic builds: do not stamp VCS info into Go binaries.
   GOFLAGS: '-buildvcs=false'
+  # The demanded gate variable's NAME, not its value. It is exported as `1` on
+  # each test step rather than set here, because an env block cannot have a key
+  # that is a variable — and setting it here would export it to every step in
+  # the job, including the ones that are not running the tier.
+  REQUIRED_TIER: ${{ inputs.required-tier }}
+
+# ===========================================================================
+# THE `tier demand` STEP — one body, present in every language job, IDENTICAL
+# in all of them.
+#
+# GitHub reusable workflows have no way to share a step, so this block is
+# duplicated. That is a deliberate trade: kit's rule is that callers override
+# and never fork, and six hand-maintained copies of a policy block is exactly
+# the drift that rule exists to prevent — so the copies are not left to drift.
+# `tier_demand_check` in tests/validate.sh asserts the step exists in every
+# language job AND that all six bodies are byte-identical. Change one, change
+# all six, or the gate goes red.
+# ===========================================================================
 
 jobs:
   # ----------------------------------------------------- configuration-only
@@ -176,7 +227,52 @@ jobs:
           working-directory: ${{ inputs.working-dir }}
       - name: test
         working-directory: ${{ inputs.working-dir }}
-        run: go test -race -coverprofile=coverage.out ./...
+        run: |
+          set -euo pipefail
+          # The demand, exported rather than inferred. guard's
+          # GUARD_REDIS_REQUIRED pattern: it turns "no database" from a skip
+          # into a failure at INVOCATION time, before a report exists, so
+          # nothing downstream can summarise the run as a pass.
+          if [ -n "${REQUIRED_TIER:-}" ]; then export "$REQUIRED_TIER=1"; fi
+          # -count=1 is mandated, not a suggestion. Go keys its test cache on
+          # the environment variables a test reads, so a gated and an ungated
+          # run already have different cache keys — genuinely good news — but
+          # mandating -count=1 removes the question instead of reasoning about
+          # it, and it costs nothing.
+          go test -race -count=1 -coverprofile=coverage.out ./... 2>&1 \
+            | tee "$RUNNER_TEMP/kit-tier.log"
+          # `pipefail` is on, so this step already exits with go test's status.
+          # Stated because without it a piped exit code is the exit of the LAST
+          # command — tee — and a test step that reports tee's status is a gate
+          # that can never fail.
+          exit "${PIPESTATUS[0]}"
+      - name: tier demand
+        working-directory: ${{ inputs.working-dir }}
+        run: |
+          set -euo pipefail
+          # An empty REQUIRED_TIER is the default and demands nothing, so a repo
+          # that has not adopted tiers is untouched. Exits before reading a log
+          # that need not exist.
+          [ -n "${REQUIRED_TIER:-}" ] || exit 0
+          log="$RUNNER_TEMP/kit-tier.log"
+          if [ ! -f "$log" ]; then
+            echo "::error::$REQUIRED_TIER was set and there is no run log at $log." >&2
+            echo "::error::A demanded tier with no log is a green build that" >&2
+            echo "::error::verified nothing, whatever the test step printed." >&2
+            exit 1
+          fi
+          # The one place the normalised format is read, and it reads only the
+          # format kit owns — never a per-language report. A `ran` line is the
+          # evidence that something executed; no `ran` line is a tier that ran
+          # zero tests, and the failure NAMES THE VARIABLE so the fix is obvious
+          # from the log alone.
+          if ! grep -qE '^ran[[:space:]]' "$log"; then
+            echo "::error::$REQUIRED_TIER was set and no 'ran <tier> <suite> <test>'" >&2
+            echo "::error::line reached this log. A gate variable that is set and a" >&2
+            echo "::error::tier that ran zero tests is a green build that verified" >&2
+            echo "::error::nothing. See templates/tier/README.md." >&2
+            exit 1
+          fi
       - name: coverage
         working-directory: ${{ inputs.working-dir }}
         run: |
@@ -211,7 +307,41 @@ jobs:
           cargo clippy --all-targets -- -D warnings
       - name: test
         working-directory: ${{ inputs.working-dir }}
-        run: cargo test
+        run: |
+          set -euo pipefail
+          # The demand, exported rather than inferred: a tier that cannot run
+          # must fail here, at invocation time, rather than report as a pass.
+          if [ -n "${REQUIRED_TIER:-}" ]; then export "$REQUIRED_TIER=1"; fi
+          cargo test 2>&1 | tee "$RUNNER_TEMP/kit-tier.log"
+          # `pipefail` is on, so this step already exits with cargo's status.
+          exit "${PIPESTATUS[0]}"
+      - name: tier demand
+        working-directory: ${{ inputs.working-dir }}
+        run: |
+          set -euo pipefail
+          # An empty REQUIRED_TIER is the default and demands nothing, so a repo
+          # that has not adopted tiers is untouched. Exits before reading a log
+          # that need not exist.
+          [ -n "${REQUIRED_TIER:-}" ] || exit 0
+          log="$RUNNER_TEMP/kit-tier.log"
+          if [ ! -f "$log" ]; then
+            echo "::error::$REQUIRED_TIER was set and there is no run log at $log." >&2
+            echo "::error::A demanded tier with no log is a green build that" >&2
+            echo "::error::verified nothing, whatever the test step printed." >&2
+            exit 1
+          fi
+          # The one place the normalised format is read, and it reads only the
+          # format kit owns — never a per-language report. A `ran` line is the
+          # evidence that something executed; no `ran` line is a tier that ran
+          # zero tests, and the failure NAMES THE VARIABLE so the fix is obvious
+          # from the log alone.
+          if ! grep -qE '^ran[[:space:]]' "$log"; then
+            echo "::error::$REQUIRED_TIER was set and no 'ran <tier> <suite> <test>'" >&2
+            echo "::error::line reached this log. A gate variable that is set and a" >&2
+            echo "::error::tier that ran zero tests is a green build that verified" >&2
+            echo "::error::nothing. See templates/tier/README.md." >&2
+            exit 1
+          fi
       - name: install coverage tool
         uses: taiki-e/install-action@cargo-llvm-cov
       - name: coverage
@@ -245,7 +375,41 @@ jobs:
         run: bundle exec rubocop --parallel
       - name: test
         working-directory: ${{ inputs.working-dir }}
-        run: bundle exec rake
+        run: |
+          set -euo pipefail
+          # The demand, exported rather than inferred: a tier that cannot run
+          # must fail here, at invocation time, rather than report as a pass.
+          if [ -n "${REQUIRED_TIER:-}" ]; then export "$REQUIRED_TIER=1"; fi
+          bundle exec rake 2>&1 | tee "$RUNNER_TEMP/kit-tier.log"
+          # `pipefail` is on, so this step already exits with rake's status.
+          exit "${PIPESTATUS[0]}"
+      - name: tier demand
+        working-directory: ${{ inputs.working-dir }}
+        run: |
+          set -euo pipefail
+          # An empty REQUIRED_TIER is the default and demands nothing, so a repo
+          # that has not adopted tiers is untouched. Exits before reading a log
+          # that need not exist.
+          [ -n "${REQUIRED_TIER:-}" ] || exit 0
+          log="$RUNNER_TEMP/kit-tier.log"
+          if [ ! -f "$log" ]; then
+            echo "::error::$REQUIRED_TIER was set and there is no run log at $log." >&2
+            echo "::error::A demanded tier with no log is a green build that" >&2
+            echo "::error::verified nothing, whatever the test step printed." >&2
+            exit 1
+          fi
+          # The one place the normalised format is read, and it reads only the
+          # format kit owns — never a per-language report. A `ran` line is the
+          # evidence that something executed; no `ran` line is a tier that ran
+          # zero tests, and the failure NAMES THE VARIABLE so the fix is obvious
+          # from the log alone.
+          if ! grep -qE '^ran[[:space:]]' "$log"; then
+            echo "::error::$REQUIRED_TIER was set and no 'ran <tier> <suite> <test>'" >&2
+            echo "::error::line reached this log. A gate variable that is set and a" >&2
+            echo "::error::tier that ran zero tests is a green build that verified" >&2
+            echo "::error::nothing. See templates/tier/README.md." >&2
+            exit 1
+          fi
       # The repo's own `rake coverage` task reads COVERAGE_FAIL_UNDER and exits
       # nonzero below it (see README: a coverage rake task is part of adoption).
       - name: coverage
@@ -276,7 +440,41 @@ jobs:
         run: mix format --check-formatted
       - name: test
         working-directory: ${{ inputs.working-dir }}
-        run: mix test
+        run: |
+          set -euo pipefail
+          # The demand, exported rather than inferred: a tier that cannot run
+          # must fail here, at invocation time, rather than report as a pass.
+          if [ -n "${REQUIRED_TIER:-}" ]; then export "$REQUIRED_TIER=1"; fi
+          mix test 2>&1 | tee "$RUNNER_TEMP/kit-tier.log"
+          # `pipefail` is on, so this step already exits with mix's status.
+          exit "${PIPESTATUS[0]}"
+      - name: tier demand
+        working-directory: ${{ inputs.working-dir }}
+        run: |
+          set -euo pipefail
+          # An empty REQUIRED_TIER is the default and demands nothing, so a repo
+          # that has not adopted tiers is untouched. Exits before reading a log
+          # that need not exist.
+          [ -n "${REQUIRED_TIER:-}" ] || exit 0
+          log="$RUNNER_TEMP/kit-tier.log"
+          if [ ! -f "$log" ]; then
+            echo "::error::$REQUIRED_TIER was set and there is no run log at $log." >&2
+            echo "::error::A demanded tier with no log is a green build that" >&2
+            echo "::error::verified nothing, whatever the test step printed." >&2
+            exit 1
+          fi
+          # The one place the normalised format is read, and it reads only the
+          # format kit owns — never a per-language report. A `ran` line is the
+          # evidence that something executed; no `ran` line is a tier that ran
+          # zero tests, and the failure NAMES THE VARIABLE so the fix is obvious
+          # from the log alone.
+          if ! grep -qE '^ran[[:space:]]' "$log"; then
+            echo "::error::$REQUIRED_TIER was set and no 'ran <tier> <suite> <test>'" >&2
+            echo "::error::line reached this log. A gate variable that is set and a" >&2
+            echo "::error::tier that ran zero tests is a green build that verified" >&2
+            echo "::error::nothing. See templates/tier/README.md." >&2
+            exit 1
+          fi
       # coveralls is a hex dep the service repo declares; it exits nonzero
       # below the minimum, which is what makes this a gate and not a report.
       - name: coverage
@@ -314,10 +512,45 @@ jobs:
       - name: test
         working-directory: ${{ inputs.working-dir }}
         run: |
+          set -euo pipefail
+          # The demand, exported rather than inferred: a tier that cannot run
+          # must fail here, at invocation time, rather than report as a pass.
+          if [ -n "${REQUIRED_TIER:-}" ]; then export "$REQUIRED_TIER=1"; fi
           if command -v uv >/dev/null 2>&1; then
-            uv run pytest --cov --cov-report=xml
+            uv run pytest --cov --cov-report=xml 2>&1 | tee "$RUNNER_TEMP/kit-tier.log"
           else
-            pytest --cov --cov-report=xml
+            pytest --cov --cov-report=xml 2>&1 | tee "$RUNNER_TEMP/kit-tier.log"
+          fi
+          # `pipefail` is on, so this step already exits with pytest's status.
+          # The PIPESTATUS index is 0 either way, because both arms are a
+          # pipeline and the `if` does not reset it.
+          exit "${PIPESTATUS[0]}"
+      - name: tier demand
+        working-directory: ${{ inputs.working-dir }}
+        run: |
+          set -euo pipefail
+          # An empty REQUIRED_TIER is the default and demands nothing, so a repo
+          # that has not adopted tiers is untouched. Exits before reading a log
+          # that need not exist.
+          [ -n "${REQUIRED_TIER:-}" ] || exit 0
+          log="$RUNNER_TEMP/kit-tier.log"
+          if [ ! -f "$log" ]; then
+            echo "::error::$REQUIRED_TIER was set and there is no run log at $log." >&2
+            echo "::error::A demanded tier with no log is a green build that" >&2
+            echo "::error::verified nothing, whatever the test step printed." >&2
+            exit 1
+          fi
+          # The one place the normalised format is read, and it reads only the
+          # format kit owns — never a per-language report. A `ran` line is the
+          # evidence that something executed; no `ran` line is a tier that ran
+          # zero tests, and the failure NAMES THE VARIABLE so the fix is obvious
+          # from the log alone.
+          if ! grep -qE '^ran[[:space:]]' "$log"; then
+            echo "::error::$REQUIRED_TIER was set and no 'ran <tier> <suite> <test>'" >&2
+            echo "::error::line reached this log. A gate variable that is set and a" >&2
+            echo "::error::tier that ran zero tests is a green build that verified" >&2
+            echo "::error::nothing. See templates/tier/README.md." >&2
+            exit 1
           fi
       - name: coverage
         working-directory: ${{ inputs.working-dir }}
@@ -349,7 +582,41 @@ jobs:
         run: npm run lint
       - name: test
         working-directory: ${{ inputs.working-dir }}
-        run: npm test
+        run: |
+          set -euo pipefail
+          # The demand, exported rather than inferred: a tier that cannot run
+          # must fail here, at invocation time, rather than report as a pass.
+          if [ -n "${REQUIRED_TIER:-}" ]; then export "$REQUIRED_TIER=1"; fi
+          npm test 2>&1 | tee "$RUNNER_TEMP/kit-tier.log"
+          # `pipefail` is on, so this step already exits with npm's status.
+          exit "${PIPESTATUS[0]}"
+      - name: tier demand
+        working-directory: ${{ inputs.working-dir }}
+        run: |
+          set -euo pipefail
+          # An empty REQUIRED_TIER is the default and demands nothing, so a repo
+          # that has not adopted tiers is untouched. Exits before reading a log
+          # that need not exist.
+          [ -n "${REQUIRED_TIER:-}" ] || exit 0
+          log="$RUNNER_TEMP/kit-tier.log"
+          if [ ! -f "$log" ]; then
+            echo "::error::$REQUIRED_TIER was set and there is no run log at $log." >&2
+            echo "::error::A demanded tier with no log is a green build that" >&2
+            echo "::error::verified nothing, whatever the test step printed." >&2
+            exit 1
+          fi
+          # The one place the normalised format is read, and it reads only the
+          # format kit owns — never a per-language report. A `ran` line is the
+          # evidence that something executed; no `ran` line is a tier that ran
+          # zero tests, and the failure NAMES THE VARIABLE so the fix is obvious
+          # from the log alone.
+          if ! grep -qE '^ran[[:space:]]' "$log"; then
+            echo "::error::$REQUIRED_TIER was set and no 'ran <tier> <suite> <test>'" >&2
+            echo "::error::line reached this log. A gate variable that is set and a" >&2
+            echo "::error::tier that ran zero tests is a green build that verified" >&2
+            echo "::error::nothing. See templates/tier/README.md." >&2
+            exit 1
+          fi
       # --if-present keeps day-one adoption green; drop it once the script exists
       # so a missing coverage step fails the build.
       - name: coverage
@@ -393,7 +660,41 @@ jobs:
         run: bun run typecheck
       - name: test
         working-directory: ${{ inputs.working-dir }}
-        run: bun test
+        run: |
+          set -euo pipefail
+          # The demand, exported rather than inferred: a tier that cannot run
+          # must fail here, at invocation time, rather than report as a pass.
+          if [ -n "${REQUIRED_TIER:-}" ]; then export "$REQUIRED_TIER=1"; fi
+          bun test 2>&1 | tee "$RUNNER_TEMP/kit-tier.log"
+          # `pipefail` is on, so this step already exits with bun's status.
+          exit "${PIPESTATUS[0]}"
+      - name: tier demand
+        working-directory: ${{ inputs.working-dir }}
+        run: |
+          set -euo pipefail
+          # An empty REQUIRED_TIER is the default and demands nothing, so a repo
+          # that has not adopted tiers is untouched. Exits before reading a log
+          # that need not exist.
+          [ -n "${REQUIRED_TIER:-}" ] || exit 0
+          log="$RUNNER_TEMP/kit-tier.log"
+          if [ ! -f "$log" ]; then
+            echo "::error::$REQUIRED_TIER was set and there is no run log at $log." >&2
+            echo "::error::A demanded tier with no log is a green build that" >&2
+            echo "::error::verified nothing, whatever the test step printed." >&2
+            exit 1
+          fi
+          # The one place the normalised format is read, and it reads only the
+          # format kit owns — never a per-language report. A `ran` line is the
+          # evidence that something executed; no `ran` line is a tier that ran
+          # zero tests, and the failure NAMES THE VARIABLE so the fix is obvious
+          # from the log alone.
+          if ! grep -qE '^ran[[:space:]]' "$log"; then
+            echo "::error::$REQUIRED_TIER was set and no 'ran <tier> <suite> <test>'" >&2
+            echo "::error::line reached this log. A gate variable that is set and a" >&2
+            echo "::error::tier that ran zero tests is a green build that verified" >&2
+            echo "::error::nothing. See templates/tier/README.md." >&2
+            exit 1
+          fi
       # --if-present for the same reason as the node job above: day-one adoption
       # must not be blocked by a coverage script that does not exist yet. Drop
       # it once `coverage` is in package.json, or this step is a report.

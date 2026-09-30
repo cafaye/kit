@@ -308,7 +308,7 @@ PY
 
   for f in "$ROOT"/.github/workflows/* "$ROOT"/lint/* "$ROOT"/docker/* \
     "$ROOT"/templates/bin-prime/* "$ROOT"/templates/compose/* \
-    "$ROOT"/templates/bin/* "$ROOT"/tests/*.sh; do
+    "$ROOT"/templates/bin/* "$ROOT"/templates/tier/*/* "$ROOT"/tests/*.sh; do
     [ -f "$f" ] || continue
     path="${f#"$ROOT"/}"
     case "$f" in
@@ -327,6 +327,72 @@ PY
         # here: "no parser for this file type" was the seven-line SKIP this
         # packet exists to remove, and printing it next to a real hadolint
         # result would say both "unchecked" and "checked" in the same run.
+        ;;
+      # The tier templates. Each of these is a file a service COPIES, so each
+      # has to parse in its own language — the rule is "parse what you hand
+      # out", and `rack_middleware.rb.snippet` shipped with syntax that was not
+      # Ruby because nothing checked the extension kit gave it.
+      #
+      # Rust is compiled rather than parsed, and that is deliberate: `tier.rs`
+      # is one self-contained crate, exactly like `templates/otel/rust/`, so
+      # `rustc --test` is both the parse and the strongest check available
+      # without inventing a module layout kit has no use for.
+      "$ROOT"/templates/tier/rust/*.rs)
+        if have rustc; then
+          check "$path  (rustc --test)" bash -c \
+            "rustc --test --edition 2021 -o \"$TMP/kit-tier-rust\" '$f' && '$TMP/kit-tier-rust' --list >/dev/null"
+        else
+          report SKIP "$path  (rustc not installed)"
+        fi
+        ;;
+      "$ROOT"/templates/tier/python/*.py)
+        if have python3; then
+          # `compile()`, not `python3 -m py_compile`. The module form writes a
+          # `__pycache__/` into the SOURCE tree, and that directory is then
+          # picked up by two other checks that iterate this one — which is how a
+          # gate that started green went red on its own artefacts. `compile()`
+          # is the same parse with no filesystem side effect at all.
+          check "$path  (compile)" python3 -c \
+            'import sys; compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec")' "$f"
+        else
+          report SKIP "$path  (python3 not installed)"
+        fi
+        ;;
+      "$ROOT"/templates/tier/ruby/*.rb)
+        if have ruby; then
+          check "$path  (ruby -c)" ruby -c "$f"
+        else
+          report SKIP "$path  (ruby not installed)"
+        fi
+        ;;
+      "$ROOT"/templates/tier/elixir/*.ex)
+        if have elixir; then
+          # `elixir -c` is not a thing. `Code.string_to_quoted/1` is the
+          # stdlib parse, it is offline, and it reports the same syntax errors
+          # the compiler would — which is the property being asserted.
+          check "$path  (Code.string_to_quoted!)" elixir -e \
+            'case Code.string_to_quoted(File.read!(hd(System.argv()))) do
+               {:error, e} -> IO.puts("syntax: #{inspect e}"); System.halt(1)
+               {:ok, _} -> :ok
+             end' "$f"
+        else
+          report SKIP "$path  (elixir not installed)"
+        fi
+        ;;
+      "$ROOT"/templates/tier/go/*.go)
+        # gofmt is run over the whole tree's Go templates in the telemetry phase
+        # below, so it is deliberately not reported twice here. `go build` would
+        # need a module kit does not have, and `go vet` needs one too — the
+        # format check is the real check, and it is where Go's own parser is
+        # unhappy.
+        ;;
+      "$ROOT"/templates/tier/*/*.ts)
+        # Stock `node --check` does not read TypeScript, and a service copying
+        # this file gets TypeScript. Reported as a SKIP with its reason rather
+        # than passed over: a skip nobody can see is a gap nobody fixes, and the
+        # summary line is how this class of gap is found. The fix is a
+        # type-stripping parser, which is a dependency, and kit is config-only.
+        report SKIP "$path  (node --check cannot read TypeScript; needs a type-stripping parser)"
         ;;
       *)
         # A new file type with no parser is a gap, so it is loud rather than
@@ -2639,6 +2705,557 @@ PY
   }
   check "$WORKFLOW  (opt-in telemetry job, defaults intact)" ci_check
 
+  # -------------------------------------------------------------------------
+  # The tier convention. Three claims, three checks, split because they decay
+  # separately: the templates drift, the wiring drifts, the allowlist rots. One
+  # check covering all three would keep passing while two of them rotted.
+  # -------------------------------------------------------------------------
+  section 'static: every language declares a tier, and says how it is collected'
+
+  # (1) The declaration, per language, in the templates.
+  #
+  # Read out of the workflow's `language` options, so there is still exactly one
+  # place to add a language — the same rule as the four-artifacts check above.
+  # For each: a `templates/tier/<lang>/` directory, the declared form inside it,
+  # and a row in the tier README naming the collector that reads it.
+  #
+  # The README row is required rather than nice-to-have, because a tier nobody
+  # can collect is a comment — and a comment is what this whole packet exists to
+  # stop being. A language with a declaration and no named collector is a
+  # language whose tier can never be required of anything.
+  tier_declaration_check() {
+    "$PY" - "$ROOT" "$CONFIG_ONLY" "$WORKFLOW" <<'PY'
+import os
+import re
+import sys
+
+import yaml
+
+root, config_only, workflow = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(workflow, encoding="utf-8") as fh:
+    doc = yaml.safe_load(fh)
+triggers = doc.get("on") or doc.get(True) or {}
+call = (triggers.get("workflow_call") or {}).get("inputs") or {}
+langs = [x for x in ((call.get("language") or {}).get("options") or []) if x != config_only]
+
+tier_readme = os.path.join(root, "templates", "tier", "README.md")
+if not os.path.isfile(tier_readme):
+    sys.exit("templates/tier/README.md is missing: a convention with no document is a rumour")
+readme = open(tier_readme, encoding="utf-8").read()
+
+# The first column of every markdown table row in that file, backticks stripped.
+# Restored to a set and compared by membership, so a row is found wherever it
+# sits in the document rather than at a guessed line.
+declared_rows = {
+    cell.strip().strip("`")
+    for line in readme.splitlines()
+    if line.strip().startswith("|")
+    for cell in [line.strip().strip("|").split("|")[0]]
+}
+
+# The declaration itself, per language: the token a service author actually
+# writes, and in every case a no-op at runtime — a build tag, an attribute
+# libtest already prints, a marker, a const, a macro. Asserting the token is
+# PRESENT in the shipped template is what stops a declaration being described in
+# a README and absent from the file a service copies. Prose is not a
+# declaration; only the template is.
+DECLARED = {
+    "go": r"^//go:build tier_db$",
+    "rust": r'#\[ignore = "cafaye:tier=',
+    "python": r"^@pytest\.mark\.tier_db$",
+    "bun": r'^export const TIER = "db" as const;$',
+    "node": r'^export const TIER = "db" as const;$',
+    "ruby": r"^\s*tier :db$",
+    "elixir": r"^  @tier :db$",
+}
+
+problems = []
+for lang in langs:
+    d = os.path.join(root, "templates", "tier", lang)
+    if not os.path.isdir(d):
+        problems.append(
+            f"{lang}: no templates/tier/{lang}/ — a language with a CI job and no tier "
+            f"declaration is a language whose tier can never be required"
+        )
+        continue
+
+    files = [
+        f
+        for f in sorted(os.listdir(d))
+        # isfile, because a directory in a template tree is a problem to
+        # REPORT, not a crash. Reading it raised IsADirectoryError and took two
+        # checks down with a traceback, which is the least useful way a gate
+        # can fail. `__pycache__` got in here for real.
+        if not f.startswith(".") and os.path.isfile(os.path.join(d, f))
+    ]
+    if not files:
+        problems.append(f"templates/tier/{lang}/ holds no files")
+        continue
+    strays = [
+        f
+        for f in sorted(os.listdir(d))
+        if not f.startswith(".") and not os.path.isfile(os.path.join(d, f))
+    ]
+    if strays:
+        problems.append(
+            f"templates/tier/{lang}/ holds {strays}, which is not a file a service "
+            f"can copy. kit hands out files; a build artefact in this tree is "
+            f"something a previous run left behind"
+        )
+
+    bodies = [open(os.path.join(d, f), encoding="utf-8").read() for f in files]
+    token = DECLARED.get(lang)
+    if token is None:
+        problems.append(
+            f"{lang}: this check knows no declared form for it. Add one — a language "
+            f"whose declaration nothing can assert is a check that cannot fail"
+        )
+    elif not any(re.search(token, b, re.M) for b in bodies):
+        problems.append(
+            f"templates/tier/{lang}/: none of {files} carries the declared form. The "
+            f"README describes a declaration the template does not have"
+        )
+
+    # The collector, named in the README's per-language table.
+    #
+    # The table is PARSED rather than substring-searched, because the rows are
+    # written as `| `go` |` — the option value in backticks, since it is the
+    # literal a caller types into `language:`. A `f"| {lang} |" in readme` test
+    # does not match a backticked cell, and the first version of this check
+    # failed on a table that was correct in every way a reader could check. A
+    # check that is right about the rule and wrong about the syntax is still
+    # wrong, and the fix belongs in the check.
+    if lang not in declared_rows:
+        problems.append(
+            f"templates/tier/README.md has no table row for {lang}: a service author "
+            f"cannot learn how their language's tier is collected"
+        )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check 'templates/tier/<lang>/  (a declared tier, and a README row naming the collector)' \
+    tier_declaration_check
+
+  # (2) The demand, wired. `REQUIRED_<TIER>=1` must be exported by every language
+  #     job and checked by every language job, or naming a variable in a caller
+  #     is a promise no job keeps.
+  #
+  #     The demand steps are byte-identical on purpose — GitHub reusable
+  #     workflows cannot share a step — so this asserts they STAY identical. Six
+  #     hand-maintained copies of a policy block is the drift kit exists to
+  #     prevent, and the only defence against hand-maintained copies is a check
+  #     that reads them.
+  #
+  #     `-count=1` is asserted on the Go job alone: no other language kit ships
+  #     has a test cache keyed on the environment, and mandating a flag that does
+  #     not exist is a check nobody could satisfy honestly.
+  tier_demand_check() {
+    "$PY" - "$ROOT" "$CONFIG_ONLY" "$WORKFLOW" <<'PY'
+import sys
+
+import yaml
+
+root, config_only, workflow = sys.argv[1], sys.argv[2], sys.argv[3]
+with open(workflow, encoding="utf-8") as fh:
+    doc = yaml.safe_load(fh)
+triggers = doc.get("on") or doc.get(True) or {}
+call = (triggers.get("workflow_call") or {}).get("inputs") or {}
+jobs = doc.get("jobs") or {}
+langs = [x for x in ((call.get("language") or {}).get("options") or []) if x != config_only]
+
+
+def strip_shell_comments(src):
+    """Remove shell comments from a `run:` body, keeping quoted `#` intact.
+
+    AGENTS.md: "a check that can be satisfied by a comment is not a check."
+    That is not a hypothetical here — this function exists because the
+    `-count=1` assertion was written as a substring test, the go step's own
+    comment block explains WHY the flag is mandated and names the flag twice,
+    and deleting the flag from the command left the check green. It was
+    satisfied by the sentence explaining that removing it would be a mistake.
+
+    Only a `#` at the start of a word begins a comment, and a `#` inside
+    single or double quotes is content. So `grep -qE '^ran[[:space:]]'` and
+    `echo "::error::#1"` both survive intact, and `# -count=1 is mandated`
+    does not.
+    """
+    out = []
+    for line in src.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        # Walk the line tracking quote state, and cut at the first `#` that
+        # follows a space outside quotes — the shell's own rule, near enough.
+        quote = None
+        cut = None
+        for i, ch in enumerate(line):
+            if quote:
+                if ch == quote:
+                    quote = None
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+            elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+                cut = i
+                break
+        out.append(line if cut is None else line[:cut])
+    return "\n".join(out)
+
+
+problems = []
+
+# Opt-in by an EMPTY default, not by "0". "0" would be a tier named 0 demanded
+# at a value that is neither true nor false, and every caller would have to know
+# that. Same reasoning as the `telemetry` input, and the same string type.
+demand = call.get("required-tier")
+if not isinstance(demand, dict):
+    problems.append("no `required-tier` workflow_call input")
+elif str(demand.get("default", "x")) != "":
+    problems.append(
+        f"`required-tier` defaults to {demand.get('default')!r}; it must default to the "
+        f"empty string, or adopting kit turns a green repo red on day one"
+    )
+elif str(demand.get("type")) != "string":
+    problems.append("`required-tier` must be type: string, for the reason telemetry is")
+
+bodies = {}
+for lang in langs:
+    steps = (jobs.get(lang) or {}).get("steps") or []
+    if "tier demand" not in [s.get("name") for s in steps]:
+        problems.append(
+            f"job {lang} has no `tier demand` step: naming a required-tier in a caller "
+            f"would be a promise no step keeps, and a gate variable that is set while "
+            f"a tier runs zero tests is a green build that verified nothing"
+        )
+    for s in steps:
+        if s.get("name") == "tier demand":
+            # The identity comparison below is on the RAW body: it is the
+            # duplication that is being compared, comments included, because two
+            # copies of a policy block that differ only in their commentary are
+            # two copies a reader has to diff by hand.
+            bodies[lang] = s.get("run") or ""
+            # The `^ran` assertion is on the body with comments stripped. The
+            # step's own comment block says "a `ran` line is the evidence that
+            # something executed", so an unstripped substring test is satisfied
+            # by the sentence describing the check rather than by the check.
+            if "^ran" not in strip_shell_comments(bodies[lang]):
+                problems.append(
+                    f"job {lang}: its `tier demand` step does not look for a 'ran' "
+                    f"line, so it cannot tell a tier that ran from one that did not"
+                )
+
+    # Both halves of the test step, because either alone is a dead gate:
+    # exporting without capturing cannot be checked, and capturing without
+    # exporting checks a variable nothing set.
+    test = next((s for s in steps if s.get("name") == "test"), None)
+    if not isinstance(test, dict):
+        problems.append(f"job {lang} has no `test` step to demand a tier from")
+        continue
+    body = strip_shell_comments(test.get("run") or "")
+    if 'export "$REQUIRED_TIER=1"' not in body:
+        problems.append(
+            f"job {lang}: its test step does not export the demanded gate variable. "
+            f"guard's GUARD_REDIS_REQUIRED fails at tier-INVOCATION time, before a "
+            f"report exists; a variable applied after the run cannot do that"
+        )
+    if "kit-tier.log" not in body:
+        problems.append(
+            f"job {lang}: its test step does not tee to kit-tier.log, so `tier demand` "
+            f"has nothing to read and exits green on an empty log"
+        )
+
+if len(set(bodies.values())) > 1:
+    problems.append(
+        "the `tier demand` steps are not identical across language jobs. They are "
+        "duplicated because GitHub reusable workflows cannot share a step, and the "
+        "duplication is only safe while a check reads them: change all of them or none"
+    )
+
+# `-count=1` on the gated tier, for the one language with an env-keyed cache.
+go_body = ""
+for s in ((jobs.get("go") or {}).get("steps") or []):
+    if s.get("name") == "test":
+        go_body = strip_shell_comments(s.get("run") or "")
+if go_body and "-count=1" not in go_body:
+    problems.append(
+        "the go test step does not pass -count=1. Go keys its test cache on the "
+        "environment a test reads, so a gated and an ungated run already differ — but "
+        "mandating the flag removes the question instead of reasoning about it"
+    )
+
+if problems:
+    sys.exit("; ".join(problems))
+print(
+    f"required-tier is opt-in (default ''), exported by all {len(langs)} language jobs, "
+    f"and checked by {len(bodies)} identical demand steps"
+)
+PY
+  }
+  check "$WORKFLOW  (required-tier is declared, demanded by every language job, and identical)" \
+    tier_demand_check
+
+  # (3) The skip allowlist and its four hygiene rules. This is the load-bearing
+  #     check of the packet, and rule 4 is the sharpest property in the repo:
+  #     AN ENTRY THAT MATCHES NOTHING IS A FAILURE.
+  #
+  #     The inventory is derived from `templates/tier/` — the declarations kit
+  #     ships — because that is the only inventory kit can see. Applying the same
+  #     rule over a service's real run is `caf gate`'s job, and that boundary is
+  #     written down in templates/tier/README.md rather than blurred here.
+  #
+  #     Note what this inventory is NOT. It is not a grep for a sentinel that
+  #     guesses whether a test "looks like" a database test, which is what fails
+  #     open. It reads ids the author DECLARED. That difference is the whole
+  #     distance between a derivation that misses new tests and one that cannot.
+  skip_allowlist_check() {
+    "$PY" - "$ROOT" <<'PY'
+import datetime
+import os
+import re
+import sys
+
+root = sys.argv[1]
+path = os.path.join(root, "templates", "tier", "skip-allowlist")
+if not os.path.isfile(path):
+    sys.exit("templates/tier/skip-allowlist is missing: a skipped test needs a recorded reason")
+
+# ---------------------------------------------------------------- the inventory
+#
+# One regex per language, reading the id the author declared. Deliberately
+# simple, and deliberately the only place kit looks at a language at all. A
+# language with no pattern here simply cannot have an allowlist entry, which is
+# the safe direction: an unresolvable entry is a failure, never a silent pass.
+ID_PATTERNS = {
+    "go": r"^func (Test\w+)\(",
+    "rust": r"^\s*fn (\w+)\(",
+    "python": r"^def (test_\w+)\(",
+    "ruby": r"^\s*def (test_\w+)\b",
+    "elixir": r'^\s*test "([\w.]+)"',
+    "bun": r'^test\("([\w]+)"',
+    "node": r'^test\("([\w]+)"',
+}
+
+inventory = set()
+tier_root = os.path.join(root, "templates", "tier")
+for lang, pattern in ID_PATTERNS.items():
+    d = os.path.join(tier_root, lang)
+    if not os.path.isdir(d):
+        continue
+    for name in sorted(os.listdir(d)):
+        # isfile, and a non-file is the declaration check's problem to report
+        # rather than this one's to crash on. See the note there.
+        if name.startswith(".") or name == "README.md":
+            continue
+        if not os.path.isfile(os.path.join(d, name)):
+            continue
+        body = open(os.path.join(d, name), encoding="utf-8").read()
+        for tid in re.findall(pattern, body, re.M):
+            inventory.add(f"{lang}/{name} {tid}")
+
+# A check that proved nothing because it looked at nothing is a check that ran
+# nothing. An empty inventory would make rule 4 either reject every entry or —
+# far worse — invite someone to relax it into a no-op that always passes.
+if not inventory:
+    sys.exit(
+        "no test ids were derived from templates/tier/, so the unused-entry rule "
+        "would be checking nothing: every ID_PATTERNS entry has stopped matching "
+        "its own template"
+    )
+
+# ---------------------------------------------------------------- the entries
+#
+#   skipped <tier> <suite-id> <test-id> reason="…" owner=… since=… until=…
+#
+# The first four fields are the normalised result line verbatim, so a result and
+# its exemption share one shape and a reader only has to learn one format.
+LINE = re.compile(
+    r'^skipped\s+(?P<tier>\S+)\s+(?P<suite>\S+)\s+(?P<test>\S+)'
+    r'(?P<fields>(?:\s+[a-z]+=(?:"[^"]*"|\S+))*)\s*$'
+)
+FIELD = re.compile(r'([a-z]+)=("[^"]*"|\S+)')
+WHY = {
+    "reason": 'without one, "flaky" becomes the reason for everything',
+    "owner": "a skip nobody owns is a skip nobody will ever remove",
+    "since": "the ratchet needs the date the decision was taken",
+    "until": "an entry that cannot expire has stopped being a decision",
+}
+
+today = datetime.date.today()
+problems = []
+seen = {}
+entries = 0
+
+for lineno, raw in enumerate(open(path, encoding="utf-8").read().splitlines(), 1):
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    entries += 1
+
+    m = LINE.match(line)
+    if not m:
+        problems.append(
+            f"line {lineno}: malformed entry. Expected 'skipped <tier> <suite-id> "
+            f"<test-id> reason=\"...\" owner=... since=YYYY-MM-DD until=YYYY-MM-DD' on "
+            f"ONE line — a wrapped reason is two entries, one of which is a parse error"
+        )
+        continue
+
+    fields = {k: v.strip('"') for k, v in FIELD.findall(m.group("fields"))}
+    key = (m.group("tier"), m.group("suite"), m.group("test"))
+
+    # Rules 1, 2 and 3: a reason, an owner, and both dates. Each message says
+    # why the rule exists, because a bare "missing field" reads like a nit.
+    for name in ("reason", "owner", "since", "until"):
+        if not fields.get(name):
+            problems.append(f"line {lineno}: entry names no {name} — {WHY[name]}")
+
+    if key in seen:
+        problems.append(
+            f"line {lineno}: duplicate entry, already listed on line {seen[key]}. Two "
+            f"lines for one test means one of them is no longer being read"
+        )
+    seen[key] = lineno
+
+    for name in ("since", "until"):
+        value = fields.get(name)
+        if not value:
+            continue
+        try:
+            parsed = datetime.date.fromisoformat(value)
+        except ValueError:
+            problems.append(f"line {lineno}: {name}={value!r} is not an ISO date (YYYY-MM-DD)")
+            continue
+        # The gate reads the clock. An expired entry is a FAILURE on the day it
+        # expires, and the file's own header says so, so nobody is surprised by
+        # a red build in January: that is the ratchet working.
+        if name == "until" and parsed < today:
+            problems.append(
+                f"line {lineno}: EXPIRED on {value} (today is {today.isoformat()}). "
+                f"Delete the entry, or move the date and write a new reason — a date "
+                f"that rolls forward by itself is not a ratchet"
+            )
+
+    # Rule 4. Modelled on ESLint's `reportUnusedDisableDirectives`, which reports
+    # a disable comment that no longer suppresses anything. Without this rule an
+    # allowlist is a ratchet that only turns one way: fixed tests stay listed,
+    # listed tests stop being checked, and within two quarters the file contains
+    # every test in the repository. The unused entry is how you find out first.
+    lookup = f"{m.group('suite')} {m.group('test')}"
+    if lookup not in inventory:
+        problems.append(
+            f"line {lineno}: entry matches NOTHING — no test id {m.group('test')!r} in "
+            f"{m.group('suite')}. The test was renamed, or the skip was fixed and the "
+            f"entry left behind. Either way it is dead weight, and dead entries are "
+            f"how an allowlist becomes a list of every test in the repository"
+        )
+
+if problems:
+    for p in problems:
+        print("  -", p)
+    sys.exit(1)
+
+# THE TOTAL, PRINTED ON PASS. The `check` helper prints a passing check's stdout
+# indented under its label, so this shows up in a GREEN run — the only place a
+# growing list is least likely to be noticed. Individual entries look justified;
+# the aggregate is the problem, and an aggregate nobody is shown is an aggregate
+# nobody watches. Conftest reports exceptions as a separate tally for this reason.
+print(
+    f"skip allowlist: {entries} entr{'y' if entries == 1 else 'ies'}, all matched "
+    f"against {len(inventory)} declared test ids — none unused, none expired. "
+    f"The total is the number to watch."
+)
+PY
+  }
+  check 'templates/tier/skip-allowlist  (reason, owner, since, until; unused entries fail)' \
+    skip_allowlist_check
+
+  # (4) Never cache a test report.
+  #
+  #     `actions/cache` `restore-keys` restores STALE caches by PREFIX MATCH, and
+  #     GitHub documents that the default branch's cache is available to other
+  #     branches. So a key built from `hashFiles('**/lockfile')` — which does not
+  #     contain the gate variable — restores a test report written by a run that
+  #     HAD the database into a run that does not. A witness restored from a
+  #     different run is not a witness.
+  #
+  #     Build products (target/, $GOCACHE, node_modules, vendor/bundle) are
+  #     cacheable and deliberately not caught here. Test reports are.
+  #
+  #     The cross-trust-boundary half — fork PRs get read-only cache access, so
+  #     any workflow using actions/cache can restore a trusted run's report — is
+  #     stated in README.md rather than checked here, because it is a property of
+  #     GitHub's cache and not of this repository.
+  no_cached_report_check() {
+    "$PY" - "$ROOT" <<'PY'
+import os
+import re
+import sys
+
+root = sys.argv[1]
+
+# A path that is a test RESULT, not a build product. The alternation is
+# anchored on a path segment or the string start, so `reports/coverage.xml` is
+# caught and `internal/report.go` is not.
+REPORT = re.compile(
+    r"(?:^|/)(?:junit|test-?results?|coverage|coverage\.\w+|report\.xml"
+    r"|pytest\.xml|nextest\.xml|gotestsum\.xml|karma[\w-]*\.xml)(?:$|[/\s'\"])"
+)
+
+problems = []
+checked = 0
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [d for d in dirnames if d not in (".git", ".venv", "node_modules")]
+    for name in sorted(filenames):
+        if not name.endswith((".yml", ".yaml")):
+            continue
+        full = os.path.join(dirpath, name)
+        rel = os.path.relpath(full, root)
+        try:
+            src = open(full, encoding="utf-8").read()
+        except OSError:
+            continue
+        if "actions/cache" not in src:
+            continue
+        checked += 1
+        # Read as text rather than through yaml: `path:` is a scalar in every
+        # shape a cache step takes, and the case that matters most is a
+        # multi-line list, which safe_load would flatten into something no error
+        # message could quote back at a reader.
+        for m in re.finditer(r"^\s*(?:-\s*)?path:\s*(.+)$", src, re.M):
+            value = m.group(1).strip().strip("'\"")
+            if REPORT.search(value):
+                lineno = src[: m.start()].count("\n") + 1
+                problems.append(
+                    f"{rel}:{lineno}: actions/cache path {value!r} is a test report. "
+                    f"restore-keys matches by PREFIX, so a report written by a run "
+                    f"that HAD the dependency is restored into a run that did not. "
+                    f"Cache build products (target/, GOCACHE, node_modules, "
+                    f"vendor/bundle); never a witness"
+                )
+
+if problems:
+    sys.exit("; ".join(problems))
+# The PASS line is written carefully, because the obvious phrasing of it is
+# wrong in a way that would mislead the next reader. kit's workflows DO cache —
+# `actions/setup-go`, `ruby/setup-ruby` with `bundler-cache`, `setup-node` with
+# `cache: npm` and `setup-uv` with `enable-cache` all keep dependency caches —
+# and every one of those is a build product. Saying "kit caches nothing" would
+# be false; saying what is actually true is the whole point of this check.
+print(
+    f"{checked} workflow file(s) use actions/cache; none caches a test report. "
+    f"Dependency caches (GOCACHE, vendor/bundle, ~/.npm, the uv cache) are build "
+    f"products and are not in scope"
+    if checked
+    else "no actions/cache step in this repo; the rule is for the adopters, and the "
+    f"dependency caches kit's own workflows do use (GOCACHE, vendor/bundle, ~/.npm) "
+    f"are build products"
+)
+PY
+  }
+  check '.github/workflows/*  (no test report is ever cached)' no_cached_report_check
+
   # Every README section a reader is told to copy must exist. A doc that points
   # at a path that was renamed is worse than no doc.
   readme_check() {
@@ -3099,13 +3716,23 @@ fi
 if [ "$RUN_TELEMETRY" -eq 1 ]; then
   # Formatting is part of the template: a service that copies a template
   # formatted differently from its neighbours is a template that reads as ours.
+  #
+  # BOTH Go template trees, not just otel's. The tier tree was added without
+  # this, and `gofmt -d` on it wanted a `#` on every ALL-CAPS doc heading — Go
+  # 1.19 reformatted doc comments, and a heading without the marker is one
+  # gofmt rewrites. It was found by running gofmt over the new files by hand,
+  # which is the part that was actually wrong: a new template tree that no
+  # existing check reads is a tree that can be malformed in silence, and the
+  # house rule is that a new file type gets its parser in the same commit.
   if have gofmt; then
-    if [ -z "$(gofmt -l "$ROOT"/templates/otel/go/*.go 2>&1)" ]; then
-      report PASS 'templates/otel/go/*.go  (gofmt clean)'
-    else
-      report FAIL 'templates/otel/go/*.go  (gofmt clean)'
-      gofmt -l "$ROOT"/templates/otel/go/*.go | sed 's/^/       /'
-    fi
+    for tree in otel tier; do
+      if [ -z "$(gofmt -l "$ROOT"/templates/"$tree"/go/*.go 2>&1)" ]; then
+        report PASS "templates/$tree/go/*.go  (gofmt clean)"
+      else
+        report FAIL "templates/$tree/go/*.go  (gofmt clean)"
+        gofmt -l "$ROOT"/templates/"$tree"/go/*.go | sed 's/^/       /'
+      fi
+    done
   else
     report SKIP 'gofmt (not installed)'
   fi

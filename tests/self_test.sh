@@ -31,6 +31,14 @@
 #         suite goes red. A suite that has never failed has never been proven to
 #         test anything, and six suites that only one language's mutation covers
 #         is five suites that might assert nothing at all.
+#   19. an allowlist entry that matches nothing -> the unused-entry check goes
+#         red. This is the sharpest property kit owns, and it is the one with
+#         the most room to be decorative: an allowlist rule that has never
+#         rejected anything is a comment in a file with a `.gitignore`-shaped
+#         name. Modelled on ESLint's reportUnusedDisableDirectives, which
+#         reports a disable comment that no longer suppresses anything —
+#         without that rule a skip list is a ratchet that only turns one way,
+#         and within two quarters it contains every test in the repository.
 #
 #   Seven of them (7-12) additionally assert WHICH check went red. Every other
 #   breakage only proves the gate can fail; those prove the check written for
@@ -516,6 +524,29 @@ expect_red_lang 'breakage 18: python stops masking trace-flags (§3.2.2.5)' \
   "$base" python traceparent.py \
   'flags=parsed.flags & SAMPLED,' \
   'flags=parsed.flags,'
+
+# 19. THE UNUSED ALLOWLIST ENTRY. The rule that stops the skip allowlist from
+#     becoming a list of every test in the repository, and the one most likely to
+#     be decorative — a hygiene rule in a data file, which is exactly the shape
+#     of a check nobody has ever seen fail.
+#
+#     The mutation is the realistic one: somebody fixed the skip, or renamed the
+#     test, and left the entry behind. The entry it appends is well-formed in
+#     every OTHER respect — it has a reason, an owner, a since, an until, and it
+#     is not a duplicate. It is only unused, which is precisely the failure the
+#     rule exists to catch and precisely the one a shape-only check would pass.
+#
+#     This asserts the NAMED check, because a tree can go red for a dozen
+#     unrelated reasons and "the gate went red" would not prove that the unused
+#     -entry rule is what rejected it.
+ALLOWLIST='templates/tier/skip-allowlist  (reason, owner, since, until; unused entries fail)'
+
+nineteen="$(fresh_copy unused-allowlist-entry)"
+cat >>"$nineteen/templates/tier/skip-allowlist" <<'ENTRY'
+skipped db go/tier_db_test.go TestTierDBRenamedAway reason="the test this was written for was renamed; the entry outlived it" owner=kit since=2026-09-30 until=2026-12-31
+ENTRY
+expect_red_check 'breakage 19: an allowlist entry that matches nothing' \
+  "$nineteen" "$ALLOWLIST" --static-only
 
 printf '\n'
 if [ "$failures" -ne 0 ]; then

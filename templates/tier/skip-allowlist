@@ -1,0 +1,94 @@
+# The skip allowlist. ONE file, in kit, for the whole fleet.
+#
+# WHAT THIS IS
+#
+# An entry permits ONE test to be absent from a required tier's expected run.
+# Without this file, a test that cannot be proven present is either silently
+# tolerated (the failure this repo exists to prevent) or the tier is simply not
+# required yet (the same failure, one step earlier).
+#
+# A JUnit report cannot express "filtered out", so the absence has to be recorded
+# somewhere a machine can read. This is that somewhere.
+#
+# WHY ONE FILE HERE AND NOT ONE PER SERVICE REPO
+#
+# Thirteen drifting copies of a list of tests is thirteen lists nobody reads in
+# aggregate, and the aggregate is the actual problem. Individual entries look
+# justified — that is what makes them dangerous. See the total rule below.
+#
+# A repo that cannot read kit's copy at run time (no submodule, no network in
+# the test step) is a real cost of this decision and is called out in
+# templates/tier/README.md rather than papered over with a generated second copy.
+# A generated copy is a drifting copy with extra steps.
+#
+# ---------------------------------------------------------------------------
+# THE FOUR HYGIENE RULES
+#
+# 1. EVERY ENTRY NAMES A REASON.
+#    Without one, "flaky" becomes the reason for everything, and a reason that
+#    means nothing cannot be reviewed, expired, or argued with.
+#
+# 2. EVERY ENTRY NAMES AN OWNER.
+#    A skip nobody owns is a skip nobody will ever remove. The owner is a person
+#    or a team, not a distribution list.
+#
+# 3. EVERY ENTRY HAS AN EXPIRY (until) AND A since DATE.
+#    The packet requires "an expiry or since date"; this file requires BOTH, and
+#    the extra strictness is deliberate. `since` is the ratchet's history — it
+#    dates the decision. `until` is the ratchet itself — an entry that cannot
+#    expire is an entry that has stopped being a decision and become a fact.
+#
+#    THE GATE READS THE CLOCK. An entry whose `until` has passed is a FAILURE,
+#    not a warning, on the day it passes. That is the design: this file is
+#    expected to go red roughly four times a year, and each time the correct
+#    response is to delete the entry or to move the date with a new reason. A
+#    gate that has never gone red is a report.
+#
+# 4. AN ENTRY THAT MATCHES NOTHING IS A FAILURE.
+#    This is the rule the rest of the file exists to make enforceable, and it is
+#    borrowed from ESLint's `reportUnusedDisableDirectives`, which reports a
+#    disable comment that no longer suppresses anything. Without it, this file is
+#    a ratchet that only turns one way: fixed tests stay listed, listed tests
+#    stop being checked, and within two quarters the list contains every test in
+#    the repository. That is the failure mode. The unused entry is how you find
+#    out first.
+#
+# THE TOTAL IS PRINTED, PROMINENTLY, ON EVERY RUN.
+#
+# Every entry individually looks justified. The aggregate is the problem, and an
+# aggregate nobody is shown is an aggregate nobody watches. Conftest reports
+# exceptions as a separate tally for exactly this reason. The gate prints the
+# count on PASS as well as on FAIL, so the number is visible in a green run —
+# a green run is where a growing list is least likely to be noticed.
+#
+# ---------------------------------------------------------------------------
+# FORMAT
+#
+#   skipped <tier> <suite-id> <test-id> reason="…" owner=… since=YYYY-MM-DD until=YYYY-MM-DD
+#
+# The first four fields are the normalised `skipped` result line from
+# templates/tier/README.md, verbatim, so a result and its exemption are the same
+# shape. <suite-id> is the language-relative file the declaration lives in; the
+# gate resolves <test-id> against the declared inventory and fails when it is
+# absent, which is rule 4.
+#
+# A `#` starts a comment. Blank lines are ignored. One entry per line, and the
+# line must be one line: a wrapped reason is two entries, one of which is a
+# parse error.
+# ---------------------------------------------------------------------------
+
+# bun has no declared-reason channel and its filtered-vs-skipped distinction is an
+# empty child element rather than a documented field, so nothing machine-readable
+# can be required of it yet. Verified on bun 1.3.12, not a documented contract.
+skipped db bun/tier.test.ts tier_db_pool_round_trips reason="bun's JUnit reporter carries no declared reason (test.skip takes none) and distinguishes filtered-out from skipped by an undocumented empty element" owner=kit since=2026-09-30 until=2026-12-31
+
+# minitest 6.0.6 ships no machine-readable reporter at all: StatisticsReporter,
+# ProgressReporter and SummaryReporter are the complete set, and all three are
+# human-readable text. Rails' default runner is minitest, so this is the Rails
+# case too. The adapter is a Minitest::Reporter subclass and is unwritten.
+skipped db ruby/tier.rb test_tier_db_pool_round_trips reason="minitest has no built-in machine-readable reporter; the tier is declared but nothing can require the test to be present until the reporter adapter is written" owner=kit since=2026-09-30 until=2026-12-31
+
+# ExUnit has no tier-declaration channel and no machine-readable inventory; a
+# module attribute is declared in tier.ex and an adapter would read it, but the
+# adapter is unwritten.
+skipped db elixir/tier.ex tier_db_pool_round_trips reason="ExUnit reports tags to a human, not to a machine; the tier is declared and the collector adapter is unwritten" owner=kit since=2026-09-30 until=2026-12-31

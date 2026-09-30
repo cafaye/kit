@@ -20,7 +20,7 @@ build lands in kit once, and reaches the next service in a pull request.
 
 | Path | What it is | Who uses it |
 |------|-----------|-------------|
-| `.github/workflows/ci.reusable.yml` | One reusable GitHub Actions workflow. Input `language` picks one of seven jobs — install, lint, test, coverage gate. Opt-in `telemetry` input adds the traceparent conformance job. No job builds or pushes an image. | Every service, via a 6-line `.github/workflows/ci.yml` |
+| `.github/workflows/ci.reusable.yml` | One reusable GitHub Actions workflow. Input `language` picks one of seven jobs — install, lint, test, coverage gate. Opt-in `telemetry` input adds the traceparent conformance job; opt-in `required-tier` demands a tier by gate-variable name. No job builds or pushes an image. | Every service, via a 6-line `.github/workflows/ci.yml` |
 | `lint/yamllint.yml` | YAML style, with the three rules Actions forces us to retune. | Any repo that lints its own YAML; kit's gate uses it on itself |
 | `lint/golangci.yml` | golangci-lint v2, correctness linters on, `errcheck` excluded only for `Close`/`Flush`. | Go services |
 | `lint/rubocop.yml` | RuboCop, `NewCops: enable`, Metrics left on. | Ruby services |
@@ -37,6 +37,9 @@ build lands in kit once, and reaches the next service in a pull request.
 | `tests/canary_test.sh` | Plants a canary in ten leak shapes against a real collector and asserts it reaches no exporter. | kit |
 | `tests/no_telemetry_in_readiness.sh` | Kills the collector and proves a service still starts, still serves and still reports healthy. | kit |
 | `templates/otel/<lang>/` | W3C traceparent: a stdlib codec, an executed conformance suite, an SDK snippet, and a README. | Every service, per language |
+| `templates/tier/<lang>/` | The **declared tier**, per language — the tests that need a real dependency, declared in the test source and read by the runner's own collector. Never grepped for a sentinel: a sentinel fails open. | Every service, per language |
+| `templates/tier/skip-allowlist` | One file for the fleet. Four hygiene rules — reason, owner, `since`, `until` — and **an entry matching nothing is a failure**. | Every service; the file itself lives here |
+| `templates/tier/README.md` | The normalised result format, the allowlist rules, and what a tier gate **cannot** catch. | Every service |
 | `templates/mise.toml` | Toolchain pins, one per language, commented. | Every service, as `mise.toml` |
 | `templates/AGENTS.md` | Skeleton repo-conventions file. | Every service, as `AGENTS.md` |
 | `tests/validate.sh` | kit's own suite — the gate. | kit |
@@ -452,6 +455,22 @@ red. It is a string rather than a boolean on purpose: GitHub coerces the bare
 word `false` to a boolean in some positions, and `if: inputs.telemetry` is a trap
 as a result.
 
+**7c. Declare your tiers, then demand one.** Copy
+`templates/tier/<lang>/` into your test tree and copy the `REQUIRED_<TIER>=1`
+gate variable into the suite — a tier that cannot fail is a skip wearing a
+green checkmark. Then name it in the caller:
+
+```yaml
+    with:
+      language: go
+      required-tier: 'REQUIRED_DB'   # exported as 1; zero tests then fails
+```
+
+Setting it commits you to the normalised result format
+(`templates/tier/README.md`) — the `tier demand` step reads a `ran` line out of
+the run log and fails **naming the variable** when the tier ran nothing. It is
+opt-in and defaults to `''`, so adopting it never turns a green repo red.
+
 **7. Run kit's own gate before you open the PR that adopts it:**
 
 ```sh
@@ -471,8 +490,83 @@ bash <kit>/tests/validate.sh
 - [ ] `AGENTS.md` copied and filled in
 - [ ] A coverage command exists and `COVERAGE_FAIL_UNDER` is above 0
 - [ ] If you propagate traces: `templates/otel/<lang>/` copied **with its suite**, `telemetry: 'true'`
+- [ ] If you have a tier: `templates/tier/<lang>/` copied, `REQUIRED_<TIER>=1` honoured,
+      `required-tier` named in the caller
+- [ ] No `actions/cache` step caches a test report
 - [ ] `CHANGELOG.md` has an entry
 - [ ] The workflow is green on the adoption PR
+
+## Test tiers — `templates/tier/`
+
+A **tier** is a class of test that needs a real dependency to mean anything: a
+database, Redis, a broker. The failure this exists to prevent has already
+happened in this fleet — **a green run in which the whole database tier never
+executed once**, because the suite reported `ok`, and `ok` is the only thing
+anybody read.
+
+Tier membership is **declared in the test source** and read by **the runner's
+own collector**. It is never grepped for a sentinel, because a sentinel fails
+*open*: Identity derives its database tier by grepping for
+`dbtest.Pool|Schema|EnvVar|TEST_DATABASE_URL`, and a test that reaches Postgres
+through a helper two files away, or through a fixture, does not match — so its
+package never enters the required list, and the run is never required to contain
+it. The test is written. It is not gated. Nobody finds out.
+
+| `language` | Declaration | Collector | Adapter? |
+|---|---|---|---|
+| `rust` | `#[ignore = "cafaye:tier=db reason=…"]` | `cargo test -- --list` | none |
+| `go` | `//go:build tier_db` | `go test -tags tier_db -list '.*' ./...` | none |
+| `python` | `@pytest.mark.tier_db` | `pytest --collect-only -q -m tier_db` | none |
+| `elixir` | `@tier :db` | none — needs one | ~15 lines |
+| `node` | `export const TIER` | none — needs one | ~15 lines |
+| `bun` | `export const TIER` | `bun test --reporter=junit` (partial) | ~15 lines |
+| `ruby` | `tier :db` class macro | none — needs one | ~15 lines |
+
+Two results here were **measured rather than assumed**, and both corrected the
+prior claim:
+
+- `cargo test -- --list --format json` is **nightly-only** (`-Z
+  unstable-options`, rustc 1.95.0). On stable, `--list` includes ignored tests
+  and `--list --ignored` gives the ignored subset — which between them carry
+  everything the JSON would have. `--list --include-ignored` lists *everything*
+  and filters nothing; it is a trap, and the Rust template says so.
+- `bun test --reporter=junit` **does** emit a full inventory — a filtered-out
+  test is still present as a `<testcase>` — so the absent-testcase failure mode
+  does not occur there. What it lacks is a declared *reason*: `test.skip` takes
+  none.
+
+The normalised result format, the skip allowlist and its four hygiene rules, the
+`REQUIRED_<TIER>` demand, and **what a tier gate cannot catch** are all in
+[`templates/tier/README.md`](templates/tier/README.md). The short version of the
+last one: the machinery can prove *"41 tests ran"*; only an assertion **inside**
+the test proves *"41 tests hit Postgres"*. A gate whose documentation overstates
+it is worse than no gate.
+
+**Floors are decrease detectors, not tier gates.** Identity's
+`1254/1166`-style floors are cheap and they catch deletion — keep them. But a
+floor is satisfied by *any* 1254 tests, including the wrong 1254, and nothing
+about it knows which tier a test belongs to.
+
+### Never cache a test report
+
+`actions/cache` `restore-keys` restores **stale** caches by **prefix match**,
+and GitHub documents that the default branch's cache is available to other
+branches. So a cache key built from `hashFiles('**/lockfile')` — which does not
+contain the gate variable — restores a test report written by a run that **had**
+the database into a run that does not.
+
+**A witness restored from a different run is not a witness.**
+
+Cache `target/`, `$GOCACHE`, `node_modules`, `vendor/bundle`. Those are build
+products. Do not cache `junit.xml`, `test-results/`, `coverage.*`, or anything
+else a gate would read as evidence. `tests/validate.sh` fails when an
+`actions/cache` step names one.
+
+There is a second, sharper version of this that no check in a single repo can
+catch: **fork pull requests get read-only cache access**, so a workflow using
+`actions/cache` lets a fork restore a trusted run's cached report into its own
+run. That is a cross-trust-boundary path into the gate, and it exists today in
+any workflow that caches at all. Treat a cached report as untrusted input.
 
 ## Design rules
 
@@ -522,6 +616,12 @@ we wrote them down to be:
   on day one, so a YAML that breaks the config greets the first adopter with a
   failure nobody authored
 - `.mjs` → `node --check`
+- `templates/tier/<lang>/*` → parsed in **their own language**, because they are
+  files a service copies: `rustc --test` (Rust, and `--list` proves the
+  inventory the allowlist reads), `compile()` (Python), `ruby -c`,
+  `Code.string_to_quoted!` (Elixir), `gofmt` (Go). TypeScript is a loud `SKIP`
+  naming its reason — stock `node --check` cannot read it, and a type-stripping
+  parser is a dependency this repo does not have
 - `docker/Dockerfile.*` → `hadolint -c lint/hadolint.yaml`, **plus** the
   non-root / no-`:latest` / no-`ADD` rules hadolint does not cover, **plus** a
   requirement that each template's own STRICTNESS NOTES state the non-root
@@ -539,6 +639,17 @@ we wrote them down to be:
   form, and no second copy anywhere in the tree
 - the `telemetry` CI job must stay opt-in and the six original jobs must stay
   gated on their language, or adopting kit breaks every consumer
+- every language with a CI job must also ship a **tier declaration** in
+  `templates/tier/<lang>/` and have a row in that directory's README naming the
+  collector that reads it — see [Test tiers](#test-tiers--templatestier)
+- the `required-tier` input must stay opt-in (default `''`), be exported by
+  every language job, and be checked by an identical `tier demand` step in each
+  one. The six copies are byte-compared, because hand-maintained copies of a
+  policy block is the drift this repo exists to prevent
+- the skip allowlist must satisfy four rules — **reason, owner, `since`,
+  `until`** — and **an entry matching nothing is a failure**. The total is
+  printed on every run, green included
+- no `actions/cache` step may cache a test report
 
 **telemetry** — the W3C traceparent suites are **executed**, one per language:
 
@@ -552,14 +663,19 @@ no `npm ci`, no `cargo fetch`. If these ever need the network, a template has
 grown a dependency and kit has stopped being config-only.
 
 **self_test** — `tests/self_test.sh` breaks a throwaway copy of this tree
-nineteen ways and asserts the gate goes red each time. Thirteen breakages are
+**twenty** ways and asserts the gate goes red each time. Fourteen breakages are
 for the static checks; one is a semantic mutation of each of the six language
 implementations, so **every suite is proven able to fail** rather than assumed
 to. A skip fails the run — a self_test that skips half its proofs and exits 0 is
-the "0 passed, 14 ignored" shape that verifies nothing. Six of the static ones
-go further and assert that one *named* check reported `FAIL`, so the check
+the "0 passed, 14 ignored" shape that verifies nothing. Seven of the static
+ones go further and assert that one *named* check reported `FAIL`, so the check
 written for a given defect is proven still load-bearing rather than being one
 of fifty checks that could have gone red for an unrelated reason.
+
+Breakage 19 is the allowlist one: an entry naming a test that does not exist,
+well-formed in every other respect. It is the rule most able to be decorative —
+a hygiene rule in a data file is exactly the shape of a check nobody has ever
+seen fail.
 
 Any `FAIL` exits 1. A `SKIP` is always reported in the summary, never hidden.
 PyYAML, yamllint and hadolint are required and are **bootstrapped by the gate
