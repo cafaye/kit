@@ -53,7 +53,11 @@ module Kit
       OpenTelemetry::SDK.configure do |c|
         c.service_name = SERVICE_NAME
         c.service_version = SERVICE_VERSION
-        c.use_all, :auto_instrumentation
+        # `use_all!` installs instrumentation for every gem on the load path:
+        # Rails, ActiveRecord, Faraday, Net::HTTP. It is a bang method for a
+        # reason — it raises if a gem is half-present, which at boot is the
+        # moment you want to hear about it rather than at 3am on a request.
+        c.use_all!
         c.add_span_processor(
           OpenTelemetry::SDK::Trace::Export::BatchSpanProcessor.new(
             OpenTelemetry::Exporter::OTLP::Exporter.new

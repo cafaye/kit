@@ -31,8 +31,17 @@
 # NO DEPENDENCIES. Stdlib only, so this file drops into any Rails service and
 # the test suite runs without `bundle install`.
 
-require "securerandom"
+require 'securerandom'
 
+# W3C Trace Context propagation, with no dependencies.
+#
+# Two entry points matter: `KitOtel.server_hop` for the inbound side and
+# `ServerHop#outbound_headers` for the outbound one. Both cannot fail — a
+# malformed or absent `traceparent` yields a new trace, because a request is
+# not an error because its trace header was garbage (3.2.2.3, 4.2).
+#
+# See the file header for the W3C Trace Context sections behind each rule, and
+# `test_traceparent.rb` for the suite that asserts them.
 module KitOtel
   # Bit 0 of trace-flags (3.2.2.5.1). It is a bit in a field, not the field's
   # value: reading `flags == 1` instead of `flags & 1 == 1` is the single most
@@ -50,8 +59,8 @@ module KitOtel
   # 3.3.1.5: "Entries larger than 128 characters long SHOULD be removed first."
   TRACESTATE_ENTRY_LIMIT = 128
 
-  ZERO_TRACE_ID = "0" * 32
-  ZERO_SPAN_ID = "0" * 16
+  ZERO_TRACE_ID = '0' * 32
+  ZERO_SPAN_ID = '0' * 16
 
   # A parsed `traceparent` header.
   #
@@ -65,13 +74,15 @@ module KitOtel
     # making our own: a service that re-decides sampling per hop produces traces
     # with holes in them, which are worse than no traces.
     #
-    # Named `sampled` with a `sampled?` alias so the predicate reads the same
-    # here as in the other five templates — a cross-language suite that has to
-    # remember which language suffixes its booleans is a suite nobody maintains.
-    def sampled
-      (flags & SAMPLED) == SAMPLED
+    # `sampled?` is the real method, because that is the Ruby spelling.
+    # `sampled` is an alias so the predicate reads the same here as in the other
+    # five templates — a cross-language suite that has to remember which language
+    # suffixes its booleans is a suite nobody maintains. Both exist; neither is
+    # deprecated.
+    def sampled?
+      flags.allbits?(SAMPLED)
     end
-    alias sampled? sampled
+    alias_method :sampled, :sampled?
   end
 
   # One service's continuation of a trace: what we tell our caller about the
@@ -80,17 +91,17 @@ module KitOtel
   # +continued+ is not a debug field: a span exporter needs to know whether this
   # is a root span in order to label it correctly.
   ServerHop = Struct.new(:trace_id, :span_id, :flags, :tracestate, :continued) do
-    def sampled
-      (flags & SAMPLED) == SAMPLED
+    def sampled?
+      flags.allbits?(SAMPLED)
     end
-    alias sampled? sampled
+    alias_method :sampled, :sampled?
 
     # The shape is fixed by 3.4: parent-id becomes this hop's span id, and the
     # version is downgraded to the one we implement. Those two mutations plus
     # the sampled flag are the entire allowed set.
     def outbound_headers
-      out = { "traceparent" => KitOtel.format_traceparent(trace_id, span_id, flags) }
-      out["tracestate"] = tracestate unless tracestate.to_s.empty?
+      out = { 'traceparent' => KitOtel.format_traceparent(trace_id, span_id, flags) }
+      out['tracestate'] = tracestate unless tracestate.to_s.empty?
       out
     end
   end
@@ -103,47 +114,100 @@ module KitOtel
     # parent-id is invalid, and 3.2.4 says to restart the trace when the version
     # cannot be parsed. There is no error to handle and no value to partially
     # trust.
+    # Split into one predicate per spec rule rather than one long guard chain.
+    #
+    # The single-method version was correct and unreadable: a 36-ABC, 17-branch
+    # method where a reviewer cannot see which rule rejects a header without
+    # reading all of it. Each check below is named after the section that
+    # requires it, so `parse_traceparent` reads as a list of rules — which is
+    # what it is — and a change to one rule is a change to one method.
+    #
+    # Every one of these returns true when the header is REJECTED. Naming them
+    # that way keeps the caller a single readable conjunction.
     def parse_traceparent(value)
       return nil if value.nil?
 
       raw = value.to_s
-      # A short header cannot hold the four fields, whatever the version.
-      return nil if raw.length < MIN_HEADER_LEN
+      return nil unless well_formed?(raw)
+      # 3.2.2.3 and 3.2.2.4 are separate from the shape: a header can be
+      # perfectly well formed and still carry an identifier the spec forbids.
+      return nil if all_zero_identifier?(raw)
 
-      # 3.2.4: "When the version prefix cannot be parsed (it's not 2 hex
-      # characters followed by a dash), the implementation should restart the
-      # trace." Checked before anything else, so a malformed version is never
-      # mistaken for a valid one.
-      return nil unless raw[2] == "-" && lowercase_hex?(raw[0, 2])
+      build_traceparent(raw)
+    end
 
+    # 3.2.4: "When the version prefix cannot be parsed ... the implementation
+    # should restart the trace." Everything the spec requires of the header's
+    # SHAPE, in the order it states them. A well-formed header is one a vendor
+    # can parse positionally; an all-zero identifier is well formed and still
+    # invalid, which is why that check is not in here.
+    def well_formed?(raw)
+      !malformed_version_prefix?(raw) &&
+        !forbidden_version?(raw) &&
+        !wrong_delimiters?(raw) &&
+        !non_hex_fields?(raw) &&
+        !wrong_length_for_version?(raw)
+    end
+
+    # The five fixed slices of a header that has already been validated. Kept out
+    # of `parse_traceparent` so that method is a list of rules and this one is a
+    # list of offsets — two things a reader can hold in their head, rather than
+    # both at once.
+    def build_traceparent(raw)
+      TraceParent.new(
+        raw[0, 2].to_i(16),   # version
+        raw[3, 32],           # trace-id
+        raw[36, 16],          # parent-id
+        raw[53, 2].to_i(16),  # trace-flags
+        raw[(MIN_HEADER_LEN + 1)..].to_s # unknown fields, for logging only
+      )
+    end
+
+    # A short header cannot hold the four fields, whatever the version.
+    # 3.2.4: "When the version prefix cannot be parsed (it's not 2 hex characters
+    # followed by a dash), the implementation should restart the trace." Checked
+    # before anything else, so a malformed version is never mistaken for a valid
+    # one.
+    def malformed_version_prefix?(raw)
+      raw.length < MIN_HEADER_LEN || raw[2] != '-' || !lowercase_hex?(raw[0, 2])
+    end
+
+    # 3.2.2.1: "Version ff is invalid."
+    def forbidden_version?(raw)
+      raw[0, 2].to_i(16) == 0xFF
+    end
+
+    # The three fixed positions, all three mandatory (3.2.4).
+    def wrong_delimiters?(raw)
+      raw[35] != '-' || raw[52] != '-'
+    end
+
+    # 3.2.2 defines the alphabet as HEXDIGLC, lowercase only.
+    def non_hex_fields?(raw)
+      [raw[3, 32], raw[36, 16], raw[53, 2]].any? { |field| !lowercase_hex?(field) }
+    end
+
+    # 3.2.2.2 defines version 00 as exactly these four fields. Trailing data
+    # means the sender is not speaking version 00, and accepting it would be
+    # inventing a format the spec does not define.
+    #
+    # 3.2.4: on a higher version the two flag characters are followed by either
+    # the end of the header or a dash introducing an unknown field.
+    def wrong_length_for_version?(raw)
       version = raw[0, 2].to_i(16)
-      # 3.2.2.1: "Version ff is invalid."
-      return nil if version == 0xFF
-
-      trace_id = raw[3, 32]
-      parent_id = raw[36, 16]
-      flags_field = raw[53, 2]
-
-      # The three fixed positions, all three mandatory (3.2.4).
-      return nil unless raw[35] == "-" && raw[52] == "-"
-      return nil unless lowercase_hex?(trace_id) && lowercase_hex?(parent_id) && lowercase_hex?(flags_field)
-
       if version.zero?
-        # 3.2.2.2 defines version 00 as exactly these four fields. Trailing data
-        # means the sender is not speaking version 00, and accepting it would be
-        # inventing a format the spec does not define.
-        return nil unless raw.length == MIN_HEADER_LEN
+        raw.length != MIN_HEADER_LEN
       elsif raw.length > MIN_HEADER_LEN
-        # 3.2.4: on a higher version the two flag characters are followed by
-        # either the end of the header or a dash introducing an unknown field.
-        return nil unless raw[MIN_HEADER_LEN] == "-"
+        raw[MIN_HEADER_LEN] != '-'
+      else
+        false
       end
+    end
 
-      # 3.2.2.3 and 3.2.2.4: all zeroes is an invalid value for both, and the
-      # required response is to ignore the header.
-      return nil if trace_id == ZERO_TRACE_ID || parent_id == ZERO_SPAN_ID
-
-      TraceParent.new(version, trace_id, parent_id, flags_field.to_i(16), raw[(MIN_HEADER_LEN + 1)..].to_s)
+    # 3.2.2.3 and 3.2.2.4: all zeroes is an invalid value for both identifiers,
+    # and the required response is to ignore the header.
+    def all_zero_identifier?(raw)
+      raw[3, 32] == ZERO_TRACE_ID || raw[36, 16] == ZERO_SPAN_ID
     end
 
     # Continue the trace described by the inbound headers.
@@ -156,7 +220,7 @@ module KitOtel
     # span lifecycle — in a service it comes from the tracer, in a test it is a
     # constant, which is why the suite can assert equality instead of a shape.
     def server_hop(headers, span_id)
-      tp = parse_traceparent(header(headers, "traceparent"))
+      tp = parse_traceparent(header(headers, 'traceparent'))
 
       if tp.nil?
         # 3.3: "If the vendor failed to parse traceparent, it MUST NOT attempt to
@@ -172,8 +236,8 @@ module KitOtel
         # 3.2.2.5: a bit field, so mask on read rather than carry the bytes
         # through. 3.2.2.5.2 requires the reserved bits to be zero outbound.
         tp.flags & SAMPLED,
-        forward_tracestate(header(headers, "tracestate")),
-        true,
+        forward_tracestate(header(headers, 'tracestate')),
+        true
       )
     end
 
@@ -184,7 +248,10 @@ module KitOtel
     # version, and a caller that could pass any version would eventually pass a
     # wrong one.
     def format_traceparent(trace_id, parent_id, flags)
-      format("00-%s-%s-%02x", trace_id, parent_id, flags & 0xFF)
+      # Annotated tokens rather than positional %s: three arguments in a row,
+      # where swapping two of them still produces a valid-looking string of the
+      # wrong length, is exactly the bug a named token makes impossible.
+      format('00-%<trace>s-%<parent>s-%<flags>02x', trace: trace_id, parent: parent_id, flags: flags & 0xFF)
     end
 
     # Apply the 3.3.1.5 limits to an inbound tracestate.
@@ -197,18 +264,27 @@ module KitOtel
     def forward_tracestate(value)
       return nil if value.nil? || value.empty?
 
-      entries = value.split(",", -1).filter_map do |raw|
+      entries = usable_tracestate_entries(value)
+      # Pop from the end until the combined value fits (3.3.1.5).
+      entries.pop while entries.length.positive? && entries.join(',').length > TRACESTATE_LIMIT
+
+      entries.empty? ? nil : entries.join(',')
+    end
+
+    # The entries that survive 3.3.1.1 and the 3.3.1.5 per-entry limit, in the
+    # order they arrived. Extracted so `forward_tracestate` reads as the two
+    # rules it implements rather than as one loop with a nested filter.
+    def usable_tracestate_entries(value)
+      value.split(',', -1).filter_map do |raw|
         entry = raw.strip
         # 3.3.1.1: "Empty and whitespace-only list members are allowed."
         next if entry.empty?
 
+        # 3.3.1.5: "Entries larger than 128 characters long SHOULD be removed
+        # first" — the expensive ones, and the least likely to be a well-known
+        # vendor key.
         entry.length > TRACESTATE_ENTRY_LIMIT ? nil : entry
       end
-
-      # Pop from the end until the combined value fits (3.3.1.5).
-      entries.pop while entries.length.positive? && entries.join(",").length > TRACESTATE_LIMIT
-
-      entries.empty? ? nil : entries.join(",")
     end
 
     # Look a header up case-insensitively.
@@ -239,7 +315,7 @@ module KitOtel
     # collision risk is theoretical; the availability risk is not.
     def new_span_id
       id = random_hex(8)
-      id == ZERO_SPAN_ID ? "0000000000000001" : id
+      id == ZERO_SPAN_ID ? '0000000000000001' : id
     end
 
     private
@@ -252,13 +328,13 @@ module KitOtel
       !str.empty? && str.match?(/\A[0-9a-f]+\z/)
     end
 
-    # +n+ bytes from SecureRandom as lowercase hex.
+    # +byte_count+ bytes from SecureRandom as lowercase hex.
     #
     # SecureRandom rather than Random: trace ids end up in logs and in traces
     # that leave the process, and a predictable trace id is an invitation to
     # correlate two users' requests by guessing.
-    def random_hex(n)
-      SecureRandom.hex(n)
+    def random_hex(byte_count)
+      SecureRandom.hex(byte_count)
     end
   end
 end

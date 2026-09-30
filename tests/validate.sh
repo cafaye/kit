@@ -296,6 +296,90 @@ PY
   }
   check 'templates/otel/*/*.snippet  (installable, versioned, not vendored)' snippet_check
 
+  # Every snippet must PARSE in its own language. This is not a style check and
+  # not a stretch: a snippet is the file a service copies, so a syntax error in
+  # one ships as a service that does not boot.
+  #
+  # It already happened. rack_middleware.rb.snippet contained
+  # `c.use_all, :auto_instrumentation`, which is not valid Ruby, and no check in
+  # this file looked at it — the artifact-presence table only asked whether the
+  # file existed, and `node --check` refuses a `.snippet` extension outright.
+  #
+  # Snippets are copied to a real extension before parsing, because
+  # `ruby -c foo.snippet` fails on the extension alone and `node --check` throws
+  # ERR_UNKNOWN_FILE_EXTENSION.
+  section 'static: every otel snippet parses in its own language'
+
+  snippet_dir="$TMP/snippets"
+  rm -rf "$snippet_dir"
+  mkdir -p "$snippet_dir"
+
+  # <lang>|<file>|<extension>|<command...>
+  while IFS='|' read -r lang file ext cmd; do
+    [ -n "$lang" ] || continue
+    src="$ROOT/templates/otel/$lang/$file"
+    [ -f "$src" ] || continue
+    copy="$snippet_dir/$lang$ext"
+    cp "$src" "$copy"
+    if out=$($cmd "$copy" 2>&1); then
+      report PASS "otel/$lang/$file  (parses as $ext)"
+    else
+      report FAIL "otel/$lang/$file  (parses as $ext)"
+      printf '%s\n' "$out" | head -8 | sed 's/^/       /'
+    fi
+  done <<'SNIPPETS'
+go|otelhttp.go.snippet|.go|gofmt -e -l
+ruby|rack_middleware.rb.snippet|.rb|ruby -c
+python|fastapi.py.snippet|.py|python3 -m py_compile
+SNIPPETS
+
+  # rustc needs its own treatment: --emit=metadata on a file importing
+  # opentelemetry fails on unresolved crates (E0432/E0433), which is not a
+  # syntax error and is exactly what a dependency-free kit should produce. So
+  # the check is "no error other than an unresolved-crate error", which still
+  # catches every parse error.
+  if have rustc; then
+    rust_copy="$snippet_dir/otel_client.rs"
+    cp "$ROOT/templates/otel/rust/otel_client.rs.snippet" "$rust_copy"
+    rust_out="$(rustc --edition 2021 --crate-type lib --emit=metadata \
+      -o /dev/null "$rust_copy" 2>&1 || true)"
+    # Compare ERROR CODES, not lines. rustc's trailing
+    # `error: aborting due to 16 previous errors` carries no code, so a
+    # line-based "is any line not E0432/E0433" test reports that summary as a
+    # syntax error. Which is what the first version of this check did.
+    rust_codes="$(printf '%s\n' "$rust_out" | grep -oE '^error\[E[0-9]+\]' | sort -u)"
+    rust_unexpected="$(printf '%s\n' "$rust_codes" | grep -vE 'E0432|E0433|E0463' || true)"
+    if [ -n "$rust_unexpected" ]; then
+      report FAIL 'otel/rust/otel_client.rs.snippet  (parses as .rs)'
+      printf '%s\n' "$rust_unexpected" | sed 's/^/       /'
+    elif [ -z "$rust_codes" ]; then
+      report PASS 'otel/rust/otel_client.rs.snippet  (parses; crates resolved)'
+    else
+      report PASS 'otel/rust/otel_client.rs.snippet  (parses; crates unresolved, as expected)'
+    fi
+  else
+    report SKIP 'otel/rust/otel_client.rs.snippet  (rustc not installed)'
+  fi
+
+  # TypeScript: node's own type stripper is a parser, and it is in the node
+  # already running this gate. No typescript-eslint, no install.
+  if have node; then
+    ts_copy="$snippet_dir/hono.ts"
+    cp "$ROOT/templates/otel/node/hono.ts.snippet" "$ts_copy"
+    # The ExperimentalWarning goes to stderr and is not a parse failure, so it
+    # is filtered rather than allowed to fail a clean parse.
+    ts_out="$(node --experimental-strip-types --check "$ts_copy" 2>&1 |
+      grep -vE 'ExperimentalWarning|trace-warnings' || true)"
+    if [ -z "$ts_out" ]; then
+      report PASS 'otel/node/hono.ts.snippet  (parses as .ts)'
+    else
+      report FAIL 'otel/node/hono.ts.snippet  (parses as .ts)'
+      printf '%s\n' "$ts_out" | head -8 | sed 's/^/       /'
+    fi
+  else
+    report SKIP 'otel/node/hono.ts.snippet  (node not installed)'
+  fi
+
   # A template must not declare a dependency. kit is config-only; if these
   # files can `require` something, kit has a lockfile and a supply chain.
   section 'static: templates/otel declare no third-party dependency'
