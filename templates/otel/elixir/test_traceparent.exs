@@ -181,7 +181,7 @@ defmodule KitOtel.TraceparentTest do
       assert hop.trace_id == @known_trace, "header #{name} was not recognised"
     end
 
-    out = hop(%{"TraceParent" => @known_header}).outbound_headers
+    out = outbound(hop(%{"TraceParent" => @known_header}))
 
     for name <- Map.keys(out) do
       assert name == String.downcase(name), "§3.2.1: send #{name} lowercase"
@@ -198,7 +198,7 @@ defmodule KitOtel.TraceparentTest do
     assert tp.trace_id == @known_trace
     assert tp.parent_id == @known_parent
 
-    out = hop(%{"traceparent" => future}).outbound_headers["traceparent"]
+    out = outbound(hop(%{"traceparent" => future}))["traceparent"]
 
     assert String.starts_with?(out, "00-"), "outbound #{out} must be downgraded to version 00"
 
@@ -217,17 +217,34 @@ defmodule KitOtel.TraceparentTest do
 
   test "new identifiers are random and never all zero" do
     # §8: 16 and 8 random bytes, never all zeroes, never repeated.
-    seen = MapSet.new()
+    #
+    # `seen` is THREADED through the loop with Enum.reduce, not rebound inside
+    # it. A `for`/`Enum.map` opens its own scope, so `seen = MapSet.put(seen, ..)`
+    # in the body would shadow the outer binding and the uniqueness assertion
+    # below would compare every draw against an empty set — green forever,
+    # checking nothing. That was the state this test was in; it is worth
+    # saying out loud because the shape is common in all six templates.
+    {_traces, spans} =
+      Enum.reduce(1..256, {MapSet.new(), MapSet.new()}, fn _i, {traces, spans} ->
+        trace_id = KitOtel.Traceparent.new_trace_id()
+        span_id = KitOtel.Traceparent.new_span_id()
 
-    for _ <- 1..256 do
-      trace_id = KitOtel.Traceparent.new_trace_id()
+        assert String.length(trace_id) == 32
+        assert String.length(span_id) == 16
+        refute trace_id == String.duplicate("0", 32)
+        refute span_id == String.duplicate("0", 16)
 
-      assert String.length(trace_id) == 32
-      refute trace_id == String.duplicate("0", 32)
-      refute MapSet.member?(seen, trace_id), "new_trace_id repeated #{trace_id} in 256 draws (§8.2)"
-      assert String.length(KitOtel.Traceparent.new_span_id()) == 16
+        refute MapSet.member?(traces, trace_id),
+               "new_trace_id repeated #{trace_id} in 256 draws (§8.2)"
 
-      seen = MapSet.put(seen, trace_id)
-    end
+        refute MapSet.member?(spans, span_id),
+               "new_span_id repeated #{span_id} in 256 draws (§8.2)"
+
+        {MapSet.put(traces, trace_id), MapSet.put(spans, span_id)}
+      end)
+
+    # The assertion above is only meaningful if the set actually grew.
+    assert MapSet.size(_traces) == 256
+    assert MapSet.size(spans) == 256
   end
 end
