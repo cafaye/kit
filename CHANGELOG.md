@@ -17,10 +17,12 @@ semver contract — it is consumed by *calling*
   copy of it.** `templates/compose/` shipped a complete local observability
   platform — the collector with a redaction allowlist **derived from core's
   schemas**, plus Tempo, Loki, Mimir and a provisioned Grafana — and **no
-  service used it**. Six repositories shipped a bespoke 44–86 line
-  `docker-compose.yml` carrying a Postgres and little else, each ~450 lines
-  from kit's, and **none** of them adopted `bin/dev`. (billing's `bin/dev` is
-  Rails' `bin/rails server`; the brief's "1 of 9" is 0 of 6 by measurement.)
+  service used it**. Six repositories shipped a bespoke 52–158 line
+  `docker-compose.yml` carrying a Postgres and little else, each hundreds of
+  lines from kit's, and **none** of them adopted `bin/dev`. (billing's `bin/dev`
+  is Rails' `bin/rails server`; the brief's "1 of 9" is 0 of 6 by measurement.
+  The line counts are a measurement, not a range that holds — other workers are
+  editing these files.)
 
   A compose file cannot be `uses:`-ed, so `bin/dev` is the only callable path:
   it fetches `templates/compose/` from the ref in **`kit.ref`** and runs it
@@ -72,18 +74,20 @@ semver contract — it is consumed by *calling*
   copy of the stack, a weakened redaction boundary, a collector config nothing
   ever starts, an unpinned ref, and a published port on a service kit already
   ships. Against this fleet: **6 repositories in scope, 13 findings** — the
-  stale-copy rule catches **billing, courier, darkroom, identity**, the pin rule
-  catches **all six**, the port rule catches **darkroom, identity**, and muse is
-  caught as **unreadable** rather than as a copy (which is worse: its stack
-  cannot start at all). It is not softened to make master green: a gate that goes
-  quiet about six copies is the gate that let them exist.
+  stale-copy rule catches **billing, courier, darkroom, identity, muse**, the pin
+  rule catches **all six**, and the port rule catches **darkroom, identity**. It
+  is not softened to make master green: a gate that goes quiet about five copies
+  is the gate that let them exist.
 
   It also found something no check in kit could have: **`muse/docker-compose.yml`
-  does not parse.** Line 65 puts a `: ` inside an unquoted YAML scalar;
-  `docker compose config` exits 1 on it, so that stack cannot start at all.
+  did not parse.** Line 65 put a `: ` inside an unquoted YAML scalar and
+  `docker compose config` exited 1 on it, so that stack could not start at all.
+  Fixed by muse's own packet; the gate reported it first, and muse now shows up
+  under the stale-copy rule instead. Recorded because the sequence is the
+  evidence that a gate reading other repositories is worth having.
 
-  The stale-copy rule keys on the **image**, not the service name — five of the
-  six call their database `db`, and a name-based check reports the fleet clean
+  The stale-copy rule keys on the **image**, not the service name — three of the
+  five call their database `db`, and a name-based check reports the fleet clean
   while every copy stands right there.
 
 - **`tests/fetch_test.sh` — the fetch path, executed.** 17 assertions against a
@@ -150,9 +154,9 @@ semver contract — it is consumed by *calling*
 - **kit-13 — the observability stack gets a live path, and a gate that says which
   repositories are not on it.** `templates/compose/` shipped a complete local
   observability platform and **no service used it**: no repository had an
-  `otel-collector.yml`, six of twelve carried a bespoke 44–86 line
-  `docker-compose.yml` whose only infrastructure was a Postgres, and one of the
-  nine adopted `bin/dev`. The stack was built, gated, and running nowhere.
+  `otel-collector.yml`, six carried a bespoke 52–158 line
+  `docker-compose.yml` whose only infrastructure was a Postgres, and **none**
+  adopted `bin/dev`. The stack was built, gated, and running nowhere.
 
   - **`bin/dev` fetches the stack from a PINNED kit ref** and runs it beside the
     service's own `docker-compose.yml`, which is an override. A compose file
@@ -201,14 +205,13 @@ semver contract — it is consumed by *calling*
     derived from core's schemas), an `otel-collector.yml` nothing ever mounts, and
     a pin that is a branch. It reads the **sibling repositories**, not kit's own
     files, because the defect is in the callers — the same shape as D4.
-    **It is red against the current fleet and that is the deliverable**: four
-    repositories carry their own copy of the shared stack, six have no pin, two
-    publish a port on a service kit already ships, and `muse/docker-compose.yml`
-    does not parse as YAML. The predicate is the image,
-    not the service name, and the image set is read out of kit's own compose file
-    rather than a hand-kept list — five of the six copies name their database `db`
-    rather than `postgres`, so a name-keyed check would report the fleet clean
-    while five copies stood right there.
+    **It is red against the current fleet and that is the deliverable**: five
+    repositories carry their own copy of the shared stack, six have no pin, and
+    two publish a port on a service kit already ships. The predicate is the
+    image, not the service name, and the image set is read out of kit's own
+    compose file rather than a hand-kept list — three of the five copies name
+    their database `db` rather than `postgres`, so a name-keyed check would report
+    the fleet clean while five copies stood right there.
 
   - **Seven breakages** (23–29), each asserting the **named** check. The five
     fleet ones run against a **fixture fleet** rather than the real one — which is

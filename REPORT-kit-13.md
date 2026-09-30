@@ -221,10 +221,10 @@ out-of-scope count is **printed**, never dropped.
 
 | Rule | Count | Which |
 |---|---|---|
-| **stale copy** — runs an image kit already ships | **4** | billing, courier, darkroom, identity |
+| **stale copy** — runs an image kit already ships | **5** | billing, courier, darkroom, identity, muse |
 | **no pin, or a pin that moves** | **6** | all six |
 | **a published port on a kit service** | **2** | darkroom, identity |
-| **unreadable compose file** | **1** | muse |
+| unreadable compose file | 0 | nobody |
 | weakened boundary | 0 | nobody |
 | dead / service-owned collector config | 0 | nobody |
 
@@ -234,18 +234,26 @@ master green is exactly what the packet refuses.
 
 Three details worth stating:
 
-- **The stale-copy check keys on the IMAGE, not the service name.** Five of the
-  six call their database `db`, not `postgres`. A name-based check reports the
+- **The stale-copy check keys on the IMAGE, not the service name.** Three of the
+  five call their database `db`, not `postgres`. A name-based check reports the
   fleet clean while every copy of the platform stands right there — and that is
   what the recovered version did.
-- **muse is counted as carrying a copy, but its file cannot be read to tell.**
-  Its `docker-compose.yml` **does not parse**. Line 65 puts a `: ` inside an
-  unquoted YAML scalar:
-  `MUSE_VAULT_KEY: ${MUSE_VAULT_KEY:?set MUSE_VAULT_KEY, or run: uv run python -m muse.vault}`.
-  Verified by two independent parsers — `docker compose config` exits 1, and
-  PyYAML raises `ScannerError`. **That stack cannot start at all**, and no check
-  in kit could have found it, because nothing in kit reads the fleet. That is
-  the argument for this gate existing, in one example.
+- **`muse` was unreadable, and this is the whole argument for the gate in one
+  example.** When the numbers above were first measured, muse's
+  `docker-compose.yml` **did not parse at all**: line 65 put a `: ` inside an
+  unquoted YAML scalar,
+  `MUSE_VAULT_KEY: ${MUSE_VAULT_KEY:?set MUSE_VAULT_KEY, or run: uv run python -m muse.vault}`,
+  and both parsers agreed — `docker compose config` exited 1, PyYAML raised
+  `ScannerError`. **That stack could not start**, and nothing in kit could have
+  found it, because nothing in kit read the fleet.
+
+  It was fixed by muse's own packet (`muse-08`, which moved muse to Postgres 17),
+  and this gate reported it as a finding first. Muse is now caught by the
+  stale-copy rule instead — the same repository, one rule further along, which is
+  what "the gate reads the callers" buys. **The finding is recorded rather than
+  deleted** because the sequence is the evidence: a check that reads other
+  repositories found a stack that could not boot, and the fix came from the
+  repository that owned it.
 - **`guard` is correctly NOT caught by the stale-copy rule.** It declares one
   service, its own, and no database. A gate that flagged it would be flagging a
   repository for being correct. It is caught by the pin rule, because it has no
@@ -443,8 +451,14 @@ running the command and reading the file it wrote, which is the only way.
    the before/after in §3 was measured on a throwaway sandbox holding
    `identity`'s real compose file — not by landing a PR. The adoption path is
    proven; the fleet is unmigrated.
-3. **`muse` could not be checked for a stale copy**, only for being unreadable.
-   Its findings are 2 of 13 for that reason, not because it is cleaner.
+3. **Whether the fleet's shape holds as the other packets land.** The numbers in
+   §5.1 are measured, and they moved while this report was written: muse's
+   `docker-compose.yml` did not parse when the gate was first run and parses now,
+   because muse's own packet fixed it. A gate that reads other repositories is
+   reading repositories that are **actively being edited by other workers**, so
+   this report states a measurement and its moment rather than a property of the
+   fleet. Re-running `tests/fleet_check.py` is the only way to know the current
+   answer.
 5. **`kit.ref` against a real GitHub remote**, including whether GitHub serves a
    `--depth 1` fetch of an arbitrary sha without `uploadpack.allowReachableSHA1InWant`.
 6. **Nothing was rebased.** Master was still `41f8bcb`, this branch's base, when
