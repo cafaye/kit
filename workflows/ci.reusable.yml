@@ -1,0 +1,295 @@
+---
+# kit — the CI path every cafaye service repo runs.
+#
+# Consumers do not copy this file; they call it (repo: github.com/cafaye/<svc>):
+#
+#   # .github/workflows/ci.yml
+#   name: ci
+#   on: [push, pull_request]
+#   permissions:
+#     contents: read
+#   jobs:
+#     ci:
+#       uses: cafaye/kit/workflows/ci.reusable.yml@master
+#       with:
+#         language: go
+#         working-dir: .
+#
+# One job per language exists on purpose: six services, six toolchains, and a
+# `language` x `version` matrix would multiply CI minutes the org cannot spend.
+# Every job is gated on `inputs.language`, so exactly one runs per call.
+#
+# STRICTNESS NOTES (read before loosening anything)
+#   - No job builds or pushes an image, and no job writes to the default branch.
+#     Release work is a separate workflow so a red test can never publish.
+#   - The coverage gate is a PLACEHOLDER (0) so adoption never blocks a repo on
+#     day one, and it is an INPUT (coverage-fail-under) so a repo raises it in
+#     its caller rather than forking this file. A gate left at 0 fails nothing.
+#   - Action refs are floating major tags where the upstream publishes them and
+#     exact tags where it does not (astral-sh/*). Dependabot upgrades are
+#     one-line diffs; full-SHA pinning is a service repo's own choice.
+#   - Every step that can run offline does. Nothing here reaches a cafaye
+#     service, so this workflow needs no secrets.
+name: ci
+on:
+  workflow_call:
+    inputs:
+      language:
+        description: 'Toolchain to build, lint, and test. One job runs; the rest skip.'
+        required: true
+        type: string
+        options:
+          - go
+          - ruby
+          - elixir
+          - python
+          - node
+          - rust
+      # Descriptions are folded, not quoted: a long description that is reflowed
+      # to fit line-length is unreadable, and Actions has no width limit on
+      # `description`. Our own lint/yamllint.yml caps source lines at 120.
+      working-dir:
+        description: >-
+          Directory holding the service manifest: go.mod, Gemfile, mix.exs,
+          pyproject.toml, package.json, or Cargo.toml.
+        required: false
+        type: string
+        default: '.'
+      versions:
+        description: >-
+          Optional JSON toolchain pin, e.g. {"go":"1.24.1","python":"3.13"}.
+          Unset keys use the toolchain default.
+        required: false
+        type: string
+        default: '{}'
+      coverage-fail-under:
+        description: >-
+          Minimum coverage percent, 0-100. Defaults to 0 so adoption never
+          blocks a repo on day one; raise it in your caller. A gate that can
+          never fail is not a gate, so do not leave this at 0.
+        required: false
+        type: string
+        default: '0'
+permissions:
+  contents: read
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # Placeholder (0) so adoption never blocks a repo on day one. A service repo
+  # raises it with the `coverage-fail-under` input — a value, not a fork of this
+  # file. Set in env so all six jobs read one number.
+  COVERAGE_FAIL_UNDER: ${{ inputs.coverage-fail-under }}
+  # Deterministic builds: do not stamp VCS info into Go binaries.
+  GOFLAGS: '-buildvcs=false'
+
+jobs:
+  # ------------------------------------------------------------- compiled
+  go:
+    name: go
+    if: ${{ inputs.language == 'go' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
+        with:
+          go-version: ${{ fromJSON(inputs.versions).go || 'stable' }}
+          cache-dependency-path: ${{ inputs.working-dir }}/go.sum
+      - name: install
+        working-directory: ${{ inputs.working-dir }}
+        run: go mod download
+      - name: build
+        working-directory: ${{ inputs.working-dir }}
+        run: go build ./...
+      - name: lint
+        uses: golangci/golangci-lint-action@v9
+        with:
+          working-directory: ${{ inputs.working-dir }}
+      - name: test
+        working-directory: ${{ inputs.working-dir }}
+        run: go test -race -coverprofile=coverage.out ./...
+      - name: coverage
+        working-directory: ${{ inputs.working-dir }}
+        run: |
+          go tool cover -func=coverage.out |
+            awk -v min="$COVERAGE_FAIL_UNDER" '
+              /total:/ { gsub(/%/, "", $3); if ($3 + 0 < min + 0) { print "coverage " $3 "% < " min "%"; bad = 1 } }
+              END { exit bad }
+            '
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        with:
+          name: coverage-go
+          path: ${{ inputs.working-dir }}/coverage.out
+          if-no-files-found: ignore
+
+  rust:
+    name: rust
+    if: ${{ inputs.language == 'rust' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+      - name: install
+        working-directory: ${{ inputs.working-dir }}
+        run: cargo fetch
+      - name: lint
+        working-directory: ${{ inputs.working-dir }}
+        run: |
+          cargo fmt --check
+          cargo clippy --all-targets -- -D warnings
+      - name: test
+        working-directory: ${{ inputs.working-dir }}
+        run: cargo test
+      - name: install coverage tool
+        uses: taiki-e/install-action@cargo-llvm-cov
+      - name: coverage
+        working-directory: ${{ inputs.working-dir }}
+        run: cargo llvm-cov --fail-under-lines "$COVERAGE_FAIL_UNDER"
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        with:
+          name: coverage-rust
+          path: ${{ inputs.working-dir }}/coverage.out
+          if-no-files-found: ignore
+
+  # -------------------------------------------------------- interpreted
+  ruby:
+    name: ruby
+    if: ${{ inputs.language == 'ruby' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      # Reads .ruby-version/.tool-versions/mise.toml from working-dir when the
+      # repo pins one, so the worktree and CI agree on the interpreter.
+      - uses: ruby/setup-ruby@v1
+        with:
+          working-directory: ${{ inputs.working-dir }}
+          bundler-cache: true
+      - name: install
+        working-directory: ${{ inputs.working-dir }}
+        run: bundle install
+      - name: lint
+        working-directory: ${{ inputs.working-dir }}
+        run: bundle exec rubocop --parallel
+      - name: test
+        working-directory: ${{ inputs.working-dir }}
+        run: bundle exec rake
+      # The repo's own `rake coverage` task reads COVERAGE_FAIL_UNDER and exits
+      # nonzero below it (see README: a coverage rake task is part of adoption).
+      - name: coverage
+        working-directory: ${{ inputs.working-dir }}
+        run: bundle exec rake coverage
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        with:
+          name: coverage-ruby
+          path: ${{ inputs.working-dir }}/coverage
+          if-no-files-found: ignore
+
+  elixir:
+    name: elixir
+    if: ${{ inputs.language == 'elixir' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: erlef/setup-beam@v1
+        with:
+          elixir-version: ${{ fromJSON(inputs.versions).elixir || '1.18' }}
+          otp-version: ${{ fromJSON(inputs.versions).erlang || '27' }}
+      - name: install
+        working-directory: ${{ inputs.working-dir }}
+        run: mix deps.get
+      - name: lint
+        working-directory: ${{ inputs.working-dir }}
+        run: mix format --check-formatted
+      - name: test
+        working-directory: ${{ inputs.working-dir }}
+        run: mix test
+      # coveralls is a hex dep the service repo declares; it exits nonzero
+      # below the minimum, which is what makes this a gate and not a report.
+      - name: coverage
+        working-directory: ${{ inputs.working-dir }}
+        run: mix coveralls --minimum-coverage "$COVERAGE_FAIL_UNDER"
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        with:
+          name: coverage-elixir
+          path: ${{ inputs.working-dir }}/cover
+          if-no-files-found: ignore
+
+  python:
+    name: python
+    if: ${{ inputs.language == 'python' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: astral-sh/setup-uv@v10.2.0
+        with:
+          working-directory: ${{ inputs.working-dir }}
+          enable-cache: true
+      # Only for the documented no-uv fallback; uv does not need it.
+      - uses: actions/setup-python@v7
+        with:
+          python-version: ${{ fromJSON(inputs.versions).python || '3.13' }}
+      - name: install
+        working-directory: ${{ inputs.working-dir }}
+        run: |
+          if command -v uv >/dev/null 2>&1; then uv sync --frozen; else pip install -e '.[dev]'; fi
+      - name: lint
+        uses: astral-sh/ruff-action@v4.1.0
+        with:
+          src: ${{ inputs.working-dir }}
+      - name: test
+        working-directory: ${{ inputs.working-dir }}
+        run: |
+          if command -v uv >/dev/null 2>&1; then
+            uv run pytest --cov --cov-report=xml
+          else
+            pytest --cov --cov-report=xml
+          fi
+      - name: coverage
+        working-directory: ${{ inputs.working-dir }}
+        run: |
+          if command -v uv >/dev/null 2>&1; then uv run coverage report --fail-under="$COVERAGE_FAIL_UNDER"; fi
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        with:
+          name: coverage-python
+          path: ${{ inputs.working-dir }}/coverage.xml
+          if-no-files-found: ignore
+
+  node:
+    name: node
+    if: ${{ inputs.language == 'node' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: ${{ fromJSON(inputs.versions).node || '22' }}
+          cache: npm
+          cache-dependency-path: ${{ inputs.working-dir }}/package-lock.json
+      - name: install
+        working-directory: ${{ inputs.working-dir }}
+        run: npm ci
+      - name: lint
+        working-directory: ${{ inputs.working-dir }}
+        run: npm run lint
+      - name: test
+        working-directory: ${{ inputs.working-dir }}
+        run: npm test
+      # --if-present keeps day-one adoption green; drop it once the script exists
+      # so a missing coverage step fails the build.
+      - name: coverage
+        working-directory: ${{ inputs.working-dir }}
+        run: npm run coverage --if-present
+      - uses: actions/upload-artifact@v7
+        if: ${{ always() }}
+        with:
+          name: coverage-node
+          path: ${{ inputs.working-dir }}/coverage
+          if-no-files-found: ignore

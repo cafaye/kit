@@ -1,0 +1,41 @@
+# kit template — Elixir/OTP service image. Copy to docker/Dockerfile.
+#
+#   docker build -f docker/Dockerfile --build-arg ELIXIR_VERSION=1.18.3 -t svc .
+#
+# STRICTNESS NOTES
+#   - Two stages, `-slim` final. The ERTS (the BEAM runtime) is the whole
+#     runtime, so this file never removes it; what we drop is the C toolchain,
+#     git, and the hex/rebar build tools.
+#   - deps are compiled in the builder, in release mode, and `_build` is copied
+#     as-is. Compiling in the runtime stage means a slower first boot and an
+#     image that changes whenever MIX_ENV leaks in from the environment.
+#   - hex/rebar are installed as the app user, in the runtime stage, writing to
+#     /app/.mix — never as root into /root/.mix, which the app user cannot read.
+ARG ELIXIR_VERSION=1.18.3
+ARG OTP_VERSION=27.3.4
+
+FROM elixir:${ELIXIR_VERSION}-otp-${OTP_VERSION}-slim AS build
+ENV MIX_ENV=prod
+WORKDIR /app
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends build-essential git \
+    && rm -rf /var/lib/apt/lists/*
+COPY mix.exs mix.lock ./
+RUN mix local.hex --force && mix local.rebar --force
+RUN mix deps.get --only prod && mix deps.compile
+COPY . .
+RUN mix compile && mix release
+
+FROM elixir:${ELIXIR_VERSION}-otp-${OTP_VERSION}-slim AS runtime
+ENV MIX_ENV=prod HOME=/app
+WORKDIR /app
+RUN groupadd --system --gid 10001 app \
+    && useradd --system --uid 10001 --gid app --create-home app
+COPY --from=build --chown=app:app /app/_build /app/_build
+COPY --from=build --chown=app:app /app/deps /app/deps
+COPY --chown=app:app . /app
+USER app
+RUN mix local.hex --force && mix local.rebar --force
+EXPOSE 4000
+# `app` is the :app name from mix.exs; mix release writes bin/app.
+ENTRYPOINT ["/app/bin/app", "start"]
