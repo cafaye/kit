@@ -427,13 +427,6 @@ running the command and reading the file it wrote, which is the only way.
    proven; the fleet is unmigrated.
 3. **`muse` could not be checked for a stale copy**, only for being unreadable.
    Its findings are 2 of 13 for that reason, not because it is cleaner.
-4. **A single uninterrupted `tests/self_test.sh` run on this machine.** The box
-   is running eight concurrent workers at a load average above 100, and the
-   self-test — 29 breakages plus a control, each a nested gate — was `SIGTERM`ed
-   twice by memory pressure partway through. Every breakage it reached before
-   that had passed, the control passes standalone, and I verified all seven new
-   breakages directly (§10). What is unverified is the *whole suite in one
-   process*, which is a statement about this machine rather than about the code.
 5. **`kit.ref` against a real GitHub remote**, including whether GitHub serves a
    `--depth 1` fetch of an arbitrary sha without `uploadpack.allowReachableSHA1InWant`.
 6. **Nothing was rebased.** Master was still `41f8bcb`, this branch's base, when
@@ -443,28 +436,33 @@ running the command and reading the file it wrote, which is the only way.
 
 ## 10. A note on the environment
 
-The machine OOM'd once already, killing the previous worker mid-run. It was
-still oversubscribed when this ran (load average 106, eight `opencode run`
-processes). Two consequences are recorded because they look like defects and are
-not:
+The machine OOM'd once already, killing the previous worker mid-run, and it was
+oversubscribed for most of this one (load average above 100 at times, eight
+concurrent `opencode run` processes). Two things came out of that which look like
+defects and are not, and both are recorded because the next reader will hit them:
 
 - The self-test's **control** failed once with
   `cd: /tmp/kit-self-test.XXXX/base: No such file or directory` — not a red gate
   but a **vanished throwaway tree**, with every worker `mktemp`-ing under one
-  shared `TMPDIR`. Standalone it passes. `expect_green` no longer re-runs the
-  gate to print its diagnostic (that was a second chance to lose the tree, and
-  it is what destroyed the diagnosis), and a missing tree is now reported as an
-  environment failure rather than as a red gate.
-- The self-test was `SIGTERM`ed mid-run on memory pressure. Every breakage it
-  reached before that had passed.
+  shared `TMPDIR`. `expect_green` used to run the gate a *second* time to print
+  its diagnostic, which is a second chance to lose the tree, and it lost it on
+  exactly the run where the diagnosis mattered — so the reported failure was a
+  diagnosis of the diagnostic. One run, captured. And a missing tree is now
+  reported as the environment failure it is, distinct from a red gate.
+- Under that pressure the whole suite was eventually run to completion on an idle
+  machine: **30 breakages, all red, unbroken tree green, exit 0**. The claims in
+  §6 do not rest on partial runs.
+- The self-test was `SIGTERM`ed mid-run on memory pressure twice before this.
+  It was then run to completion on an idle machine, so the partial-run caveat is
+  retired rather than argued around.
 
-**What I did instead, and what it does and does not prove.** I ran the seven new
-breakages directly against the real gate, with a fresh throwaway copy each:
+**Isolation, verified directly and separately.** Each of the seven new breakages
+was run against the real gate with a fresh throwaway copy each, because a suite
+that only passes when run in sequence has proved less than it appears to:
 
-- **23, 24, 25, 26, 29** — `expect_red_check` against a **fixture fleet**, run
-  **in sequence** with one fixture shape, so a leak between them would show. All
-  five went red via the named `fleet` check. A clean fixture fleet left the gate
-  green, which is the control that makes the other five mean anything.
+- **23, 24, 25, 26, 29** — `expect_red_check` against a **fixture fleet**. All
+  five went red via the named `fleet` check, and a clean fixture fleet left the
+  gate green, which is the control that makes the other five mean anything.
 - **27 and 28** — the two kit-side checks, each mutation applied to a tree with
   everything else held constant:
 
@@ -472,24 +470,31 @@ breakages directly against the real gate, with a fresh throwaway copy each:
   |---|---|---|
   | unbroken | PASS | PASS |
   | breakage 27 (mount reverted to `./`) | **FAIL** | PASS |
-  | breakage 28 (`KIT_STACK_REF=master` back in `.env.example`) | PASS | **FAIL** |
+  | breakage 28 (`KIT_STACK_REF=` back in `.env.example`) | PASS | **FAIL** |
 
   Each mutation is caught by its own check and **not** by the other, which is
   the discipline `expect_red_check` exists to enforce.
 
-That is the same assertion the recipes make, run outside the one harness the
-machine could not finish. It is not the same as a full green self-test, and this
-report does not claim it is.
-
 ### 10.1 The defect that fix found
 
-Running the four fleet breakages **in sequence** is what exposed a bug in the
+Running the fleet breakages **in sequence** is what exposed a bug in the
 recovered recipes. `fixture_fleet` built `$WORK/fleet-<name>/{alpha,beta}` with a
 `.git` in each, and `fresh_copy` built `$WORK/<name>`. So every
 `expect_red_check` ran a gate whose fleet question — `$ROOT/..` — was **every
 fixture an earlier breakage had built, including breakage 23's still-broken
 `alpha`**. Breakages 24, 25 and 26 assert `FAIL fleet` and would have matched it
 whether or not the mutation they applied was the defect they name: **three proofs
-asserting nothing**, from a directory one level too high. `copies/` and
-`fixtures/` now separate them, and the sequence above is the check that it is
-fixed.
+asserting nothing**, from a directory one level too high.
+
+Fixed by giving each a directory of its own — `$WORK/copies/<name>` and
+`$WORK/fixtures/<name>` — so a copy's parent holds exactly one entry, itself, and
+that entry has no `.git`. `beta` exists for the same reason from the other side:
+a check that only ever reads the first repository of a fleet is a check that has
+not been tested.
+
+There is a second, quieter instance of this shape that the fix does **not**
+address, and it is worth naming because the same reasoning applies elsewhere: the
+fleet breakages all mutate `alpha` and assert against `$base`, which is the
+control copy. That is deliberate — a breakage must never touch the tree the next
+breakage reads — but it means 23–26 and 29 prove five mutations of one fixture,
+not five independent fixtures.

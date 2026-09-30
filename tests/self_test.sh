@@ -130,12 +130,12 @@ copy_name=""
 # Every `expect_red_check` runs `validate.sh` inside a throwaway copy, and
 # `validate.sh` asks `fleet_check.py` about `$ROOT/..` — the copy's PARENT. If
 # that parent is `$WORK`, then every fixture fleet an earlier breakage built
-# (`$WORK/fleet-<name>/{alpha,beta}`, each with a `.git`) is a repository the
-# gate can see, and the first one's `svcbad` is still broken. So breakage 23's
+# (`$WORK/fixtures/<name>/{alpha,beta}`, each with a `.git`) is a repository the
+# gate can see, and the first one's `alpha` is still broken. So breakage 23's
 # defect makes EVERY LATER breakage go red, and breakages 24-26 would pass on
 # `FAIL fleet` whether or not the mutation they applied was the defect they name.
 #
-# Three proofs asserting nothing, caused by a directory that was one level too
+# Four proofs asserting nothing, caused by a directory that was one level too
 # high. `copies/` is a directory that holds copies and nothing else, so a copy's
 # parent contains exactly one entry — itself — and that entry has no `.git`.
 fresh_copy() {
