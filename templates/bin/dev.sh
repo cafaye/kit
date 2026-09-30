@@ -945,9 +945,17 @@ pin_cmd() {
   local old
   old="$(stack_ref)"
 
-  local old_dir="" new_dir
+  # The same-ref case FIRST, before anything is fetched. Pinning to the ref you
+  # are already on is not a move, it is a no-op, and answering it by fetching two
+  # copies of the same commit is both slow and a lie about what happened.
+  if [ "$old" = "$new" ]; then
+    step "already pinned to $new"
+    info "nothing to do. The stack is unchanged."
+    return 0
+  fi
+
+  local new_dir old_dir="" old_cache
   new_dir="$(stack_home)/$new"
-  local old_cache
   old_cache="$(stack_home)/$old"
   if stack_is_usable "$old_cache" "$old"; then
     old_dir="$old_cache"
@@ -955,22 +963,44 @@ pin_cmd() {
     old_dir="$(stack_setting KIT_STACK_DIR "")"
   fi
 
+  # FETCH BOTH SIDES, or say plainly that it could not.
+  #
+  # The first version only fetched the NEW ref, inside the branch that already
+  # needed the old one on disk — so on a machine that had never run `bin/dev` it
+  # printed "the current ref is not on this machine, so the diff cannot be computed
+  # here" and wrote the pin anyway. That is the command's entire reason for
+  # existing: it is the one place a developer sees what they are about to change,
+  # and a first `bin/dev pin` — the first use, and the use most likely to BE the
+  # upgrade — was the one case where it could not.
+  #
+  # The cache is keyed by ref, so fetching both is two directories that do not
+  # touch each other. Offline is honoured rather than attempted:
+  # `KIT_STACK_OFFLINE=1` says the diff needs the network and still writes the
+  # pin, because refusing to record a move somebody has already decided on because
+  # the laptop is on a train would be a worse answer than saying so.
+  local offline
+  offline="$(stack_setting KIT_STACK_OFFLINE 0)"
   step "what changes between $old and $new"
-  if [ -z "$old_dir" ]; then
-    info "the current ref ($old) is not on this machine, so the diff cannot be computed here."
-    info "Run it on a machine with the cache warm, or fetch the old ref first:"
-    info "  git -C $(stack_home) init $old_dir 2>/dev/null || true"
-  elif [ "$old" = "$new" ]; then
-    info "same ref — nothing to do."
-    return 0
+  if [ -z "$old_dir" ] && [ "$offline" != "1" ]; then
+    info "fetching the current ref so the diff is real rather than a claim"
+    fetch_stack "$old" "$old_cache" || true
+    stack_is_usable "$old_cache" "$old" && old_dir="$old_cache"
+  fi
+  if [ ! -d "$new_dir" ] && [ "$offline" != "1" ]; then
+    fetch_stack "$new" "$new_dir" || true
+  fi
+
+  if [ -z "$old_dir" ] || [ ! -d "$new_dir" ]; then
+    info "the stack diff could NOT be computed: one of the two refs is not on this"
+    info "machine. The pin is still written — refusing to record a move you have"
+    info "already decided on is not this command's job — but read what you are"
+    info "pinning before you commit it:"
+    info "  git -C <a kit checkout> diff --stat $old $new -- templates/compose"
   else
-    # The old tree is already on disk and the new one is fetched into a
-    # directory keyed by its ref, so this is two real directories and `diff -r`
-    # on the one subtree that is the stack. A diff of the whole repository would
-    # be the classifier's job, not this script's.
-    [ -d "$new_dir" ] || {
-      fetch_stack "$new" "$new_dir"
-    }
+    # Two real directories, and `diff -r` over the one subtree that IS the stack.
+    # A diff of the whole repository would be the classifier's job and not this
+    # script's: what a developer needs here is which CONTAINERS change, because
+    # that is what the move costs them.
     local changed
     changed="$(diff -rq "$old_dir/templates/compose" "$new_dir/templates/compose" 2>/dev/null || true)"
     if [ -z "$changed" ]; then
@@ -996,11 +1026,16 @@ pin_cmd() {
   local tmp
   tmp="$REF_FILE.new.$$"
   {
-    printf '# The kit ref this repository runs. One line: a 40-character commit'
-    printf '# sha, or a v<semver> tag. NEVER a branch.
-'
-    printf '# Move it with:  bin/dev pin <ref>   (it prints the stack diff first)
-'
+    # `printf '%s\n' TEXT` and NOT `printf 'TEXT\n'`. In a single-quoted shell
+    # string `\n` is two characters, so the string runs on past the closing quote
+    # and the next line is parsed as code — which is exactly what happened here,
+    # and it left the emitted `kit.ref` reading
+    #   # ...a 40-character commit# sha, or a v<semver> tag...
+    # with two comment lines run together by a missing newline. The format string
+    # and the text are separate arguments, so there is no escape to get wrong.
+    printf '%s\n' '# The kit ref this repository runs. One line: a 40-character commit'
+    printf '%s\n' '# sha, or a v<semver> tag. NEVER a branch.'
+    printf '%s\n' '# Move it with:  bin/dev pin <ref>   (it prints the stack diff first)'
     printf '%s\n' "$new"
   } >"$tmp"
   mv "$tmp" "$REF_FILE"

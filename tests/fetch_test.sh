@@ -338,6 +338,86 @@ else
   pass "a vendored copy at a different ref is refused, not silently used"
 fi
 
+# ---------------------------------------------------------------------------
+# 7. `bin/dev pin` — the DELIBERATE upgrade
+# ---------------------------------------------------------------------------
+# The command exists for one reason: to show what changes before it writes the
+# pin. It is the only place a developer sees the consequence of the move, and the
+# first `bin/dev pin` is the first use and the most likely to BE the upgrade.
+#
+# Both assertions below are for bugs this file found by running the command rather
+# than by reading it.
+pin_service="$WORK/svc-pin"
+make_service "$pin_service" "$PIN_SHA"
+rm -rf "$WORK/cache-pin"
+
+# A ref whose stack really does differ, so "the diff is empty" cannot be what a
+# broken implementation produces. A second commit changes one line of the compose
+# file, and a tag is cut on it.
+# A SECOND remote, carrying a second commit, because the first version of this
+# built the second seed by copying `$SEED` — which the fixture block deletes once
+# the bare remote exists, so the copy failed and the script aborted rather than
+# asserting anything. A test that dies in its own setup asserts nothing at all,
+# and it looks exactly like a passing run that stopped early.
+PIN_SEED2="$WORK/seed2"
+git clone --quiet "$REMOTE" "$PIN_SEED2"
+printf '\n# kit-13 fetch_test: a change the pin diff must notice\n' \
+  >>"$PIN_SEED2/templates/compose/docker-compose.yml"
+git -C "$PIN_SEED2" add -A
+git -C "$PIN_SEED2" -c user.email=t@example.invalid -c user.name=kit13 commit -q -m "second"
+PIN_SHA2="$(git -C "$PIN_SEED2" rev-parse HEAD)"
+rm -rf "$WORK/kit-remote2.git"
+git clone --bare --quiet "$PIN_SEED2" "$WORK/kit-remote2.git"
+sed -i.bak "s|^KIT_STACK_URL=.*|KIT_STACK_URL=file://$WORK/kit-remote2.git|" \
+  "$pin_service/.env" && rm -f "$pin_service/.env.bak"
+
+run_dev "$pin_service" pin "$PIN_SHA2"
+if [ "$DEV_EC" -ne 0 ]; then
+  fail "bin/dev pin to a second commit failed (exit $DEV_EC)"
+  printf '%s\n' "$DEV_OUT" | tail -8 | sed 's/^/        /'
+elif printf '%s' "$DEV_OUT" | grep -q 'cannot be computed'; then
+  # The bug this asserts: on a COLD cache — the first use, and the one that
+  # matters — the command said it could not compute the diff and wrote the pin
+  # anyway. The whole reason the command exists was absent on its first run.
+  fail "bin/dev pin gave up on the diff from a cold cache, which is the FIRST use"
+  printf '%s\n' "$DEV_OUT" | tail -8 | sed 's/^/        /'
+elif ! printf '%s' "$DEV_OUT" | grep -q 'docker-compose.yml'; then
+  fail "bin/dev pin printed a pin message but no diff, so the move was invisible"
+  printf '%s\n' "$DEV_OUT" | tail -8 | sed 's/^/        /'
+else
+  pass "bin/dev pin fetches both refs and prints a REAL stack diff from a cold cache"
+fi
+
+if [ "$(tail -1 "$pin_service/kit.ref")" = "$PIN_SHA2" ]; then
+  pass "bin/dev pin wrote kit.ref, and the sha is the last line"
+else
+  fail "kit.ref does not end with the new sha: $(cat "$pin_service/kit.ref" | tr '\n' '|')"
+fi
+
+# The header it writes. A `printf 'text\n'` inside single quotes emits a literal
+# backslash-n, and two such lines run together into `# ...commit# sha, or...` —
+# a comment block that reads as one garbled line. Asserted on the SHAPE (every
+# comment line starts with `# `, none contains a second `#`), not on the wording.
+if grep -v '^#' "$pin_service/kit.ref" | grep -q '#'; then
+  fail "a comment line in kit.ref contains a second '#' — two comment lines were written as one"
+  sed 's/^/        /' "$pin_service/kit.ref"
+else
+  pass "the comment header bin/dev pin writes is one '#' per line"
+fi
+
+# The same ref is a no-op, and says so. Pinning to the ref you are already on is
+# not a move; answering it by fetching two copies of one commit would be a lie
+# about what happened.
+run_dev "$pin_service" pin "$PIN_SHA2"
+if [ "$DEV_EC" -ne 0 ]; then
+  fail "bin/dev pin to the CURRENT ref exited $DEV_EC"
+elif ! printf '%s' "$DEV_OUT" | grep -qiE 'nothing to do|unchanged|already pinned'; then
+  fail "bin/dev pin to the ref already pinned did not say it was a no-op"
+  printf '%s\n' "$DEV_OUT" | tail -6 | sed 's/^/        /'
+else
+  pass "bin/dev pin to the ref already pinned is a no-op, and says so"
+fi
+
 printf '\n'
 if [ "$failures" -ne 0 ]; then
   echo "FAIL: fetch — $failures assertion(s) failed."
