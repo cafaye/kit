@@ -667,7 +667,10 @@ Stated here rather than in a footnote.
     and appeared complete, header and recipe together, between two of my
     commits. I could not attribute it: there are four or five other workers on
     this machine in sibling worktrees, and I have no way to see which one wrote
-    here.
+    here. It is not a stray file either — the other writer **committed to this
+    branch**: `8f86f1a fix(gate): the header/recipe check could not see a recipe
+    inside an `if`` sits between two of my commits, repairing the very check
+    whose torn read I had just been hit by.
 
     Three consequences, and I would rather state them than tidy them away:
 
