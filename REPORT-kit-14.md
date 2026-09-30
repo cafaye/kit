@@ -1045,18 +1045,22 @@ that nobody witnessed is the thing §7.10 is about.
   green on the pinned Ruby 4.0.1; and, with `/usr/bin/ruby` 2.6.10 forced onto
   `PATH`, the single clear "too old" FAIL quoted in §10.5 with **no**
   `NoMethodError` anywhere in the output.
-- A full `bash tests/validate.sh` reached the end of the **static** phase and
-  **all six telemetry suites PASS** — go, **ruby**, elixir, python, node, rust —
-  with **zero FAIL lines in the whole log** — before the harness sent it
-  `SIGKILL` at the `observability` phase. That kill is the machine, not the
-  tree: it carried several other workers' full gate runs concurrently.
+- `bash tests/validate.sh --no-observability` — **green, exit 0, zero `FAIL`
+  lines in the whole log**: the static phase, all six telemetry suites
+  (go, **ruby**, elixir, python, node, rust), `staleness_test` at 26 cases, and
+  `self_test` at 31 breakages red with the unbroken tree green. Run to
+  completion, from my own hands.
+- A first, uninterrupted `bash tests/validate.sh` (with observability) reached
+  the end of the **static** phase and **all six telemetry suites PASS** before
+  the harness sent it `SIGKILL` at the `observability` phase. That kill is the
+  machine, not the tree: it was carrying several other workers' full gate runs
+  concurrently.
 
-**Not observed, and therefore not claimed:** a single uninterrupted full
-`bash tests/validate.sh` to its final `PASS: every check passed.` line, and
-therefore the two docker-requiring observability proofs
-(`tests/canary_test.sh`, `tests/no_telemetry_in_readiness.sh`), which I have
-never seen run to completion on this branch. The `--no-observability` run in
-§10.6b is the closest substitute and it is not the same claim.
+**Not observed, and therefore not claimed:** the two docker-requiring
+observability proofs (`tests/canary_test.sh`,
+`tests/no_telemetry_in_readiness.sh`). The run below used `--no-observability`
+because the first attempt was SIGKILLed at exactly that phase, so I have still
+never seen those two complete on this branch.
 
 ### 10.6b The gate as last run
 
@@ -1069,14 +1073,24 @@ PASS templates/otel/elixir  (elixir test suite)
 PASS templates/otel/python  (python3 test suite)
 PASS templates/otel/node    (node test suite)
 PASS templates/otel/rust    (rustc test suite)
+
+PASS: staleness_test — 26 case(s), including the red proof.
 PASS: self_test — all 31 breakages went red, and the unbroken tree is green.
+
 PASS: every check passed.
 note: 2 check(s) skipped — reported above, never hidden.
+$ echo $?
+0
 ```
 
-The two skips are the TypeScript tier files that `node --check` cannot read
-(`templates/tier/bun/tier.test.ts`, `templates/tier/node/tier.test.ts`) — a
-reported gap, unchanged by this work, and reported rather than hidden.
+**Zero `FAIL` lines in the whole log.** The two skips are the TypeScript tier
+files that `node --check` cannot read (`templates/tier/bun/tier.test.ts`,
+`templates/tier/node/tier.test.ts`) — a reported gap, unchanged by this work,
+and reported rather than hidden.
+
+Suite counts pass and skip, kept apart as the brief requires: **6 telemetry
+suites passed, 31 self-test breakages red, 26 staleness cases, 2 skips, 0
+fails.**
 
 ### 10.7 A second, unrelated pre-existing defect found on the way
 
