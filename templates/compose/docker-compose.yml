@@ -165,10 +165,42 @@ services:
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
-      # `pg_isready` alone returns true before the init scripts finish, which is
-      # the classic "migrations failed against a database that was not ready"
-      # flake. The -U/-d pair makes it check the real thing.
-      test: ["CMD-SHELL", "pg_isready -U ${KIT_POSTGRES_USER:-cafaye} -d ${KIT_POSTGRES_DB:-cafaye_platform}"]
+      # A REAL QUERY, against the database this container actually has.
+      #
+      # This line was wrong for a long time and the comment above it said so out
+      # loud: "`pg_isready` alone returns true before the init scripts finish …
+      # The -U/-d pair makes it check the real thing." Measured, inside the
+      # container, against a database and a role that DO NOT EXIST:
+      #
+      #   $ pg_isready -U identity -d nosuchdb -q ; echo $?
+      #   0
+      #   $ psql -U identity -d nosuchdb -tAc 'select 1' >/dev/null ; echo $?
+      #   2
+      #
+      # `pg_isready` reports whether the server is ACCEPTING CONNECTIONS. Its
+      # `-U` and `-d` do not authenticate and do not select — they are
+      # diagnostics, and the readiness answer is 0 either way. So the `-U/-d`
+      # pair bought nothing, and the claim that this probe "makes it check the
+      # real thing" was decoration: the stack reported postgres ready on a
+      # container whose named database did not exist, which is the exact
+      # "migrations failed against a database that was not ready" flake the
+      # comment says it exists to prevent.
+      #
+      # `psql … -tAc 'select 1'` is what actually connects, authenticates as the
+      # role, and opens the named database. Against a database that does not
+      # exist it exits 2; against the real one it exits 0. That is the difference
+      # between a probe and a decoration.
+      #
+      # `$$`, because compose interpolates `$VAR` in this file before YAML is
+      # parsed, so quoting does not protect it — `$POSTGRES_USER` rendered as
+      # `-U ""`. `$$` renders one literal `$` and the container's shell expands
+      # it against the MERGED environment, which is what makes the probe follow a
+      # service that renamed its own database instead of checking kit's default
+      # inside someone else's container.
+      test:
+        - CMD-SHELL
+        - pg_isready -q -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" &&
+          psql -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -tAc 'select 1' >/dev/null
       interval: 5s
       timeout: 3s
       # retries * interval is the readiness budget: 30s to accept connections,

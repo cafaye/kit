@@ -3,11 +3,13 @@
 **Worktree:** `worker/kit-13-observe` · **Base:** `master` at `41f8bcb`
 
 The brief's premise, checked rather than assumed: `kit/templates/compose/` ships a
-complete observability platform, and **no service used it**. No repository had an
-`otel-collector.yml`. Six of the twelve carried a bespoke 44–86 line
-`docker-compose.yml` whose only infrastructure was a Postgres. One of the nine
-adopted `bin/dev`. This packet gives the stack a callable path and a gate that
-says, loudly, which repositories are not on it.
+complete observability platform, and **no service used it**. No repository in the
+fleet had an `otel-collector.yml`. **Six** carry a bespoke 44–86 line
+`docker-compose.yml` whose only infrastructure is a Postgres; **nine** ship none
+at all; **one** adopted `bin/dev`. (The brief said "nine services ship a bespoke
+44–86 line compose" and "1 of 9 adopt `bin/dev`" — the measured fleet is 6 and 1.
+The numbers here are the measured ones.) This packet gives the stack a callable
+path and a gate that says, loudly, which repositories are not on it.
 
 ---
 
@@ -60,14 +62,45 @@ failure the pin exists to prevent. Refused, **before any network call**:
 bin/dev pin v0.4.0        # prints the stack diff between the two refs, THEN writes kit.ref
 ```
 
-It writes the pin and nothing else. It does not touch `.env` beyond nothing, does
-not run compose, and does not upgrade images — the containers that come up next are
-a separate, visible step.
+It writes the pin and nothing else. It does not touch `.env`, does not run
+compose, and does not upgrade images — the containers that come up next are a
+separate, visible step.
 
-**Proven by `tests/fetch_test.sh`, 14 assertions, all executed.** The remote is a
+**Two bugs this command had, and neither was visible by reading it.**
+
+1. **The diff was never computed on a cold cache.** `pin_cmd` used the ref already
+   on disk and fetched only the *new* one, so on a machine that had never run
+   `bin/dev` — the first use, and the use most likely to *be* the upgrade — it
+   printed "the current ref is not on this machine, so the diff cannot be computed
+   here" and wrote the pin anyway. The command's entire reason for existing was
+   absent on the one run that mattered. It now fetches **both** refs: the cache is
+   keyed by ref, so they are two directories that cannot interfere, `KIT_STACK_OFFLINE=1`
+   is honoured rather than attempted, and when one side genuinely cannot be
+   obtained it says so plainly and names the exact `git diff` to run by hand
+   instead of reporting a success it cannot back.
+2. **The header it wrote was garbled.** `printf '# ...commit\n'` inside single
+   quotes emits a literal backslash-`n`, so the string ran on past the closing
+   quote and the following line was parsed as shell. The emitted `kit.ref` read
+
+   ```
+   # The kit ref this repository runs. One line: a 40-character commit# sha, or a v<semver> tag. NEVER a branch.
+   ```
+
+   — two comment lines run together into one. `printf '%s\n' TEXT` has no escape
+   to get wrong.
+
+`bin/dev pin` to the ref **already** pinned is a no-op and says so. That check
+runs *first*, before anything is fetched: pinning to where you already are is not
+a move, and answering it by fetching two copies of one commit is both slow and a
+false account of what happened.
+
+**Proven by `tests/fetch_test.sh`, 18 assertions, all executed.** The remote is a
 bare repository built from this tree and fetched over `file://`, so the suite needs
 no network — a CI runner and a laptop on a train get the same answer, and a flaky
-network can never be mistaken for a broken gate.
+network can never be mistaken for a broken gate. Four of the eighteen exist only
+because the command above was *run* against a real second commit; they assert the
+diff names a changed file, that the sha is the last line of `kit.ref`, that the
+comment header is one `#` per line, and that a same-ref pin is announced.
 
 ---
 

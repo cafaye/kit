@@ -79,14 +79,17 @@
 #               authoritative, every edit to it changes nothing, and a
 #               developer has no way to find out.
 #           26. a `kit.ref` holding `master` -> the pin check goes red.
-#   27-28. the two kit-side halves of the same packet -> the named check goes red.
+#   27-29. the override rules, each against the named check.
 #           27. a vendor config mount that stopped resolving from the fetched
 #               tree. Found by RUNNING the stack; `docker compose config`
 #               renders the same project and every other check stays green.
 #           28. the pin moved back into `.env`, where it is git-ignored and so
 #               exists on exactly one machine.
+#           29. a service publishes a port on a service kit already ships. The
+#               merge appends rather than substitutes, so nothing errors and the
+#               port the developer meant to move is still bound.
 #
-#   Nine of them (7-10, 11, 12, 19, 20, 27, 28) additionally assert WHICH check
+#   Ten of them (7-10, 11, 12, 19, 20, 23-26, 27-29) additionally assert WHICH check
 #         went red. Every other breakage only proves the gate can fail; those
 #         prove the check written for that defect is still load-bearing, which is
 #         a different claim and the one that decays silently. 21 and 22 assert
@@ -213,14 +216,41 @@ expect_red_script() {
   fi
 }
 
+# ONE run, and its output is CAPTURED rather than re-fetched.
+#
+# The first version ran the gate twice: once discarding the output to read the
+# exit status, and again to print the diagnostic. That is a second chance to
+# lose the throwaway tree, and on the run where it mattered it lost it — the
+# control was reported as
+#
+#   FAIL self_test: unbroken tree — the gate is RED on an unbroken tree
+#   self_test.sh: line 223: cd: /tmp/kit-self-test.XXXX/base: No such file or directory
+#
+# which is a diagnosis of the DIAGNOSTIC, not of the gate. The gate had already
+# said something; nobody could read it. `|| ec=$?` rather than a bare assignment
+# is what keeps `set -e` from killing the harness before the status is read —
+# the same trap `expect_red_lang` documents, and the reason it is written out
+# again here rather than shared: the harness has no library.
 expect_green() {
   local label="$1" dir="$2"
   shift 2
-  if (cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" >/dev/null 2>&1); then
+  local out ec=0
+  if [ -d "$dir" ]; then
+    out="$(cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" 2>&1)" || ec=$?
+  else
+    # Distinct from a red gate, because it is: the tree is gone, not failing.
+    printf 'FAIL self_test: %s — the throwaway copy %s does not exist\n' "$label" "$dir"
+    printf '       Every worker on this machine mktemps under the same TMPDIR, so a\n'
+    printf '       sibling that deleted its own tree broadly can delete this one. That\n'
+    printf '       is an environment failure and NOT evidence about the gate.\n'
+    failures=$((failures + 1))
+    return
+  fi
+  if [ "$ec" -eq 0 ]; then
     printf 'PASS self_test: %s — the gate is green on an unbroken tree\n' "$label"
   else
-    printf 'FAIL self_test: %s — the gate is RED on an unbroken tree\n' "$label"
-    (cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" 2>&1 | tail -20 | sed 's/^/       /')
+    printf 'FAIL self_test: %s — the gate is RED on an unbroken tree (exit %s)\n' "$label" "$ec"
+    printf '%s\n' "$out" | grep -E '^(FAIL|note:|  -|       )' | tail -20 | sed 's/^/       /'
     failures=$((failures + 1))
   fi
 }

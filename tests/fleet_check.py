@@ -19,7 +19,7 @@ WHAT IT IS FOR
          infrastructure — a `postgres` container of its own, a collector
          config of its own. It drifts, and nothing notices, because the file
          parses and the container starts.
-      2. WEAKENED BOUNDARY. The service overrides the collector's config
+      2. WEAKENED BOUNDARY, and a misread override. The service overrides the collector's config
          mount, its command or its image. That file carries the redaction
          allowlist, DERIVED from core's schemas, and a service that owns it is
          shipping a telemetry boundary nobody derived — so prompt content
@@ -314,6 +314,37 @@ def check_override_surface(repo: str, name: str, compose: dict, problems: list) 
                     f"content leaves the process inside it. To use your own backend, set "
                     f"<SERVICE>_OTEL_ENDPOINT, which is the only contract."
                 )
+
+    # A `ports:` on a service kit ALREADY SHIPS. Compose MERGES a second file
+    # per key, and `ports` is a list, so a second file's entries APPEND rather
+    # than replace. A service that writes
+    #
+    #     services:
+    #       postgres:
+    #         ports: ["15433:5432"]
+    #
+    # gets postgres listening on 15500 AND on 15433 — which is not the override
+    # it reads like, and it collides with whatever else wanted 15433. Measured
+    # against `docker compose config` rather than assumed; the unsurprising
+    # merge semantics are exactly the ones that bite.
+    #
+    # The documented way to move a published port is the VARIABLE, in `.env`:
+    # `KIT_POSTGRES_PORT=15433`. That is a different mechanism, it replaces
+    # rather than appends, and it is the only one the port-block rule in
+    # kit's own compose file can see.
+    for kit_name in _kit_images:
+        cfg = services.get(kit_name)
+        if isinstance(cfg, dict) and cfg.get("ports"):
+            published = ", ".join(str(p) for p in cfg["ports"])
+            problems.append(
+                f"{name}/{kit_name}: publishes ports ({published}) in a file that is "
+                f"MERGED with the fetched stack, not substituted for it. Compose "
+                f"appends a second file's `ports:` list rather than replacing it, so "
+                f"this repository ends up with postgres on kit's port AND on this one. "
+                f"Move the port with its variable in .env instead "
+                f"(KIT_POSTGRES_PORT, KIT_REDIS_PORT, …) — a variable replaces, a list "
+                f"appends."
+            )
 
     for backend in AGPL_BACKENDS:
         svc = services.get(backend)
