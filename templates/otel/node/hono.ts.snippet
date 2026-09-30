@@ -1,0 +1,153 @@
+// kit template — wire W3C trace propagation into a Bun/Hono/TypeScript service
+// with the upstream OpenTelemetry SDK, instead of the hand-rolled codec.
+//
+// THIS IS THE SUPPORTED PATH FOR A NEW SERVICE. `traceparent.mjs` exists for the
+// cases the SDK does not cover: a webhook signer, a test that asserts
+// propagation without standing up a tracer. If you are serving HTTP, use this.
+//
+// This is a SNIPPET, not a file to copy verbatim. Versions are in pins.md; kit
+// vendors nothing and `bun add` is how you take the dependency.
+//
+// WHAT IT DOES FOR YOU
+//   - Reads an inbound `traceparent` and continues it (W3CTraceContextPropagator
+//     is named explicitly below rather than left to the default).
+//   - Writes `traceparent` and `tracestate` on every outbound fetch.
+//   - Never rejects a request over a malformed header. §3.2.2.3 says ignore it.
+//
+// SPEC: W3C Trace Context, W3C Recommendation 23 November 2021
+//       https://www.w3.org/TR/trace-context/
+//
+// ---------------------------------------------------------------------------
+// bun add @opentelemetry/api@2.0.0
+// bun add @opentelemetry/sdk-trace-base@2.0.0
+// bun add @opentelemetry/exporter-trace-otlp-proto@0.57.0
+// bun add @opentelemetry/sdk-trace-node@0.57.0
+// bun add @opentelemetry/core@2.0.0
+// bun add @opentelemetry/auto-instrumentations-node@0.57.0
+//
+// `@opentelemetry/api` before `@opentelemetry/sdk-*`, and the instrumentation
+// packages on the sdk's minor: an sdk newer than its api, or an instrumentation
+// newer than its sdk, compiles and then records no spans at runtime. Both
+// mistakes look identical in a trace view, which is why the versions here are
+// explicit rather than `latest`.
+// ---------------------------------------------------------------------------
+
+import { context, propagation, SpanStatusCode, trace } from "@opentelemetry/api";
+import {
+  BasicTracerProvider,
+  BatchSpanProcessor,
+} from "@opentelemetry/sdk-trace-base";
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
+import { W3CTraceContextPropagator } from "@opentelemetry/core";
+import { Hono } from "hono";
+
+const SERVICE_NAME = process.env.OTEL_SERVICE_NAME ?? "<service-name>";
+const SERVICE_VERSION = process.env.OTEL_SERVICE_VERSION ?? "0.0.0";
+
+/**
+ * Build a tracer provider, or return null when no endpoint is configured.
+ *
+ * NO EXPORTER BY DEFAULT, and this is the load-bearing part. OTEL_EXPORTER_OTLP_ENDPOINT
+ * is opt-in: unset means spans stay in this process, and we do not fall back to
+ * a vendor's default endpoint. A developer who clones this service and runs it
+ * locally must not have their spans leave the machine — the same privacy
+ * boundary templates/compose/otel-collector.yml enforces, applied in code
+ * because a Bun process can be started without compose.
+ */
+export function buildTracerProvider(): BasicTracerProvider | null {
+  const endpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
+  if (endpoint === undefined || endpoint === "") return null;
+
+  const provider = new BasicTracerProvider({
+    resource: resourceFromAttributes({
+      "service.name": SERVICE_NAME,
+      "service.version": SERVICE_VERSION,
+    }),
+  });
+
+  // BatchSpanProcessor, not SimpleSpanProcessor: one export per span makes the
+  // collector the bottleneck and drops spans on a slow network.
+  provider.addSpanProcessor(
+    new BatchSpanProcessor({
+      exporter: new OTLPTraceExporter({ url: `${endpoint}/v1/traces` }),
+    }),
+  );
+  return provider;
+}
+
+let provider: BasicTracerProvider | null = null;
+
+/** Register the provider and the W3C propagator. Call once, at startup. */
+export function installTelemetry(): void {
+  provider = buildTracerProvider();
+  if (provider === null) return;
+
+  // Named explicitly. The default propagator IS W3C today, but several
+  // instrumentations call register() themselves and a service that depends on a
+  // default it never wrote down breaks silently when one of them changes it.
+  provider.register({
+    propagator: new W3CTraceContextPropagator(),
+  });
+}
+
+/** Flush before the process exits, or the last spans are lost. */
+export async function shutdownTelemetry(): Promise<void> {
+  await provider?.shutdown();
+}
+
+/**
+ * Middleware: continue the caller's trace, or start a new one.
+ *
+ * extract() on a malformed header returns the context UNCHANGED and a null
+ * remote span — a new trace with no error thrown. That is §3.2.2.3's required
+ * response, and it is why this middleware has no try/catch: there is nothing to
+ * catch.
+ */
+export function traceMiddleware(serviceName: string) {
+  const tracer = trace.getTracer(serviceName);
+
+  return async (c: Context, next: Next) => {
+    const extracted = propagation.extract(context.active(), c.req.raw.headers);
+    const span = tracer.startSpan(`${c.req.method} ${new URL(c.req.url).pathname}`, {}, extracted);
+
+    // context.with is what makes the span current for everything downstream,
+    // including an outbound fetch. A span that is started but never made active
+    // attributes nothing to the work it was started for.
+    return context.with(trace.setSpan(extracted, span), async () => {
+      try {
+        await next();
+        span.setStatus({ code: SpanStatusCode.OK });
+      } catch (err) {
+        span.recordException(err as Error);
+        span.setStatus({ code: SpanStatusCode.ERROR, message: String(err) });
+        throw err;
+      } finally {
+        span.end();
+      }
+    });
+  };
+}
+
+/**
+ * An outbound fetch that carries the current trace.
+ *
+ * Use this instead of bare `fetch` for service-to-service calls. A bare fetch
+ * breaks the trace at that hop, silently and permanently, with no error anywhere
+ * to grep for. The header is injected from the active context, so there is
+ * nothing to pass and nothing to forget.
+ */
+export async function tracedFetch(input: string | URL | Request, init: RequestInit = {}) {
+  const headers = new Headers(init.headers);
+  // inject mutates the carrier in place; the fetch context is what decides which
+  // trace is injected, so this must run inside context.with above.
+  propagation.inject(context.active(), { set: (k, v) => headers.set(k, v) });
+  return fetch(input as RequestInfo, { ...init, headers });
+}
+
+/** Assemble the app with tracing on. */
+export function buildApp() {
+  installTelemetry();
+  const app = new Hono();
+  app.use("*", traceMiddleware(SERVICE_NAME));
+  return app;
+}

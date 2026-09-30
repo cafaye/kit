@@ -188,29 +188,113 @@ if missing:
 PY
   }
 
+  # Every language ships: the codec, its suite, the SDK wiring snippet, and a
+  # README saying when to use which. The README is not optional — a template
+  # nobody knows when to use is a template nobody uses.
+  #
+  # The field count is deliberately variable. Five languages carry a separate
+  # test file; rust does not, because `rustc --test` builds a single crate from
+  # one source with the suite inline. Its presence is asserted below instead, by
+  # looking for the `#[test]` functions — a presence check on a file that has
+  # none in it would be satisfied by a crate shipping an implementation and no
+  # proof, which is the exact thing this packet exists to prevent.
+  #
+  # `pins.md` lives at the otel root, not under rust/: it pins all six
+  # languages' OTel versions, and a version table scoped to one language reads
+  # as "rust's versions" to the next person who greps for it.
   otel_readme='templates/otel/README.md'
-  if otel_required "$otel_readme"; then
-    report PASS "$otel_readme  (present)"
+  if otel_required "$otel_readme" 'templates/otel/pins.md'; then
+    report PASS 'templates/otel/{README.md,pins.md}  (present)'
   else
-    report FAIL "$otel_readme  (present)"
+    report FAIL 'templates/otel/{README.md,pins.md}  (present)'
   fi
 
-  while IFS='|' read -r lang a b c d; do
+  while IFS='|' read -r lang a b c d e; do
     [ -n "$lang" ] || continue
-    if otel_required "templates/otel/$lang/$a" "templates/otel/$lang/$b" \
-      "templates/otel/$lang/$c" "templates/otel/$lang/$d"; then
-      report PASS "templates/otel/$lang/  (4 artifacts present)"
+    wanted=("templates/otel/$lang/$a" "templates/otel/$lang/$b" "templates/otel/$lang/$c")
+    [ -n "$d" ] && wanted+=("templates/otel/$lang/$d")
+    [ -n "$e" ] && wanted+=("templates/otel/$lang/$e")
+    if otel_required "${wanted[@]}"; then
+      report PASS "templates/otel/$lang/  (${#wanted[@]} artifacts present)"
     else
-      report FAIL "templates/otel/$lang/  (4 artifacts present)"
+      report FAIL "templates/otel/$lang/  (${#wanted[@]} artifacts present)"
     fi
   done <<'OTEL'
 go|traceparent.go|traceparent_test.go|otelhttp.go.snippet|README.md
 ruby|traceparent.rb|test_traceparent.rb|rack_middleware.rb.snippet|README.md
 elixir|traceparent.ex|test_traceparent.exs|phoenix_telemetry.ex.snippet|README.md
-rust|traceparent.rs|otel_client.rs.snippet|README.md|pins.md
+rust|traceparent.rs|otel_client.rs.snippet|README.md
 python|traceparent.py|test_traceparent.py|fastapi.py.snippet|README.md
 node|traceparent.mjs|traceparent.test.mjs|hono.ts.snippet|README.md
 OTEL
+
+  # rust keeps its suite inline, so "the test file exists" is not a check that
+  # can be run on it. This is the equivalent.
+  check 'templates/otel/rust/traceparent.rs  (carries its own suite)' bash -c \
+    "grep -qE '#\[test\]' '$ROOT/templates/otel/rust/traceparent.rs'"
+
+  # A snippet that names no version is a snippet nobody can install: the reader
+  # copies a floating major, gets three minors of drift, and files a bug
+  # against a version they chose. And a snippet that vendors is a snippet that
+  # has turned kit into a dependency — the rule AGENTS.md states as "no
+  # dependencies, ever", checked rather than trusted.
+  snippet_check() {
+    "$PY" - "$ROOT" <<'PY'
+import os
+import re
+import sys
+
+root = sys.argv[1]
+snippets = {
+    "go": "otelhttp.go.snippet",
+    "ruby": "rack_middleware.rb.snippet",
+    "elixir": "phoenix_telemetry.ex.snippet",
+    "rust": "otel_client.rs.snippet",
+    "python": "fastapi.py.snippet",
+    "node": "hono.ts.snippet",
+}
+
+# Each language names its installer in a different verb; the point is that one
+# of them appears, not which.
+install = re.compile(
+    r"\b(go get|bun add|npm add|yarn add|bundle add|mix deps\.get"
+    r"|pip install|uv add|cargo add)\b"
+)
+# A version is a digit. `@latest`, `^1.2.3` and a bare `^` are all rejected
+# below for different reasons, but all of them fail this.
+versioned = re.compile(r"[=<>@~^ ]\s*v?\d+\.\d+")
+
+problems = []
+for lang, name in snippets.items():
+    path = os.path.join(root, "templates", "otel", lang, name)
+    if not os.path.isfile(path):
+        continue  # absence is the artifact-presence check's job, not a second failure
+    body = open(path, encoding="utf-8").read()
+
+    if not install.search(body):
+        problems.append(f"otel/{lang}/{name}: no install line — a reader cannot install from this")
+
+    # Floating-version scan runs over COMMENT LINES INCLUDED, unlike the
+    # composer's no-literal-URL rule. A snippet puts its install commands in a
+    # comment block precisely so a reader copies one line and the file is still
+    # valid in a repo with no OTel dep; stripping comments first would have
+    # thrown those away and the check would have passed a snippet with no
+    # install line at all — which is what it did on its first run.
+    for lineno, line in enumerate(body.splitlines(), 1):
+        if "@latest" in line or "@main" in line or "@master" in line:
+            problems.append(f"otel/{lang}/{name}:{lineno}: floating ref: {line.strip()[:60]}")
+
+    # A version is a digit somewhere in the body. Prose mentioning "no
+    # dependencies" must not satisfy it, so the match is anchored to the
+    # characters that actually introduce a version.
+    if not versioned.search(body):
+        problems.append(f"otel/{lang}/{name}: no versioned dependency anywhere")
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check 'templates/otel/*/*.snippet  (installable, versioned, not vendored)' snippet_check
 
   # A template must not declare a dependency. kit is config-only; if these
   # files can `require` something, kit has a lockfile and a supply chain.

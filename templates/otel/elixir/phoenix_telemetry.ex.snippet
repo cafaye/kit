@@ -1,0 +1,181 @@
+# kit template — W3C trace propagation in a Phoenix service, via :telemetry.
+#
+# THIS IS THE SUPPORTED PATH FOR A NEW SERVICE. `traceparent.ex` is the
+# stdlib-only alternative for a Req plug, a PubSub subscriber, or a test that
+# asserts propagation without standing up an SDK.
+#
+# This is a SNIPPET, not a file to copy verbatim. Versions are in pins.md; kit
+# vendors nothing and you take the dep with `mix deps.get`.
+#
+# WHAT IT DOES FOR YOU
+#   - Reads an inbound `traceparent` and continues it, starting a new trace when
+#     it is absent or malformed.
+#   - Emits a `:telemetry` span for every Phoenix instrumented event — a query,
+#     a cache read, an HTTP call — not just for the request.
+#   - Puts the trace id in the log metadata so `grep trace_id=...` finds the
+#     request.
+#
+# NEVER RAISES OVER A MALFORMED HEADER. §3.2.2.3 says ignore it, and §4.2 says a
+# tracestate alone is invalid and must be discarded. Phoenix's telemetry events
+# are emitted unconditionally, so there is no rescue needed and none offered.
+#
+# SPEC: W3C Trace Context, W3C Recommendation 23 November 2021
+#       https://www.w3.org/TR/trace-context/
+#
+# ---------------------------------------------------------------------------
+# mix deps.get
+#   {:opentelemetry, "~> 1.5"},
+#   {:opentelemetry_exporter,
+#    "~> 1.5",
+#    only: [:dev, :test, :prod]},
+#   {:opentelemetry_bandit, "~> 0.6"},
+#   {:opentelemetry_phoenix, "~> 0.3"},
+#   {:telemetry_metrics, "~> 1.0"}
+# ---------------------------------------------------------------------------
+
+defmodule Courier.Telemetry do
+  @moduledoc """
+  OpenTelemetry setup for a Phoenix service.
+
+  The config is built in code rather than in config/runtime.exs so that the
+  no-exporter-by-default rule is in one readable place with a comment on it,
+  instead of spread across environment-variable interpolation that nobody reads
+  at 2am.
+  """
+
+  require Logger
+
+  @service_name "courier"
+  @service_version Mix.Project.config()[:version] || "0.0.0"
+
+  @doc """
+  Configure and start the SDK.
+
+  NO EXPORTER BY DEFAULT, and this is the load-bearing part. The exporter is
+  started only when `OTEL_EXPORTER_OTLP_ENDPOINT` is set: unset means spans stay
+  in this BEAM node, and we never fall back to a vendor's default endpoint. A
+  developer who clones this service and runs it locally must not have their
+  spans leave their machine — the same privacy boundary
+  `templates/compose/otel-collector.yml` enforces, applied in code because a
+  Phoenix release can boot without compose.
+  """
+  def start_link(opts \\ []) do
+    :ok =
+      :opentelemetry.set_application_logger(:logger)
+
+    :ok =
+      :opentelemetry.set_tracer_logger(fn level, message ->
+        Logger.log(level, message)
+      end)
+
+    resource = [
+      service: {service.name, @service_name},
+      service: {service.version, @service_version}
+    ]
+
+    config = [
+      # A sampler that respects the caller's decision rather than re-deciding per
+      # hop. `parent_based` is the part that matters: a service that samples
+      # independently produces traces with holes, which are worse to debug than
+      # no traces at all.
+      span_processor: batch_span_processor(resource),
+      sampler: {:parent_based, %{root: {:always_on, []}}},
+      resource: resource
+    ]
+
+    :ok = :opentelemetry.start(:otel_exporter, config)
+
+    Logger.info("telemetry started: service=#{@service_name} version=#{@service_version}")
+    :ok
+  end
+
+  defp batch_span_processor(resource) do
+    opts = [
+      # A queue that drops rather than blocks. Under load a telemetry pipeline
+      # that backpressures the request path takes the service down with it, and
+      # losing spans is strictly better.
+      schedules: [
+        export_interval: 5_000,
+        max_queue_size: 2_048,
+        exporting_timeout: 30_000
+      ]
+    ]
+
+    case System.get_env("OTEL_EXPORTER_OTLP_ENDPOINT") do
+      nil ->
+        # Nothing to export to. Registering a no-op span processor keeps every
+        # `[:telemetry]` call in the codebase valid, so no call site needs a
+        # `if telemetry_enabled?` around it.
+        :otel_simple_processor
+
+      endpoint ->
+        :otel_batch_processor
+        |> then(fn processor ->
+          {:otel_exporter, processor, %{resource: resource, endpoint: endpoint}}
+        end)
+        |> :otel_span_processor()
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Supervision tree. The exporter is a child of the app's supervisor, so a crash
+# in telemetry restarts telemetry and not the request path.
+#
+#   children = [
+#     Courier.Telemetry,
+#     {Bandit, plug: CourierWeb.Endpoint, scheme: :http}
+#   ]
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Reading the trace id, for a log line or a response header.
+#
+# With the SDK, `OpenTelemetry.Tracer.get_current_span(ctx)` gives you the span
+# and `:otel_span_id`/`:otel_trace_id` its identifiers. Without it, use
+# `KitOtel.Traceparent.server_hop/2` from traceparent.ex, which is what the
+# conformance suite covers.
+# ---------------------------------------------------------------------------
+defmodule CourierWeb.TraceId do
+  @moduledoc """
+  The current trace id, for logs and the x-trace-id response header.
+  """
+
+  def current, do: OpenTelemetry.Tracer.get_current_span(:otel) |> elem(1) |> trace_id()
+
+  defp trace_id(span) do
+    case OpenTelemetry.Tracer.get_current_span(:otel) do
+      {_, :undefined} -> "unknown"
+      _ -> span |> OpenTelemetry.Span.trace_id() |> encode()
+    end
+  end
+
+  defp encode(id) do
+    id |> :binary.encode_hex(case: :lower)
+  rescue
+    # An invalid span context, not an invalid id. Better a header saying
+    # "unknown" than a 500 on a log-formatting path.
+    _ -> "unknown"
+  end
+
+  @doc """
+  A plug that puts the trace id on the response.
+
+  A trace a user cannot quote back to you is a trace you will be asked about and
+  cannot find.
+  """
+  def put_trace_id(conn, _opts) do
+    Plug.Conn.put_resp_header(conn, "x-trace-id", current())
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Outbound propagation.
+#
+# Req and Finch both propagate automatically once the SDK is started, because
+# both read the trace from the process dictionary that the SDK sets. The manual
+# form, for a raw :httpc call, is below — and it is the one worth reading, since
+# it shows exactly what goes on the wire.
+# ---------------------------------------------------------------------------
+# :httpc.request(:get, {url, headers}, [], body_format: :binary)
+# where headers: [{"traceparent", "00-#{trace_id}-#{span_id}-01"}]

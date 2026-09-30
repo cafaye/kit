@@ -1,0 +1,147 @@
+# kit template — W3C trace propagation in a FastAPI service.
+#
+# THIS IS THE SUPPORTED PATH FOR A NEW SERVICE. `traceparent.py` is the
+# stdlib-only alternative for a Celery task that calls another service, a
+# webhook signer, or a test that asserts propagation without standing up an SDK.
+# Use this file for requests.
+#
+# This is a SNIPPET, not a file to copy verbatim. Versions are in pins.md; kit
+# vendors nothing and you add the dep with uv/pip.
+#
+# WHAT IT DOES FOR YOU
+#   - Reads an inbound `traceparent` and continues it, starting a new trace when
+#     it is absent or malformed.
+#   - Injects `traceparent` and `tracestate` on every outbound httpx call.
+#   - Puts the trace id in the log line and on the response, so a user-reported
+#     id leads straight to the request.
+#
+# NEVER RETURNS A 4xx OVER A MALFORMED HEADER. §3.2.2.3 says to ignore it and
+# §4.2 says a missing traceparent is not an error. This middleware has no
+# exception path because there is nothing to raise.
+#
+# SPEC: W3C Trace Context, W3C Recommendation 23 November 2021
+#       https://www.w3.org/TR/trace-context/
+#
+# ---------------------------------------------------------------------------
+# uv add opentelemetry-api opentelemetry-sdk opentelemetry-instrumentation-fastapi
+# uv add opentelemetry-exporter-otlp-proto-grpc
+# or: pip install "opentelemetry-sdk==1.30.0" "opentelemetry-instrumentation-fastapi==0.51b0"
+# ---------------------------------------------------------------------------
+
+from __future__ import annotations
+
+import logging
+import os
+from collections.abc import Awaitable, Callable
+
+from fastapi import FastAPI, Request, Response
+from opentelemetry import trace
+from opentelemetry.exporter.otlp.proto.grpc.trace_exporter import OTLPSpanExporter
+from opentelemetry.instrumentation.fastapi import FastAPIInstrumentor
+from opentelemetry.propagate import set_global_textmap
+from opentelemetry.propagators.composite import CompositePropagator
+from opentelemetry.sdk.resources import Resource
+from opentelemetry.sdk.trace import TracerProvider
+from opentelemetry.sdk.trace.export import BatchSpanProcessor
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
+
+SERVICE_NAME = os.environ.get("OTEL_SERVICE_NAME", "muse")
+SERVICE_VERSION = os.environ.get("OTEL_SERVICE_VERSION", "0.0.0")
+
+log = logging.getLogger(__name__)
+
+
+def configure_telemetry() -> TracerProvider | None:
+    """Configure the SDK, or return None when there is nowhere to export to.
+
+    NO EXPORTER BY DEFAULT, and this is the load-bearing part. The exporter is
+    configured only when ``OTEL_EXPORTER_OTLP_ENDPOINT`` is set: unset means
+    spans stay in this process, and we never fall back to a vendor's default
+    endpoint. A developer who clones this service and runs it locally must not
+    have their spans leave their machine — the same privacy boundary
+    ``templates/compose/otel-collector.yml`` enforces, applied in code because a
+    uvicorn process can start without compose.
+
+    Returns None rather than a no-op provider so the caller can tell "not
+    configured" from "configured and failing", which is the difference between a
+    dev machine and an incident.
+    """
+    # Named explicitly. The default global propagator IS W3C today, but
+    # FastAPIInstrumentor and any library that calls set_global_textmap can
+    # replace it, and a service that depends on a default it never wrote down
+    # breaks silently when one of them does.
+    set_global_textmap(
+        CompositePropagator([TraceContextTextMapPropagator()])
+    )
+
+    endpoint = os.environ.get("OTEL_EXPORTER_OTLP_ENDPOINT")
+    if not endpoint:
+        log.info("OTEL_EXPORTER_OTLP_ENDPOINT unset; traces stay in-process")
+        return None
+
+    provider = TracerProvider(
+        resource=Resource.create(
+            {"service.name": SERVICE_NAME, "service.version": SERVICE_VERSION}
+        )
+    )
+    # BatchSpanProcessor, not SimpleSpanProcessor: one export per span makes the
+    # collector the bottleneck and drops spans on a slow network.
+    provider.add_span_processor(
+        BatchSpanProcessor(OTLPSpanExporter(endpoint=endpoint))
+    )
+    trace.set_tracer_provider(provider)
+    return provider
+
+
+def instrument(app: FastAPI) -> FastAPI:
+    """Attach the SDK to a FastAPI app. Call before the app starts serving."""
+    FastAPIInstrumentor.instrument_app(app)
+    return app
+
+
+# ---------------------------------------------------------------------------
+# Trace id in the log and on the response.
+#
+# A trace you cannot find in the log is a trace nobody debugs. The response
+# header is what lets a browser-side error report be tied to a server trace
+# without a log search.
+# ---------------------------------------------------------------------------
+
+
+@app.middleware("http")
+async def trace_id_middleware(
+    request: Request, call_next: Callable[[Request], Awaitable[Response]]
+) -> Response:
+    span = trace.get_current_span()
+    context = span.get_span_context()
+    trace_id = format(context.trace_id, "032x") if context.is_valid else "unknown"
+
+    with trace.get_tracer(SERVICE_NAME).start_as_current_span(
+        f"{request.method} {request.url.path}"
+    ):
+        response = await call_next(request)
+        response.headers["x-trace-id"] = trace_id
+        return response
+
+
+# ---------------------------------------------------------------------------
+# Outbound propagation.
+#
+# `inject()` writes the active context into the carrier. It reads the context
+# from the current span, so it must be called inside the request that owns the
+# trace — which is why this is a helper taking no span argument: passing one in
+# is how the wrong trace gets sent.
+#
+# Use this instead of a bare `httpx.AsyncClient` for service-to-service calls. A
+# bare client breaks the trace at that hop, silently and permanently, with no
+# error anywhere to grep for.
+# ---------------------------------------------------------------------------
+
+
+async def traced_post(url: str, **kwargs) -> httpx.Response:
+    from opentelemetry.propagate import inject
+
+    headers = dict(kwargs.pop("headers", {}))
+    inject(headers)
+    async with httpx.AsyncClient() as client:
+        return await client.post(url, headers=headers, **kwargs)

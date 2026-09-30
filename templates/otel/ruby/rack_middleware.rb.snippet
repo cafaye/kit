@@ -1,0 +1,174 @@
+# kit template — W3C trace propagation in a Rails service, as Rack middleware.
+#
+# THIS IS THE SUPPORTED PATH FOR A NEW SERVICE. `traceparent.rb` is the
+# stdlib-only alternative for a Sidekiq job, a webhook signer, or a test that
+# asserts propagation without standing up an SDK. Use this file for requests.
+#
+# This is a SNIPPET, not a file to copy verbatim. Versions are in pins.md; kit
+# vendors nothing and you add the gem with bundler.
+#
+# WHAT IT DOES FOR YOU
+#   - Reads an inbound `traceparent` and continues it, starting a new trace when
+#     it is absent or malformed.
+#   - Puts the trace and span ids in the Rails log line, so a request can be
+#     found in the log by the id a user pasted from a trace view.
+#   - Installs an ActiveSupport::Notifications subscriber so a span exists for
+#     every instrumented event (SQL, cache, HTTP), not just the request.
+#
+# NEVER FAILS A REQUEST OVER A MALFORMED HEADER. §3.2.2.3 says to ignore the
+# header, and §4.2 says a tracestate on its own is invalid and must be
+# discarded. There is no exception to rescue here because there is no raise.
+#
+# SPEC: W3C Trace Context, W3C Recommendation 23 November 2021
+#       https://www.w3.org/TR/trace-context/
+#
+# ---------------------------------------------------------------------------
+# bundle add opentelemetry-sdk
+# bundle add opentelemetry-exporter-otlp
+# bundle add opentelemetry-instrumentation-rails
+# ---------------------------------------------------------------------------
+
+# config/initializers/otel.rb
+require "opentelemetry/sdk"
+require "opentelemetry/exporter/otlp"
+require "opentelemetry/instrumentation/rails"
+
+module Kit
+  # Telemetry setup. Initializer order matters: this runs after the Rails
+  # initializers that read config, so the exporter is configured before the
+  # first request is served.
+  module Telemetry
+    SERVICE_NAME = ENV.fetch("OTEL_SERVICE_NAME", "billing").freeze
+    SERVICE_VERSION = ENV.fetch("OTEL_SERVICE_VERSION", "0.0.0").freeze
+
+    # NO EXPORTER BY DEFAULT, and this is the load-bearing part.
+    # OTEL_EXPORTER_OTLP_ENDPOINT is opt-in. Unset means spans stay in this
+    # process: a developer who clones this service and runs it locally must not
+    # have their spans leave the machine. The same privacy boundary
+    # templates/compose/otel-collector.yml enforces, applied in code because a
+    # Rails process can boot without compose.
+    def self.install!
+      return unless ENV["OTEL_EXPORTER_OTLP_ENDPOINT"]
+
+      OpenTelemetry::SDK.configure do |c|
+        c.service_name = SERVICE_NAME
+        c.service_version = SERVICE_VERSION
+        c.use_all, :auto_instrumentation
+        c.add_span_processor(
+          OpenTelemetry::SDK::Trace::Export::BatchSpanProcessor.new(
+            OpenTelemetry::Exporter::OTLP::Exporter.new
+          )
+        )
+      end
+    end
+  end
+end
+
+Kit::Telemetry.install!
+
+# ---------------------------------------------------------------------------
+# config/initializers/trace_context.rb
+#
+# Rails 7.1+ has built-in trace propagation, and this file is only needed below
+# that. Check before adding it: two propagators in one process is a trace whose
+# parent is whichever one ran last, and that is not debuggable.
+# ---------------------------------------------------------------------------
+if Rails::VERSION::STRING < "7.1"
+  require "opentelemetry-propagator-railtie"
+
+  Rails.application.config.middleware.insert_before(
+    0,
+    OpenTelemetry::Propagator::Railtie::TraceContextInjector
+  )
+end
+
+# ---------------------------------------------------------------------------
+# The propagation middleware, in full, for the case where you want the ids in
+# the log without the SDK. stdlib only: no gem, no exporter, nothing to ship.
+# Copy to app/middleware/kit_trace_context.rb and add it above the router.
+# ---------------------------------------------------------------------------
+
+module Kit
+  # Rack middleware: continue the inbound trace, expose it to the request, put
+  # the ids in the log line.
+  #
+  # `KitOtel::Traceparent` (traceparent.rb) is the stdlib codec. With the SDK
+  # installed, use OpenTelemetry::TracePropagation instead — the only thing this
+  # middleware adds is the log line.
+  class TraceContext
+    HEADER = "traceparent".freeze
+
+    def initialize(app)
+      @app = app
+    end
+
+    def call(env)
+      headers = collect_headers(env)
+      hop = KitOtel.server_hop(headers, KitOtel.new_span_id)
+
+      # The request-scoped accessor is how a controller reaches the trace without
+      # threading it through every method argument.
+      RequestStore.store(:trace_id, hop.trace_id)
+      RequestStore.store(:span_id, hop.span_id)
+      RequestStore.store(:sampled, hop.sampled?)
+
+      env["kit.trace_id"] = hop.trace_id
+      env["kit.span_id"] = hop.span_id
+      env["kit.outbound_headers"] = hop.outbound_headers
+
+      status, headers_out, body = @app.call(env)
+      # The response carries the trace id so a browser-side error report can be
+      # tied to a server trace without a log search.
+      headers_out = headers_out.merge("x-trace-id" => hop.trace_id)
+      [status, headers_out, body]
+    end
+
+    private
+
+    # Rack 3 gives each header its own key ("HTTP_TRACEPARENT"); Rack 2 joins
+    # them with newlines. Both are handled, because a service that only reads
+    # one of them silently loses every trace after a Rack upgrade.
+    def collect_headers(env)
+      collected = {}
+      env.each do |key, value|
+        name = key.to_s
+        if name.start_with?("HTTP_")
+          collected[name.delete_prefix("HTTP_").downcase.tr("_", "-")] = value
+        elsif name == "CONTENT_TYPE" || name == "CONTENT_LENGTH"
+          collected[name.downcase.tr("_", "-")] = value
+        end
+      end
+      collected
+    end
+  end
+end
+
+# ---------------------------------------------------------------------------
+# Logging the ids. A trace you cannot find in the log is a trace nobody debugs.
+# ---------------------------------------------------------------------------
+# config/initializers/trace_logging.rb
+Rails.application.config.log_tags = [
+  proc { |request| "trace_id=#{request.env['kit.trace_id']}" },
+  proc { |request| "span_id=#{request.env['kit.span_id']}" }
+]
+
+# ---------------------------------------------------------------------------
+# Outbound: a Faraday client that propagates.
+#
+# `faraday-otel` is the supported wiring; the hand-rolled version is below
+# because it is short enough to read and shows exactly what is on the wire.
+# ---------------------------------------------------------------------------
+class TracingClient < Faraday::Connection
+  # ...
+end
+
+Faraday.new(url: "https://courier.internal") do |f|
+  f.request :trace_context # from faraday-otel; injects traceparent + tracestate
+  f.adapter Faraday::Adapter::NetHttp
+end
+
+# The manual equivalent, for a service that does not use Faraday:
+def traced_post(url, payload, headers: {})
+  hop_headers = RequestStore.store(:kit_outbound_headers) || KitOtel.server_hop({}, KitOtel.new_span_id).outbound_headers
+  HTTParty.post(url, body: payload.to_json, headers: headers.merge(hop_headers))
+end
