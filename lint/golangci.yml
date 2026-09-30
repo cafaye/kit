@@ -1,0 +1,55 @@
+---
+# golangci-lint v2 config — copy to .golangci.yml in a Go service repo.
+#   golangci-lint run ./...
+#
+# STRICTNESS NOTES
+#   - version: "2" is the config schema version, not the tool version; CI runs
+#     whatever golangci-lint-action installs.
+#   - errcheck, govet, ineffassign, staticcheck, unused are the default set and
+#     stay on. We add the correctness linters that have actually caught cafaye
+#     bugs: bodyclose (leaked HTTP bodies), noctx (requests without context),
+#     errorlint (mis-wrapped errors), exhaustive (missed switch cases).
+#   - go: "1.24" is a FLOOR, not a pin: it must match the lowest go directive in
+#     the service's go.mod, and it is the one line CI can silently disagree
+#     with. A service that raises its go directive must raise this.
+#   - We disable errcheck on Close/Flush only: those return errors nobody can
+#     act on, and forcing a `//nolint` per call site is how people learn to
+#     ignore errcheck. No other exclusion is pre-approved.
+version: '2'
+run:
+  go: '1.24'
+  timeout: 5m
+linters:
+  enable:
+    - bodyclose
+    - copyloopvar
+    - errorlint
+    - exhaustive
+    - misspell
+    - noctx
+    - revive
+    - unconvert
+    - wastedassign
+  settings:
+    exhaustive:
+      default-signifies-exhaustive: true
+    misspell:
+      locale: US
+    revive:
+      enable-all-rules: false
+      rules:
+        - name: context-as-argument
+        - name: empty-block
+        - name: error-naming
+        - name: error-return
+        - name: indent-error-flow
+        - name: unreachable-code
+  exclusions:
+    rules:
+      - path: _test\.go
+        linters:
+          - errcheck
+formatters:
+  enable:
+    - gofmt
+    - goimports

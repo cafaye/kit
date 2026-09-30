@@ -1,0 +1,36 @@
+# kit template — Node/TypeScript service image. Copy to docker/Dockerfile.
+#
+#   docker build -f docker/Dockerfile --build-arg NODE_VERSION=22 -t svc .
+#
+# STRICTNESS NOTES
+#   - Two stages. The builder compiles with the full dev dependency tree; the
+#     runtime stage runs `npm ci --omit=dev`, so nothing a test needed is
+#     reachable in production.
+#   - `node:*-slim`, never `node:*`: full Debian ships a browser and a document
+#     toolchain a gateway or worker never calls.
+#   - The official `node` image already has a non-root `node` user (uid 1000), so
+#     we use it instead of creating a second one; chown the app dir to it.
+#   - `npm ci` (not `npm install`): ci installs exactly package-lock.json and
+#     fails if the lock and manifest disagree, which is the whole point.
+#   - No init/tini. The ENTRYPOINT execs node directly, so PID 1 is the service
+#     and SIGTERM reaches it; a shell wrapper would swallow both.
+ARG NODE_VERSION=22
+
+FROM node:${NODE_VERSION}-slim AS build
+WORKDIR /app
+ENV CI=true
+COPY package.json package-lock.json ./
+RUN npm ci
+COPY . .
+RUN npm run build --if-present
+
+FROM node:${NODE_VERSION}-slim AS runtime
+ENV NODE_ENV=production PORT=3000
+WORKDIR /app
+COPY package.json package-lock.json ./
+RUN npm ci --omit=dev && npm cache clean --force
+COPY --from=build --chown=node:node /app/dist ./dist
+COPY --chown=node:node . .
+USER node
+EXPOSE 3000
+ENTRYPOINT ["node", "dist/main.js"]

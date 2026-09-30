@@ -1,0 +1,38 @@
+# kit template — Rust service image. Copy to docker/Dockerfile in the service repo.
+#
+#   docker build -f docker/Dockerfile --build-arg RUST_VERSION=1.84.0 -t svc .
+#
+# STRICTNESS NOTES
+#   - Two stages. The builder has rustc + cargo; the runtime does not.
+#   - We build a fully static musl binary (`-C target-feature=+crt-static`) so
+#     the final stage can be distroless/static. The alternative is
+#     distroless/cc, which carries glibc and libgcc — larger, and it only works
+#     if every linked dependency is glibc-compatible.
+#   - `--locked` is not optional: without it cargo silently updates Cargo.lock in
+#     the build, so two builds of the same commit are not the same binary.
+#   - The runtime copies CA certificates in because a service that calls Stripe
+#     or an OIDC provider fails TLS without them; distroless ships none.
+ARG RUST_VERSION=1.84
+
+FROM rust:${RUST_VERSION}-slim-bookworm AS build
+RUN rustup target add x86_64-unknown-linux-musl
+WORKDIR /src
+# Cargo resolves against the manifests first so the dependency layer caches.
+COPY Cargo.toml Cargo.lock ./
+RUN mkdir -p src \
+    && echo 'fn main() {}' > src/main.rs \
+    && cargo build --release --locked \
+    && rm -rf src
+COPY src ./src
+ARG SERVICE_NAME=service
+RUN cargo build --release --locked --bin "${SERVICE_NAME}" \
+    && cp "target/x86_64-unknown-linux-musl/release/${SERVICE_NAME}" /out/service \
+    && strip "target/x86_64-unknown-linux-musl/release/${SERVICE_NAME}"
+
+FROM gcr.io/distroless/static-debian12:nonroot AS runtime
+WORKDIR /app
+COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
+COPY --from=build /out/service /app/service
+USER nonroot:nonroot
+EXPOSE 8080
+ENTRYPOINT ["/app/service"]

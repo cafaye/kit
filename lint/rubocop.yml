@@ -1,0 +1,37 @@
+---
+# rubocop config — copy to .rubocop.yml in a Ruby service repo.
+#   bundle exec rubocop --parallel
+#
+# STRICTNESS NOTES
+#   - TargetRubyVersion tracks the oldest interpreter we deploy, not the newest
+#     installed. Raising it is a deliberate support decision, not a bump.
+#   - NewCops: enable means a new cop fails CI on upgrade instead of warning
+#     forever. That is the point: warnings nobody reads are not strictness.
+#   - SuggestExtensions is on so `rubocop -a` proposes the extra gems
+#     (rubocop-rails, -rspec) a Rails or RSpec repo needs.
+#   - We do NOT disable Metrics/*. Long methods are the thing a reviewer should
+#     see in a diff, and Rails controllers/controllers are the usual offender —
+#     extract a plain object instead of adding an exclusion.
+#   - Layout/LineLength is 120 to match the rest of the org's YAML and CI logs.
+AllCops:
+  TargetRubyVersion: 3.4
+  NewCops: enable
+  SuggestExtensions: true
+  Exclude:
+    - 'bin/**/*'
+    - 'db/schema.rb'
+    - 'node_modules/**/*'
+    - 'tmp/**/*'
+    - 'vendor/**/*'
+Layout/LineLength:
+  Max: 120
+Metrics/MethodLength:
+  Max: 15
+Metrics/ClassLength:
+  Max: 150
+Style/Documentation:
+  Enabled: true
+Naming/PredicateName:
+  Enabled: true
+Naming/MethodParameterName:
+  MinNameLength: 3
