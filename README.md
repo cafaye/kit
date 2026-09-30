@@ -453,7 +453,7 @@ no `npm ci`, no `cargo fetch`. If these ever need the network, a template has
 grown a dependency and kit has stopped being config-only.
 
 **self_test** — `tests/self_test.sh` breaks a throwaway copy of this tree
-eleven ways and asserts the gate goes red each time. Five breakages are for the
+twelve ways and asserts the gate goes red each time. Six breakages are for the
 static checks; one is a semantic mutation of each of the six language
 implementations, so **every suite is proven able to fail** rather than assumed
 to. A skip fails the run — a self_test that skips half its proofs and exits 0 is

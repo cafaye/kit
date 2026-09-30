@@ -642,7 +642,23 @@ fi
 # A NOTE rather than a failure: the summary is a diagnostic, and a build of the
 # processor that omits it is still enforcing. Reported so a reader knows the
 # receipt was not available in this run rather than assuming it was checked.
-if docker logs "$PROJECT-collector-1" 2>&1 | grep -qi 'redact'; then
+#
+# THE LOG IS CAPTURED TO A FILE FIRST, and that is not tidiness — it is the
+# difference between a check that works and one that works two times in three.
+# `docker logs ... | grep -qi redact` under `set -o pipefail` is a race: `grep -q`
+# exits at the FIRST match and closes the pipe, so `docker logs` takes SIGPIPE
+# and exits 141 — but only if it had not already finished writing. With the
+# collector at debug level the log is large, so "had not finished" is the common
+# case and the check reported "no redaction summary" on a run where the summary
+# was plainly there. Reading a file has no pipe and no SIGPIPE, so there is
+# nothing left to race against.
+docker logs "$PROJECT-collector-1" >"$WORK/collector.log" 2>&1 || true
+
+# Polled, not read once. The processor writes the summary while it redacts and
+# the batch processor flushes afterwards, so the ordering is usually right — and
+# "usually" is not a property a receipt can rest on.
+if wait_for "the collector records what it redacted" 20 \
+  grep -qi 'redact' "$WORK/collector.log"; then
   pass "the collector's own log records the redaction — removal is observed, not inferred"
 else
   note "no redaction summary in the collector's log this run; removal is asserted by absence only"
@@ -656,7 +672,15 @@ note "assumes it is scrubbed is the reader who puts a prompt in one."
 
 # The spanmetrics connector builds metric labels from spans, so its output is a
 # SEPARATE path from the direct metric payload and worth confirming separately.
-if grep -qi 'span_metrics\|cafaye_span\|duration' "$CAPTURE" 2>/dev/null; then
+#
+# Polled, because the connector flushes on its OWN interval (5s here, via
+# KIT_OTEL_METRICS_FLUSH_INTERVAL) rather than with the batch it came from. Read
+# once, immediately after the direct payload's assertions, it is absent about a
+# third of the time and the test NOTEd "no spanmetrics output in this capture"
+# on a run where the connector had simply not flushed yet — which reads as
+# "the connector is not wired" and is really "nobody waited".
+if wait_for "the spanmetrics connector flushes derived metrics" 30 \
+  grep -qi 'span_metrics\|cafaye_span\|duration' "$CAPTURE"; then
   pass "the spanmetrics connector emitted derived metrics from redacted spans"
 else
   note "no spanmetrics output in this capture; the metric assertions cover the direct OTLP path"

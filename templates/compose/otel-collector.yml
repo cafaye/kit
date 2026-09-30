@@ -536,7 +536,11 @@ processors:
       # reserves for counters.
       - context: metric
         statements:
-          - 'set(name, Concat([name, "_total"], ":")) where IsMatch(name, "\\.calls$")'
+          # `Concat`'s second argument is the DELIMITER, not a prefix — the
+          # first version passed `":"` and produced a metric called
+          # `cafaye_calls:_total`, which is worse than no suffix at all because
+          # it looks deliberate.
+          - 'set(name, Concat([name, "_total"], "")) where IsMatch(name, "\\.calls$")'
       - context: datapoint
         statements:
           - 'delete_key(attributes, "redaction.redacted.count")'

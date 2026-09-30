@@ -2407,7 +2407,7 @@ fi
 
 if [ "$RUN_SELF_TEST" -eq 1 ]; then
   section 'self_test: this gate is able to fail'
-  if check 'tests/self_test.sh  (eleven breakages, eleven reds)' \
+  if check 'tests/self_test.sh  (twelve breakages, twelve reds)' \
     bash "$ROOT/tests/self_test.sh"; then
     :
   fi

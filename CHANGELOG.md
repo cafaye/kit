@@ -8,6 +8,69 @@ and by *copying* files out of `lint/`, `docker/`, and `templates/`.
 
 ### Added
 
+- **The observability stack** (PLAN.md §7b). Observability is ON BY DEFAULT and
+  worked on in dev: `bin/dev up` brings up the OTel collector and the four LGTM
+  backing services, and a service with nothing configured exports into them
+  because `<SERVICE>_OTEL_ENDPOINT` *defaults* to the collector that ships with
+  the stack. `<SERVICE>_OTEL_ENDPOINT` is the only contract (core D16); the
+  shipped collector is just its default value, and unsetting it is a genuine
+  no-op implemented with `OTEL_SDK_DISABLED`.
+  - `templates/compose/otel-collector.yml` — OTLP **and** container-stderr
+    receivers, the redaction allowlist **derived from core's schemas**, the
+    `spanmetrics` connector, and fan-out to Tempo/Loki/Mimir. Every endpoint is
+    a `${env:...}`; the gate fails on a literal.
+  - `templates/compose/{tempo,loki,mimir}/` and
+    `templates/compose/grafana/provisioning/` — vendor **configuration** and
+    Grafana provisioning as files: three datasources, the dashboard provider, two
+    dashboards and three alert rules, all working on first load.
+  - `templates/compose/docker-compose.yml` — the four backing services, pinned
+    to exact tags, healthchecked, memory-bounded, in an `observability` profile.
+    **Grafana, Loki, Tempo and Mimir are AGPL-3.0 and ship UNMODIFIED**;
+    `tests/validate.sh` fails on a `build:` stanza on any of them.
+  - `templates/compose/.env.example` — every `${KIT_*}` the stack reads, with
+    the port block documented.
+  - `tests/canary_test.sh` — plants a canary in ten shapes a leak could take
+    against a real collector and asserts it reaches no exporter, **and** that the
+    allowed data survived.
+  - `tests/no_telemetry_in_readiness.sh` — proves a service starts, serves and
+    reports healthy with the collector killed, and that a collector whose three
+    backends all refuse connections stays healthy, does not restart and does not
+    enter a retry loop.
+  - The six `templates/otel/<lang>/*.snippet` files now honour
+    `<SERVICE>_OTEL_ENDPOINT`, default to the shipped collector, implement the
+    free no-op with `OTEL_SDK_DISABLED`, record `error.type` and never
+    `error.message`, and emit **exception log records** rather than the
+    deprecated `exception` span event.
+  - `templates/AGENTS.md` — an Observability section, so the endpoint contract
+    and "telemetry is never in a readiness path" reach the service repo where a
+    probe would actually be written.
+
+### Changed
+
+- **The port block.** Every published host port moved into **15000-15999**,
+  one hundred per service: 15000 Grafana, 15500 Postgres, 15600 NATS client,
+  15700 NATS monitoring, 15800 Redis, 15900 Tempo, 15901 Loki, 15902 Mimir. Not
+  5432/4222/6379, which are the two or three most likely things already
+  listening on a developer's machine — and `bin/dev` is the first command a new
+  person runs. The gate asserts membership of the block and no reuse, as a RANGE
+  rather than a list, so adding a service does not mean editing a check.
+- **`templates/compose/otel-collector.yml` no longer ships `debug` only.** It
+  fans out to three backends now, so the privacy boundary is restated as what it
+  can actually be: every endpoint a `${env:}`, the exporter set exactly those
+  three plus the local `debug`, and a `redaction/*` processor in every pipeline
+  before `batch` and therefore before every exporter.
+- `templates/bin/dev.sh` — `STACK_TIMEOUT` 120s → 180s (five more containers,
+  four with a real initialisation), brings up the `observability` profile by
+  default, prints the wall-clock, and prints the observability URLs. The
+  escape hatch is `KIT_DEV_PROFILES=`.
+- `templates/compose/docker-compose.yml` — the collector's healthcheck probes
+  its real `health_check` endpoint instead of printing its component list, and
+  the four stores' healthcheck budgets were raised after measuring them.
+- `tests/validate.sh` gained an `observability` phase and a `--no-observability`
+  flag; both docker-requiring proofs SKIP loudly when docker is absent.
+
+### Added
+
 - `workflows/ci.reusable.yml` — a `bun` job: `bun install --frozen-lockfile` →
   `bun run typecheck` → `bun test`, with an opt-in coverage step. Exists because
   `guard` was hand-rolling a whole workflow for want of one; a repo that adopts
@@ -23,7 +86,9 @@ and by *copying* files out of `lint/`, `docker/`, and `templates/`.
   migrating rather than half-starting.
 - `templates/compose/otel-collector.yml` — receiver, batch processor, and a
   `debug` exporter that writes to the collector's own stdout. Sends nothing
-  anywhere, by default and by gate.
+  anywhere, by default and by gate. **Superseded by kit-03** below: the
+  collector now fans out to Tempo, Loki and Mimir, because observability is on
+  by default. The `debug` exporter and the "no literal endpoint" rule stay.
 - `templates/otel/<lang>/` — per language: a stdlib `traceparent.*` codec, an
   executed conformance suite, an SDK wiring snippet with a documented
   "when to use which" README, and a statement of the W3C sections implemented.

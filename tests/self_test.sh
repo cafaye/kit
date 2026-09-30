@@ -6,21 +6,36 @@
 #
 # WHAT THIS IS FOR
 #   A gate that only ever goes green is a report, not a gate. This script copies
-#   the tree to a throwaway directory, breaks it four ways — once per kind of
-#   check — and asserts the gate goes RED each time. Each breakage must be
-#   caught by a *different* check, so a passing self_test means the checks are
-#   independent and not one lucky assertion standing in for all of them.
+#   the tree to a throwaway directory, breaks it once per kind of check, and
+#   asserts the gate goes RED each time. Each breakage must be caught by a
+#   *different* check, so a passing self_test means the checks are independent
+#   and not one lucky assertion standing in for all of them.
 #
-# THE ELEVEN BREAKAGES
-#   1. delete a language template   -> the artifact-presence check goes red
-#   2. ship a collector exporter   -> the privacy check goes red
-#   3. corrupt the python codec    -> the executed test suite goes red
-#   4. hardcode a compose port     -> the parameterization check goes red
-#   5. flip the CI input default   -> the "consumers stay green" check goes red
+# THE TWELVE BREAKAGES
+#   1.  delete a language template   -> the artifact-presence check goes red
+#   2.  add a collector exporter    -> the privacy check goes red
+#   2b. DELETE the tempo exporter   -> the same check goes red from the other
+#        side. A set difference only catches the extra; this catches the
+#        missing, which is the mistake that ships a stack that collects
+#        everything and prints it.
+#   3.  corrupt the python codec    -> the executed test suite goes red
+#   4.  hardcode a compose port     -> the parameterization check goes red
+#   5.  flip the CI input default   -> the "consumers stay green" check goes red
 #   6-11. one semantic mutation per language implementation -> THAT language's
 #         suite goes red. A suite that has never failed has never been proven to
 #         test anything, and six suites that only one language's mutation covers
 #         is five suites that might assert nothing at all.
+#
+#   Breakages 2 and 4 were both REWRITTEN in kit-03, for the same reason and it
+#   is worth recording: their recipes named strings that no longer exist. 2
+#   mutated `exporters: [debug]`, which the traces pipeline stopped being when
+#   it began fanning out to three backends; 4 replaced a literal
+#   `${KIT_POSTGRES_PORT:-5432}`, which stopped existing when the stack moved
+#   into kit's 15000-15999 port block. In both cases `edit` refused to apply the
+#   mutation — correct behaviour, since a stale recipe must not silently pass —
+#   and the gate went red on that breakage and never reached the next one. A
+#   self_test whose recipe no longer applies is a self_test that has stopped
+#   testing the thing it names.
 #
 # WHAT IT IS NOT
 #   This is not exhaustive mutation testing. Each implementation gets exactly one
@@ -208,13 +223,58 @@ one="$(fresh_copy missing-template)"
 rm -f "$one/templates/otel/go/traceparent.go"
 expect_red 'breakage 1: templates/otel/go/traceparent.go deleted' "$one" --static-only
 
-# 2. the privacy boundary. The one check that must never be satisfiable by
-#    anything a developer is likely to paste.
+# 2. the privacy boundary, in the shape the check actually forbids. This recipe
+#    mutated `exporters: [debug]` -> `exporters: [debug, otlp]`, which was the
+#    traces pipeline as it stood before the collector fanned out to three
+#    backends. The pipeline now reads `[spanmetrics, otlp/tempo, debug]`, the
+#    string is gone, and `edit` refused to apply it — which is the right
+#    behaviour (a stale mutation recipe must not silently pass) and is also why
+#    the gate went red on breakage 2 and never reached 3.
+#
+#    The mutation below therefore ADDS the exporter the check warns about by
+#    name: a bare `otlp` with an endpoint a developer could paste, sitting
+#    beside the three backends it has no business next to.
 two="$(fresh_copy exporting-collector)"
 edit "$two/templates/compose/otel-collector.yml" \
-  'exporters: [debug]' \
-  'exporters: [debug, otlp]'
-expect_red 'breakage 2: collector traces pipeline exports over the network' "$two" --static-only
+  '  otlp/tempo:
+' \
+  '  otlp:
+    endpoint: ${env:KIT_TEMPO_OTLP_ENDPOINT}
+  otlp/tempo:
+'
+edit "$two/templates/compose/otel-collector.yml" \
+  'exporters: [spanmetrics, otlp/tempo, debug]' \
+  'exporters: [spanmetrics, otlp/tempo, debug, otlp]'
+expect_red 'breakage 2: collector gains an exporter nobody read' "$two" --static-only
+
+# 2b. THE OTHER HALF OF THE SAME CLAIM, and the one a set difference never
+#     checked. Breakage 2 above proves the gate objects to an exporter that
+#     should not be there; this proves it objects to a BACKEND THAT IS MISSING.
+#     A config whose only exporter is `debug` satisfies "nothing unexpected"
+#     while shipping no observability at all — a stack that collects everything
+#     and prints it. Deleting the whole tempo exporter block takes out the
+#     definition and the pipeline reference together, which is what deleting it
+#     in review would actually look like.
+two_b="$(fresh_copy missing-backend)"
+edit "$two_b/templates/compose/otel-collector.yml" \
+  '      exporters: [spanmetrics, otlp/tempo, debug]' \
+  '      exporters: [spanmetrics, debug]'
+"$PY" - "$two_b/templates/compose/otel-collector.yml" <<'PY'
+import re
+import sys
+
+# Drop the whole `otlp/tempo:` block by indentation, the same way the canary
+# test removes one — a regex anchored on the next key does not survive the
+# comment block that sits between the exporters.
+path = sys.argv[1]
+lines = open(path, encoding="utf-8").read().splitlines(keepends=True)
+start = next(i for i, line in enumerate(lines) if line.rstrip("\n") == "  otlp/tempo:")
+end = start + 1
+while end < len(lines) and (not lines[end].strip() or lines[end].startswith("    ")):
+    end += 1
+open(path, "w", encoding="utf-8").write("".join(lines[:start] + lines[end:]))
+PY
+expect_red 'breakage 2b: the collector ships no exporter for tempo at all' "$two_b" --static-only
 
 # 3. a template that compiles, parses, and silently drops the sampled flag.
 #    Only an executed suite catches this; no grep would.
@@ -226,9 +286,17 @@ expect_red 'breakage 3: python codec stops preserving trace-flags' "$three" \
 
 # 4. a hardcoded host port. The kind of edit nobody notices in review and every
 #    second service on a laptop hits.
+#
+#    The default this one used to pin was 5432. That was correct when
+#    docker-compose.yml was the only compose file in kit; the observability work
+#    moved every published port into the 15000-15999 block, so the literal this
+#    replaced no longer exists and `edit` refused — which is why the gate went
+#    red here having passed 1, 2, 2b and 3. The recipe is now pinned to the port
+#    actually shipped, so this breakage is the one a reviewer would really make:
+#    taking the default out of the substitution.
 four="$(fresh_copy hardcoded-port)"
 edit "$four/templates/compose/docker-compose.yml" \
-  '"${KIT_POSTGRES_PORT:-5432}:5432"' '"5432:5432"'
+  '"${KIT_POSTGRES_PORT:-15500}:5432"' '"5432:5432"'
 expect_red 'breakage 4: docker-compose.yml hardcodes a published port' "$four" --static-only
 
 # 5. a kit change that would break every consumer's CI. The opt-in job must stay
@@ -300,4 +368,4 @@ if [ "$skips" -ne 0 ]; then
   echo "FAIL: self_test — $skips breakage(s) skipped for a missing toolchain. A skipped proof is not a proof."
   exit 1
 fi
-echo "PASS: self_test — all 11 breakages went red, and the unbroken tree is green."
+echo "PASS: self_test — all 12 breakages went red, and the unbroken tree is green."

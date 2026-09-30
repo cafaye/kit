@@ -23,7 +23,8 @@ kit/
 ├── templates/
 │   ├── bin-prime/<lang>.sh       # the worktree primer
 │   ├── bin/dev.sh                # the local developer loop
-│   ├── compose/                  # postgres + nats + redis + otel collector
+│   ├── compose/                  # postgres + nats + redis + collector + LGTM
+│   │   ├── grafana/provisioning/ # datasources, dashboards, alert rules (files)
 │   ├── otel/<lang>/              # W3C traceparent: codec, suite, snippet
 │   ├── mise.toml                 # toolchain pin template
 │   └── AGENTS.md                 # skeleton for a service repo
@@ -47,17 +48,32 @@ Three phases, and all three must pass:
 
 - **static** — every artifact parses, and the strictness decisions are still
   what we wrote them down to be. A parse is the weakest check; the rest are
-  semantic: no collector exporter but `debug`, no literal URL, every
-  `${env:...}` the collector reads actually passed into the container, every
-  published port a `${KIT_*:default}`, every language with all four artifacts.
+  semantic: the collector's redaction allowlist **derived from core's
+  schemas** and compared both ways, redaction before every exporter, no literal
+  URL, every `${env:...}` the collector reads actually passed into the
+  container, every published port a `${KIT_*:default}` inside kit's claimed
+  15000-15999 block, telemetry in nobody's readiness path, and every language
+  with all four artifacts.
 - **telemetry** — the six W3C traceparent suites are **executed**, one per
   language. Stdlib only and offline on purpose. If they ever need the network,
   a template has grown a dependency and kit has stopped being config-only.
-- **self_test** — eleven breakages of a throwaway copy, asserting the gate goes
+
+- **observability** — the two claims that are worth nothing unexercised: a
+  canary secret in ten leak shapes reaches no exporter (and the allowed data
+  survives), and a service starts, serves and reports healthy with the collector
+  killed. Both need a real collector, so both SKIP loudly without docker —
+  never pass silently.
+- **self_test** — twelve breakages of a throwaway copy, asserting the gate goes
   red each time. Six of them are a semantic mutation of one language each, so
   **every suite is proven able to fail** rather than assumed to.
 
-- Tests are written **first** and watched fail before the artifacts exist.
+- Tests are written **first** and watched fail before the artifacts exist. A
+  config written from documentation instead of from the pinned image is a config
+  that breaks on the first `bin/dev up`: Tempo, Loki and Mimir all reject keys
+  with messages that name a Go type rather than a config key. Every vendor
+  config in this repo was verified by loading it into its image.
+- **Never weaken a check to make the gate green.** If a check is wrong, fix the
+  check and say so in the commit message.
 - `shellcheck` and `node` run when installed and are skipped when not; PyYAML
   is required. A skip is reported in the summary, never hidden — and a *skip in
   self_test* fails the run, because a proof nobody ran is not a proof.
@@ -74,7 +90,7 @@ Three phases, and all three must pass:
   rubocop ran on kit's own Ruby with kit's own config. That is the only way an
   obsolete key surfaces before six repos inherit it.
 - The suite must be able to fail: `self_test` breaks a throwaway copy of the
-  tree eleven ways and asserts the run goes red. If you change the suite, keep
+  tree twelve ways and asserts the run goes red. If you change the suite, keep
   that true.
 
 ## Adding a language
