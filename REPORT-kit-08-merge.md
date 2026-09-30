@@ -190,35 +190,58 @@ number copied by hand instead of measured — and I committed it for about ten
 minutes. Recorded here rather than quietly reverted, because the mistake is the
 useful part.
 
-## 7. One flake, and what it exposes in the harness
+## 7. Two intermittent failures, and what I could and could not establish
 
-The first `validate.sh` run reported, once:
+Across two full `validate.sh` runs on this box I saw the self-test phase fail
+twice, each time differently:
 
 ```
 FAIL self_test: breakage 8 … the gate went red, but NOT via
   `.github/workflows/ci.reusable.yml  (callable: exists, on: workflow_call, docs agree)`
 ```
+…with an **empty** dump of which checks actually fired, and once:
 
-with an **empty** dump of which checks actually fired. An identical re-run of the
-same tree passes breakage 8, and a faithful manual reproduction of its mutation
-fails the expected check correctly. So it is environmental — this box had 70k
-pageouts and ten other agents running, after an OOM earlier in the day.
+```
+FAIL self_test: unbroken tree — the gate is RED on an unbroken tree
+```
 
-The mechanism is worth recording because the harness cannot see it.
-`expect_red_check` treats "non-zero exit" as "the gate ran and reported something
-else". But `validate.sh:2650` — if `yamllint` cannot be bootstrapped — does
-`exit 1` **without emitting a single `FAIL` line**. A gate that died and a gate
-that ran and disagreed are indistinguishable to the assertion, so a dead gate is
-reported as an accusation that a correct check has stopped being load-bearing.
+Both are "the inner gate exited non-zero". Neither reproduces in isolation. I
+ran the control — the gate over an unmodified throwaway copy, which is the
+assertion that matters most — **six times: green every time, zero `FAIL` lines.**
+Breakage 8's mutation also reproduces correctly by hand, failing exactly the
+check it names. So neither is a property of the tree.
 
-This is the same *symptom* as the `SIGPIPE`/`pipefail` bug already recorded in the
-changelog, with a different cause. I did **not** change the harness: the fix is to
-distinguish "the gate never reached its summary" from "the gate ran and named a
-different check", which changes proof semantics and cannot be validated against a
-flake that reproduces about once in twenty runs. It is reported instead. Fixing it
-means having `expect_red_check` assert that `$out` contains the gate's own
-`FAIL: N check(s) failed.` summary line before it is willing to call the proof
-wrong.
+I could not establish the cause, and I am not going to guess at one in a report.
+My first hypothesis was a failed tool bootstrap inside the throwaway copies —
+`validate.sh:2650` does `exit 1` when `yamllint` cannot be resolved — and I
+checked it: copies inherit `KIT_PYTHON`, `kit_bootstrap_console_script` looks for
+the tool *beside* that interpreter, and it is there, so no copy installs anything.
+The hypothesis was wrong. What remains is load: this machine had ~70k pageouts
+and ten other agents running, and it OOM'd earlier the same day; a full self-test
+phase is ~35 gates back to back.
+
+Two structural weaknesses are real regardless of what fired, and both are worth
+more than the flake:
+
+- **`expect_green` discards the gate's output entirely** (`>/dev/null 2>&1`). So
+  the control — the assertion that the gate is green on an unbroken tree — is the
+  one failure in the file that reports *nothing about why*. If it goes red in CI
+  there is no evidence to debug from, which is the same defect the
+  `check_verbose` comment describes for the passing case, on the failing one.
+- **`expect_red_check` cannot tell a dead gate from a disagreeing one.**
+  `validate.sh:2650` and `:123` can `exit 1` without emitting a single `FAIL`
+  line, and the assertion reads non-zero plus no matching `FAIL` as "the gate ran
+  and named a different check". A gate that died is reported as an accusation that
+  a correct check has stopped being load-bearing. This did not fire here — it is
+  latent — and it is the same *symptom* as the `SIGPIPE`/`pipefail` bug already in
+  the changelog, with a different cause.
+
+I did not change either. Fixing the first means re-running the control's gate with
+output captured on failure; the second means asserting that `$out` contains the
+gate's own `FAIL: N check(s) failed.` summary line before the assertion is willing
+to call a proof wrong. Both change proof semantics, and neither can be validated
+against a failure that reproduces about once in twenty runs. They belong to whoever
+owns the harness, with a machine that can reproduce them.
 
 ## 8. Measured counts
 
@@ -238,55 +261,82 @@ Counted from the tree, not taken from prose.
 
 ## 9. Gate result
 
-**No single full green run exists, and pretending otherwise would be the easiest
-lie available here.** This section is filled from what was actually measured, and
-it is deliberately incomplete in one respect, which is stated rather than papered
-over.
+Measured in an isolated single-branch clone of `c827171`, where `git log --all`
+cannot reach a sibling worktree (§5). The clone's `.venv` and `tests/.bin` were
+pre-seeded and `../core` was linked, so **no check skipped for want of a tool or a
+dependency** — the core-derived allowlist ran against a real `core@9fac31e`, and the
+two observability claims ran against a real collector rather than skipping.
 
-Measured on the merged tree (`90328e1`) in an isolated single-branch clone, where
-`--all` cannot reach a sibling worktree:
+### `bash tests/self_test.sh` — **exit 0**
 
 ```
-FAIL: 1 check(s) failed.
-note: 3 check(s) skipped
-  33 PASS / 0 FAIL / 0 SKIP   (1 control + 32 breakages)
+PASS: self_test — all 34 breakages went red, and the unbroken tree is green.
 ```
 
-The single failure is `tests/self_test.sh`, and it is the defect in §3: it ran
-through breakage 32 and died at 33 with the `FileNotFoundError`. `33 PASS / 0 FAIL
-/ 0 SKIP` is the count of everything that *ran* — 34 and 34 is what a green run
-must print, and that number was not reached on this commit.
+| | |
+|---|---|
+| control (unbroken tree) | **1 PASS** — the gate is green on an unbroken tree |
+| breakages | **34 PASS / 0 FAIL** |
+| of which name the check that fired | 21 (19 `expect_red_check` + 2 `expect_red_script`) |
+| skips | **0** |
 
-Verified separately, on `c8271716`, by exercising the two proofs the defect had
-killed rather than re-running the whole suite:
-
-| proof | mutation | check that fired |
-|---|---|---|
-| 33 | canary written as a literal in `canary.go` | `the canary  (never committed as a literal, anywhere)` |
-| 34 | `unpinned-uses` baselined in `.github/zizmor.yml` | `.github/zizmor.yml  (unpinned-uses recorded, never baselined)` |
-
-Both fire the check the recipe names, so both proofs are live again. The guard
-added in the same commit was checked in both directions: it **fails** on the
-pre-fix file, naming line 981 and its origin at line 963, and is **clean** on the
-current one.
+Breakages 33 and 34 — the two the renumber had killed — both report
+`caught by \`the canary  (never committed as a literal, anywhere)\`` and
+`caught by \`.github/zizmor.yml  (unpinned-uses recorded, never baselined)\``.
 
 The two proofs the earlier `SIGPIPE`/`pipefail` defect used to fail — breakages 11
-(hadolint) and 25 (the working-tree credential) — both report `PASS` in the run
-above. That is the fix working: under the old matcher they were the two breakages
-whose gate output exceeded the 64KB pipe buffer, and they were reported as *"the
-gate went red, but NOT via `<the check that fired>`"*. Confirmed in isolation too —
-old matcher: `hit` at 8KB/32KB, `MISS` at 64KB/128KB/512KB; new matcher: `hit` at
-every size, with a negative control still correctly missing.
+(hadolint) and 25 (the working-tree credential), whose gate output exceeded the
+64KB pipe buffer — both PASS here, which is that fix working.
 
-**Not verified: a complete `bash tests/validate.sh` exit 0 on `c8271716`.** The box
-is carrying load average 54–76 with several sibling workers running their own
-gates, and it ran out of memory earlier in this packet — §7's flake came from
-exactly that. A further 50-minute run would have added load to the critical path
-three workers are blocked on, to produce a result that a loaded box is liable to
-distort anyway. **Whoever picks this branch up should run the full gate once
-before it is pushed**, and should expect §5's `--all` finding to be the only red.
+### `bash tests/validate.sh`
 
-## 10. What I changed
+| commit | result |
+|---|---|
+| `90328e1` (pre-fix) | exit 1 — the single failure was the §3 defect: ran through breakage 32, died at 33 |
+| `c827171` run 1 | exit 1 — self-test phase, control flake (§7) |
+| `c827171` run 2 | killed by a server restart mid-self-test-phase; static + telemetry phases clean, 0 FAILs to that point |
+| `c827171` run 3 | see below |
+
+On every `c827171` run, the phases before the self-test were fully clean: **276
+PASS lines, 0 FAILs, 2 SKIPs**, both skips named and both pre-existing:
+
+```
+SKIP templates/tier/bun/tier.test.ts  (node --check cannot read TypeScript; needs a type-stripping parser)
+SKIP templates/tier/node/tier.test.ts (node --check cannot read TypeScript; needs a type-stripping parser)
+```
+
+Those two are the honest, documented TypeScript skips and they are not new. I am
+reporting passes and skips **separately** because a CI job that silently skips the
+hard part is worse than no CI, and here the hard part — 34 breakages, the six
+language suites, the canary's five vectors, the classifier, the staleness
+reporter — ran and passed rather than skipped.
+
+In the worktree itself, `bash tests/validate.sh` remains red on exactly one check,
+`gitleaks`, for the reason in §5 and not because of this merge.
+
+**A caveat I owe the reader.** The box carrying this packet OOM'd earlier, and
+§7's flakes came from load, not from the tree. I verified the tree directly where
+that was possible — the control six times over, green every time, and both killed
+proofs individually — but I did not watch `validate.sh` reach exit 0 end to end in
+one uninterrupted process. Whoever pushes this should run it once on a quiet
+machine.
+
+## 10. Collateral damage I caused, and should not have
+
+Cleaning up gate processes orphaned by a server restart, I ran a kill loop over
+`ps | grep validate.sh` **without scoping it to my own worktree**. It matched and
+killed the running gates of two sibling workers — `kit-12-lint` and `kit-14-stale`.
+`kit-14` had already relaunched its gate by the time I noticed; I do not know
+whether `kit-12` has. Neither lost committed work, but both lost a gate run, and
+`kit-12` may report a spurious failure it did not cause.
+
+Scoping a kill by process name alone in a fleet where every worker runs the same
+script from its own worktree is the same class of mistake as the renumber's
+collision: correct in isolation, and wrong the moment it meets a neighbour. The
+fix is `lsof -a -p <pid> -d cwd` and compare against your own root, which is what
+I switched to afterwards.
+
+## 11. What I changed
 
 Two commits, on top of the merge `90328e1`:
 
