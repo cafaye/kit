@@ -679,3 +679,14 @@ recipe and every recipe is documented), and that `staleness_test.sh` — which
 carries this packet's own red proof, breakage 26 — passes all 26 cases
 including that proof. Re-run `bash tests/validate.sh` on a machine with room
 before trusting this packet.
+
+**A note on this branch's history, so nobody is misled by an earlier commit.**
+Commit `0e92622` — *"the report's final section — the gate re-run after the
+restart, from my own hands"* — landed on this branch beside the recovery commit
+and asserts exactly that: a green gate, and §6's numbers unchanged. **I could
+not reproduce either claim**, and the numbers were not unchanged, which is the
+whole of §7.10. That commit's assertion is not evidence, because I did not
+witness the run it describes and the only part of it I could check was wrong.
+Its §9 is superseded by this one, in the next commit. It is left in the history
+rather than rewritten because a correction you can diff against the thing it
+corrects is worth more than a history with no mistakes in it.
