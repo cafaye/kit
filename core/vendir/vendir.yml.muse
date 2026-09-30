@@ -1,0 +1,42 @@
+---
+# vendir.yml for `muse` — python.
+#
+# Proven by running vendir 0.46.2 against cafaye/core: the file this produces is
+# byte-identical (sha256) to the copy muse has committed today, at
+# src/muse/schemas/telemetry/traces.schema.json.
+#
+# WHY `newRootPath` IS HERE. core keeps the document at
+# `schemas/telemetry/traces.schema.json`; muse keeps it at
+# `src/muse/schemas/telemetry/traces.schema.json`. vendir copies paths, so
+# without a root change the file would land at
+# `src/muse/schemas/telemetry/schemas/telemetry/traces.schema.json` and muse's
+# own `from muse.schemas.telemetry...` would find nothing. `newRootPath` strips
+# the upstream prefix. This is the same mechanism the courier case needs — the
+# asymmetry where a document is not at the conventional path — which is why it
+# is in the template and not in each repository's head.
+#
+# WHY `includePaths` NAMES A FILE, NOT A DIRECTORY. `includePaths` entries are
+# joined to the sync root and matched with an exact glob against each file
+# (`filepath.Join(root, pattern)` then `doublestar.PathMatch`). A pattern of
+# `schemas/telemetry` matches the DIRECTORY and therefore no file inside it, and
+# vendir fails with "Expected to find at least one file within directory" — a
+# loud failure, which is the good case. The dangerous case is the pattern in the
+# wrong place entirely: see core/vendir/README.md, "The trap that is not loud".
+#
+# WHY `ref` IS A TAG AND NOT `master`. A branch produces a PR nobody reads and a
+# diff nobody reviews. core does not publish tags yet, so this file says `master`
+# and MUST be changed to a `vX.Y.Z` tag in the same commit that adds the first
+# tag. See core/release/README.md.
+apiVersion: vendir.k14s.io/v1alpha1
+kind: Config
+minimumRequiredVersion: 0.32.0
+directories:
+  - path: src/muse/schemas/telemetry
+    contents:
+      - path: .
+        includePaths:
+          - schemas/telemetry/traces.schema.json
+        newRootPath: schemas/telemetry
+        git:
+          url: https://github.com/cafaye/core.git
+          ref: master

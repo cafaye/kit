@@ -1,0 +1,153 @@
+{
+  "about": "Named change classes for the core fan-out, and the tier each one breaks. Read by tests/classify.py; nothing else parses it. The rules are DATA, not code, so that the set of changes this repository has an opinion about is auditable in one read and diffable in one commit. A change no rule matches is not 'no recognised breakage' — it is UNRECOGNISED, and UNRECOGNISED is the strictest tier, so it always fails (see the `unmodelled-keyword` rule and AGENTS.md, 'The gate fails closed').",
+  "tiers": {
+    "FILE": "strictest. The document's own structure changed: a generated or hand-written binding to it stops compiling or stops unmarshalling. A Go struct, a Rust struct, and a Python pydantic model are all FILE consumers.",
+    "PACKAGE": "the document's contract between parts of itself changed, but a payload-only consumer still parses and validates.",
+    "WIRE_JSON": "the JSON on the wire changed shape in a way a validator notices, but a consumer that only validates payloads survives it.",
+    "WIRE": "lenient. Purely additive or documentation-only. A consumer at this tier survives."
+  },
+  "subset": "HOW TO READ A TIER, because getting this backwards is easy and the implementation is the authority. The strictness order is FILE(0) < PACKAGE(1) < WIRE_JSON(2) < WIRE(3): a LOWER index is a STRICTER change. A rule's `tier` is how strict that change is — `documentation-changed: WIRE` means the change is only strict at the WIRE level, i.e. nothing stricter than WIRE cares. A consumer passes `--tier T` to say how strict its own code is, and the gate fails when the change is at least as strict as the consumer, i.e. index(change) <= index(T). Three consequences worth stating because they look wrong until you check them: (a) a FILE consumer, the strictest, is the most protected and fails on the fewest changes; (b) a WIRE consumer fails on every breaking change, because everything strict also breaks the wire; (c) tiers are cumulative, so a FILE change is never survivable by declaring a looser tier. This mirrors buf: a consumer picks the category that matches what it actually depends on, and a stricter choice is a narrower one.",
+  "unrecognisedTier": "FILE",
+  "unrecognisedIsBreaking": true,
+  "unrecognisedTierWhy": "The single most important value in this file, and the only one that is deliberately not derived from a rule. Anything classify.py cannot place is assigned this tier, which means: a JSON Schema keyword it does not model, a change shape it has no observation for, a document that differs in a way no rule names. It is FILE — the strictest — so an unrecognised change fails at EVERY tier a caller can declare, including the loosest. It was FILE in the Python and FILE in a rule at the same time, and the duplication was found by a self-test breakage that inverted one of them and the suite stayed green: a property asserted in two places is a property asserted in neither. Hence one key, and the counterexample is one token. Do not derive it from a rule; the whole point is that there is no rule.",
+  "advisoryOps": [
+    "documentation:changed",
+    "required:reordered",
+    "enum:reordered"
+  ],
+  "advisoryOpsWhy": "The complete, closed set of operations that may be absorbed without failing the gate. It has three entries, and each had to argue for itself: a documentation edit, and a reordering of `required` or `enum` — both of which are provably not semantic changes, since JSON Schema defines those two keywords as sets. It is still a closed list, because a list that can grow by a later commit is not a control. classify.py refuses to load a catalogue whose `breaking: false` rule names anything outside this set, so widening it is a deliberate, diffable act in this one file rather than a quiet edit to a `breaking` flag. This is the `reportUnusedDisableDirectives` shape MD12 already adopted for ESLint: an escape hatch with no hygiene rule is a ratchet that only turns one way.",
+  "rules": [
+        {
+      "id": "file-added",
+      "tier": "WIRE",
+      "op": "file-added",
+      "why": "A new payload schema cannot break a consumer that does not reference it yet."
+    },
+    {
+      "id": "file-removed",
+      "tier": "FILE",
+      "op": "file-removed",
+      "why": "Every vendoring repo has the path in its own tree. Deleting the upstream file deletes the vendored copy on the next sync, and the import that read it stops resolving."
+    },
+    {
+      "id": "dialect-changed",
+      "tier": "FILE",
+      "op": "dialect-changed",
+      "why": "$schema or $id moved. A different JSON Schema dialect, or a different identity, changes what every validator in the fleet resolves the document to."
+    },
+    {
+      "id": "property-added",
+      "tier": "WIRE_JSON",
+      "op": "properties:key-added",
+      "why": "An added property a document does not require is additive for a validator. A FILE consumer sees a struct gaining a field, which its language tolerates, so this does not reach FILE. Note this pairs with required-property-added: a property that is both added and required produces two observations and takes the stricter tier."
+    },
+    {
+      "id": "property-removed",
+      "tier": "WIRE_JSON",
+      "op": "properties:key-removed",
+      "why": "Removing an optional property is a wire change a payload validator notices. If the removed property was also in `required`, the change additionally emits required:item-removed, which is FILE, so the pair resolves to FILE without this rule needing to know about `required`."
+    },
+    {
+      "id": "required-property-added",
+      "tier": "PACKAGE",
+      "op": "required:item-added",
+      "why": "The document now demands a field a conforming producer may not be sending. Producers that validate their own output against this document break; consumers reading it do not."
+    },
+    {
+      "id": "required-property-removed",
+      "tier": "FILE",
+      "op": "required:item-removed",
+      "why": "A binding generated from the document loses a guaranteed-present field, and the document's own invariant is gone. This is the observation that makes `property-removed` resolve to FILE when the property was required."
+    },
+    {
+      "id": "enum-value-added",
+      "tier": "WIRE_JSON",
+      "op": "enum:item-added",
+      "why": "A validator that only checks membership keeps accepting everything it accepted. A validator that pins the exact set has to widen."
+    },
+    {
+      "id": "enum-value-removed",
+      "tier": "FILE",
+      "op": "enum:item-removed",
+      "why": "A producer still emitting a removed value now produces a document its own core rejects. This is the class of change that is additive-looking in a diff and catastrophic in a deploy."
+    },
+    {
+      "id": "type-changed",
+      "tier": "FILE",
+      "op": "type:changed",
+      "why": "Any movement of `type` — object to array, string to integer, a union gaining or losing a member — changes what a binding unmarshals into."
+    },
+    {
+      "id": "pattern-changed",
+      "tier": "FILE",
+      "op": "pattern:changed",
+      "why": "Deciding whether one regular expression is a subset of another is not decidable in general, so this rule does not try to tell narrowing from widening. Any `pattern` change is FILE. A rule that guessed the direction would be a rule that is wrong the day someone writes a pattern it cannot compare."
+    },
+    {
+      "id": "numeric-constraint-changed",
+      "tier": "FILE",
+      "op": "numeric-constraint:changed",
+      "why": "minimum, maximum, exclusiveMinimum, exclusiveMaximum, multipleOf. Raising a minimum rejects payloads that used to validate and is invisible in a diff; any change is FILE for the same reason as pattern-changed."
+    },
+    {
+      "id": "length-constraint-changed",
+      "tier": "FILE",
+      "op": "length-constraint:changed",
+      "why": "minLength, maxLength, minItems, maxItems, minProperties, maxProperties, uniqueItems. Same reasoning as numeric-constraint-changed."
+    },
+    {
+      "id": "format-changed",
+      "tier": "FILE",
+      "op": "format:changed",
+      "why": "`format` is an assertion in every validator that implements it and a comment in every validator that does not, so the blast radius depends on the consumer. Strictest tier is the honest answer."
+    },
+    {
+      "id": "const-changed",
+      "tier": "FILE",
+      "op": "const:changed",
+      "why": "The document stopped accepting the one value it accepted."
+    },
+    {
+      "id": "additional-properties-changed",
+      "tier": "PACKAGE",
+      "op": "additionalProperties:changed",
+      "why": "Flipping additionalProperties from true to false rejects every document carrying a field the schema does not name, which is the classic way a 'harmless' core change breaks every producer at once."
+    },
+    {
+      "id": "composition-changed",
+      "tier": "FILE",
+      "op": "composition:changed",
+      "why": "allOf, anyOf, oneOf, not, if/then/else. Composition changes the meaning of the document rather than one of its leaves, and the tools that resolve it are the least uniform part of any validator."
+    },
+    {
+      "id": "default-changed",
+      "tier": "WIRE_JSON",
+      "op": "default:changed",
+      "why": "A default is a producer-side hint. A validator ignores it; a code generator that baked the old one in changes behaviour, which is why this is not WIRE."
+    },
+    {
+      "id": "set-reordered",
+      "tier": "WIRE",
+      "breaking": false,
+      "op": "{family}:reordered",
+      "why": "`required` and `enum` are SETS to a JSON Schema validator: the specification defines both as collections whose order carries no meaning, and a duplicate member is ignored. So a document that lists the same members in a different order is the same document. Without this rule the classifier would report the reorder as UNRECOGNISED — which is the safe direction and still wrong, because a gate that goes red on a provably cosmetic change trains the first person who hits it to reach for the gate rather than for the cause. That is how a fail-closed gate becomes a fail-open one, and it is why this is named here rather than left to the default. The op is written `{family}:reordered` because `required` and `enum` share the code path; the classifier substitutes the family, and an unlisted family therefore falls through to UNRECOGNISED again."
+    },
+    {
+      "id": "documentation-changed",
+      "tier": "WIRE",
+      "breaking": false,
+      "op": "documentation:changed",
+      "why": "title, description and the other documentation-only keywords. Reported in full, and explicitly NOT breaking — which is a stronger claim than being left out of the tier ladder, because it is asserted in the catalogue rather than implied by silence. `breaking: false` is only honoured for an op named in advisoryOps, so this cannot become a general escape hatch. This is the one change an auto-merge may absorb unattended, and naming it here is what keeps 'fail closed' from decaying into 'red on every PR'."
+    }
+  ],
+  "descriptions": [
+    "description",
+    "title",
+    "$comment",
+    "examples",
+    "default",
+    "deprecated",
+    "readOnly",
+    "writeOnly"
+  ]
+}

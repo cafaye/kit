@@ -2526,6 +2526,19 @@ STUB
     esac
   }
   check 'templates/bin/dev.sh  (KIT_DEV_PROFILES= escape hatch actually runs)' dev_escape_hatch_check
+  # ------------------------------------------------------------------ core
+  # The fan-out standard: vendir templates, the shared Renovate policy, and the
+  # two runnable pieces (the change classifier and the staleness reporter).
+  #
+  # `core_fanout_check` is a real parser over four file types and its failure
+  # modes are specific enough to be worth reading in one place, so it lives in
+  # tests/core_fanout_check.py rather than inlined here.
+  section 'static: the core fan-out standard'
+  core_fanout_check() {
+    "$PY" "$ROOT/tests/core_fanout_check.py" "$ROOT"
+  }
+  check 'core/vendir/ + core/renovate/  (structurally what Renovate and vendir need)' \
+    core_fanout_check
 
   # Dogfood lint/yamllint.yml on every YAML in the tree, not just the two
   # compose templates. kit ships the config and a repo that copies it lints its
@@ -2582,6 +2595,24 @@ STUB
       check "$rel  (yamllint -c lint/yamllint.yml)" \
         "$YAMLLINT" -c "$ROOT/lint/yamllint.yml" "$ROOT/$rel"
     done < <(yamls_of_the_tree)
+
+    # The glob above only reaches `*.yml` and `*.yaml`, and kit now ships YAML
+    # under other names: the vendir templates are `vendir.yml.<service>` so that
+    # a repository that copies one to `vendir.yml` gets a file Renovate's
+    # `managerFilePatterns` can find, while kit's own tree is never itself a
+    # vendir target.
+    #
+    # A file a service copies that breaks kit's own lint config greets its first
+    # CI run with a failure nobody authored, which is the `rack_middleware.rb.snippet`
+    # defect in AGENTS.md arriving in a different costume. So they are linted
+    # here by name, and the name list is explicit: a glob over
+    # `core/vendir/vendir.yml.*` would also catch a backup file.
+    for rel in core/vendir/vendir.yml.template core/vendir/vendir.yml.muse \
+               core/vendir/vendir.yml.pantry core/vendir/vendir.yml.caf; do
+      [ -f "$ROOT/$rel" ] || continue
+      check "$rel  (yamllint -c lint/yamllint.yml, under a non-.yml name)" \
+        "$YAMLLINT" -c "$ROOT/lint/yamllint.yml" "$ROOT/$rel"
+    done
   fi
 
   # The CI workflow gains a job; assert the job exists, is opt-in, and that the
@@ -3819,6 +3850,28 @@ if [ "$RUN_OBSERVABILITY" -eq 1 ]; then
       bash "$ROOT/tests/no_telemetry_in_readiness.sh"
   fi
 fi
+# phase: classifier + staleness — the two runnable pieces, executed
+# ===========================================================================
+#
+# Separate from `static` and run unconditionally, because both are the property
+# rather than the shape: classify_test asserts that the classifier FAILS on an
+# unrecognised change, and staleness_test asserts that the reporter tells
+# `current` from `unknown` from `undeclared`. A check that only parses those two
+# files would pass on a classifier that waves every change through.
+#
+# Both scripts build their own fixtures in a temp directory, so neither depends
+# on a repository being checked out or on the network.
+
+  # NOTE: deliberately not guarded by RUN_STATIC. kit-05's own comment
+  # called these "the property rather than the shape", but the block shipped
+  # wrapped in `if [ "$RUN_STATIC" -eq 1 ]`, which would let a static-analysis
+  # skip silently drop the fail-closed proof. A gate that skips is not green.
+check 'tests/classify_test.sh  (19 cases, incl. the fail-closed property)' \
+  bash "$ROOT/tests/classify_test.sh"
+
+section 'staleness: the fleet reporter tells the states apart'
+check 'tests/staleness_test.sh  (12 cases, incl. the red proof)' \
+  bash "$ROOT/tests/staleness_test.sh"
 
 # ===========================================================================
 # phase: self_test — prove the gate can go red
@@ -3832,7 +3885,7 @@ if [ "$RUN_SELF_TEST" -eq 1 ]; then
   # a hardcoded number is exactly the kind of thing that goes stale quietly when
   # the next packet adds a check. The wording follows from the count so the two
   # cannot disagree.
-  _st_breakages=$(grep -cE '^expect_red(_check|_lang)? ' "$ROOT/tests/self_test.sh" || true)
+  _st_breakages=$(grep -cE '^expect_red(_check|_lang|_script)? ' "$ROOT/tests/self_test.sh" || true)
 
   # The header is a promise about what the file proves, and a promise nobody
   # reads is decoration. Compare the breakage numbers the header NAMES against

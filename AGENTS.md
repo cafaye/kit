@@ -25,6 +25,11 @@ kit/
 │   ├── rubocop.yml   eslint.config.mjs
 │   └── hadolint.yaml                      # argues the one rule it ignores
 ├── docker/                               # Dockerfile.<lang> templates
+├── core/                                 # the cafaye/core fan-out standard
+│   ├── README.md                           # why, and the three failure modes
+│   ├── vendir/                             # vendir.yml per consuming repo
+│   ├── renovate/                           # the one shared Renovate policy
+│   └── release/                            # what core needs to be taggable
 ├── templates/
 │   ├── bin-prime/<lang>.sh               # the worktree primer
 │   ├── bin/dev.sh                        # the local developer loop
@@ -36,7 +41,10 @@ kit/
 │   ├── tier/README.md                    # the format, the rules, and the limits
 │   ├── mise.toml                         # toolchain pin template
 │   └── AGENTS.md                         # skeleton for a service repo
-└── tests/validate.sh                     # THE gate
+└── tests/
+    ├── validate.sh                       # THE gate
+    ├── classify.py  rules.json           # the change classifier, failing closed
+    └── staleness.py                      # the fleet staleness reporter
 ```
 
 Flat on purpose. `grep -r` finds everything; there is no plugin system to
@@ -120,12 +128,19 @@ Three phases, and all three must pass:
   survives), and a service starts, serves and reports healthy with the collector
   killed. Both need a real collector, so both SKIP loudly without docker —
   never pass silently.
-- **self_test** — twenty breakages of a throwaway copy, asserting the gate goes
-  red each time. Six of them are a semantic mutation of one language each, so
-  **every suite is proven able to fail** rather than assumed to. Seven assert
+- **classifier + staleness** — the change classifier and the staleness reporter
+  are *executed*, not parsed, and deliberately **outside** the `RUN_STATIC`
+  guard: a check that only parsed those two files would pass on a classifier
+  that waves every change through. They stay runnable when static analysis is
+  skipped, because a gate that skips is not green.
+- **self_test** — twenty-three breakages of a throwaway copy, asserting the gate
+  goes red each time. Six of them are a semantic mutation of one language each,
+  so **every suite is proven able to fail** rather than assumed to. Eight assert
   that one *named* check reported `FAIL`, so a check written for a specific
-  defect is proven still load-bearing.
-
+  defect is proven still load-bearing. Two assert that a *proof* goes red: one
+  inverts the classifier's fail-closed property, and one makes the staleness
+  reporter call an undeclared pin `current`. A property nobody has tried to
+  break is a property nobody has tested.
 - Tests are written **first** and watched fail before the artifacts exist. A
   config written from documentation instead of from the pinned image is a config
   that breaks on the first `bin/dev up`: Tempo, Loki and Mimir all reject keys
@@ -171,6 +186,30 @@ Three phases, and all three must pass:
   tree nineteen ways and asserts the run goes red. If you change the suite, keep
   that true.
 
+## The classifier fails closed, and that is a rule about code
+
+A difference `classify.py` cannot place is assigned `rules.json`'s
+`unrecognisedTier`, which is `FILE`, and is breaking. **Both facts live in
+`rules.json` and nowhere else.** An earlier version stated the tier in the Python
+*and* in a rule, and the self-test breakage written to invert it left the suite
+**green** — because the headline case never reached the line that was broken. A
+property stated in two places is a property asserted in zero times.
+
+So:
+
+- Adding a JSON Schema keyword the classifier does not model is a **decision**,
+  not an omission. It falls to `unrecognisedTier` deliberately; make it
+  deliberate in the same commit.
+- The escape hatch is fenced. A rule may set `breaking: false`, and the
+  catalogue **refuses to load** if the operation is not in `advisoryOps`.
+  Without that rule the one escape hatch is the first place a fail-open
+  classifier reappears, and `advisoryOps` is a closed list on purpose: a list
+  that grows by a later commit is not a control.
+- `advisoryOps` has three entries — a documentation edit, and a reordering of
+  `required` or `enum`, both provably non-semantic because JSON Schema defines
+  those two keywords as sets. Each had to argue for itself. Widening the list is
+  a deliberate, diffable act in one file.
+
 ## Adding a language
 
 1. Add `<lang>` to the `language` input's `options` in
@@ -206,6 +245,18 @@ an `option` with no `job` is a green build that ran nothing.
 
 - **Config only.** No runtime code, no dependencies, no generated output. If
   kit grows a dependency it has stopped being conventions.
+  - **The one carve-out, and why it is a carve-out rather than a precedent.**
+    `core/` ships a change classifier and a staleness reporter, which are
+    programs rather than configuration. They are here because a standard
+    without a thing that enforces it is a standard enforced by whoever reads
+    it. They stay inside the boundary deliberately: **standard library only,
+    no import outside `json`/`os`/`re`/`sys`/`argparse`/`subprocess`**, no
+    installable dependency, and **nothing imports them** — the real test of this
+    rule is that nothing here is a library, and a classifier is not. The
+    reporter prints a table for a scheduled job and **never commits its
+    output**, because a committed report is the "generated output" this rule
+    forbids and the kind of file that rots. If a third program is proposed, the
+    default answer is no.
 - **Callers override, they never fork.** Anything that differs per service —
   versions, thresholds, names — is an input or a build arg, never a copy of a
   file. Six repos each holding their own workflow is the drift this repo
@@ -259,6 +310,9 @@ an `option` with no `job` is a green build that ran nothing.
 ## Before you commit
 
 - [ ] `bash tests/validate.sh` is green, and you have pasted the output
+- [ ] Every claim about a third-party tool is verified against its source or an
+      actual run, and anything you could not verify is written down as such
+- [ ] You did not add a file type without adding the check that lints it
 - [ ] New or changed config is covered by a check that would catch its absence
 - [ ] `README.md` still matches the tree (every language, every file)
 - [ ] `CHANGELOG.md` has an entry

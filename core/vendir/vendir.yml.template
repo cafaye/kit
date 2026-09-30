@@ -1,0 +1,60 @@
+---
+# The template kit ships for a repository adopting the core fan-out.
+#
+# Copy to `vendir.yml` at the repository root and change four things, marked
+# TODO below. Everything else is already correct, and the parts that look
+# arbitrary are arbitrary on purpose — each one is a decision that is easy to get
+# wrong in a way that is silent, and the reasoning is in core/vendir/README.md.
+#
+# THE FOUR THINGS TO CHANGE
+#
+#   1. `ref`            a semver TAG from core, never `master`.
+#   2. `includePaths`   the document(s) you consume, named as `path/to/file`.
+#   3. `newRootPath`    the upstream directory to strip, so the file lands where
+#                       your own code reads it.
+#   4. `path`           the directory in THIS repository it lands in.
+#
+# `apiVersion`, `kind`, `minimumRequiredVersion` and the `git:` block's `url` are
+# not yours to change. `url` must be `https://` or `ssh://` — vendir rejects
+# anything else, and Renovate's extractor requires the same shape, so a
+# `git@github.com:...` URL is a config that syncs locally and is invisible to the
+# bot that is supposed to bump it.
+#
+# COMMIT `vendir.lock.yml`. Not as an option: Renovate's vendir manager locates
+# the lockfile with `getSiblingFileName(packageFileName, 'vendir.lock.yml')` and
+# returns `null` — a warning in the log and no artifact update — when it is
+# missing or empty. The result is the worst available outcome: a PR that moves
+# the pin and does NOT re-copy the bytes, which looks exactly like a correct
+# re-vendor in the diff. kit's gate fails on a `vendir.yml` with no lockfile for
+# this reason.
+apiVersion: vendir.k14s.io/v1alpha1
+kind: Config
+
+# The oldest vendir that understands every field used here. `includePaths` and
+# `newRootPath` are long-standing; this floor is about the schema, not them.
+minimumRequiredVersion: 0.32.0
+
+directories:
+  # TODO(4): the directory in THIS repository the document lands in.
+  - path: schemas
+    contents:
+      # `path` under a content entry is the name vendir gives the copy INSIDE the
+      # directory above. `.` means "no intermediate directory", which is what
+      # makes `newRootPath` below meaningful — with a real name here the copy
+      # would gain that directory on top of the one `newRootPath` produced.
+      - path: .
+        # TODO(2): the documents you consume. One entry per document, or one glob
+        # for a whole subtree (`schemas/telemetry/**`). A bare directory name
+        # matches no file and vendir fails loudly — see the README.
+        includePaths:
+          - schemas/cafaye.manifest.schema.json
+        # TODO(3): the upstream directory to strip. This is what lets a document
+        # live at a different path in your repository than in core, which is the
+        # courier asymmetry and the reason this field is not optional.
+        newRootPath: schemas
+        git:
+          url: https://github.com/cafaye/core.git
+          # TODO(1): a semver tag. `master` is a moving target that produces a
+          # PR nobody reads; a tag is the reviewable unit, and semver gives the
+          # additive-vs-breaking axis for free.
+          ref: v0.1.0

@@ -42,7 +42,49 @@ build lands in kit once, and reaches the next service in a pull request.
 | `templates/tier/README.md` | The normalised result format, the allowlist rules, and what a tier gate **cannot** catch. | Every service |
 | `templates/mise.toml` | Toolchain pins, one per language, commented. | Every service, as `mise.toml` |
 | `templates/AGENTS.md` | Skeleton repo-conventions file. | Every service, as `AGENTS.md` |
+| `core/` | The `cafaye/core` fan-out: a `vendir.yml` per consuming repo, the one shared Renovate policy, and what `core` needs to publish semver tags. | Any repo that consumes core's schemas |
+| `tests/classify.py` | Classifies a change to a vendored schema set into `FILE`/`PACKAGE`/`WIRE_JSON`/`WIRE`, and **fails closed** on anything `tests/rules.json` does not name. Stdlib only. | Any repo that vendors core |
+| `tests/staleness.py` | Reads every consuming repo's recorded pin, resolves where `core` is now, prints the distance. `--fail-on-behind` turns it into a gate. | Scheduled, fleet-wide |
 | `tests/validate.sh` | kit's own suite — the gate. | kit |
+
+## The core fan-out — `core/`
+
+Six repositories copy bytes out of `cafaye/core` and nothing in the fleet makes
+that copy reach them. `core/` is the standard that does, and — as much as
+anything else — the record of what is still unproven about it.
+
+**Start at [`core/README.md`](core/README.md).** It opens with what was
+*measured* rather than what was assumed, and the measurement is not what the
+design was briefed on: one repository declares a core pin at all, two hold
+vendored bytes with no recorded origin, and two fetch core at test time on
+purpose.
+
+| file | what it is |
+| --- | --- |
+| [`core/vendir/vendir.yml.{muse,pantry,caf}`](core/vendir/) | The three real consumers, in three languages. `muse` and `pantry` are proven byte-identical (sha256) to what those repos have committed today; `caf` cannot migrate without a rename and its banner says so. |
+| [`core/vendir/vendir.yml.template`](core/vendir/) | What a fourth repository copies. Four things to change, each marked. |
+| [`core/renovate/renovate.json5`](core/renovate/) | The single `inheritConfig` policy for the whole fleet. |
+| [`core/renovate/SETUP.md`](core/renovate/) | The ordered steps to stand the policy repo up, **and what to verify before onboarding a second repository**. |
+| [`core/release/release.yml`](core/release/) | The workflow `core` needs before any of it can move. Ships here; belongs in `core/.github/workflows/`. |
+
+Two things worth knowing before you read any of it, because both were found by
+running the tools rather than by reading about them:
+
+- **`includePaths` nested under `git:` is silently ignored.** vendir drops keys
+  its schema does not declare, the filter ends up empty, and `vendir sync`
+  vendors the *entire* upstream repository while exiting **0**. It reads
+  correctly. `tests/validate.sh` has a check for exactly this shape and
+  `self_test.sh` breaks it on purpose.
+- **`renovate.json5` uses `constraints.vendir`, not `installTools`.** The first is
+  what the vendir manager actually reads; the second is scoped to
+  `postUpgradeTasks` and is *also* wrong in shape — it is an object keyed by tool
+  name, not an array. Both checked in Renovate's source; see the comments in the
+  file.
+
+The change classifier and the staleness reporter are the two things here that
+are programs rather than configuration, and they are the reason the standard is
+enforceable. Both are standard-library only and neither is imported by anything.
+Their conventions are in [`AGENTS.md`](AGENTS.md#the-classifier-fails-closed-and-that-is-a-rule-about-code).
 
 ## The local stack — `templates/compose/`
 

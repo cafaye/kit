@@ -1,0 +1,44 @@
+---
+# vendir.yml for `caf` — go. READ THE BANNER: this one does not migrate as-is.
+#
+# caf today vendors core's manifest schema at
+#   internal/contract/schemas/manifest-0.2.json
+# and core publishes it as
+#   schemas/cafaye.manifest.schema.json
+#
+# The BYTES are identical — sha256 `9f90b370…` on both sides, measured — but the
+# FILENAME is not, and vendir has no rename. Its content schema
+# (pkg/vendir/config/directory.go) offers `path`, `includePaths`, `excludePaths`,
+# `ignorePaths`, `legalPaths`, `newRootPath` and `permissions`, and nothing that
+# renames a file. Running this config lands the document at
+# `internal/contract/schemas/cafaye.manifest.schema.json`; verified, not assumed.
+#
+# So caf's migration is a rename plus a commit, not a config drop. The rename
+# touches nine references in six files, and three of them are load-bearing:
+#
+#   internal/contract/schema.go:19          //go:embed schemas/manifest-0.2.json
+#   internal/contract/schema.go:27          //go:generate shasum -a 256 …manifest-0.2.json
+#   internal/contract/contract_test.go:428  fails if the copy is hand-edited
+#
+# The third is the one to keep. It is the sha256 parity guard that makes a stale
+# copy UNMERGEABLE rather than merely detected, and it is the reason this
+# migration is safe at all. Rename the file and the guard with it; drop the guard
+# and the whole design is a report.
+#
+# After the rename, this config is correct as written. The alternative — leaving
+# caf on the hand-bumped form — is a legitimate choice, and the cost of that
+# choice is one more repository whose copy nobody bumps for it. Both are recorded
+# rather than decided here, because kit does not own caf's Go source layout.
+apiVersion: vendir.k14s.io/v1alpha1
+kind: Config
+minimumRequiredVersion: 0.32.0
+directories:
+  - path: internal/contract/schemas
+    contents:
+      - path: .
+        includePaths:
+          - schemas/cafaye.manifest.schema.json
+        newRootPath: schemas
+        git:
+          url: https://github.com/cafaye/core.git
+          ref: master

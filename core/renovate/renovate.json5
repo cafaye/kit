@@ -1,0 +1,141 @@
+{
+  // ---------------------------------------------------------------------------
+  // cafaye/renovate-config — the ONE policy that governs all thirteen repos.
+  //
+  // Read this file's comments as load-bearing. Every option below was checked
+  // against Renovate's own source at commit f998d68 (2026-09-30), and three of
+  // them are not what the documentation's shape suggests. The checks and their
+  // outcomes are recorded in REPORT-kit-05-fanout.md.
+  //
+  // WHY A SEPARATE REPOSITORY AT ALL. `inheritConfig` is read once, before any
+  // repository is processed, so a policy change is one pull request in one place
+  // instead of thirteen. That is the entire argument, and it is worth the extra
+  // repository: a fleet policy that lives in thirteen files is thirteen policies.
+  // ---------------------------------------------------------------------------
+
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+
+  // Fail CLOSED on an unrecognised change is a property of the classifier, not
+  // of this file — but it is why `ignorePaths` below is empty rather than
+  // "whatever we have not got round to". An unrecognised change must reach the
+  // gate and be classified there; the gate is what fails closed.
+  ignorePaths: [],
+
+  // ---------------------------------------------------------------------------
+  // The core fan-out.
+  //
+  // `vendir` is Renovate's built-in manager, not a `customManagers` regex. The
+  // difference is not style: the regex manager moves a pin and cannot re-copy the
+  // bytes, and its only closure is `postUpgradeTasks`, which is disabled by
+  // default for security and requires every command to match a global
+  // `allowedCommands` regex — which means re-running `npm run vendor` or
+  // `mix deps.get` per repository, reintroducing exactly the per-language
+  // runtime this design exists to remove. `vendir` runs `vendir sync` inside
+  // `updateArtifacts()` and commits the re-copied bytes in the same PR
+  // (lib/modules/manager/vendir/artifacts.ts). One static Go binary, no
+  // per-language runtime.
+  // ---------------------------------------------------------------------------
+  enabledManagers: ['vendir'],
+
+  // The pin is a git ref, so Renovate resolves it with the `git-refs` datasource.
+  // Two verified consequences, both of which argue for a tag:
+  //
+  //   * `git-refs` returns BOTH tags and heads as candidate versions
+  //     (lib/modules/datasource/git-refs/index.ts filters on
+  //     `type === 'tags' || type === 'heads'`). A branch named `master` is
+  //     therefore a candidate "version" alongside every tag.
+  //   * the extractor sets no `versioning`, so the datasource default applies.
+  //
+  // Stating `semver` explicitly removes both questions. It is not decoration: a
+  // policy that leaves versioning to an implicit default is a policy that changes
+  // meaning when a dependency ships a new default.
+  packageRules: [
+    {
+      description: 'core and every other vendir git source is a semver tag',
+      matchManagers: ['vendir'],
+      matchDatasources: ['git-refs'],
+      versioning: 'semver',
+    },
+
+    // -----------------------------------------------------------------------
+    // F3. A re-vendor PR can be green about the copy and red about the code.
+    //
+    // The trap is a PR whose *copy* is correct and whose *build* is red for a
+    // reason the diff does not explain. Thirteen of these land at once and the
+    // platform team eats thirteen interruptions to fix a bug in one repository.
+    //
+    // So: additive changes may merge unattended; breaking changes may not, and
+    // carry a label that says so. `automerge: false` on the breaking rule is
+    // the load-bearing line and the label is for the human.
+    //
+    // NOTE, verified rather than assumed: Renovate has no `needsCodeChanges`
+    // option at this ref (zero case-insensitive matches for "codechange" across
+    // lib/). The signal is therefore the label, and the enforcement is the
+    // absence of `automerge` — which is a stronger control anyway, because a
+    // label is advice and a missing automerge is a mechanism.
+    // -----------------------------------------------------------------------
+    {
+      description: 'additive core bumps may merge unattended',
+      matchManagers: ['vendir'],
+      matchUpdateTypes: ['minor', 'patch', 'pin', 'digest'],
+      automerge: true,
+      labels: ['core-bump', 'auto-merge-ok'],
+    },
+    {
+      description: 'a major core bump is a breaking change: label it, never auto-merge it',
+      matchManagers: ['vendir'],
+      matchUpdateTypes: ['major'],
+      automerge: false,
+      labels: ['core-bump', 'needs-code-change'],
+    },
+  ],
+
+  // ---------------------------------------------------------------------------
+  // THE TOOL CONSTRAINT. This is the part the packet flagged as
+  // documented-but-unconfirmed, so here is the confirmed answer and the
+  // mechanism, because the mechanism is the part that was wrong.
+  //
+  // It is NOT `installTools`. Two reasons, both verified:
+  //
+  //   1. `installTools` is typed `Partial<Record<ToolName, Record<never, never>>>`
+  //      and validated by iterating `Object.keys(val)` and rejecting anything
+  //      that is not a tool name. The array form `installTools: ['vendir']` —
+  //      the shape the packet proposed — iterates the key `"0"`, fails
+  //      `isToolName`, and is a configuration error. The object form is
+  //      `installTools: { vendir: {} }`.
+  //   2. `installTools` is scoped to `postUpgradeTasks` (`parents:
+  //      ['postUpgradeTasks']` in the option schema). The vendir manager never
+  //      reads it. What it reads is `constraints`, through
+  //      `resolveToolConstraint(config, 'vendir')`.
+  //
+  // `constraints` is the correct lever, and it is inheritable:
+  // `resolveToolConstraint` reads `config.constraints?.[toolName]` from the
+  // repository config, which is the inherited config merged with the
+  // repository's own. `lib/util/exec/index.ts` turns `toolConstraints` into
+  // `generateInstallCommands`, so the vendir binary is installed from
+  // containerbase at exactly this version before `vendir sync` runs.
+  //
+  // On inheritable config, the flag to look for is `globalOnly`, not
+  // `inheritConfigSupport`. In `lib/config/validation.ts` the inherited-config
+  // check is nested INSIDE the global-option check:
+  //
+  //   if (isGlobalOption(key)) {
+  //     ...
+  //     } else if (!isFalseGlobal(key, parentPath)
+  //              && !(configType === 'inherit' && isInhertConfigOption(key)))
+  //
+  // so `inheritConfigSupport` only ever exempts an option that is ALSO
+  // `globalOnly`. `constraints` is not `globalOnly` and needs no exemption. So
+  // the feared cost — "the tool constraint moves to each repo's config" — does
+  // not arise, and it does not arise for a better reason than the one assumed.
+  // ---------------------------------------------------------------------------
+  constraints: {
+    vendir: '0.46.2',
+  },
+
+  // A vendir failure is a failure, not a warning. `artifactErrorResult` is what
+  // Renovate returns when `vendir sync` exits non-zero, and letting it warn
+  // would let a PR land that changed the pin and not the bytes.
+  ignoreUnstable: false,
+  osvOffline: true,
+}
