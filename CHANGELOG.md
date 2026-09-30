@@ -79,18 +79,45 @@ semver contract — it is consumed by *calling*
 - **`tests/staleness.py --scope templates` measured the fleet, and the brief's
   numbers did not survive it.** `README.md` opens
   [what the fleet actually adopted](#what-the-fleet-actually-adopted) with the
-  result. The corrections worth stating here: `mise.toml` and `AGENTS.md` are
-  9/9 diverged and both divergences are **adoption working** (README steps 4
-  and 5), with 8–19 code lines between them once comments are stripped; and
+  result. The corrections worth stating here: `mise.toml` is 9/9 diverged and
+  the divergence is **adoption working**, because the template is the union of
+  every language's pins (19 tools) and a service keeps the two it needs;
+  `AGENTS.md` is 9/9 diverged and the divergence is the **opposite** — the
+  template was superseded, only 12–40 of its 121 lines survive per service, and
+  `## Observability` survives in **none** of the nine; and
   `lint/*` is **3 diverged, 3 absent**, not 0/9, because `billing`, `parlor` and
   `identity` each hold a linter config that is their own — none carrying kit's
   STRICTNESS NOTES block. The honest sentence is "nobody lints with kit's
   rules", not "nobody lints".
 
+- **Four numbers in my own first draft were wrong, and all four flattered the
+  measurement.** They are corrected above, in `templates/parity-allowlist` and
+  in the report, and they are written down here because the pattern is the
+  point: a figure that cannot survive being recomputed is a liability in a file
+  whose whole job is to be believed.
+  - **`AGENTS.md` "8–19 lines with markdown comments stripped".** The template
+    has no comments to strip, and normalising the `<...>` placeholders does not
+    shrink the diff either — still 315–669 changed lines. The nine are not
+    filled-in forms, and this is the artefact where the fleet has the **least**
+    of kit's template.
+  - **`mise.toml` "8–19 code lines apart".** Not a number this comparison
+    produces; the real figure is 80–110, and legitimately so.
+  - **`bin/prime` "32 to 63 lines", and "the fleet's versions begin `#!/bin/sh`".**
+    The range is 12–58. Only `caf` and `courier` use that shebang; `darkroom`,
+    `muse` and `parlor` use kit's own, and **`identity/bin/prime` has no shebang
+    at all**. All seven reasons asserted it; it was true for two. `billing`'s
+    is not stale either — it carries the STRICTNESS NOTES block and is 12 lines
+    from kit's ruby template, with Rails commands added.
+  - **`billing/bin/dev` "predates kit's observability profile, brings up postgres
+    and nats only".** It is two lines: `#!/usr/bin/env ruby` and
+    `exec "./bin/rails", "server", *ARGV`. A Rails server shim, not a copy of
+    kit's loop in any era. The claim was inferred from a line count rather than
+    read off the file.
+
 - **One of my own sentences was wrong, which is why it is here.** The first draft
   of `REPORT-kit-14.md` and of eight ledger entries said a partially-adopted
   compose stack "cannot start". Checked with `docker compose config`: it does
-  not. None of the seven services' compose files mounts any of kit's eleven,
+  not. None of the six services' compose files mounts any of kit's stack files,
   each declares one or two services of its own, and five of six pass validation
   — they are **replacements that kept a filename**, not broken copies. The
   reporter now says what it measured ("partially adopted: N of 12 members

@@ -672,10 +672,11 @@ def collect_cell(repo_name: str, repo_dir: str, artefact: dict, kit_dir: str,
         #
         # The note does NOT claim the stack cannot start. An earlier version did,
         # and it was wrong: none of this fleet's compose files mounts any of
-        # kit's eleven, so these are REPLACEMENTS that kept a filename, not
+        # kit's stack files, so these are REPLACEMENTS that kept a filename, not
         # kit's stack with pieces removed. `docker compose config` is green on
-        # five of the seven. The reporter compares bytes and cannot tell those
-        # two situations apart, so the note says what it measured and stops.
+        # five of the six that have one. The reporter compares bytes and cannot
+        # tell those two situations apart, so the note says what it measured and
+        # stops.
         held = len(present_identical) + len(differing)
         if not differing:
             shape = "every member it holds is byte-identical to kit's"

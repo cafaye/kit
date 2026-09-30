@@ -628,8 +628,8 @@ fi
 #     And it has to say what it MEASURED. An earlier version of the note ended
 #     "a stack missing members does not start", which is a claim the reporter
 #     cannot support: it compares bytes, and a service whose compose file mounts
-#     none of kit's eleven is a REPLACEMENT, not a broken copy. The real fleet
-#     is exactly that case — `docker compose config` is green on five of its
+#     none of kit's stack files is a REPLACEMENT, not a broken copy. The real
+#     fleet is exactly that case — `docker compose config` is green on five of its
 #     six compose files — so the sentence was wrong about the fleet this reporter
 #     is pointed at, which is the only kind of wrong worth fixing.
 if printf '%s\n' "$OUT" | grep -qE '[0-9]+ absent' \

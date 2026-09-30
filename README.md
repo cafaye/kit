@@ -50,27 +50,32 @@ one cell.
 Three findings the packet's brief did not contain, and all three changed what
 was built:
 
-1. **Nine cell counts that the brief predicted as uniform are not.**
-   `mise.toml` and `AGENTS.md` are 9/9 *diverged*, and both divergences are
-   **adoption working** — step 4 says raise every placeholder, step 5 says fill
-   in the placeholders. With markdown and shell comments stripped, the nine
-   `AGENTS.md` files differ from the template by 8 to 19 lines, not by the
-   309–634 the raw diff reports. A reporter that printed only the raw number
-   would make the best-behaved artefact in the fleet look like the worst.
+1. **`mise.toml` and `AGENTS.md` are 9/9 *diverged*, and the two divergences
+   mean opposite things.** `mise.toml` is adoption working: the template is
+   kit's **union of every language's tool pins** (19 tools, 74 code lines), so a
+   service keeping two of them and raising the versions reads as 80–110 lines of
+   divergence by construction — `muse` keeps `python` and `uv` out of nineteen.
+   `AGENTS.md` is the opposite: the template is 121 lines and each service
+   wrote its own 281–664 line document, keeping only **12–40** of the
+   template's lines. `## Observability` — the template's largest section, and
+   the one recording the telemetry convention — **survives in none of the
+   nine**, including the eight that adopted that convention through kit's own
+   workflow. The template was superseded, not filled in.
 2. **`lint/*.yml` is not 0/9. It is 3 diverged, 3 absent.** `billing`,
    `parlor` and `identity` each hold their own linter config, all three
    differing from kit's, and none of the three carrying kit's STRICTNESS NOTES
    block — which is where a config records *what* it enforces and why. The
    honest sentence is "nobody lints with kit's rules", not "nobody lints".
 3. **The local stack is not "drifted", it is *not there*.** Of the twelve files
-   in `templates/compose/`, the fleet holds `docker-compose.yml` in seven
-   services and `.env.example` in two. The collector, Tempo, Loki, Mimir and
-   the Grafana provisioning are **0 of 12, in all nine services**. Those seven
+   in `templates/compose/`, the fleet holds `docker-compose.yml` in six
+   services and `.env.example` in two, and seven services hold at least one
+   member. The collector, Tempo, Loki, Mimir and
+   the Grafana provisioning are **0 of 12, in all nine services**. Those six
    compose files are each ~420 lines different from kit's, and the number is
    the least interesting thing about them. They are also **replacements rather
-   than broken copies**: none of them mounts a single one of kit's eleven files
+   than broken copies**: none of them mounts a single one of kit's stack files
    (`grep -cE '\./(otel-collector|tempo|loki|mimir|grafana)'` is 0 in all
-   seven), each declares one or two services of its own, and
+   six), each declares one or two services of its own, and
    `docker compose config` is **green on five of the six** — so they are valid
    stacks that are simply not this one. The reporter calls the state `diverged`
    and reports the member breakdown; it does not claim the stack is broken,
@@ -205,8 +210,9 @@ The one that reads `core/`'s consumers is `--scope core`, and it is documented i
 consumers is `--scope templates`, and the difference is not cosmetic: a pin can
 be stale and a file can be **gone**, and `templates/` has drifted far enough
 that gone is the commonest answer. The seven stacks above are the worked
-example — the fleet holds seven of them and none of the other eleven files each
-one needs, which is the finding a drift-only reporter has no word for.
+example — the fleet holds `docker-compose.yml` in six services and none of the
+other eleven files each one needs, which is the finding a drift-only reporter
+has no word for.
 
 ## The local stack — `templates/compose/`
 

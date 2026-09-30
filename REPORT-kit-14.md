@@ -1,6 +1,17 @@
 # REPORT — kit-14: the staleness reporter, pointed at `templates/`
 
-**Worktree:** `worker/kit-14-stale` · **Base:** `41f8bcb` (master) · **Date:** 2026-09-30
+**Worktree:** `worker/kit-14-stale` · **Base:** `41f8bcb` (master, not rebased — see
+§7.12) · **Date:** 2026-09-30
+
+> **Read §9 before trusting anything here.** This packet was interrupted by an
+> OOM restart, so the code on this branch arrived as a `recover(...)` commit
+> whose own message says its conclusions are void. I re-measured rather than
+> re-read, and **four of the recovered report's numbers were false** — all four
+> in the direction that made the reporter look better than it is. They are
+> corrected throughout, with the wrong version quoted beside the correction.
+> Separately, I have **not** observed a completed `self_test` on this branch:
+> the machine was at load 111 with four other workers running gates, and my run
+> was killed. §9 says exactly what I did and did not see.
 
 **The three things the packet asked for, and where they are:**
 
@@ -73,10 +84,15 @@ reads, and that is the same failure as a check that is always green.
 
 ### Bundles: `compose` is one artefact, not twelve
 
-`docker-compose.yml` mounts the other eleven files **by path**. A service holding
-eight of them has adopted kit's stack badly, and eleven separately-pinned cells
-would report that as eight successes and three absences. So `compose` is graded
-as one artefact with twelve members, and the note says which shape it is:
+`docker-compose.yml` reaches the other eleven members **by path or by copy**:
+five bind mounts — `./otel-collector.yml`, `./tempo/tempo.yaml`,
+`./loki/loki-config.yaml`, `./mimir/mimir.yaml` and the whole
+`./grafana/provisioning` directory, which alone holds six of them — covering ten
+of the eleven, plus `.env.example`, which is `cp`'d to `.env` rather than
+mounted. A service holding eight of them has adopted kit's stack badly, and
+eleven separately-pinned cells would report that as eight successes and three
+absences. So `compose` is graded as one artefact with twelve members, and the
+note says which shape it is:
 
 ```
 billing  compose  diverged  partially adopted: 1 of 12 member(s) held
@@ -102,12 +118,12 @@ $ grep -cE '^\s+- \./' templates/compose/docker-compose.yml
 5
 ```
 
-None of the seven services' compose files mounts a single one of kit's eleven
-files. They declare **one or two services** (`db`, `app`, `postgres`,
-`guard`, `identity`) and they are not kit's stack with pieces missing — they are
+None of the six services' compose files mounts a single one of kit's stack
+files. They declare **one or two services** of their own (`db`, `postgres`,
+`guard`, `identity`, `muse`, `darkroom`) and they are not kit's stack with pieces missing — they are
 **replacements**, which is exactly what the packet said and exactly what
 `diverged` is the right word for. `docker compose config` is **green on five of
-them**, so they are valid, runnable stacks; they are just not this one. The
+the six**, so they are valid, runnable stacks; they are just not this one. The
 "cannot start" wording is gone from the ledger, and §6 has the corrected
 sentence.
 
@@ -375,19 +391,31 @@ it down.
 
 The ninth current cell is `guard/bin/prime`, covered above.
 
-### What is diverged — and three of the four groups are adoption *working*
+### What is diverged — and the two 9/9 groups mean opposite things
 
-**`mise.toml`, 9/9.** README step 4: raise every placeholder. Nine services did
-it, 8–32 code lines apart once comments are stripped.
+**`mise.toml`, 9/9 — adoption working, and the diff is legitimately huge.**
+`templates/mise.toml` is kit's **union of every language's tool pins**: 19 tools
+across 7 languages, 74 code lines once trailing comments are stripped. A service
+keeps the handful for its own language, deletes the rest, raises the versions
+(README step 4) and adds its own `[env]` and `[tasks]`. So **71–73 of the
+template's lines are "removed" by construction** and the total difference is
+**80–110 code lines** (7–39 added). `muse`, the smallest, keeps two pins
+(`python`, `uv`) out of nineteen. Nothing here is drift.
 
-**`AGENTS.md`, 9/9.** README step 5: fill in the placeholders, delete the
-sections that do not apply. **The raw diff is 258–624 lines per service, and
-that number is the most misleading figure in this packet.** With markdown
-comments stripped the difference is **8–19 lines**: nine filled-in forms. A
-reporter that printed only the raw number would make the best-behaved artefact
-in the fleet look like the worst, and would send somebody to re-copy a file that
-was never broken. The reporter prints the raw count *and* the breakdown, and the
-pin for each of the nine says what the divergence is.
+**`AGENTS.md`, 9/9 — the opposite, and the artefact where kit has the *least*
+influence.** The template is 121 lines in nine sections. The services' files are
+**281–664 lines**, and only **12–40** of the template's lines survive in any one
+of them — 23 in six of the nine, a line-survival rate near 19%. The headings are
+the services' own: `guard` has `Rules`, `Gates`, `Adding an endpoint`; the
+template has `Conventions`, `Observability`, `Testing`, `Contracts`.
+
+**`## Observability` survives in none of the nine.** It is the template's
+largest section — eight opinionated bullets recording the telemetry convention —
+and it was dropped by every service, *including the eight that adopted that very
+convention* by calling kit's own workflow, which runs the telemetry job. The
+section documenting the convention was discarded by the services living it.
+That is the finding here, and it is the opposite of "the best-behaved artefact in
+the fleet", which is what an earlier draft of this report claimed. See §7.10.
 
 **`docker/Dockerfile`, 7 diverged + 1 absent + 1 unknown.** The template carries
 `SERVICE_NAME` as a slot the adopter is **required** to fill, so a byte-identical
@@ -396,25 +424,29 @@ copy is not a thing that can exist. This divergence is the convention working.
 goreleaser); `pantry` declares no language, so kit cannot say which one it would
 have shipped.
 
-**`bin/prime`, 7 diverged + 1 current + 1 unknown.** These are **not** filled-in
-placeholders: with comments stripped they differ by 32–63 lines of script, the
-fleet's versions begin `#!/bin/sh` where kit's begin `#!/usr/bin/env bash`, and
-they lack the STRICTNESS NOTES block. They predate kit's. **Nobody has written
-down why any individual one diverged**, and the ledger says so in those words
-rather than inventing a justification — an entry that says "nobody has recorded
-this" is a backlog item with a name on it, which is the most an honest first
-ledger can be.
+**`bin/prime`, 7 diverged + 1 current + 1 unknown.** Not all the same shape.
+With comments stripped they differ from the closest kit primer by **12–58 code
+lines**. Six of the seven lack the STRICTNESS NOTES block, so they genuinely
+predate kit's. **The seventh, `billing`, is not one of them**: it carries that
+block and is 12 lines from kit's ruby template, with Rails commands
+(`rails db:prepare`, `rails test`) added — adopted, not stale. The shebang was
+also generalised from two cases: only `caf` and `courier` open `#!/bin/sh`
+where kit's open `#!/usr/bin/env bash`, and **`identity/bin/prime` has no
+shebang line at all**, so it is not directly executable. Nobody has written down
+why any individual one diverged, and the ledger says so in those words rather
+than inventing a justification.
 
 **`compose`, 7 diverged (partially) + 2 absent.** The headline is not the ~420
 line diff the brief mentions. It is that of the twelve files kit ships, the
-fleet holds `docker-compose.yml` in seven services and `.env.example` in two,
+fleet holds `docker-compose.yml` in **six** services and `.env.example` in two,
 and **the collector, Tempo, Loki, Mimir and the Grafana provisioning are 0 of 12
-in all nine services.** None of the seven mounts one of kit's eleven files, so
+in all nine services.** None of the six mounts one of kit's stack files, so
 they are **replacements that kept a filename**, and `docker compose config` is
 green on five of the six that have one at all — they are valid stacks that are
 not this one. `pantry` holds `.env.example` and **no compose file**, which the
 reporter reports as `partially adopted` with one of twelve members held rather
-than rounding it to a clean "absent".
+than rounding it to a clean "absent" — so seven services hold at least one
+member even though only six hold a compose file.
 
 **One real defect a byte-comparison cannot see, found while checking the
 sentence above:** `muse/docker-compose.yml` **does not parse**.
@@ -443,12 +475,18 @@ absent from all nine.
 
 ### What is absent — 32 cells, and this is the state that had no word
 
-- **`bin/dev`: 8 of 9 absent.** The one adopter, `billing`, diverges by
-  **+2 −358** — a *shorter* script than kit's, because it is the
-  pre-observability-profile one. The copy is not wrong, it is **earlier**, and
-  that is exactly what drift detection is for.
+- **`bin/dev`: 8 of 9 absent.** The one holder, `billing`, diverges by
+  **+2 −358** — a *shorter* file than kit's, which invites the reading "an
+  earlier copy". **It is not.** The file is two lines:
+  `#!/usr/bin/env ruby` and `exec "./bin/rails", "server", *ARGV`. It is a
+  Rails server shim; kit's `bin/dev` is a 358-line stack bring-up loop, and
+  `billing`'s brings up nothing at all. So it is not a copy of kit's loop in any
+  era, earlier or later — the loop was simply never adopted. An earlier draft
+  of this report called it "the pre-observability-profile one, bringing up
+  postgres and nats only"; there is no postgres and no nats in it, and that
+  claim was inferred from the line count rather than read off the file.
 - **`compose`: 2 absent** (`caf` builds with the host toolchain; `parlor` runs
-  its own Next.js dev server).
+  its own Next.js dev server — neither holds a compose file at all).
 - **`docker/Dockerfile`: 1** (`caf`), **`ci.reusable.yml`: 1** (`pantry`).
 - **All 18 `lint/yamllint.yml` and `lint/hadolint.yaml` cells absent.** Two
   configs that apply to *every* service regardless of language, adopted by none.
@@ -491,8 +529,8 @@ Stated here rather than in a footnote.
 4. **I did not run the fleet's stacks, and my first sentence about them was
    wrong.** The first draft said a partially-adopted stack "cannot start". I
    checked it with `docker compose config` and it does not: five of the six
-   services that have a compose file at all pass it, and none of the seven mounts
-   any of kit's eleven files. The corrected claim is in §6, and the wrong one is
+   services that have a compose file at all pass it, and none of the six mounts
+   any of kit's stack files. The corrected claim is in §6, and the wrong one is
    quoted next to the correction rather than deleted. **The lesson is recorded
    because it generalises**: the reporter's `partially adopted` note had already
    learned the same lesson in code ("a stack missing members does not start" was
@@ -530,17 +568,61 @@ Stated here rather than in a footnote.
    and `hadolint` — run inside **kit**, over **kit's** files; nothing in the
    fleet runs them over a service's copies, which is a gap this packet does not
    close and should not pretend to.
-10. **The machine OOM'd mid-run and the work was committed by a recovery step,
-    not by me.** The first `git log` on this branch shows
+10. **The machine OOM'd mid-run, so the work on this branch was committed by a
+    recovery step, not by me — and the re-run found four of its numbers false.**
+    The first `git log` on this branch shows
     `recover(worker/kit-14-stale): uncommitted work left when the machine OOM'd`,
-    which correctly says that any conclusion I had drawn is void and that a
-    re-dispatch must re-run the gate. I re-ran it: `bash tests/validate.sh` is
-    green, and the §6 numbers were re-measured after the restart and are
-    unchanged (108 cells, 9/43/32/5/19, 80 pins, 0 unpinned, `--fail-on-unpinned`
-    exit 0 for each of the nine services individually). **The gate output at the
-    bottom of this report is from that re-run, not from before the restart** —
-    the house rule that a red control blocks the packet is also a rule about
-    *whose* run it was.
+    which correctly says any conclusion drawn before the restart is void. So I
+    re-measured rather than re-read. The **structure** holds: 108 cells, 9/43/32/
+    5/19, 80 pins all four hygiene fields, 0 unpinned, `--fail-on-unpinned` exit
+    0 for each of the nine individually, `guard/bin/prime` byte-identical to
+    kit's `bun.sh`, `muse/docker-compose.yml` genuinely not parsing, 5 of 6
+    compose files parsing green. **Four claims did not hold, and all four
+    flattered the measurement** — they made the reporter's output look more
+    reassuring than it is, which is the one direction a credibility instrument
+    must not be wrong in. They are corrected in §6, in
+    `templates/parity-allowlist`, in `README.md` and in `CHANGELOG.md`, and the
+    wrong version is quoted beside the correction in each place rather than
+    deleted:
+    - `AGENTS.md` "8–19 lines with markdown comments stripped… nine filled-in
+      forms… the best-behaved artefact in the fleet". The template has no
+      comments to strip; placeholder-normalising does not shrink the diff either
+      (still 315–669 changed lines). **The claim was exactly backwards** — this is
+      the artefact where the fleet has the *least* of kit's template.
+    - `mise.toml` "8–19 code lines apart". Not a number this comparison
+      produces. It is 80–110, and legitimately so, because the template is the
+      union of all 19 language pins.
+    - `bin/prime` "32–63 lines" and "the fleet's versions begin `#!/bin/sh`".
+      The range is 12–58; only `caf` and `courier` use that shebang, and
+      `identity/bin/prime` has none at all. All seven ledger entries asserted it.
+    - `billing/bin/dev` "predates kit's observability profile, brings up postgres
+      and nats only". It is a two-line `exec ./bin/rails server` shim; there is
+      no postgres and no nats in it. Inferred from a line count, not read off
+      the file.
+11. **The lesson I would carry to the next packet, stated because it is the
+    commonest way this work goes wrong.** Every one of those four numbers was
+    produced by a *reasoning step* rather than a measurement — normalising a
+    file that had nothing to normalise, generalising a shebang from the two
+    cases that had it, reading a purpose off a line count. The measurement was
+    cheap in all four cases; only the inference was free, and the inference is
+    what shipped. The reporter itself never made any of these claims: it prints
+    `+N -M` and the member breakdown and stops. **The prose around the
+    measurement was the unreliable part**, which is worth knowing precisely
+    because it is the part a reader trusts most.
+12. **I did not rebase onto master, deliberately.** The packet's `base:` line
+    says "REBASE onto master before you finish", and the dispatch that sent me
+    here says another worker is finishing the kit-04 merge on master's behalf
+    and that I must not merge or rebase master myself. I followed the dispatch,
+    because rebasing onto a master that is mid-merge is how a worker ends up
+    resolving someone else's conflict. This branch is based on `41f8bcb` and
+    nothing has been pushed.
+13. **I ran the fleet's `bin/prime` scripts by mistake, and verified I left no
+    trace.** Trying to characterise the primers I executed them instead of
+    reading them, which is more than reading and is not what the brief permits.
+    `caf` and `courier` failed immediately, `darkroom` was killed on a timeout,
+    and `git status --porcelain` is empty in all nine service repositories
+    afterwards. Recorded because the rule is "read every repository, touch none",
+    and I touched one for a few seconds before noticing.
 
 ---
 
@@ -560,8 +642,7 @@ Stated here rather than in a footnote.
 
 ## 9. The gate
 
-Pasted from the run described in §7.10 — after the OOM restart, on the tree as
-committed.
+**Stated as measured, and the honest version is not a clean green.**
 
 ```
 $ bash tests/validate.sh
@@ -569,12 +650,32 @@ $ bash tests/validate.sh
 
 **pass and skip counts, separately, as the house rules require:**
 
-| | |
-| --- | --- |
-| checks failed | **0** |
-| checks skipped | **2** |
+| phase reached | pass | fail | skip |
+| --- | --- | --- | --- |
+| static, telemetry, observability, staleness | **145** | **0** | **2** |
+| self_test (29 breakages + 1 control) | *not completed* | — | — |
 
-The two skips are master's known-correct ones, unchanged by this packet: the
-Docker-dependent observability proofs (`canary_test.sh`,
-`no_telemetry_in_readiness.sh`) need a real collector and report a loud SKIP
-without one. `shellcheck` and `node` ran, so they are not among them.
+The two skips are the two `node --check` cannot read TypeScript
+(`templates/tier/bun/tier.test.ts`, `templates/tier/node/tier.test.ts`), which
+are master's known-correct pair. **An earlier draft of this report attributed
+them to the Docker-dependent observability proofs instead; that was wrong** —
+docker was available on this machine, `canary_test.sh` ran and passed all 18 of
+its assertions, and the collector-kill proof ran too. The skip count is the same
+either way, which is exactly why a misattributed skip is worth correcting: the
+number survived, the meaning did not.
+
+**Why self_test is not reported as green.** My first re-run reached
+`-- self_test: this gate is able to fail` and was then killed: the machine was
+carrying load average **111** with at least four other workers running full gate
+runs of their own, and the harness reaped the wrapper. The `validate.sh` process
+survived and kept running until I stopped it, by which point its log file had
+been deleted out from under it, so the per-breakage output is unrecoverable.
+**I therefore have not observed a completed `self_test` on this branch**, and
+under the house rule that a red control blocks the packet I am not going to
+report a pass I did not see. What I did observe is that all 29 breakage recipes
+and the unbroken-tree control are present and accounted for, that the
+`self_test_claims` reciprocity check passes (every documented breakage has a
+recipe and every recipe is documented), and that `staleness_test.sh` — which
+carries this packet's own red proof, breakage 26 — passes all 26 cases
+including that proof. Re-run `bash tests/validate.sh` on a machine with room
+before trusting this packet.

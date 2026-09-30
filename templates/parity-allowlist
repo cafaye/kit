@@ -126,41 +126,62 @@ unknown pantry docker/Dockerfile reason="this service calls no kit workflow, so 
 # made and the date it was made is worth having written down. Pinning it costs
 # nine lines and buys a record; not pinning it would cost the ability to tell
 # "pinned to 3.4.0 on purpose" from "drifted since the template moved".
+#
+# The diff is LARGE — 80 to 110 code lines — and that is the expected shape, not
+# a warning. `templates/mise.toml` is kit's union of every language's tool pins:
+# 19 tools across 7 languages, 74 code lines once trailing comments are
+# stripped. A service keeps the handful for its own language, deletes the rest,
+# and adds its own `[env]` and `[tasks]`. So 71 to 73 of the template's lines are
+# "removed" by construction. `muse`, the smallest diff, keeps two pins (python,
+# uv) out of nineteen. An earlier draft of this file described the difference as
+# "8 to 19 code lines", which is not a number this comparison produces at all.
 
-diverged billing mise.toml reason="every placeholder raised to the versions this service deploys, which is README step 4" owner=billing since=2026-09-30 until=2026-12-31
-diverged caf mise.toml reason="every placeholder raised to the versions this service deploys, which is README step 4" owner=caf since=2026-09-30 until=2026-12-31
-diverged courier mise.toml reason="every placeholder raised to the versions this service deploys, which is README step 4" owner=courier since=2026-09-30 until=2026-12-31
-diverged darkroom mise.toml reason="every placeholder raised to the versions this service deploys, which is README step 4" owner=darkroom since=2026-09-30 until=2026-12-31
-diverged guard mise.toml reason="every placeholder raised to the versions this service deploys, which is README step 4" owner=guard since=2026-09-30 until=2026-12-31
-diverged identity mise.toml reason="every placeholder raised to the versions this service deploys, which is README step 4" owner=identity since=2026-09-30 until=2026-12-31
-diverged muse mise.toml reason="every placeholder raised to the versions this service deploys, which is README step 4" owner=muse since=2026-09-30 until=2026-12-31
-diverged pantry mise.toml reason="every placeholder raised to the versions this service deploys, which is README step 4" owner=pantry since=2026-09-30 until=2026-12-31
-diverged parlor mise.toml reason="every placeholder raised to the versions this service deploys, which is README step 4" owner=parlor since=2026-09-30 until=2026-12-31
+diverged billing mise.toml reason="the template is kit's union of every language's tool pins (19 tools, 74 code lines); this service keeps its own, raises the versions to what it deploys (README step 4) and adds its own env and tasks" owner=billing since=2026-09-30 until=2026-12-31
+diverged caf mise.toml reason="the template is kit's union of every language's tool pins (19 tools, 74 code lines); this service keeps its own, raises the versions to what it deploys (README step 4) and adds its own env and tasks" owner=caf since=2026-09-30 until=2026-12-31
+diverged courier mise.toml reason="the template is kit's union of every language's tool pins (19 tools, 74 code lines); this service keeps its own, raises the versions to what it deploys (README step 4) and adds its own env and tasks" owner=courier since=2026-09-30 until=2026-12-31
+diverged darkroom mise.toml reason="the template is kit's union of every language's tool pins (19 tools, 74 code lines); this service keeps its own, raises the versions to what it deploys (README step 4) and adds its own env and tasks" owner=darkroom since=2026-09-30 until=2026-12-31
+diverged guard mise.toml reason="the template is kit's union of every language's tool pins (19 tools, 74 code lines); this service keeps its own, raises the versions to what it deploys (README step 4) and adds its own env and tasks" owner=guard since=2026-09-30 until=2026-12-31
+diverged identity mise.toml reason="the template is kit's union of every language's tool pins (19 tools, 74 code lines); this service keeps its own, raises the versions to what it deploys (README step 4) and adds its own env and tasks" owner=identity since=2026-09-30 until=2026-12-31
+diverged muse mise.toml reason="the template is kit's union of every language's tool pins (19 tools, 74 code lines); this service keeps its own, raises the versions to what it deploys (README step 4) and adds its own env and tasks" owner=muse since=2026-09-30 until=2026-12-31
+diverged pantry mise.toml reason="the template is kit's union of every language's tool pins (19 tools, 74 code lines); this service keeps its own, raises the versions to what it deploys (README step 4) and adds its own env and tasks" owner=pantry since=2026-09-30 until=2026-12-31
+diverged parlor mise.toml reason="the template is kit's union of every language's tool pins (19 tools, 74 code lines); this service keeps its own, raises the versions to what it deploys (README step 4) and adds its own env and tasks" owner=parlor since=2026-09-30 until=2026-12-31
 
 # --- AGENTS.md --------------------------------------------------------------
 #
-# Measured: 9/9 diverged, and the diffs are enormous — 309 to 634 changed
-# lines. Read the measurement rather than the number: with markdown comments
-# stripped, the code-level difference is 8 to 19 lines. What each service did
-# was FILL IN THE TEMPLATE. `<service-name>` became the service's name, `<go |
-# ruby | ...>` became its language, and the "delete the sections that do not
-# apply" instruction was followed. That is README step 5 completing.
+# Measured: 9/9 diverged, and this is the artefact where kit's template has
+# been SUPERSEDED rather than filled in. The template is 121 lines in nine
+# sections. The services' files are 281 to 664 lines, and only 12 to 40 of the
+# template's lines survive in any one of them — 23 in six of the nine, a line
+# survival rate near 19%. The headings are the services' own: `guard` has
+# "Rules", "Gates", "Adding an endpoint"; the template has "Conventions",
+# "Observability", "Testing", "Contracts", "Before you open a PR".
 #
-# So the honest reason is the same for all nine, and the enormous raw diff is
-# evidence FOR the pin rather than against it: a copy that differs by four
-# hundred lines and still means the same thing is a filled-in form, and a
-# reporter that could not say so would make this look like the worst drift in
-# the fleet when it is one of the least.
+# `## Observability` — the template's largest section, and the one that records
+# the telemetry convention in eight opinionated bullets — survives in NONE of
+# the nine. Including the eight services that adopted that very convention, by
+# calling kit's own workflow, which runs the telemetry job. So the template
+# section documenting the convention was dropped by the services living it.
+#
+# A CORRECTION, because a pin defended by a number that does not survive being
+# checked is worse than one that states the divergence plainly. This file
+# previously said the raw diff was "the most misleading figure in the packet",
+# that with "comments stripped" the difference was 8 to 19 lines, and that the
+# nine were filled-in forms. All three were wrong, and the first was wrong in
+# the direction that flattered the measurement: the template contains no
+# comments to strip, and normalising the `<...>` placeholders does not shrink
+# the diff either — it is still 315 to 669 changed lines. The divergence is
+# large, it is real, and it is the artefact where the fleet has the LEAST of
+# kit's template, not the most.
 
-diverged billing AGENTS.md reason="the template's placeholders are filled in and the sections that do not apply are deleted, which is README step 5" owner=billing since=2026-09-30 until=2026-12-31
-diverged caf AGENTS.md reason="the template's placeholders are filled in and the sections that do not apply are deleted, which is README step 5" owner=caf since=2026-09-30 until=2026-12-31
-diverged courier AGENTS.md reason="the template's placeholders are filled in and the sections that do not apply are deleted, which is README step 5" owner=courier since=2026-09-30 until=2026-12-31
-diverged darkroom AGENTS.md reason="the template's placeholders are filled in and the sections that do not apply are deleted, which is README step 5" owner=darkroom since=2026-09-30 until=2026-12-31
-diverged guard AGENTS.md reason="the template's placeholders are filled in and the sections that do not apply are deleted, which is README step 5" owner=guard since=2026-09-30 until=2026-12-31
-diverged identity AGENTS.md reason="the template's placeholders are filled in and the sections that do not apply are deleted, which is README step 5" owner=identity since=2026-09-30 until=2026-12-31
-diverged muse AGENTS.md reason="the template's placeholders are filled in and the sections that do not apply are deleted, which is README step 5" owner=muse since=2026-09-30 until=2026-12-31
-diverged pantry AGENTS.md reason="the template's placeholders are filled in and the sections that do not apply are deleted, which is README step 5" owner=pantry since=2026-09-30 until=2026-12-31
-diverged parlor AGENTS.md reason="the template's placeholders are filled in and the sections that do not apply are deleted, which is README step 5" owner=parlor since=2026-09-30 until=2026-12-31
+diverged billing AGENTS.md reason="kit's 121-line template was superseded by this service's own 664-line document; 40 of the template's lines survive and ## Observability is not among them" owner=billing since=2026-09-30 until=2026-12-31
+diverged caf AGENTS.md reason="kit's 121-line template was superseded by this service's own 369-line document; 23 of the template's lines survive and ## Observability is not among them" owner=caf since=2026-09-30 until=2026-12-31
+diverged courier AGENTS.md reason="kit's 121-line template was superseded by this service's own 384-line document; 23 of the template's lines survive and ## Observability is not among them" owner=courier since=2026-09-30 until=2026-12-31
+diverged darkroom AGENTS.md reason="kit's 121-line template was superseded by this service's own 281-line document; 23 of the template's lines survive and ## Observability is not among them" owner=darkroom since=2026-09-30 until=2026-12-31
+diverged guard AGENTS.md reason="kit's 121-line template was superseded by this service's own 307-line document; 23 of the template's lines survive and ## Observability is not among them" owner=guard since=2026-09-30 until=2026-12-31
+diverged identity AGENTS.md reason="kit's 121-line template was superseded by this service's own 489-line document; 23 of the template's lines survive and ## Observability is not among them" owner=identity since=2026-09-30 until=2026-12-31
+diverged muse AGENTS.md reason="kit's 121-line template was superseded by this service's own 402-line document; 17 of the template's lines survive and ## Observability is not among them" owner=muse since=2026-09-30 until=2026-12-31
+diverged pantry AGENTS.md reason="kit's 121-line template was superseded by this service's own 308-line document; 21 of the template's lines survive and ## Observability is not among them" owner=pantry since=2026-09-30 until=2026-12-31
+diverged parlor AGENTS.md reason="kit's 121-line template was superseded by this service's own 325-line document; 12 of the template's lines survive and ## Observability is not among them" owner=parlor since=2026-09-30 until=2026-12-31
 
 # --- bin/prime --------------------------------------------------------------
 #
@@ -172,34 +193,50 @@ diverged parlor AGENTS.md reason="the template's placeholders are filled in and 
 # credits with causing the `bun` job to exist, so it is the one service that
 # copied a kit template after it was written rather than before.
 #
-# The seven divergences are NOT filled-in placeholders. Measured with comments
-# stripped, they differ by 32 to 63 lines of script: the fleet's primers predate
-# kit's, and the shape of the difference is uniform — the services' versions
-# begin `#!/bin/sh` where kit's begin `#!/usr/bin/env bash` and carry a short
-# header, and they lack the STRICTNESS NOTES block. Nobody has written down WHY
-# any individual one diverged. That is what the reason below says, and it is
-# the honest thing for a first ledger to say: a backlog, dated, with a name
+# The seven divergences are NOT filled-in placeholders, and they are not all the
+# same shape. Measured with comments stripped, they differ from the closest kit
+# primer by 12 to 58 code lines. Six of the seven lack kit's STRICTNESS NOTES
+# block, so they genuinely predate kit's primer. The seventh, `billing`, HAS
+# that block and is 12 lines from kit's ruby template: it is adopted, with
+# Rails commands added, and pinning it as "predates kit's" was wrong.
+#
+# The shebang, too, was generalised from two cases. Only `caf` and `courier`
+# open `#!/bin/sh` where kit's open `#!/usr/bin/env bash`; `darkroom`, `muse`
+# and `parlor` use kit's own shebang. `identity` has NO shebang at all — line 1
+# is a `#` comment — which is a defect a byte-comparison cannot report, and it
+# is written into the reason rather than smoothed over. Nobody has written down
+# WHY any individual one diverged. That is what the reasons below say, and it
+# is the honest thing for a first ledger to say: a backlog, dated, with a name
 # against it.
 
-diverged billing bin/prime reason="this primer predates kit's and uses #!/bin/sh; nobody has recorded why it was not replaced" owner=billing since=2026-09-30 until=2026-12-31
-diverged caf bin/prime reason="this primer predates kit's and uses #!/bin/sh; nobody has recorded why it was not replaced" owner=caf since=2026-09-30 until=2026-12-31
-diverged courier bin/prime reason="this primer predates kit's and uses #!/bin/sh; nobody has recorded why it was not replaced" owner=courier since=2026-09-30 until=2026-12-31
-diverged darkroom bin/prime reason="this primer predates kit's and uses #!/bin/sh; nobody has recorded why it was not replaced" owner=darkroom since=2026-09-30 until=2026-12-31
-diverged identity bin/prime reason="this primer predates kit's and uses #!/bin/sh; nobody has recorded why it was not replaced" owner=identity since=2026-09-30 until=2026-12-31
-diverged muse bin/prime reason="this primer predates kit's and uses #!/bin/sh; nobody has recorded why it was not replaced" owner=muse since=2026-09-30 until=2026-12-31
-diverged parlor bin/prime reason="this primer predates kit's and uses #!/bin/sh; nobody has recorded why it was not replaced" owner=parlor since=2026-09-30 until=2026-12-31
+diverged billing bin/prime reason="kit's ruby primer with this service's Rails commands added (rails db:prepare, rails test); 12 code lines from kit's, and the STRICTNESS NOTES block is present" owner=billing since=2026-09-30 until=2026-12-31
+diverged caf bin/prime reason="this primer predates kit's: it lacks the STRICTNESS NOTES block and opens #!/bin/sh where kit's opens #!/usr/bin/env bash; nobody has recorded why it was not replaced" owner=caf since=2026-09-30 until=2026-12-31
+diverged courier bin/prime reason="this primer predates kit's: it lacks the STRICTNESS NOTES block and opens #!/bin/sh where kit's opens #!/usr/bin/env bash; nobody has recorded why it was not replaced" owner=courier since=2026-09-30 until=2026-12-31
+diverged darkroom bin/prime reason="this primer predates kit's: it lacks the STRICTNESS NOTES block; nobody has recorded why it was not replaced" owner=darkroom since=2026-09-30 until=2026-12-31
+diverged identity bin/prime reason="this primer predates kit's: it lacks the STRICTNESS NOTES block and has no shebang line at all, so it is not directly executable; nobody has recorded why it was not replaced" owner=identity since=2026-09-30 until=2026-12-31
+diverged muse bin/prime reason="this primer predates kit's: it lacks the STRICTNESS NOTES block; nobody has recorded why it was not replaced" owner=muse since=2026-09-30 until=2026-12-31
+diverged parlor bin/prime reason="this primer predates kit's: it lacks the STRICTNESS NOTES block; nobody has recorded why it was not replaced" owner=parlor since=2026-09-30 until=2026-12-31
 unknown pantry bin/prime reason="this service calls no kit workflow, so it declares no language and kit cannot say which primer it would have copied" owner=pantry since=2026-09-30 until=2026-12-31
 
 # --- bin/dev ----------------------------------------------------------------
 #
 # Measured: 1 diverged, 8 absent. This is the packet's 1/9, confirmed.
 #
-# `billing` is the one that adopted it, and it diverges by +2 -358 lines: it is
-# a SHORTER script than kit's. kit's `bin/dev` gained the observability profile
-# — Tempo, Loki, Mimir and Grafana, five more containers and four more
-# initialisations — in kit-13, and `billing`'s copy is the pre-observability
-# one. So the copy is not wrong, it is EARLIER, and that is exactly the drift
-# detection is for.
+# `billing` is the one that holds one, and it diverges by +2 -358 lines: it is a
+# SHORTER script than kit's, which is the shape that invites the reading "an
+# earlier copy". It is not. The file is two lines:
+#
+#     #!/usr/bin/env ruby
+#     exec "./bin/rails", "server", *ARGV
+#
+# It is a Rails server shim. kit's `bin/dev` is a 358-line stack bring-up loop —
+# compose up, wait for health, migrate, seed an admin, print the URLs — and
+# `billing`'s brings up nothing at all, so it is not a copy of kit's loop in
+# any era, earlier or later. An earlier draft of this file called it "the
+# pre-observability profile copy, bringing up postgres and nats only"; there is
+# no postgres and no nats in it, and the claim was inferred from the line count
+# rather than read off the file. Diverged is the right state and the old reason
+# was fiction.
 #
 # The other eight drive compose directly and never adopted the loop. That is a
 # choice, not an oversight — but it is a choice nobody wrote down, and a choice
@@ -207,15 +244,15 @@ unknown pantry bin/prime reason="this service calls no kit workflow, so it decla
 # backlog item with a name on it, which is the most this file can honestly be
 # on day one.
 
-diverged billing bin/dev reason="this copy predates kit's observability profile: it brings up postgres and nats only, and nobody has recorded whether that was a decision" owner=billing since=2026-09-30 until=2026-12-31
-absent caf bin/dev reason="this service drives compose directly; the loop was never adopted and nobody has said so" owner=caf since=2026-09-30 until=2026-12-31
+diverged billing bin/dev reason="not a copy of kit's loop in any era: this is a two-line Rails server shim (exec ./bin/rails server) where kit's brings a 358-line stack up, so the loop was never adopted" owner=billing since=2026-09-30 until=2026-12-31
+absent caf bin/dev reason="this service holds no compose stack at all — it builds with the host toolchain and goreleaser — so kit's bring-up loop was never applicable" owner=caf since=2026-09-30 until=2026-12-31
 absent courier bin/dev reason="this service drives compose directly; the loop was never adopted and nobody has said so" owner=courier since=2026-09-30 until=2026-12-31
 absent darkroom bin/dev reason="this service drives compose directly; the loop was never adopted and nobody has said so" owner=darkroom since=2026-09-30 until=2026-12-31
 absent guard bin/dev reason="this service drives compose directly; the loop was never adopted and nobody has said so" owner=guard since=2026-09-30 until=2026-12-31
 absent identity bin/dev reason="this service drives compose directly; the loop was never adopted and nobody has said so" owner=identity since=2026-09-30 until=2026-12-31
 absent muse bin/dev reason="this service drives compose directly; the loop was never adopted and nobody has said so" owner=muse since=2026-09-30 until=2026-12-31
-absent pantry bin/dev reason="this service drives compose directly; the loop was never adopted and nobody has said so" owner=pantry since=2026-09-30 until=2026-12-31
-absent parlor bin/dev reason="this service drives compose directly; the loop was never adopted and nobody has said so" owner=parlor since=2026-09-30 until=2026-12-31
+absent pantry bin/dev reason="this service holds kit's .env.example but no compose file at all, so there is no stack for kit's loop to bring up" owner=pantry since=2026-09-30 until=2026-12-31
+absent parlor bin/dev reason="this service holds no compose stack — it runs its own Next.js dev server — so kit's bring-up loop was never adopted" owner=parlor since=2026-09-30 until=2026-12-31
 
 # --- compose (the local stack, twelve files) --------------------------------
 #
@@ -225,11 +262,13 @@ absent parlor bin/dev reason="this service drives compose directly; the loop was
 # stack.
 #
 # The measurement that matters: of the twelve files kit ships, the fleet holds
-# `docker-compose.yml` in seven services and `.env.example` in two. The
-# collector, the three trace/metric stores and the Grafana provisioning are
-# **0 for 12 across all nine services**. The reporter says "partially adopted"
-# rather than reporting eleven separate cells and calling the seven successes
-# adoption.
+# `docker-compose.yml` in SIX services and `.env.example` in two, and seven
+# services hold at least one member of the twelve (`pantry` holds
+# `.env.example` and no compose file, which is why it reads as partially
+# adopted rather than absent). The collector, the three trace/metric stores and
+# the Grafana provisioning are **0 for 12 across all nine services**. The
+# reporter says "partially adopted" rather than reporting eleven separate cells
+# and calling the seven successes adoption.
 #
 # WHAT THESE ARE, AND IT IS NOT "A BROKEN STACK". Checked, because the first
 # draft of this file said "so it cannot start" and that was a guess dressed as a
@@ -240,11 +279,20 @@ absent parlor bin/dev reason="this service drives compose directly; the loop was
 #   $ grep -cE '^\s+- \./' templates/compose/docker-compose.yml
 #   5
 #
-# None of the seven mounts a single one of kit's eleven files. They declare ONE
-# OR TWO SERVICES (`db`, `app`, `postgres`, `guard`, `identity`) and they are
-# not kit's stack with pieces removed — they are REPLACEMENTS that kept a
-# filename. `docker compose config` is GREEN on five of the seven, so they are
-# valid, runnable stacks. They are simply not this one.
+# None of the six mounts a single one of kit's stack files. They declare ONE OR
+# TWO SERVICES of their own (`db`, `postgres`, `guard`, `identity`, `muse`,
+# `darkroom`) and they are not kit's stack with pieces removed — they are
+# REPLACEMENTS that kept a filename. `docker compose config` is GREEN on five of
+# the six, so they are valid, runnable stacks. They are simply not this one.
+#
+# The five bind mounts are worth being exact about, because an earlier draft of
+# this file said the compose file "mounts the other eleven files by path". It
+# binds FIVE paths, and one of them is a directory: `./otel-collector.yml`,
+# `./tempo/tempo.yaml`, `./loki/loki-config.yaml`, `./mimir/mimir.yaml` and
+# `./grafana/provisioning` — the last of which holds six of the twelve members.
+# That is ten of the eleven non-compose members reachable by path. The
+# eleventh, `.env.example`, is not mounted at all: it is `cp`'d to `.env`, which
+# is why it is a bundle member at all.
 #
 # So the honest reason is the boring one: these seven predate kit's
 # observability profile, nobody re-copied, and nobody recorded a decision. That
