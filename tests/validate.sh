@@ -17,7 +17,7 @@
 #   telemetry  the W3C traceparent templates are EXECUTED, one suite per
 #              language. This is the phase that is easy to fake and so is the
 #              one that runs the code rather than greps it.
-#   self_test  breaks a throwaway copy of this tree four ways and asserts the
+#   self_test  breaks a throwaway copy of this tree once per kind of check and asserts the
 #              gate goes red each time. A gate that cannot fail is not a gate.
 #
 # One line per check: PASS, FAIL, or SKIP. Any FAIL exits 1. A SKIP is always
@@ -39,6 +39,15 @@ trap 'rm -rf "$TMP"' EXIT
 # heredocs because the path being wrong is exactly the defect this packet
 # exists to fix — see the `callable path` check below.
 WORKFLOW='.github/workflows/ci.reusable.yml'
+
+# The one `language` option that is not a language. `none` means "this
+# repository has no service manifest": no go.mod, no Gemfile, no
+# pyproject.toml. It exists because the repository that defines the workflow
+# is itself such a repository, and without it kit cannot call its own
+# standard — the file was uncallable by the only repo that had any business
+# calling it. A real Dockerfile, a `bin/prime` and a mise pin are meaningless
+# for it, so the four-artifacts rule deliberately does not apply.
+CONFIG_ONLY='none'
 
 PY="${KIT_PYTHON:-$ROOT/.venv/bin/python}"
 [ -x "$PY" ] || PY=python3
@@ -413,19 +422,25 @@ SNIPPETS
     # workflow's `language` options, so there is exactly one place to add a
     # language and the workflow cannot claim one the tree does not have.
     #
-    # The path arrives as argv[2] rather than being written out again here: a
+    # `$2` is the option that means "no language" and so ships no artifacts.
+    # It is skipped here rather than being special-cased out of the workflow,
+    # because a hardcoded name in two places is exactly how the two drift.
+    #
+    # The path arrives as argv[3] rather than being written out again here: a
     # second copy of this string is a second thing to forget to move.
-    "$PY" - "$ROOT" "$WORKFLOW" <<'PY'
+    "$PY" - "$ROOT" "$CONFIG_ONLY" "$WORKFLOW" <<'PY'
 import sys
 
 import yaml
 
-with open(sys.argv[2], encoding="utf-8") as fh:
+skip = sys.argv[2]
+with open(sys.argv[3], encoding="utf-8") as fh:
     doc = yaml.safe_load(fh)
 triggers = doc.get("on") or doc.get(True) or {}
 call = (triggers.get("workflow_call") or {}).get("inputs") or {}
 for lang in ((call.get("language") or {}).get("options") or []):
-    print(lang)
+    if lang != skip:
+        print(lang)
 PY
   }
 
@@ -442,18 +457,20 @@ PY
   # grepping, so a key that appears in a comment does not count as a pin — a
   # check that can be satisfied by a comment is not a check.
   mise_check() {
-    "$PY" - "$ROOT" "$WORKFLOW" <<'PY'
+    "$PY" - "$ROOT" "$CONFIG_ONLY" "$WORKFLOW" <<'PY'
 import re
 import sys
 
 root = sys.argv[1]
-with open(sys.argv[2], encoding="utf-8") as fh:
+config_only = sys.argv[2]
+with open(sys.argv[3], encoding="utf-8") as fh:
     import yaml
 
     doc = yaml.safe_load(fh)
 triggers = doc.get("on") or doc.get(True) or {}
 call = (triggers.get("workflow_call") or {}).get("inputs") or {}
-langs = (call.get("language") or {}).get("options") or []
+# `none` is the absence of a toolchain; there is no mise tool to pin for it.
+langs = [x for x in ((call.get("language") or {}).get("options") or []) if x != config_only]
 
 source = open(f"{root}/templates/mise.toml", encoding="utf-8").read()
 # Only the [tools] table, and only its own lines: a version mentioned in a
@@ -726,13 +743,14 @@ PY
   # default call still runs exactly the six original jobs. A kit change that
   # breaks every consumer's CI is a kit change that does not ship.
   ci_check() {
-    "$PY" - "$ROOT" "$WORKFLOW" <<'PY'
+    "$PY" - "$ROOT" "$CONFIG_ONLY" "$WORKFLOW" <<'PY'
 import re
 import sys
 
 import yaml
 
-with open(sys.argv[2], encoding="utf-8") as fh:
+config_only = sys.argv[2]
+with open(sys.argv[3], encoding="utf-8") as fh:
     doc = yaml.safe_load(fh)
 
 problems = []
@@ -770,12 +788,29 @@ for lang in languages:
 
 # A caller can only pass what `options` allows, so an option with no job is a
 # green build that ran nothing, and a job with no option is a job no repo can
-# reach. The two lists are the same list.
+# reach. The two lists are the same list — plus the one option that names the
+# absence of a language, which has a job of its own.
 options = ((call.get("language") or {}).get("options")) or []
-if sorted(options) != sorted(languages):
+if sorted(options) != sorted(languages + [config_only]):
     problems.append(
-        f"`language` options {sorted(options)} do not match the job set {sorted(languages)}"
+        f"`language` options {sorted(options)} do not match the job set "
+        f"{sorted(languages + [config_only])}"
     )
+
+# `none` is what lets a repository with no service manifest adopt this
+# workflow at all, and kit is such a repository. It gets the same treatment as
+# every other option: a job, and a guard on the input. An option whose job has
+# no `if` would run in all thirteen consumer repos on day one.
+cjob = jobs.get(config_only)
+if not isinstance(cjob, dict):
+    problems.append(
+        f"job {config_only} disappeared: without it a repository with no service "
+        f"manifest cannot call this workflow, which is why kit never called its own"
+    )
+else:
+    cond = cjob.get("if")
+    if cond is None or f"inputs.language == '{config_only}'" not in cond:
+        problems.append(f"job {config_only} is not gated on its language input")
 
 tjob = jobs.get("telemetry")
 if not isinstance(tjob, dict):
@@ -795,7 +830,7 @@ else:
 # broken in review — an expression that never resolves, and a `${{` that opens a
 # block it never closes — are caught by reading the source as text. A file
 # needing this check is a file that needed it.
-source = open(sys.argv[2], encoding="utf-8").read()
+source = open(sys.argv[3], encoding="utf-8").read()
 for match in re.finditer(r"\$\{\{", source):
     lineno = source[: match.start()].count("\n") + 1
     tail = source[match.start() :]
@@ -1077,7 +1112,7 @@ fi
 
 if [ "$RUN_SELF_TEST" -eq 1 ]; then
   section 'self_test: this gate is able to fail'
-  if check 'tests/self_test.sh  (eleven breakages, eleven reds)' \
+  if check 'tests/self_test.sh  (twelve breakages, twelve reds)' \
     bash "$ROOT/tests/self_test.sh"; then
     :
   fi

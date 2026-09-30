@@ -6,18 +6,19 @@
 #
 # WHAT THIS IS FOR
 #   A gate that only ever goes green is a report, not a gate. This script copies
-#   the tree to a throwaway directory, breaks it four ways — once per kind of
-#   check — and asserts the gate goes RED each time. Each breakage must be
-#   caught by a *different* check, so a passing self_test means the checks are
-#   independent and not one lucky assertion standing in for all of them.
+#   the tree to a throwaway directory, breaks it once per kind of check — and
+#   asserts the gate goes RED each time. Each breakage must be caught by a
+#   *different* check, so a passing self_test means the checks are independent
+#   and not one lucky assertion standing in for all of them.
 #
-# THE ELEVEN BREAKAGES
+# THE TWELVE BREAKAGES
 #   1. delete a language template   -> the artifact-presence check goes red
 #   2. ship a collector exporter   -> the privacy check goes red
 #   3. corrupt the python codec    -> the executed test suite goes red
 #   4. hardcode a compose port     -> the parameterization check goes red
 #   5. flip the CI input default   -> the "consumers stay green" check goes red
-#   6-11. one semantic mutation per language implementation -> THAT language's
+#   6. ungate the `none` job       -> the option/job agreement check goes red
+#   7-12. one semantic mutation per language implementation -> THAT language's
 #         suite goes red. A suite that has never failed has never been proven to
 #         test anything, and six suites that only one language's mutation covers
 #         is five suites that might assert nothing at all.
@@ -199,7 +200,7 @@ expect_red_lang() {
 
 printf -- '-- self_test: a gate that cannot fail is not a gate\n'
 
-# The control. If the unbroken tree is already red, the four breakages below
+# The control. If the unbroken tree is already red, the breakages below
 # prove nothing, so this runs first and the run is meaningless without it.
 base="$(fresh_copy base)"
 expect_green 'unbroken tree' "$base" --static-only
@@ -240,7 +241,19 @@ five="$(fresh_copy ci-not-opt-in)"
 edit "$five/.github/workflows/ci.reusable.yml" "default: 'false'" "default: 'true'"
 expect_red "breakage 5: the telemetry CI job is no longer opt-in" "$five" --static-only
 
-# 6-11. One semantic mutation per language implementation, each against a
+# 6. the option with no job. A caller can pass `language: none` — the value
+#    that lets a repository with no service manifest (kit among them) call this
+#    workflow at all — and get a green build that ran nothing, because the job
+#    is no longer guarded by the input that selects it. The drift AGENTS.md
+#    calls out for any new `language` option, proven on the one option whose
+#    absence is a broken call rather than a missing toolchain.
+six="$(fresh_copy ungated-config-job)"
+edit "$six/.github/workflows/ci.reusable.yml" \
+  "if: \${{ inputs.language == 'none' }}" \
+  "if: \${{ inputs.language == 'go' }}"
+expect_red 'breakage 6: the `none` job is no longer gated on its own input' "$six" --static-only
+
+# 7-12. One semantic mutation per language implementation, each against a
 # different spec rule, and each asserting THAT language's suite goes red.
 #
 # These all read from the same throwaway copy as breakage 1 rather than taking a
@@ -250,7 +263,7 @@ base="$(fresh_copy language-mutants)"
 
 #   go    §3.2.2.5  stop masking trace-flags on read. Still compiles, still runs,
 #                  and quietly forwards reserved bits to the next service.
-expect_red_lang 'breakage  6: go stops masking trace-flags (§3.2.2.5)' \
+expect_red_lang 'breakage  7: go stops masking trace-flags (§3.2.2.5)' \
   "$base" go traceparent.go \
   'Flags:      tp.Flags & sampledFlag,' \
   'Flags:      tp.Flags,'
@@ -258,7 +271,7 @@ expect_red_lang 'breakage  6: go stops masking trace-flags (§3.2.2.5)' \
 #   ruby  §3.2.2  widen the alphabet to accept uppercase hex. The classic bug:
 #                one service folds case, the next rejects the header, and a trace
 #                breaks at the hop between them.
-expect_red_lang 'breakage  7: ruby accepts uppercase hex (§3.2.2)' \
+expect_red_lang 'breakage  8: ruby accepts uppercase hex (§3.2.2)' \
   "$base" ruby traceparent.rb \
   '!str.empty? && str.match?(/\A[0-9a-f]+\z/)' \
   '!str.empty? && str.match?(/\A[0-9a-fA-F]+\z/)'
@@ -266,21 +279,21 @@ expect_red_lang 'breakage  7: ruby accepts uppercase hex (§3.2.2)' \
 #   elixir §3.2.2.2  stop rejecting trailing data on a version-00 header. Nothing
 #                   crashes; the header is just no longer the format we claim to
 #                   implement.
-expect_red_lang 'breakage  8: elixir accepts trailing junk on version 00 (§3.2.2.2)' \
+expect_red_lang 'breakage  9: elixir accepts trailing junk on version 00 (§3.2.2.2)' \
   "$base" elixir traceparent.ex \
   'defp check_trailing(value, 0), do: if(byte_size(value) == @min_header_len, do: :ok, else: {:error, :invalid})' \
   'defp check_trailing(_value, 0), do: :ok'
 
 #   node  §3.3.1.5  raise the tracestate limit until truncation never fires. A
 #                   limit nobody enforces is a limit nobody wrote on purpose.
-expect_red_lang 'breakage  9: node never truncates tracestate (§3.3.1.5)' \
+expect_red_lang 'breakage 10: node never truncates tracestate (§3.3.1.5)' \
   "$base" node traceparent.mjs \
   'const TRACESTATE_LIMIT = 512;' \
   'const TRACESTATE_LIMIT = 100000;'
 
 #   rust  §3.2.2.3  accept an all-zero trace-id. The spec forbids it outright; a
 #                   codec that allows it merges unrelated traces into one.
-expect_red_lang 'breakage 10: rust accepts an all-zero trace-id (§3.2.2.3)' \
+expect_red_lang 'breakage 11: rust accepts an all-zero trace-id (§3.2.2.3)' \
   "$base" rust traceparent.rs \
   'if trace_id == ZERO_TRACE_ID || parent_id == ZERO_SPAN_ID {' \
   'if parent_id == ZERO_SPAN_ID {'
@@ -288,7 +301,7 @@ expect_red_lang 'breakage 10: rust accepts an all-zero trace-id (§3.2.2.3)' \
 #   python §3.2.2.5  the same dropped mask as go, in a different language, on
 #                   purpose: a rule asserted in one suite and not the other is a
 #                   rule two services will disagree about.
-expect_red_lang 'breakage 11: python stops masking trace-flags (§3.2.2.5)' \
+expect_red_lang 'breakage 12: python stops masking trace-flags (§3.2.2.5)' \
   "$base" python traceparent.py \
   'flags=parsed.flags & SAMPLED,' \
   'flags=parsed.flags,'
@@ -303,4 +316,4 @@ if [ "$skips" -ne 0 ]; then
   echo "FAIL: self_test — $skips breakage(s) skipped for a missing toolchain. A skipped proof is not a proof."
   exit 1
 fi
-echo "PASS: self_test — all 11 breakages went red, and the unbroken tree is green."
+echo "PASS: self_test — all 12 breakages went red, and the unbroken tree is green."

@@ -172,7 +172,7 @@ jobs:
   ci:
     uses: cafaye/kit/.github/workflows/ci.reusable.yml@master
     with:
-      language: go          # go | ruby | elixir | python | node | bun | rust
+      language: go          # go | ruby | elixir | python | node | bun | rust | none
       working-dir: .        # the dir holding go.mod / Gemfile / pyproject.toml
 ```
 
@@ -197,6 +197,16 @@ Two jobs for two languages? Call it twice with two different `language` values.
 `typecheck`, `bun test`. It exists because `guard` was hand-rolling an entire
 workflow for want of one — a repo that has adopted `bun` here can delete that
 file and collapse it to the `uses:` above.
+
+`none` is the eighth value, for a repository with **no service manifest at all**
+— no `go.mod`, no `Gemfile`, no `pyproject.toml`. The other seven jobs each
+open by reading one, so there was no way for such a repository to call this
+workflow; in practice that excluded `kit` itself, which is why `kit`'s own CI is
+a `uses: ./.github/workflows/ci.reusable.yml` with `language: none`, and why
+the repository that defines the standard is the first one held to it. That job
+runs your repository's own `tests/validate.sh` and **fails if it is missing** —
+a config gate with no gate in it is the same defect as a coverage threshold left
+at `0`.
 
 **2. Copy the linter config** that matches your language into the repo root, so
 the config is part of the code review that changes the code:
@@ -340,7 +350,7 @@ no `npm ci`, no `cargo fetch`. If these ever need the network, a template has
 grown a dependency and kit has stopped being config-only.
 
 **self_test** — `tests/self_test.sh` breaks a throwaway copy of this tree
-eleven ways and asserts the gate goes red each time. Five breakages are for the
+twelve ways and asserts the gate goes red each time. Six breakages are for the
 static checks; one is a semantic mutation of each of the six language
 implementations, so **every suite is proven able to fail** rather than assumed
 to. A skip fails the run — a self_test that skips half its proofs and exits 0 is

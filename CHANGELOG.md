@@ -5,13 +5,27 @@ semver contract — it is consumed by *calling*
 `.github/workflows/ci.reusable.yml@master` and by *copying* files out of
 `lint/`, `docker/`, and `templates/`.
 
-> Entries under **Earlier** record the path the file had *at the time*. It was
+> Entries under **Earlier**, and the three `workflows/ci.reusable.yml` bullets
+> below, record the path the file had *at the time*. It was
 > `workflows/ci.reusable.yml` until the move recorded in Unreleased/Changed.
 
 ## Unreleased
 
 ### Added
 
+- `.github/workflows/ci.yml` — kit calling its own reusable workflow with
+  `uses: ./.github/workflows/ci.reusable.yml`. The repository that defines the
+  standard is now the first repository held to it, and if the callable path ever
+  breaks again it is red on kit's own commit rather than discovered by the
+  first service that adopts it.
+- A `none` value for the `language` input, and a `none` job that runs the
+  calling repository's own `tests/validate.sh`. **This is a bug fix, not a
+  feature.** The workflow was uncallable by any repository without a service
+  manifest — which includes `kit`. `language` is `required: true` and every
+  value in `options` named a toolchain, so `uses: ./.github/workflows/ci.reusable.yml`
+  had no input that could make it resolve. The job fails when `tests/validate.sh`
+  is absent, because a config gate with no gate in it is the same defect as a
+  coverage threshold left at `0`.
 - `workflows/ci.reusable.yml` — a `bun` job: `bun install --frozen-lockfile` →
   `bun run typecheck` → `bun test`, with an opt-in coverage step. Exists because
   `guard` was hand-rolling a whole workflow for want of one; a repo that adopts
@@ -65,7 +79,7 @@ semver contract — it is consumed by *calling*
   ci.reusable.yml@master` line in the README resolved to nothing. No repository
   in the fleet was calling it. It is now a **move, not a mirror**: one file, at
   the only path GitHub will resolve, so there is no second copy to diverge.
-- `self_test.sh` grew from 5 breakages to 11. Six are new: one semantic
+- `self_test.sh` grew from 5 breakages to 12. Six are new: one semantic
   mutation per language implementation, each against a different W3C section, so
   **every** suite is proven able to fail rather than assumed to. A mutant that
   fails to compile is its own verdict rather than a pass, a missing toolchain is

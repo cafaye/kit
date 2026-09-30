@@ -65,7 +65,7 @@ Three phases, and all three must pass:
 - **telemetry** — the six W3C traceparent suites are **executed**, one per
   language. Stdlib only and offline on purpose. If they ever need the network,
   a template has grown a dependency and kit has stopped being config-only.
-- **self_test** — eleven breakages of a throwaway copy, asserting the gate goes
+- **self_test** — twelve breakages of a throwaway copy, asserting the gate goes
   red each time. Six of them are a semantic mutation of one language each, so
   **every suite is proven able to fail** rather than assumed to.
 
@@ -86,7 +86,7 @@ Three phases, and all three must pass:
   rubocop ran on kit's own Ruby with kit's own config. That is the only way an
   obsolete key surfaces before six repos inherit it.
 - The suite must be able to fail: `self_test` breaks a throwaway copy of the
-  tree eleven ways and asserts the run goes red. If you change the suite, keep
+  tree twelve ways and asserts the run goes red. If you change the suite, keep
   that true.
 
 ## Adding a language
@@ -110,6 +110,15 @@ artifacts landed with it, in one commit.
 
 Half a language is worse than none: the whole point of kit is that every repo
 that adopts it gets the same thing.
+
+`none` is not a language and is deliberately exempt from the four-artifacts
+rule: it is the option for a repository with no service manifest, and it runs
+that repository's own `tests/validate.sh`. It exists because without it `kit`
+could not call this workflow — every `language` value named a toolchain this
+repository does not have, which left the repository that defines the standard
+structurally excluded from using it. If you add a job for a new option, the
+`ci_check` block in `tests/validate.sh` must know about it in the same commit:
+an `option` with no `job` is a green build that ran nothing.
 
 ## Rules
 
