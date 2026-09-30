@@ -153,3 +153,79 @@ MSG
   PY="$root/.venv/bin/python"
   return 0
 }
+
+# kit_bootstrap_console_script <name> <module> — sets $CONSOLE, or exits 1.
+#
+# yamllint is required and has the same failure mode PyYAML had, so it gets the
+# same treatment. The subtlety is WHERE it has to live.
+#
+# It cannot simply be `$ROOT/.venv/bin/yamllint`. $PY is not always the
+# bootstrap's own interpreter: it is a system python3 that already had PyYAML
+# when no venv was needed, or — inside self_test — the interpreter of the tree
+# that was invoked, passed in as KIT_PYTHON so sixteen throwaway copies share
+# one. In both cases `$ROOT/.venv` does not exist, and looking there yielded
+#
+#     FAIL yamllint (required, not installed: pip install -r ...)
+#
+# on a clean clone of the real tree. A required check whose path is hardcoded
+# to a directory the resolver may have decided not to create is a gate that
+# fails on arrival, which is the exact defect this file was written to remove.
+#
+# So the script is looked for next to the interpreter we actually chose, then on
+# PATH, and only then installed — into that same interpreter, so the two can
+# never disagree about which environment the tool lives in.
+#
+# $CONSOLE is a variable, not an echo, for the same reason $PY is.
+# shellcheck disable=SC2034
+kit_bootstrap_console_script() {
+  local name="$1" module="$2" root="$3"
+
+  local beside
+  beside="$(dirname "$PY")/$name"
+  if [ -x "$beside" ]; then
+    CONSOLE="$beside"
+    return 0
+  fi
+  if command -v "$name" >/dev/null 2>&1; then
+    CONSOLE="$(command -v "$name")"
+    return 0
+  fi
+
+  printf 'note: installing %s into %s (first run)\n' "$name" "$PY" >&2
+  if ! "$PY" -m pip install --quiet --disable-pip-version-check "$module" >&2; then
+    cat >&2 <<MSG
+the gate needs $name, and installing it failed (no network, or no permission
+to write to the environment). To do it by hand:
+
+    $PY -m pip install -r $root/tests/requirements.txt
+
+then re-run:
+
+    bash tests/validate.sh
+MSG
+    return 1
+  fi
+
+  if [ -x "$beside" ]; then
+    CONSOLE="$beside"
+    return 0
+  fi
+  # A venv on some platforms puts scripts elsewhere; ask the interpreter rather
+  # than guessing a path.
+  CONSOLE="$("$PY" -c 'import sysconfig, sys; print(sysconfig.get_path("scripts"))' 2>/dev/null)/$name"
+  if [ -x "$CONSOLE" ]; then
+    return 0
+  fi
+
+  cat >&2 <<MSG
+pip reported installing $name, but it is still not on PATH and cannot be
+imported as $module. The environment is broken rather than the gate. Check:
+
+    $PY -m pip list
+
+then re-run:
+
+    bash tests/validate.sh
+MSG
+  return 1
+}

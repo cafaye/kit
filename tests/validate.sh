@@ -760,18 +760,26 @@ PY
   # the absence is a defect in the environment, not a neutral fact, and it is
   # the difference between "this YAML is bad" and "I did not look".
   section 'static: every YAML in the tree is yamllint clean'
-  YAMLLINT="${KIT_YAMLLINT:-$ROOT/.venv/bin/yamllint}"
+  if [ -z "${KIT_YAMLLINT:-}" ]; then
+    if ! kit_bootstrap_console_script yamllint yamllint "$ROOT"; then
+      exit 1
+    fi
+    YAMLLINT="$CONSOLE"
+  else
+    YAMLLINT="$KIT_YAMLLINT"
+  fi
   if [ ! -x "$YAMLLINT" ]; then
-    report FAIL 'yamllint (required, not installed: pip install -r tests/requirements.txt)'
+    report FAIL "yamllint (KIT_YAMLLINT=$YAMLLINT is not executable)"
   else
     # Lint the tree, not a hand-kept list. `git ls-files` rather than `find` so
     # the gate lints exactly what a caller clones, and so a .venv full of
     # somebody else's YAML never enters the report. Falls back to `find` in a
     # throwaway copy from self_test, which is not a git repository.
+    #
     # `while read` rather than `mapfile` into an array: mapfile is a bash 4
-    # builtin, and kit's gate is also run by the `sh` that ships in a slim
-    # container. A loop over a pipeline needs no array and no `set -u`-safe
-    # empty expansion.
+    # builtin and kit's gate is also run by whatever `bash` a slim container
+    # ships. A loop over a pipeline needs no array, and no `set -u`-safe empty
+    # expansion.
     yamls_of_the_tree() {
       if [ -d "$ROOT/.git" ] || [ -f "$ROOT/.git" ]; then
         git -C "$ROOT" ls-files '*.yml' '*.yaml' 2>/dev/null
