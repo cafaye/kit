@@ -11,9 +11,18 @@
 #   - Wheels are built into /wheels and installed with --no-index, so the
 #     runtime stage never reaches a package index at build time. Without that
 #     flag a compromised index is a production compromise.
+#   - The final stage runs non-root, as `app` (uid 10001), created with a fixed
+#     numeric uid so the image is reproducible. A container running as root is a
+#     container where a bug is a host compromise.
 #   - uv is the resolver of record (see the CI job and templates/bin-prime); pip
 #     remains only as the documented fallback, and it is not installed here.
+#   - UV_VERSION is pinned because the resolver's own version changes what it
+#     resolves. A bare `pip install uv` is a different lockfile on every day
+#     uv ships a release, which makes the image unreproducible for a reason
+#     that has nothing to do with the service. Kept in step with the `uv` pin
+#     in templates/mise.toml; hadolint's DL3013 is what found this.
 ARG PYTHON_VERSION=3.13
+ARG UV_VERSION=0.5.11
 
 FROM python:${PYTHON_VERSION}-slim AS build
 ENV PIP_DISABLE_PIP_VERSION_CHECK=1 PIP_NO_CACHE_DIR=1
@@ -23,7 +32,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/*
 COPY pyproject.toml ./
 COPY uv.lock* ./
-RUN pip install uv \
+RUN pip install "uv==${UV_VERSION}" \
     && if [ -f uv.lock ]; then uv export --frozen --no-dev --no-emit-project -o requirements.txt; \
        else printf '.\n' > requirements.txt; fi
 COPY . .

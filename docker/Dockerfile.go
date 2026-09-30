@@ -12,8 +12,10 @@
 #     gcr.io/distroless/base-debian12 and re-test before you ship it.
 #   - The build context is the service root, so `COPY . .` sees go.mod. Set
 #     working-dir in the CI caller if the module lives in a subdirectory.
-#   - nonroot, not root: the distroless nonroot user is uid 65532. There is no
-#     shell in this image, so a compromised process cannot curl and pipe.
+#   - The final stage runs non-root, as `nonroot:nonroot` (uid 65532) — the
+#     user the distroless image ships. There is no shell in this image, so a
+#     compromised process cannot curl and pipe, and root would be a container
+#     where a bug is a host compromise.
 ARG GO_VERSION=1.24
 
 FROM golang:${GO_VERSION} AS build

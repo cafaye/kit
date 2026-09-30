@@ -43,6 +43,36 @@ semver contract — it is consumed by *calling*
   the config greets the first adopting repo with a failure nobody authored. A
   skip here would hide a broken config behind a missing tool on precisely the
   machine that had not run the gate before.
+- **`lint/hadolint.yaml`, and real lint on all seven Dockerfiles.** They were
+  the only artifact in the tree with no parser at all — seven `SKIP ... (no
+  parser for this file type)` lines, honest and completely uncovered, on a file
+  every adopting service inherits. They now get three layers: hadolint
+  (required, pinned to 2.15.1, verified against hadolint's published
+  `checksums.sha256`); a non-root / no-`:latest` / no-`ADD` check for the two
+  properties hadolint cannot see; and a check that each template's own
+  STRICTNESS NOTES state the non-root guarantee to the reader deciding whether
+  to adopt the file.
+
+  **hadolint found a real defect on its first run.** `docker/Dockerfile.python`
+  ran `pip install uv` with no version, so the resolver's own version decided
+  what every build resolved to — an unpinned build input in the one image whose
+  whole point is a frozen resolution. Now `ARG UV_VERSION=0.5.11`, in step with
+  the `uv` pin in `templates/mise.toml`.
+
+  **The third check found a documentation bug in the same run.**
+  `Dockerfile.bun`'s STRICTNESS NOTES said *"The official image has no
+  unprivileged user, so we create one."* `oven/bun:1.3.12-slim` ships `bun` at
+  uid 1000 (verified against the running container) and the `useradd` that note
+  described was never in the file — the note described a different Dockerfile
+  than the one being read. Three of the seven said nothing about non-root at
+  all; all seven say so now.
+- The one ignored hadolint rule is DL3008 ("pin apt versions"), argued in
+  `lint/hadolint.yaml` rather than assumed: a hardcoded `build-essential=12.9`
+  in a template thirteen repos copy is a version thirteen people must remember
+  to bump, and the day Debian drops that build every one of them fails at once —
+  a correlated outage caused by a security patch landing. A service that wants
+  reproducible apt resolution pins in its own repo, which is the
+  "callers override, they never fork" rule.
 - `expect_red_check` in `tests/self_test.sh`, which asserts that one *named*
   check reported `FAIL` rather than merely that the gate went red. Breakages
   7-10 use it, so the check written for each layout/documentation drift is
@@ -114,7 +144,7 @@ semver contract — it is consumed by *calling*
   ci.reusable.yml@master` line in the README resolved to nothing. No repository
   in the fleet was calling it. It is now a **move, not a mirror**: one file, at
   the only path GitHub will resolve, so there is no second copy to diverge.
-- `self_test.sh` grew from 5 breakages to 16. Six are per-language semantic
+- `self_test.sh` grew from 5 breakages to 18. Six are per-language semantic
   mutations, each against a different W3C section, so
   **every** suite is proven able to fail rather than assumed to. A mutant that
   fails to compile is its own verdict rather than a pass, a missing toolchain is

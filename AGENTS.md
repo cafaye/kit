@@ -21,6 +21,9 @@ kit/
 │   ├── ci.reusable.yml                   # the workflow six repos call
 │   └── ci.yml                            # kit calling its own workflow
 ├── lint/                                 # configs a service copies verbatim
+│   ├── yamllint.yml  golangci.yml
+│   ├── rubocop.yml   eslint.config.mjs
+│   └── hadolint.yaml                      # argues the one rule it ignores
 ├── docker/                               # Dockerfile.<lang> templates
 ├── templates/
 │   ├── bin-prime/<lang>.sh               # the worktree primer
@@ -100,9 +103,9 @@ Three phases, and all three must pass:
 - **telemetry** — the six W3C traceparent suites are **executed**, one per
   language. Stdlib only and offline on purpose. If they ever need the network,
   a template has grown a dependency and kit has stopped being config-only.
-- **self_test** — sixteen breakages of a throwaway copy, asserting the gate goes
+- **self_test** — eighteen breakages of a throwaway copy, asserting the gate goes
   red each time. Six of them are a semantic mutation of one language each, so
-  **every suite is proven able to fail** rather than assumed to. Four assert
+  **every suite is proven able to fail** rather than assumed to. Six assert
   that one *named* check reported `FAIL`, so a check written for a specific
   defect is proven still load-bearing.
 
@@ -110,15 +113,22 @@ Three phases, and all three must pass:
 - `shellcheck` and `node` run when installed and are skipped when not. A skip is
   reported in the summary, never hidden — and a *skip in self_test* fails the
   run, because a proof nobody ran is not a proof.
-- **PyYAML and yamllint are required and are bootstrapped, not required of
-  you.** `tests/bootstrap.sh` resolves an interpreter, builds `.venv` and pip
-  installs `tests/requirements.txt` when nothing usable is present. Resolve
+- **PyYAML, yamllint and hadolint are required and are bootstrapped, not
+  required of you.** `tests/bootstrap.sh` resolves an interpreter, builds
+  `.venv`, pip installs `tests/requirements.txt`, and fetches a pinned hadolint
+  release verified against hadolint's published `checksums.sha256`. Resolve
   order: `$KIT_PYTHON` (an override is a promise — if it cannot import yaml
   the gate says so rather than silently substituting a different one), then
   `.venv`, then any `python3` on PATH that already has PyYAML, then bootstrap.
   A required check whose tool path is hardcoded to a directory the resolver may
   have skipped is a gate that fails on arrival; that is a bug this file has
   already had once.
+- **A skip is a gap, and the summary line is how you find it.** The seven
+  Dockerfiles sat behind `SKIP ... (no parser for this file type)` for the whole
+  life of kit-02, and the only reason anyone knew is that the summary printed
+  `note: 7 check(s) skipped`. A skip that is honest is still a check that ran
+  nothing — and a new file type with no parser is reported, never quietly
+  ignored. If you add a file type, add the parser in the same commit.
 - When adding an artifact, add the check that would catch its absence. A
   validator nobody extends is a validator that quietly rots.
 - **Parse what you hand out.** A file a service copies has to parse in its own
@@ -132,7 +142,7 @@ Three phases, and all three must pass:
   rubocop ran on kit's own Ruby with kit's own config. That is the only way an
   obsolete key surfaces before six repos inherit it.
 - The suite must be able to fail: `self_test` breaks a throwaway copy of the
-  tree sixteen ways and asserts the run goes red. If you change the suite, keep
+  tree eighteen ways and asserts the run goes red. If you change the suite, keep
   that true.
 
 ## Adding a language

@@ -5,6 +5,9 @@
 # STRICTNESS NOTES
 #   - Two stages. The final stage is `ruby:*-slim`, not `ruby:*`: full Debian
 #     ships a browser, a docs toolchain, and ~400 MB that a service never calls.
+#   - The final stage runs non-root, as `app` (uid 10001), created with a fixed
+#     numeric uid so the image is reproducible. A container running as root is a
+#     container where a bug is a host compromise.
 #   - `BUNDLE_PATH=/usr/local/bundle` keeps gems out of the app user's home so a
 #     non-root runtime user can read them without chmod-ing the whole tree.
 #   - `BUNDLE_WITHOUT=development:test` is the single most useful line in this

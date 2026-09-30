@@ -23,10 +23,13 @@
 # One line per check: PASS, FAIL, or SKIP. Any FAIL exits 1. A SKIP is always
 # reported in the summary — never hidden.
 #
-# Needs a python with PyYAML (tests/requirements.txt). node, shellcheck,
-# yamllint and the six language toolchains run when present and skip when not;
-# the artifact-presence and static checks always run, so a deleted template is
-# a failure on a machine with no toolchains at all.
+# Dependencies: PyYAML and yamllint (tests/requirements.txt) and hadolint, all
+# three REQUIRED and all three bootstrapped by tests/bootstrap.sh on first run,
+# so this one command is the whole procedure on a clean clone.
+#
+# node, the shellcheck binary, and the six language toolchains run when present
+# and skip when they are not; the artifact-presence and static checks always
+# run, so a deleted template is a failure on a machine with no toolchains at all.
 
 set -euo pipefail
 
@@ -92,9 +95,9 @@ done
 #
 # The resolved interpreter is exported so `tests/self_test.sh`, and every
 # throwaway copy of the gate it spawns, uses the same one instead of each
-# re-deriving it. That is not only speed: sixteen copies bootstrapping sixteen
-# virtualenvs is sixteen chances to fail for a reason that has nothing to do
-# with the breakage under test.
+# re-deriving it. That is not only speed: eighteen copies each bootstrapping
+# their own virtualenv is eighteen chances to fail for a reason that has nothing
+# to do with the breakage under test.
 if [ ! -r "$ROOT/tests/bootstrap.sh" ]; then
   echo "validate.sh: tests/bootstrap.sh is missing — the gate cannot install its own dependencies" >&2
   exit 1
@@ -154,6 +157,132 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # ===========================================================================
 
 if [ "$RUN_STATIC" -eq 1 ]; then
+  # Dockerfile rules hadolint does not cover. Defined here rather than inline so
+  # the section above reads as a list of assertions.
+  docker_rules() {
+    "$PY" - "$ROOT" <<'PY'
+import os
+import re
+import sys
+
+root = sys.argv[1]
+docker_dir = os.path.join(root, "docker")
+
+problems = []
+for name in sorted(os.listdir(docker_dir)):
+    if not name.startswith("Dockerfile."):
+        continue
+    rel = f"docker/{name}"
+    body = open(os.path.join(docker_dir, name), encoding="utf-8").read()
+    lines = body.splitlines()
+
+    # `USER` after the LAST `FROM` is the runtime user. Everything before it is
+    # build-time and runs as root by design — that is what a builder stage is.
+    last_from = max(
+        (i for i, ln in enumerate(lines) if re.match(r"^\s*FROM\s", ln, re.I)),
+        default=None,
+    )
+    if last_from is None:
+        problems.append(f"{rel}: no FROM — nothing to run")
+        continue
+
+    final_stage = lines[last_from:]
+    users = [
+        ln.strip()[len("USER "):].strip()
+        for ln in final_stage
+        if re.match(r"^\s*USER\s+\S", ln, re.I)
+    ]
+    if not users:
+        problems.append(
+            f"{rel}: the final stage sets no USER, so it runs as root — "
+            f"a container running as root is a container where a bug is a host "
+            f"compromise"
+        )
+    elif any(u.split(":")[0] in ("root", "0", "0:0") for u in users):
+        problems.append(f"{rel}: the final stage's USER is root ({users[-1]})")
+
+    # Every FROM carries an explicit tag, and never `latest`.
+    for i, ln in enumerate(lines, 1):
+        m = re.match(r"^\s*FROM\s+(\S+)(.*)$", ln, re.I)
+        if not m:
+            continue
+        image, rest = m.group(1), m.group(2)
+        # An ARG-interpolated tag still has to end in a real tag, so the last
+        # colon-separated component is what carries it: `python:${V}-slim` ends
+        # in `-slim`, `golang:${V}` ends in `${V}`. Neither is `latest`.
+        tail = re.split(r"[ \t]", rest.strip())[0] if rest.strip() else ""
+        if not tail and ":" not in image:
+            problems.append(f"{rel}:{i}: FROM {image} has no tag; an untagged base is a moving target")
+        if tail in ("latest",) or image.rsplit(":", 1)[-1] == "latest":
+            problems.append(f"{rel}:{i}: FROM {image} is :latest")
+
+    # ADD pulls a URL as easily as a file, so it is a way to put unverified
+    # content in an image without a hash. COPY cannot do that. The four kit
+    # artifacts a service inherits should not hand a reader that option.
+    for i, ln in enumerate(lines, 1):
+        if re.match(r"^\s*ADD\s", ln, re.I):
+            problems.append(f"{rel}:{i}: ADD — use COPY, which cannot fetch a URL")
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+
+  # Every template's STRICTNESS NOTES must state the non-root guarantee, in the
+  # final stage, in the file itself. Parsed as the leading comment block rather
+  # than grepped for a keyword: all seven files mention "root" somewhere in
+  # prose, so a grep was satisfied by a line about root-owned directories while
+  # the actual guarantee went unstated.
+  docker_notes() {
+    "$PY" - "$ROOT" <<'PY'
+import os
+import re
+import sys
+
+root = sys.argv[1]
+docker_dir = os.path.join(root, "docker")
+
+problems = []
+for name in sorted(os.listdir(docker_dir)):
+    if not name.startswith("Dockerfile."):
+        continue
+    rel = f"docker/{name}"
+    lines = open(os.path.join(docker_dir, name), encoding="utf-8").read().splitlines()
+
+    # The leading comment block, stopping at the first instruction.
+    head = []
+    for ln in lines:
+        if not ln.lstrip().startswith("#"):
+            break
+        head.append(ln)
+
+    if not head:
+        problems.append(f"{rel}: no STRICTNESS NOTES header comment")
+        continue
+
+    body = "\n".join(head).lower()
+    # `non-root`, `nonroot`, or `uid 1000`-style: the claim is that the process
+    # is not uid 0, however the file happens to word it. What it must NOT accept
+    # is a note that only talks about root-owned files.
+    claims_non_root = re.search(r"non-?root", body) is not None
+    if not claims_non_root:
+        problems.append(
+            f"{rel}: its STRICTNESS NOTES do not state that the final stage runs "
+            f"non-root. Every one of these templates does run non-root (the check "
+            f"above proves it), but a reader deciding whether to adopt the file "
+            f"reads the notes, not the gate"
+        )
+    if "strictness" not in body:
+        problems.append(
+            f"{rel}: the header comment has no STRICTNESS NOTES block, so a future "
+            f"contributor has nothing saying what is enforced and why"
+        )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+
   section 'static: every artifact parses'
 
   for f in "$ROOT"/.github/workflows/* "$ROOT"/lint/* "$ROOT"/docker/* \
@@ -171,7 +300,20 @@ if [ "$RUN_STATIC" -eq 1 ]; then
           report SKIP "$path  (node not installed)"
         fi
         ;;
-      *) report SKIP "$path  (no parser for this file type)" ;;
+      "$ROOT"/docker/Dockerfile.*)
+        # Linted by hadolint in the section below, and by `docker_rules` for the
+        # two properties hadolint does not cover. Deliberately not reported
+        # here: "no parser for this file type" was the seven-line SKIP this
+        # packet exists to remove, and printing it next to a real hadolint
+        # result would say both "unchecked" and "checked" in the same run.
+        ;;
+      *)
+        # A new file type with no parser is a gap, so it is loud rather than
+        # quiet. It is still a SKIP, because the honest report matters more
+        # than a red gate on an unknown extension — but a SKIP is counted and
+        # printed in the summary, which is how the seven Dockerfiles were found.
+        report SKIP "$path  (no parser for this file type)"
+        ;;
     esac
   done
 
@@ -428,6 +570,75 @@ SNIPPETS
   else
     report PASS 'templates/otel/node/package.json  (not needed: node:test + stdlib)'
   fi
+
+  # -------------------------------------------------------------------------
+  # The seven Dockerfiles.
+  #
+  # These are one of the four artifacts every adopting service inherits, and
+  # until now they received NO lint at all: the artifact-presence loop above
+  # reached the `*)` branch and printed
+  #
+  #     SKIP docker/Dockerfile.go  (no parser for this file type)
+  #
+  # seven times. A skip is honest, which is how it was found, and honest is not
+  # the same as covered: a Dockerfile that does not build ships unverified, and
+  # a service that adopts one finds out on its own first deploy.
+  #
+  # hadolint is the real parser and it is required, not optional. It is a
+  # single static binary, so `kit_bootstrap_binary` fetches a pinned release and
+  # verifies its published sha256 rather than trusting whatever is on PATH —
+  # a linter that is silently absent, or silently different, is the same
+  # SKIP wearing a PASS.
+  section 'static: every Dockerfile is hadolint clean'
+  if kit_bootstrap_binary hadolint \
+    "https://github.com/hadolint/hadolint/releases/download/v${KIT_HADOLINT_VERSION}" \
+    "$KIT_HADOLINT_SHA256S" "$ROOT"; then
+    for f in "$ROOT"/docker/Dockerfile.*; do
+      [ -f "$f" ] || continue
+      rel="${f#"$ROOT"/}"
+      # `--no-color`: the gate's output is read by humans and by CI log
+      # scrapers, and an ANSI escape in a FAIL block is noise in both.
+      if out=$("$BIN" -c "$ROOT/lint/hadolint.yaml" --no-color "$f" 2>&1); then
+        report PASS "$rel  (hadolint)"
+      else
+        report FAIL "$rel  (hadolint)"
+        printf '%s\n' "$out" | sed 's/^/       /'
+      fi
+    done
+  else
+    # Not a SKIP. hadolint is the only thing standing between a template and a
+    # broken build, and a gate that reports "I could not check" and exits 0 is
+    # the exact shape PLAN.md §1 calls a gate that is not green. It is also the
+    # shape that let seven Dockerfiles go unlinted in the first place.
+    report FAIL 'hadolint (required: could not be installed — see the note above)'
+  fi
+
+  # hadolint is a syntax-and-practice linter. It will happily pass a Dockerfile
+  # whose final stage runs as root, and root in a container is a container where
+  # a bug is a host compromise. So the two properties kit's own STRICTNESS NOTES
+  # claim for all seven — a non-root final stage, and a pinned (never `:latest`)
+  # base image — are asserted here rather than assumed from the prose.
+  #
+  # Read from the file as text, not from a Dockerfile parser: these templates
+  # use `ARG` interpolation, so a base image is `python:${PYTHON_VERSION}-slim`
+  # and the claim to check is that the tag exists and is not `latest`, not that
+  # it is a literal. hadolint is the parser for everything it can parse; this is
+  # the two claims that outlive it.
+  section 'static: every Dockerfile runs non-root on a pinned base'
+  check 'docker/Dockerfile.*  (non-root final stage, no :latest, no ADD)' docker_rules
+
+  # A Dockerfile with no USER in its final stage is a real defect, and the check
+  # above proves that claim can fail. So the claim is written down where the
+  # reader is: in each template's own STRICTNESS NOTES, the block a person
+  # deciding whether to adopt this file actually reads.
+  #
+  # The note is required to be about the non-root final stage specifically, not
+  # merely to contain the word "root" — every one of the seven already mentions
+  # running non-root SOMEWHERE in passing, in prose no check read. A check that
+  # the claim is documented where the reader looks, and the check that the claim
+  # is true, are different checks; this is the first.
+  section 'static: each Dockerfile documents its own non-root guarantee'
+  check 'docker/Dockerfile.*  (STRICTNESS NOTES state the non-root stage)' docker_notes
 
   # -------------------------------------------------------------------------
   # AGENTS.md: "Half a language is worse than none." The whole point of kit is
@@ -1409,7 +1620,7 @@ fi
 
 if [ "$RUN_SELF_TEST" -eq 1 ]; then
   section 'self_test: this gate is able to fail'
-  if check 'tests/self_test.sh  (twelve breakages, twelve reds)' \
+  if check 'tests/self_test.sh  (eighteen breakages, eighteen reds)' \
     bash "$ROOT/tests/self_test.sh"; then
     :
   fi

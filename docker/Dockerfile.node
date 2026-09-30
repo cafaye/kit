@@ -8,8 +8,10 @@
 #     reachable in production.
 #   - `node:*-slim`, never `node:*`: full Debian ships a browser and a document
 #     toolchain a gateway or worker never calls.
-#   - The official `node` image already has a non-root `node` user (uid 1000), so
-#     we use it instead of creating a second one; chown the app dir to it.
+#   - The final stage runs non-root, as `node` (uid 1000) — the official `node`
+#     image already has that user, so we use it instead of creating a second
+#     one; chown the app dir to it. A container running as root is a container
+#     where a bug is a host compromise.
 #   - `npm ci` (not `npm install`): ci installs exactly package-lock.json and
 #     fails if the lock and manifest disagree, which is the whole point.
 #   - No init/tini. The ENTRYPOINT execs node directly, so PID 1 is the service

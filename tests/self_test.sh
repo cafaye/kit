@@ -11,7 +11,7 @@
 #   *different* check, so a passing self_test means the checks are independent
 #   and not one lucky assertion standing in for all of them.
 #
-# THE SIXTEEN BREAKAGES
+# THE EIGHTEEN BREAKAGES
 #   1. delete a language template   -> the artifact-presence check goes red
 #   2. ship a collector exporter   -> the privacy check goes red
 #   3. corrupt the python codec    -> the executed test suite goes red
@@ -21,7 +21,9 @@
 #   7-10. break the agreement between the documented `uses:` string and the
 #         real path, in the four ways it can break -> the callable-path check
 #         goes red
-#   11-16. one semantic mutation per language implementation -> THAT language's
+#   11-12. break a Dockerfile -> the hadolint check, and the non-root check that
+#         exists because hadolint has no rule for a missing USER
+#   18. one semantic mutation per language implementation -> THAT language's
 #         suite goes red. A suite that has never failed has never been proven to
 #         test anything, and six suites that only one language's mutation covers
 #         is five suites that might assert nothing at all.
@@ -364,7 +366,37 @@ edit "$ten/.github/workflows/ci.yml" \
 expect_red_check 'breakage 10: kit CI calls a remote ref instead of its own local copy' \
   "$ten" "$CALLABLE" --static-only
 
-# 11-16. One semantic mutation per language implementation, each against a
+# 11-12. The Dockerfiles. These are one of the four artifacts every adopting
+#       service inherits, and until this packet they were the only artifact in
+#       the tree with no parser at all — seven `SKIP ... (no parser for this
+#       file type)` lines that nobody had to look at twice because the summary
+#       said "note: 7 skipped".
+#
+#       A skipped check proves nothing (PLAN.md §1), so each breakage asserts a
+#       NAMED check went red, and the two breakages target the two different
+#       claims: the linter, and the rules the linter does not cover.
+DOCKERLINT='docker/Dockerfile.*  (non-root final stage, no :latest, no ADD)'
+
+# 11. A Dockerfile defect only hadolint can see. `pip install uv` with no
+#     version is DL3013, and it was in the tree the whole time — a resolver
+#     whose version silently decides what your lockfile resolves to.
+eleven="$(fresh_copy unpinned-pip)"
+edit "$eleven/docker/Dockerfile.python" \
+  'RUN pip install "uv==${UV_VERSION}" \' 'RUN pip install uv \'
+expect_red_check 'breakage 11: a Dockerfile pins nothing (hadolint DL3013)' \
+  "$eleven" 'docker/Dockerfile.python  (hadolint)' --static-only
+
+# 12. A Dockerfile defect hadolint does NOT see: the final stage dropped its
+#     USER, so the image would run as root. hadolint has no rule for this —
+#     DL3002 ("last USER should not be root") only fires when a USER is
+#     present and wrong, and a missing USER is silence. This is the check that
+#     has to exist precisely because the real parser cannot cover it.
+twelve="$(fresh_copy dockerfile-as-root)"
+edit "$twelve/docker/Dockerfile.go" 'USER nonroot:nonroot' '# USER removed'
+expect_red_check 'breakage 12: a Dockerfile final stage runs as root' \
+  "$twelve" "$DOCKERLINT" --static-only
+
+# 13-18. One semantic mutation per language implementation, each against a
 # different spec rule, and each asserting THAT language's suite goes red.
 #
 # These all read from the same throwaway copy as breakage 1 rather than taking a
@@ -374,7 +406,7 @@ base="$(fresh_copy language-mutants)"
 
 #   go    §3.2.2.5  stop masking trace-flags on read. Still compiles, still runs,
 #                  and quietly forwards reserved bits to the next service.
-expect_red_lang 'breakage 11: go stops masking trace-flags (§3.2.2.5)' \
+expect_red_lang 'breakage 13: go stops masking trace-flags (§3.2.2.5)' \
   "$base" go traceparent.go \
   'Flags:      tp.Flags & sampledFlag,' \
   'Flags:      tp.Flags,'
@@ -382,7 +414,7 @@ expect_red_lang 'breakage 11: go stops masking trace-flags (§3.2.2.5)' \
 #   ruby  §3.2.2  widen the alphabet to accept uppercase hex. The classic bug:
 #                one service folds case, the next rejects the header, and a trace
 #                breaks at the hop between them.
-expect_red_lang 'breakage 12: ruby accepts uppercase hex (§3.2.2)' \
+expect_red_lang 'breakage 14: ruby accepts uppercase hex (§3.2.2)' \
   "$base" ruby traceparent.rb \
   '!str.empty? && str.match?(/\A[0-9a-f]+\z/)' \
   '!str.empty? && str.match?(/\A[0-9a-fA-F]+\z/)'
@@ -390,21 +422,21 @@ expect_red_lang 'breakage 12: ruby accepts uppercase hex (§3.2.2)' \
 #   elixir §3.2.2.2  stop rejecting trailing data on a version-00 header. Nothing
 #                   crashes; the header is just no longer the format we claim to
 #                   implement.
-expect_red_lang 'breakage 13: elixir accepts trailing junk on version 00 (§3.2.2.2)' \
+expect_red_lang 'breakage 15: elixir accepts trailing junk on version 00 (§3.2.2.2)' \
   "$base" elixir traceparent.ex \
   'defp check_trailing(value, 0), do: if(byte_size(value) == @min_header_len, do: :ok, else: {:error, :invalid})' \
   'defp check_trailing(_value, 0), do: :ok'
 
 #   node  §3.3.1.5  raise the tracestate limit until truncation never fires. A
 #                   limit nobody enforces is a limit nobody wrote on purpose.
-expect_red_lang 'breakage 14: node never truncates tracestate (§3.3.1.5)' \
+expect_red_lang 'breakage 16: node never truncates tracestate (§3.3.1.5)' \
   "$base" node traceparent.mjs \
   'const TRACESTATE_LIMIT = 512;' \
   'const TRACESTATE_LIMIT = 100000;'
 
 #   rust  §3.2.2.3  accept an all-zero trace-id. The spec forbids it outright; a
 #                   codec that allows it merges unrelated traces into one.
-expect_red_lang 'breakage 15: rust accepts an all-zero trace-id (§3.2.2.3)' \
+expect_red_lang 'breakage 17: rust accepts an all-zero trace-id (§3.2.2.3)' \
   "$base" rust traceparent.rs \
   'if trace_id == ZERO_TRACE_ID || parent_id == ZERO_SPAN_ID {' \
   'if parent_id == ZERO_SPAN_ID {'
@@ -412,7 +444,7 @@ expect_red_lang 'breakage 15: rust accepts an all-zero trace-id (§3.2.2.3)' \
 #   python §3.2.2.5  the same dropped mask as go, in a different language, on
 #                   purpose: a rule asserted in one suite and not the other is a
 #                   rule two services will disagree about.
-expect_red_lang 'breakage 16: python stops masking trace-flags (§3.2.2.5)' \
+expect_red_lang 'breakage 18: python stops masking trace-flags (§3.2.2.5)' \
   "$base" python traceparent.py \
   'flags=parsed.flags & SAMPLED,' \
   'flags=parsed.flags,'
@@ -427,4 +459,4 @@ if [ "$skips" -ne 0 ]; then
   echo "FAIL: self_test — $skips breakage(s) skipped for a missing toolchain. A skipped proof is not a proof."
   exit 1
 fi
-echo "PASS: self_test — all 16 breakages went red, and the unbroken tree is green."
+echo "PASS: self_test — all 18 breakages went red, and the unbroken tree is green."

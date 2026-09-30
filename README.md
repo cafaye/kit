@@ -25,7 +25,8 @@ build lands in kit once, and reaches the next service in a pull request.
 | `lint/golangci.yml` | golangci-lint v2, correctness linters on, `errcheck` excluded only for `Close`/`Flush`. | Go services |
 | `lint/rubocop.yml` | RuboCop, `NewCops: enable`, Metrics left on. | Ruby services |
 | `lint/eslint.config.mjs` | ESLint 9 flat config, type-checked rules on. | Node/TypeScript/Bun services |
-| `docker/Dockerfile.<lang>` | Seven multi-stage templates. `go` and `rust` finish on distroless; the rest finish on `*-slim`. All run non-root. | Every service |
+| `docker/Dockerfile.<lang>` | Seven multi-stage templates. `go` and `rust` finish on distroless; the rest finish on `*-slim`. All run non-root. Linted by `hadolint -c lint/hadolint.yaml`, plus a non-root/no-`:latest`/no-`ADD` check the linter does not cover. | Every service |
+| `lint/hadolint.yaml` | hadolint config, with the one ignored rule (DL3008) argued rather than assumed. | Any repo that ships a Dockerfile |
 | `templates/bin-prime/<lang>.sh` | The worktree primer: one script per language, exit 0 only when the tree is genuinely ready. | Every service, as `bin/prime` |
 | `templates/bin/dev.sh` | The local developer loop: bring the stack up, wait for health, migrate, seed an admin, print the URLs. Idempotent, fails loudly. | Every service, as `bin/dev` |
 | `templates/compose/docker-compose.yml` | Postgres, NATS+JetStream, Redis and the OTel collector. Every port parameterized, every image pinned, every service healthchecked. | Every service, as `docker-compose.yml` |
@@ -344,6 +345,11 @@ we wrote them down to be:
   on day one, so a YAML that breaks the config greets the first adopter with a
   failure nobody authored
 - `.mjs` → `node --check`
+- `docker/Dockerfile.*` → `hadolint -c lint/hadolint.yaml`, **plus** the
+  non-root / no-`:latest` / no-`ADD` rules hadolint does not cover, **plus** a
+  requirement that each template's own STRICTNESS NOTES state the non-root
+  guarantee. Required, not optional: see
+  [what the gate lints the Dockerfiles with](#what-the-gate-lints-the-dockerfiles-with-and-why)
 - handed-out scripts → must be executable
 - every language in the CI workflow must have a Dockerfile, a `bin/prime` and a
   `[tools]` pin — "half a language is worse than none"
@@ -369,16 +375,56 @@ no `npm ci`, no `cargo fetch`. If these ever need the network, a template has
 grown a dependency and kit has stopped being config-only.
 
 **self_test** — `tests/self_test.sh` breaks a throwaway copy of this tree
-sixteen ways and asserts the gate goes red each time. Ten breakages are for the
-static checks; one is a semantic mutation of each of the six language
+eighteen ways and asserts the gate goes red each time. Twelve breakages are for
+the static checks; one is a semantic mutation of each of the six language
 implementations, so **every suite is proven able to fail** rather than assumed
 to. A skip fails the run — a self_test that skips half its proofs and exits 0 is
-the "0 passed, 14 ignored" shape that verifies nothing. Four of the static ones
+the "0 passed, 14 ignored" shape that verifies nothing. Six of the static ones
 go further and assert that one *named* check reported `FAIL`, so the check
 written for a given defect is proven still load-bearing rather than being one
-of forty checks that could have gone red for an unrelated reason.
+of fifty checks that could have gone red for an unrelated reason.
 
 Any `FAIL` exits 1. A `SKIP` is always reported in the summary, never hidden.
-PyYAML and yamllint are required and are bootstrapped by the gate itself
-(`tests/requirements.txt`); the six language toolchains and `shellcheck` run when
-present.
+PyYAML, yamllint and hadolint are required and are **bootstrapped by the gate
+itself**; the six language toolchains and `shellcheck` run when present.
+
+### What the gate lints the Dockerfiles with, and why
+
+`docker/Dockerfile.*` is the one artifact here that used to have **no parser at
+all** — seven lines reading `SKIP ... (no parser for this file type)`, honest,
+and completely uncovered. It now has two layers:
+
+- **`hadolint -c lint/hadolint.yaml`** — a real parser, required, pinned to
+  2.15.1 and verified against hadolint's published `checksums.sha256`. Not
+  optional: hadolint is a single static binary the gate fetches on first run, so
+  "it was not installed" is not an excuse available to anyone, and a linter that
+  is silently a different version is the same skip wearing a pass.
+  `failure-threshold: warning` — hadolint's `info` tier is advisory style, and a
+  gate people run with `--no-fail` is not a gate. The **one** ignored rule is
+  DL3008 ("pin apt versions"), and the argument for it is written out in
+  `lint/hadolint.yaml`: these are templates thirteen repos copy, so a hardcoded
+  `build-essential=12.9` is a version thirteen people must remember to bump,
+  and the day Debian drops that build every one of them fails at once — a
+  correlated outage caused by a security patch landing.
+- **`docker/Dockerfile.*  (non-root final stage, no :latest, no ADD)`** — the
+  two properties hadolint does **not** cover. DL3002 only fires when a `USER` is
+  present and wrong; a *missing* `USER` is silence, and silence is how an image
+  ships running as root. `ADD` is refused because it can fetch a URL, so it is a
+  way to put unverified content in an image without a hash.
+
+A third check requires each template's `STRICTNESS NOTES` to state the non-root
+guarantee in the file itself. All seven do run non-root, and the check above
+proves it; this one is about the reader deciding whether to adopt the file, who
+reads the notes and not the gate.
+
+hadolint found one real defect on its first run, which is the argument for
+having run it: `docker/Dockerfile.python` did `pip install uv` with no version,
+so the resolver's own version silently decided what a build resolved. It is now
+`ARG UV_VERSION=0.5.11`, in step with the `uv` pin in `templates/mise.toml`.
+
+It also found a documentation bug, which is the argument for the third check:
+`Dockerfile.bun`'s notes said *"The official image has no unprivileged user, so
+we create one."* The official `oven/bun:1.3.12-slim` image ships `bun` at uid
+1000 (verified against the running container), and the `useradd` that note
+described was never in the file — so the note described a different Dockerfile
+than the one being read.
