@@ -743,9 +743,10 @@ gitignored — so **every fresh clone and every CI runner** hit it, including th
 CI job this repository now runs on itself.
 
 The binaries go in `tests/.bin/` rather than `.venv/bin/` for the same reason
-one level down: `tests/self_test.sh` copies the tree twenty-nine times per gate
-run, and a tool in a directory the copy does not carry is re-downloaded once per
-copy.
+one level down: `tests/self_test.sh` copies the tree thirty times per gate run —
+34 breakages over 29 copies, because the six language mutants share one, plus the
+unbroken-tree control's own — and a tool in a directory the copy does not carry
+is re-downloaded once per copy.
 
 `tests/validate.sh` runs in three phases and prints one line per check.
 

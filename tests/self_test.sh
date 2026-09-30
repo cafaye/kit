@@ -960,7 +960,18 @@ expect_red_check 'breakage 32: the reference type marshals its credential' \
 #     now holds a credential-shaped string — a gitleaks finding, and an
 #     allowlist entry somebody will eventually add. The check that catches it is
 #     `the canary (never committed as a literal, anywhere)`.
-canary_literal="$(fresh_copy canary-committed-as-literal)"
+# The DIRECTORY is `canary_as_literal`, not `canary_literal`, and that is not
+# taste. `canary_literal` is the name kit-04 used for the assembled VALUE below,
+# and the renumber that gave 24-34 descriptive directory names gave this one the
+# value's name. The directory variable was then reassigned to the value a few
+# lines later, so `edit` was handed
+# `cafaye_canary_…/templates/secrets/go/canary.go` and died with a
+# FileNotFoundError — which killed breakage 33 AND 34, and the run, before the
+# summary printed. Two proofs dead, reported as a crash rather than as a missing
+# check. A directory variable and a value variable must never share a name here;
+# `validate.sh` now checks that, because a name collision is invisible to review
+# and fatal only when the recipe runs.
+canary_as_literal="$(fresh_copy canary-committed-as-literal)"
 # The replacement is the EXACT value the check looks for: prefix plus 32 bytes,
 # and it is ASSEMBLED here for the same reason `plant_probe` assembles its PAT.
 #
@@ -979,11 +990,11 @@ canary_literal="$(fresh_copy canary-committed-as-literal)"
 canary_prefix='cafaye_canary_'
 canary_body="$(printf 'notarealsecret%.0s' 1 2 3)"
 canary_literal="$canary_prefix${canary_body:0:32}"
-edit "$canary_literal/templates/secrets/go/canary.go" \
+edit "$canary_as_literal/templates/secrets/go/canary.go" \
   'canary   = CanaryPrefix + strings.Repeat(canaryBody, 3)[:CanaryBytes]' \
   "canary   = \"$canary_literal\""
 expect_red_check 'breakage 33: the canary is committed as a literal' \
-  "$canary_literal" 'the canary  (never committed as a literal, anywhere)' --static-only
+  "$canary_as_literal" 'the canary  (never committed as a literal, anywhere)' --static-only
 
 # 34. The zizmor config baselines unpinned-uses — the trade made invisibly, in a
 #     file that looks like routine housekeeping. Every finding is still

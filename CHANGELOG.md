@@ -25,16 +25,22 @@ semver contract — it is consumed by *calling*
     mutants** were dropped, not renumbered: they are master's 13–18 byte for
     byte, and a second copy would prove the same six rules twice under two
     names. kit-04's **eleven unique breakages** moved to **24–34**.
-  - `tests/validate.sh`: 45 check invocations on master, 34 on kit-04, **59
-    merged** — twenty of the sites are shared, which is why the union is less
-    than the sum. Both sides' checks survive: master's tier block and kit-04's
-    secrets block were the two real conflict hunks, and neither was picked over
-    the other. Comparing the *labels* rather than the counts is what proves that:
-    every label on either side is still present in the merged file, except two
-    that were resolved deliberately — `collector_check`, which is one function
-    whose label disagreed (master's fuller revision won) and whose kit-04 version
-    was an earlier, smaller copy of the same function; and the `self_test`
-    invocation site itself, which is the union documented below.
+  - `tests/validate.sh`: 45 check sites on master, 34 on kit-04, **59
+    merged** — twenty of the sites are shared verbatim, which is why the union is
+    less than the sum. Both sides' checks survive, and what proves it is the
+    *label* set rather than the count: every label on either side is still present
+    in the merged file, except two that were resolved deliberately —
+    `collector_check`, which is one function whose label disagreed (master's
+    fuller revision won) and whose kit-04 version was an earlier, smaller copy of
+    the same function; and the `self_test` invocation site itself, which is the
+    union documented below.
+    Master's `collector_check` also *subsumes* the part of kit-04's that is not
+    superseded: `receivers` and `batch` are asserted per signal rather than for
+    `traces` alone. The rest is deliberately gone — kit-04's "the traces pipeline
+    ships to no non-local exporter" described the pre-fan-out stack, whose only
+    exporter was `debug`, and it would go red against the tempo/loki/mimir
+    fan-out master now ships. Keeping it would have been a check that fails on a
+    correct tree, which is worse than no check.
   - The `self_test` invocation site now takes the union of both: `check_verbose`
     (kit-04's — the list of breakages that went red *is* the evidence, and a
     plain `check` prints one line and throws the rest away) with master's
@@ -90,6 +96,20 @@ semver contract — it is consumed by *calling*
   58, for a file that carries 34.
 - A section comment read `# 30-22.` where the canary vectors are `30`–`33`: the
   renumber script's arithmetic leaking into prose.
+- **Two of the thirty-four proofs were dead, and the renumber is what killed
+  them.** Giving breakages `24`–`34` descriptive directory names named breakage
+  33's copy `canary_literal` — which was already the name of the canary **value**
+  assembled six lines below it. The recipe reassigned the variable to the value,
+  so `edit` was handed `cafaye_canary_…/templates/secrets/go/canary.go` and died
+  with a `FileNotFoundError`. Breakage 33 never ran, and because the script stops
+  at the first crash neither did 34: *"the canary is committed as a literal"* and
+  *"the zizmor config baselines unpinned-uses"* had silently stopped being
+  tested, and the run died before printing its summary. Restored to `kit-04`'s
+  naming, where the directory was `twentytwo` and the value `canary_literal`.
+  Nothing about reading the file shows this — both lines are correct in
+  isolation, `bash -n` is happy, and the header/recipe agreement below is
+  perfect while both are wrong — so `self_test_claims` now also asserts that no
+  throwaway-copy directory variable is ever reassigned.
 
 - **kit-07 — the declared tier, and the allowlist that is supposed to shrink.**
   A tier is a class of test that needs a real dependency. The failure this

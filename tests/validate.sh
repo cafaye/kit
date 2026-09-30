@@ -5065,6 +5065,37 @@ for missing in sorted(named - carried, key=breakage_sort):
 for orphan in sorted(carried - named, key=breakage_sort):
     problems.append(f"recipe proves breakage {orphan} but the header does not document it")
 
+# A throwaway-copy DIRECTORY variable that is REASSIGNED stops being a path.
+# This is here because it already happened, and it happened silently: the
+# renumber that gave breakages 24-34 descriptive directory names gave breakage
+# 33's directory the name `canary_literal`, which was already the name of the
+# canary VALUE assembled six lines below it. The reassignment meant `edit` was
+# handed `cafaye_canary_.../templates/secrets/go/canary.go`, the recipe died with
+# a FileNotFoundError, and breakage 33 never ran — taking 34 with it, because
+# the script stops at the first crash. Two proofs dead, and the only symptom was
+# a traceback in a phase whose output nobody reads on a green run.
+#
+# Nothing about READING the file shows this. Both lines look correct in isolation,
+# and `bash -n` is happy, and the header/recipe agreement above is perfect while
+# both of them are wrong. So it is asserted here, where a check already parses
+# this file.
+_lines = src.splitlines()
+_fresh = re.compile(r'^(\w+)="\$\(fresh_copy\b')
+_assign = re.compile(r'^(\w+)=')
+_dirvars = {}
+for _n, _line in enumerate(_lines, 1):
+    _m = _fresh.match(_line)
+    if _m and _m.group(1) not in _dirvars:
+        _dirvars[_m.group(1)] = _n
+for _n, _line in enumerate(_lines, 1):
+    _m = _assign.match(_line)
+    if not _m or _m.group(1) not in _dirvars or _fresh.match(_line):
+        continue
+    problems.append(
+        f"line {_n}: `{_m.group(1)}` holds a throwaway copy (assigned at line "
+        f"{_dirvars[_m.group(1)]}) and is reassigned here, so that recipe edits a path that no longer exists"
+    )
+
 # `sys.exit` rather than `return`: this is a top-level script, not a function
 # body, and the other checks in this file use the same shape. A `return` here is
 # a SyntaxError at import time — which is exactly how this check first failed.
