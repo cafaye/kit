@@ -4364,7 +4364,7 @@ if [ "$RUN_SELF_TEST" -eq 1 ]; then
   # a hardcoded number is exactly the kind of thing that goes stale quietly when
   # the next packet adds a check. The wording follows from the count so the two
   # cannot disagree.
-  _st_breakages=$(grep -cE '^expect_red(_check|_lang|_script)? ' "$ROOT/tests/self_test.sh" || true)
+  _st_breakages=$(grep -cE '^ *expect_red(_check|_lang|_script)? ' "$ROOT/tests/self_test.sh" || true)
 
   # The header is a promise about what the file proves, and a promise nobody
   # reads is decoration. Compare the breakage numbers the header NAMES against
@@ -4426,7 +4426,21 @@ carried = set(
         # a pattern missing `_script` calls them undocumented. Same omission as
         # the `_st_breakages` count above — one bug, two symptoms, because the
         # helper list was written down twice.
-        r"""^expect_red(?:_check|_lang|_script)? ['"]breakage\s+(\d+[a-z]?):""",
+        #
+        # INDENTATION IS ALLOWED, and it has to be. Breakage 30 is guarded by a
+        # `command -v ruby` test — a missing interpreter SKIPs, and self_test's
+        # own rule is that a skipped proof is a failed proof — so its recipe sits
+        # inside an `if` and is indented. The column-0 pattern then reported
+        # "header documents breakage 30 but no recipe carries it" against a
+        # recipe that is right there, which is a check inventing a disagreement
+        # to report a difference that does not exist.
+        #
+        # What the anchoring was FOR is preserved: the first token must still be
+        # `expect_red`, so the `printf 'SKIP self_test: breakage 30 …'` line in
+        # the same branch is not counted as a recipe. A looser pattern that
+        # matched that line would double-count 30 and hide the very skip the
+        # guard exists to surface.
+        r"""^\s*expect_red(?:_check|_lang|_script)? ['"]breakage\s+(\d+[a-z]?):""",
         src,
         re.M,
     )

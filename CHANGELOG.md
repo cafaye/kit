@@ -2064,6 +2064,40 @@ e
 .
 ### Fixed
 
+- **The gate blamed the ruby template for a toolchain that could not run it.**
+  On a machine whose system Ruby is 2.6.10, `templates/otel/ruby`'s suite
+  raised three `NoMethodError: undefined method 'filter_map'` and the summary
+  read
+
+      FAIL templates/otel/ruby  (ruby test suite)
+
+  which accuses a template that is correct. The template calls
+  `Array#filter_map` (Ruby 2.7), that is a **runtime** call, and so the
+  interpreter's age arrived as a stack trace from inside a helper instead of a
+  refusal to run. Ruby was the only language in this phase that could answer
+  wrongly rather than decline: go's `go.mod` plus `GOTOOLCHAIN=local`, rustc's
+  `--edition`, and python's `from __future__ import annotations` all refuse on
+  their own.
+
+  `tests/validate.sh` now consults a **toolchain floor before running the
+  suite**, and reports the toolchain as the cause. The floor is a **feature
+  probe** (`Array.method_defined?(:filter_map)`) rather than a version literal,
+  because a literal in the runner is a claim about the template that nothing
+  checks — raise the template's floor and the claim rots silently. It is a
+  probe and not a version comparison because the real question is not "how old
+  is this ruby" but "can it run the code we ship", which is answerable exactly.
+
+  A too-old interpreter is a **FAIL, not a SKIP**: the suite is installed, the
+  code is here, and the check genuinely did not run. An *absent* toolchain is
+  still a SKIP — that is an environment without the language, not a broken one.
+
+  Attributed as **pre-existing**, with evidence, in REPORT-kit-14: the same
+  three errors reproduce on a clean clone of `origin/master` under master's own
+  runner, `run_ruby` is byte-identical between master and this branch, and the
+  diff never touched `templates/otel/ruby`. Self-test breakage 30 deletes the
+  one line that consults the floor and asserts the misleading red returns, so
+  the check is proven load-bearing rather than merely present.
+
 - **A check that a comment could satisfy.** The `-count=1` assertion was a plain
   substring test over the go step's `run:` body, and that body's own comment
   block names the flag twice while explaining why removing it would be a

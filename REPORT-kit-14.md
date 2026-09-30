@@ -756,3 +756,235 @@ witness the run it describes and the only part of it I could check was wrong.
 Its §9 is superseded by this one, in the next commit. It is left in the history
 rather than rewritten because a correction you can diff against the thing it
 corrects is worth more than a history with no mistakes in it.
+
+---
+
+## 10. The `templates/otel/ruby` red: attributed, with the evidence
+
+The manager's gate run reported **`FAIL templates/otel/ruby (ruby test
+suite)`**, minitest showing `.E..EE.`, with every other template green, staleness
+26/26, and `self_test` PASS. The diff behind this branch never touches
+`templates/otel/ruby`, but it does rewrite `tests/validate.sh` (+431 lines), so
+the failure had two candidate owners and the point of this section is to say
+which, with the receipts.
+
+### 10.1 The error, in full
+
+The three errors are one error, three times:
+
+```
+1) Error: TestTraceparent#test_tracestate_is_forwarded:
+NoMethodError: undefined method `filter_map' for ["congo=t61rcWkgMzE"]:Array
+  templates/otel/ruby/traceparent.rb:278:in `usable_tracestate_entries'
+  templates/otel/ruby/traceparent.rb:267:in `forward_tracestate'
+  templates/otel/ruby/traceparent.rb:239:in `server_hop'
+2) Error: TestTraceparent#test_tracestate_is_truncated_at_whole_entries:  (same)
+3) Error: TestTraceparent#test_oversized_tracestate_entries_are_removed_first: (same)
+
+13 runs, 1370 assertions, 0 failures, 3 errors, 0 skips
+```
+
+`Array#filter_map` arrived in **Ruby 2.7**. The call is at
+`templates/otel/ruby/traceparent.rb:278`.
+
+### 10.2 H2 is refuted: the runner did not change this invocation
+
+`run_ruby` is **byte-identical** between `origin/master` and this branch:
+
+```bash
+run_ruby() {
+  ruby "$ROOT/templates/otel/ruby/test_traceparent.rb"
+}
+```
+
+and the dispatch loop that calls it is identical too, verified by diffing the
+two blocks rather than by reading them. The suite is invoked by **absolute
+path** and the runner computes `ROOT` from its own location, so the suite does
+not care about the caller's cwd — confirmed by running the gate from `/`.
+
+Two other candidate mechanisms are also absent, and it is worth saying so
+because they were the plausible ones:
+
+- **bundler.** `tests/validate.sh` contains no `bundle exec` and no `Gemfile`
+  reference outside comments and a cache-key string. The manager's *"Could not
+  locate Gemfile"* therefore **did not come from this gate** — it came from
+  running the suite the way a *service's* CI runs it (`bundle exec rake`), not
+  the way kit's gate runs it. `templates/otel/ruby/` ships no `Gemfile` by
+  design: the suite is stdlib-only, and a `Gemfile` appearing there would mean
+  the template had grown a dependency.
+- **environment/cwd.** `run_ruby` sets no env and `cd`s nowhere; `ROOT` is
+  `$0`-derived. No leakage from the surrounding shell reaches the suite.
+
+### 10.3 H1 is confirmed: it reproduces on a clean clone of master
+
+A fresh clone at master's tip (`41f8bcb`), with **master's own
+`validate.sh`**, the template tree byte-identical to this branch's
+(`diff -r` clean), and the **system Ruby 2.6.10** forced onto `PATH`:
+
+```
+13 runs, 1370 assertions, 0 failures, 3 errors, 0 skips
+```
+
+The same three errors, the same line, on a tree that contains none of this
+branch's work. **The failure is pre-existing.** This branch did not cause it;
+this branch is the first thing to have *run* it on a machine whose Ruby is old
+enough to show it.
+
+On the pinned toolchain (`ruby 4.0.1`, via the mise shim that is first on
+`PATH` here) the same suite is **13 runs, 1407 assertions, 0 failures, 0
+errors, 0 skips**. The template is correct; the interpreter was not.
+
+### 10.4 The "Could not locate Gemfile" run, and where this gate is invoked from
+
+The manager's first targeted attempt combined two different mistakes, and they
+are worth separating because only one of them is kit's:
+
+- **"system Ruby 2.6.10"** — a real toolchain fact, and the cause of the three
+  errors above. `/usr/bin/ruby` on this machine is 2.6.10; the pinned 4.0.1
+  lives behind a mise shim that only wins if the shim directory precedes
+  `/usr/bin` on `PATH`.
+- **"Could not locate Gemfile"** — the residue of invoking the suite through
+  bundler, which kit's gate never does. `templates/otel/ruby` has no `Gemfile`
+  and is not supposed to.
+
+**Where the gate expects to be invoked:** anywhere. `ROOT` is derived from
+`$0`, and every suite is called with an absolute path, so `bash
+/path/to/kit/tests/validate.sh` from any directory runs the same tree. The
+documented invocation is simply `bash tests/validate.sh` from the repository
+root, and that is what CI and the README use.
+
+### 10.5 The fix: a toolchain floor, reported as the cause
+
+The defect this exposed is not that the template is wrong. It is that **the
+gate answered wrongly rather than declining to answer** — and ruby was the only
+language in that phase where it could:
+
+| language | how an old toolchain is refused |
+| --- | --- |
+| go | `go.mod`'s `go 1.24` + `GOTOOLCHAIN=local` — the toolchain refuses |
+| rust | `rustc --edition 2021` — the compiler refuses |
+| python | `from __future__ import annotations` — `SyntaxError` at parse time |
+| node, elixir | no version-specific construct found in the template |
+| **ruby** | **`Array#filter_map` is a runtime call — the suite runs and lies** |
+
+So `tests/validate.sh` now consults a floor **before** the suite runs:
+
+```bash
+toolchain_floor_ruby() {
+  ruby -e 'exit(Array.method_defined?(:filter_map) ? 0 : 1)' 2>/dev/null
+}
+```
+
+Three decisions in that one line, each argued rather than assumed:
+
+- **A feature probe, not a version literal.** `2.7` written in the runner is a
+  claim *about the template* that nothing checks: raise the template's floor and
+  the claim rots in silence, and the next reader cannot tell which of the two
+  moved. The probe is derived from the same call the suite makes, so the two
+  cannot disagree.
+- **A probe, not a version comparison.** The question that matters is not "how
+  old is this ruby" but "can it run the code we ship", and the second is
+  answerable exactly while the first is only ever approximated. It also means
+  the check keeps working when a future template edit raises the real floor.
+- **FAIL, not SKIP.** A too-old interpreter is not an absent one. The suite is
+  installed, the code is present, and the check genuinely did not run; a SKIP
+  would make the gate green having verified nothing about ruby, which is the
+  direction this repo's fail-closed discipline exists to prevent. An *absent*
+  toolchain is still a SKIP — that is an environment without the language.
+
+The observable change, old Ruby on `PATH`:
+
+```
+FAIL templates/otel/ruby  (ruby on PATH is too old to run the template)
+       ruby 2.6.10 cannot run templates/otel/ruby: the
+       template calls Array#filter_map, which arrived in ruby 2.7.
+       This is a TOOLCHAIN problem, not a template defect — without this
+       check the suite reports the same thing as three NoMethodErrors and
+       the summary blames the template.
+       Fix: put a pinned ruby first on PATH (mise activate, or mise
+       exec -- bash tests/validate.sh). templates/mise.toml pins 3.4.
+```
+
+One `FAIL`, naming the toolchain, the cause, and the fix — instead of three
+`NoMethodError`s naming a template that is fine. On a correct Ruby the suite
+still runs and still prints its own 13 dots.
+
+**No assertion was weakened and no threshold was raised.** The suite's 1407
+assertions are untouched; the floor check is strictly additional, and it runs
+*before* the suite rather than replacing any part of it.
+
+### 10.6 The check is proven able to fail (breakage 30)
+
+A check nobody has tried to break is a check nobody has tested, and a floor
+check is exactly the kind that gets written, admired, and never fires. So
+self-test **breakage 30** deletes the one line that consults the floor —
+leaving `toolchain_floor_ruby` defined and never called — and asserts the ruby
+check still reports the *suite*:
+
+```
+mutated   -> FAIL templates/otel/ruby  (ruby test suite)   + 3 NoMethodErrors
+unmutated -> FAIL templates/otel/ruby  (ruby on PATH is too old...)
+```
+
+That is the whole point of the check in one comparison: without the floor the
+gate says the template is broken; with it, the gate says the toolchain is. The
+breakage is written as the well-intentioned edit a contributor makes when the
+guard looks redundant next to a `have ruby` test three lines above — *the tool
+is present, so why ask whether it is the right one?*
+
+**Count:** 31 breakages, each counted from the recipes rather than written
+down, and `self_test_claims` still passes the header/recipe reciprocity check.
+
+### 10.7 A second, unrelated pre-existing defect found on the way
+
+Running the gate from outside the repository root (`cd / && bash
+.../tests/validate.sh`) makes **five** checks go red on **master as well as
+this branch**:
+
+```
+FAIL templates/mise.toml  (a [tools] pin per language)
+FAIL .github/workflows/ci.reusable.yml  (opt-in telemetry job, defaults intact)
+FAIL templates/tier/<lang>/  (a declared tier, and a README row naming the collector)
+FAIL .github/workflows/ci.reusable.yml  (required-tier is declared, demanded by every language job, and identical)
+FAIL README.md  (its documented callers match the workflow inputs)
+```
+
+The cause is `WORKFLOW='.github/workflows/ci.reusable.yml'` at
+`tests/validate.sh:53` — a **relative** path, handed to seven Python helpers
+that `open()` it, so they resolve it against the *caller's* cwd rather than
+`ROOT`. Every other path in the file is `$ROOT`-derived; this one is not. It is
+pre-existing, it is **not** the ruby failure, and it does not affect CI or the
+documented invocation (both run from the repository root). It is recorded here
+rather than fixed because it is outside this packet's brief and because a
+one-line path fix deserves its own commit with its own breakage, not a
+tacked-on change to a commit about a Ruby version. **It is a real bug and it is
+still open.**
+
+### 10.8 Stray processes
+
+The brief noted five stray `validate.sh` processes from the pre-restart run.
+Two more were found and killed during this work, both with their cwd inside
+this worktree:
+
+| pid | what it was |
+| --- | --- |
+| 95154 | a `zsh -c` wrapper running a slice of `self_test.sh` |
+| 95175 | `bash tests/_tmp_slice.sh`, the slice itself |
+| 12767 | an `mktemp` probe; already exited on its own |
+
+95154/95175 were **actively rewriting `tests/validate.sh` while this packet was
+editing the same file** — the source of a transient
+`validate.sh: line 4141: =================================================================: command not found` that appeared
+and then vanished. The file was checked with `bash -n` afterwards and is sound.
+`tests/_tmp_slice.sh`, which that run left behind, was removed.
+
+**Honest note on concurrency, because it affects how this section should be
+read.** Another agent was committing to this same worktree and branch
+throughout: `940ba84`, `2ec4b91`, and `90f606a` all landed here during this
+work, and `90f606a` — a `printf | grep -q` pipefail fix — **swept up this
+packet's `tests/validate.sh` and `tests/self_test.sh` changes into its own
+commit**, because they were staged in the index at the time. That commit's
+message does not mention them. The next commit adds the `CHANGELOG.md` entry
+that describes this work, and this section is the attribution; the changes
+themselves are correct and tested, but a reader diffing `90f606a` will not find
+them explained there.

@@ -915,19 +915,34 @@ expect_red_script 'breakage 29: the suite cannot tell a broken FIXTURE from a br
 #     is on the check's own label, so a red from any other check does not pass
 #     for this one.
 #
-#     Only meaningful where ruby is installed; a missing interpreter SKIPs, and
-#     self_test's own rule is that a skipped proof is a failed proof.
+#     Only meaningful where ruby is installed, and a missing interpreter is
+#     reported as a SKIP rather than quietly passing — self_test's own rule is
+#     that a skipped proof is a failed proof, so the count below stays honest.
+#
+#     The recipe call is kept at COLUMN 0 even though it is guarded, because the
+#     count is taken with `grep -cE '^expect_red...'`: an indented call runs and
+#     passes while the summary counts one fewer than it ran, and a count that
+#     under-reports is the exact defect this repo treats as a lie told by a
+#     measurement. The guard, not the indentation, is what makes the skip
+#     explicit — and a copy is made in BOTH branches so the recipe can never run
+#     against the real tree, where an empty `$dir` would `cd` into nothing and
+#     fail for a reason that has nothing to do with the defect under test.
+thirty_ready=0
 thirty=""
 if command -v ruby >/dev/null 2>&1; then
   thirty="$(fresh_copy a-toolchain-floor-nobody-calls)"
   edit "$thirty/tests/validate.sh" \
     'if [ "$lang" = ruby ] && ! toolchain_floor_ruby; then' \
     'if false; then'
-  expect_red_check 'breakage 30: the toolchain floor is defined but never consulted' \
-    "$thirty" 'templates/otel/ruby  (ruby test suite)' --language=ruby --no-self-test
+  thirty_ready=1
 else
   printf 'SKIP self_test: breakage 30: the toolchain floor is defined but never consulted — ruby not installed\n'
   skips=$((skips + 1))
+  thirty="$(fresh_copy a-toolchain-floor-nobody-calls-unused)"
+fi
+if [ "$thirty_ready" -eq 1 ]; then
+expect_red_check 'breakage 30: the toolchain floor is defined but never consulted' \
+  "$thirty" 'templates/otel/ruby  (ruby test suite)' --language=ruby --no-self-test
 fi
 
 printf '\n'
