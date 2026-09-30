@@ -275,7 +275,7 @@ The first two are read, not reimplemented: the artefact-table check calls
 | # | mutation | caught by |
 | --- | --- | --- |
 | 23 | a parity entry naming an artefact kit does not ship (the rename case) | the named dead-entry check |
-| 24 | a parity entry naming a repository that does not exist | the same check, the **other** direction |
+| 24 | an **expired** parity entry — the ratchet firing | the same check |
 | 25 | `templates/bin-prime/bun.sh` deleted | the named artefact-table check |
 | 26 | `absent` reported as `current` | `staleness_test.sh` |
 | 27 | graded by `quick_ratio() > 0.99` instead of equality | `staleness_test.sh` |
@@ -288,6 +288,11 @@ changed in the classification turns the commonest column of the report green.
 removes a finding, the other invents one — and a gate that can only do one of
 them is half a gate.
 
+**24 is the first time anything in kit has watched a ratchet fire.** Both
+allowlists have carried an expiry rule for a packet each, and the tier file's own
+header says *"a gate that has never gone red is a report."* This is that
+sentence becoming a fact.
+
 **28 is a check I added because I had just claimed a rule in `AGENTS.md` that
 nothing enforced.** "Standard library only" had been a sentence for the whole
 life of the carve-out with no check behind it. Writing the check immediately
@@ -297,6 +302,31 @@ check walks the **AST**, not the text, so a function-local import — which is w
 a careful contributor actually writes — is read the same as a top-level one, and
 it asserts that every module it finds is named in the sentence. A boundary
 nobody can cross is not a boundary.
+
+### Two of my own breakages were wrong, and the gate is what said so
+
+Both were caught by the first full `self_test` run, and both are the failure
+mode the house rules are about rather than a surprise:
+
+- **23 named a REAL artefact id.** The recipe was meant to append an entry for
+  `lint/eslint.config.ts` — a plausible "it got renamed" id — and the first
+  version used `lint/eslint.config.mjs`, which `artifacts.json` really does
+  declare. So the entry was live, the gate was right to pass, and the breakage
+  proved nothing. The recipe now **asserts its own premise** before mutating,
+  which is the only fix: a mutation that has silently stopped breaking the thing
+  it names is the same defect as a stale test, and `edit` exists in this file
+  for exactly that reason.
+- **24 asserted a check that does not exist.** The original recipe claimed that
+  a parity entry naming a *repository that is not on disk* takes the gate red. It
+  does not and it cannot — kit's CI has no sibling checkouts, so no gate here
+  knows which repositories exist. The reporter *can* see (it is handed
+  `--repos-dir`), and `tests/staleness_test.sh` proves that case in three
+  shapes, one of which is exactly it. So the recipe was re-pointed at the expiry
+  rule, which the gate really has. **The fix was not to add a fleet roster to
+  kit so the gate could answer a question it was never asked.**
+
+All six were then verified individually against a throwaway copy, each by the
+*named* check, before the full run.
 
 ### `tests/staleness_test.sh` — 26 cases, up from 12
 

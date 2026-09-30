@@ -86,6 +86,14 @@
 #         the failure text named the reporter when the reporter had simply been
 #         handed a smaller fleet. A red that misattributes itself is worse than
 #         no red, so this asserts the EXPLANATION, not only the exit status.
+#   30. delete the one line that consults the ruby toolchain floor, leaving the
+#         probe defined and never called -> the ruby check still runs the suite.
+#         A floor check that is written, admired and never fires is the shape
+#         this breakage is the well-intentioned version of: `have ruby` is three
+#         lines above, so asking whether it is the RIGHT ruby looks redundant.
+#         `Array#filter_map` is a runtime call, so without the floor an old
+#         interpreter reports three NoMethodErrors and the summary blames a
+#         template that is correct.
 #
 #   These are numbered 20-22 rather than 19-21 because 19 is the allowlist
 #   breakage above, from the tier work. Both packets numbered their first entry
@@ -216,7 +224,7 @@ expect_red_check() {
   shift 3
   local out ec=0
   out=$(cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" 2>&1) || ec=$?
-  if printf '%s\n' "$out" | grep -qF "FAIL $want"; then
+  if grep -qF "FAIL $want" <<<"$out"; then
     printf 'PASS self_test: %s — caught by `%s`\n' "$label" "$want"
   elif [ "$ec" -eq 0 ]; then
     printf 'FAIL self_test: %s — the gate stayed GREEN\n' "$label"
@@ -250,7 +258,7 @@ expect_red_script() {
   elif [ -n "$want" ]; then
     local out
     out=$(cd "$dir" && KIT_PYTHON="$PY" bash "$script" "$@" 2>&1) || true
-    if printf '%s\n' "$out" | grep -qF "$want"; then
+    if grep -qF "$want" <<<"$out"; then
       printf 'PASS self_test: %s — the proof went red, and said why\n' "$label"
     else
       printf 'FAIL self_test: %s — the proof went red but did NOT say %s\n' "$label" "$want"
@@ -889,6 +897,38 @@ edit "$twentynine/tests/staleness_test.sh" \
 rm -rf "$TPL/absent-svc/.git"'
 expect_red_script 'breakage 29: the suite cannot tell a broken FIXTURE from a broken reporter' \
   "$twentynine" tests/staleness_test.sh '' 'this is NOT a reporter result'
+
+# 30. A TOOLCHAIN FLOOR THAT IS NOT WIRED TO ANYTHING.
+#
+#     The ruby floor check exists because a system ruby 2.6.10 on PATH made the
+#     suite report three NoMethodErrors and the summary blame the template. A
+#     check like that is exactly the kind that is written, admired, and never
+#     fires — the floor function can be defined, the suite can still be invoked
+#     unconditionally, and the gate is green on a machine that cannot run the
+#     template at all.
+#
+#     So the breakage deletes the ONE line that consults the floor, leaving the
+#     probe defined and never called, and asserts the ruby check still reports
+#     the suite. Written as the well-intentioned edit a contributor makes when
+#     the guard "looks redundant" next to a `have ruby` test three lines above:
+#     the tool is present, so why ask whether it is the right one? The assertion
+#     is on the check's own label, so a red from any other check does not pass
+#     for this one.
+#
+#     Only meaningful where ruby is installed; a missing interpreter SKIPs, and
+#     self_test's own rule is that a skipped proof is a failed proof.
+thirty=""
+if command -v ruby >/dev/null 2>&1; then
+  thirty="$(fresh_copy a-toolchain-floor-nobody-calls)"
+  edit "$thirty/tests/validate.sh" \
+    'if [ "$lang" = ruby ] && ! toolchain_floor_ruby; then' \
+    'if false; then'
+  expect_red_check 'breakage 30: the toolchain floor is defined but never consulted' \
+    "$thirty" 'templates/otel/ruby  (ruby test suite)' --language=ruby --no-self-test
+else
+  printf 'SKIP self_test: breakage 30: the toolchain floor is defined but never consulted — ruby not installed\n'
+  skips=$((skips + 1))
+fi
 
 printf '\n'
 if [ "$failures" -ne 0 ]; then

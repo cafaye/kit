@@ -144,6 +144,13 @@ Three phases, and all three must pass:
   `current`, an **absent** template reported `current`, and a copy graded by
   **resemblance** rather than equality. A property nobody has tried to break is
   a property nobody has tested.
+- **A breakage recipe asserts its own premise before it mutates.** Two of
+  kit-14's six recipes were wrong and the suite caught both: one named an
+  artefact id that `artifacts.json` really declares, so the mutation broke
+  nothing, and one asserted that a check would go red when no such check exists
+  in this repository. `edit` already refuses an unmatched string; the same
+  instinct applies to a recipe whose *subject* has moved. A mutation that has
+  silently stopped breaking the thing it names is a proof of nothing.
 - Tests are written **first** and watched fail before the artifacts exist. A
   config written from documentation instead of from the pinned image is a config
   that breaks on the first `bin/dev up`: Tempo, Loki and Mimir all reject keys

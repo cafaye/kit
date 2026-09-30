@@ -616,7 +616,7 @@ SNIPPETS
     ex_copy="$snippet_dir/phoenix_telemetry.ex"
     cp "$ROOT/templates/otel/elixir/phoenix_telemetry.ex.snippet" "$ex_copy"
     ex_out="$(elixir -r "$ROOT/templates/otel/elixir/traceparent.ex" "$ex_copy" 2>&1 || true)"
-    if printf '%s\n' "$ex_out" | grep -qE '\*\* \((Compile|Syntax)Error\)|^\s*error:'; then
+    if grep -qE '\*\* \((Compile|Syntax)Error\)|^\s*error:' <<<"$ex_out"; then
       report FAIL 'otel/elixir/phoenix_telemetry.ex.snippet  (parses as .ex)'
       printf '%s\n' "$ex_out" | head -8 | sed 's/^/       /'
     else
@@ -4169,6 +4169,42 @@ if [ "$RUN_TELEMETRY" -eq 1 ]; then
 
   section 'telemetry: W3C traceparent propagation, executed'
 
+  # -------------------------------------------------------------------------
+  # The toolchain floor, checked BEFORE any suite runs.
+  #
+  # Written because of what this phase did on a machine with a system Ruby
+  # 2.6.10 on PATH: the suite ran, three tests raised `NoMethodError: undefined
+  # method 'filter_map'`, and the summary said
+  #
+  #     FAIL templates/otel/ruby  (ruby test suite)
+  #
+  # which is a false accusation. Nothing is wrong with the template. The
+  # interpreter on PATH was older than the one construct the template uses, and
+  # `Array#filter_map` is a RUNTIME call, so the failure arrives as a stack
+  # trace from inside a helper rather than as a refusal to run. Every other
+  # language here fails loudly on its own — go's go.mod plus GOTOOLCHAIN=local,
+  # rustc's --edition, python's `from __future__ import annotations` — so this
+  # was the only one that could report a wrong answer instead of no answer.
+  #
+  # The floor is a FEATURE PROBE, not a version number, and that is the whole
+  # design. A literal like `2.7` in this file is a claim about the template
+  # that nothing checks: raise the template's floor and the claim rots; the
+  # probe is derived from the same call the suite makes, so the two cannot
+  # disagree. It is a probe rather than a version comparison because the
+  # interesting question is not "how old is this ruby" but "can it run the code
+  # we ship" — which is answerable exactly, and which a version string can only
+  # approximate.
+  #
+  # FAIL, not SKIP. A too-old interpreter is not an absent one: the suite is
+  # installed, the code is here, and the check is genuinely unrun. Reporting
+  # SKIP would make the gate green having verified nothing about ruby — the
+  # "a gate that skips is not green" rule, and the direction this repo's own
+  # fail-closed discipline points. An ABSENT toolchain is still a SKIP: that is
+  # an environment without the language, not a broken one.
+  toolchain_floor_ruby() {
+    ruby -e 'exit(Array.method_defined?(:filter_map) ? 0 : 1)' 2>/dev/null
+  }
+
   # Each language is one command. Everything is stdlib-only and offline: no
   # `go mod download`, no bundle install, no npm ci, no cargo fetch. If these
   # ever need the network the template has grown a dependency and kit has
@@ -4222,6 +4258,22 @@ if [ "$RUN_TELEMETRY" -eq 1 ]; then
     esac
     if ! have "$tool"; then
       report SKIP "templates/otel/$lang  ($tool not installed)"
+      continue
+    fi
+    # Only ruby has a probe, and only because it is the only one that can fail
+    # silently — see the note above `toolchain_floor_ruby`. The other five
+    # refuse on their own, and a floor check for a toolchain that already
+    # refuses is a second place to be wrong.
+    if [ "$lang" = ruby ] && ! toolchain_floor_ruby; then
+      report FAIL "templates/otel/$lang  (ruby on PATH is too old to run the template)"
+      printf '%s\n' \
+        "       ruby $(ruby -e 'print RUBY_VERSION') cannot run templates/otel/ruby: the" \
+        "       template calls Array#filter_map, which arrived in ruby 2.7." \
+        "       This is a TOOLCHAIN problem, not a template defect — without this" \
+        "       check the suite reports the same thing as three NoMethodErrors and" \
+        "       the summary blames the template." \
+        "       Fix: put a pinned ruby first on PATH (mise activate, or mise" \
+        "       exec -- bash tests/validate.sh). templates/mise.toml pins 3.4."
       continue
     fi
     check "templates/otel/$lang  ($tool test suite)" "run_$lang"

@@ -100,7 +100,7 @@ expect_unrecognised() {
   local label="$1" ec=0
   local out
   out=$("$PY" "$CLASSIFY" "$OLD" "$NEW" --tier WIRE --rules "$RULES" 2>&1) || ec=$?
-  if [ "$ec" -ne 0 ] && printf '%s\n' "$out" | grep -q 'unrecognised'; then
+  if [ "$ec" -ne 0 ] && grep -q 'unrecognised' <<<"$out"; then
     printf 'PASS classify_test: %s\n' "$label"
     passes=$((passes + 1))
   else
@@ -265,8 +265,8 @@ mixed_out=""
 mixed_ec=0
 mixed_out=$("$PY" "$CLASSIFY" "$OLD" "$NEW" --tier FILE --rules "$RULES" 2>&1) || mixed_ec=$?
 if [ "$mixed_ec" -ne 0 ] \
-    && printf '%s\n' "$mixed_out" | grep -q 'type-changed' \
-    && printf '%s\n' "$mixed_out" | grep -q 'documentation-changed'; then
+    && grep -q 'type-changed' <<<"$mixed_out" \
+    && grep -q 'documentation-changed' <<<"$mixed_out"; then
   printf 'PASS classify_test: every observation is reported, not only the strictest\n'
   passes=$((passes + 1))
 else
@@ -292,7 +292,7 @@ advisory_ec=0
 advisory_out=$("$PY" "$CLASSIFY" "$OLD" "$NEW" --tier FILE --rules "$RULES" 2>&1) \
   || advisory_ec=$?
 if [ "$advisory_ec" -eq 0 ] \
-    && printf '%s\n' "$advisory_out" | grep -q 'documentation-changed'; then
+    && grep -q 'documentation-changed' <<<"$advisory_out"; then
   printf 'PASS classify_test: an advisory change is reported and does not fail the gate\n'
   passes=$((passes + 1))
 else

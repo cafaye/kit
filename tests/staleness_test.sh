@@ -54,6 +54,28 @@ fi
 FLEET="$WORK/fleet"
 mkdir -p "$FLEET"
 
+# WHY EVERY ASSERTION BELOW IS A HERE-STRING AND NOT A PIPE.
+#
+# `printf '%s\n' "$OUT" | grep -qE '...'` is a race, and this file ran it 28
+# times under `set -o pipefail`. `grep -q` exits at the FIRST match and closes
+# the pipe, so `printf` takes SIGPIPE and dies 141 — but only if it had not
+# already finished writing. The reporter's table is large (9 fixture services,
+# ~60 rows), so "had not finished" is the common case, and `pipefail` then turns
+# a SUCCESSFUL match into a non-zero pipeline. The `if` reads that as "the
+# assertion failed" and the case goes red for a reason that has nothing to do
+# with the reporter.
+#
+# It bit for real: the self_test control went red at load average 160 with
+# `printf: write error: Broken pipe` on the line before the failing case, and the
+# case named the reporter. `tests/canary_test.sh` already documents this exact
+# race and fixes it the same way — "reading a file has no pipe and no SIGPIPE,
+# so there is nothing left to race against". A here-string is the same answer for
+# a value already in a variable: no pipe, no SIGPIPE, nothing to race against.
+#
+# The same rewrite was applied to `self_test.sh` (whose `expect_red_check` pipes
+# an entire gate run — the largest producer here), `classify_test.sh`,
+# `validate.sh` and `canary_test.sh`: 36 sites in total.
+
 failures=0
 passes=0
 
@@ -176,10 +198,10 @@ run() {
 # 1. the control: the table names all five repositories and gets the states right.
 run
 if [ "$EC" -eq 0 ] \
-    && printf '%s\n' "$OUT" | grep -qE '^current-repo .* current$' \
-    && printf '%s\n' "$OUT" | grep -qE '^behind-repo .* behind$' \
-    && printf '%s\n' "$OUT" | grep -qE '^handbumped-repo .* behind$' \
-    && printf '%s\n' "$OUT" | grep -qE '^undeclared-repo .* undeclared$'; then
+    && grep -qE '^current-repo .* current$' <<<"$OUT" \
+    && grep -qE '^behind-repo .* behind$' <<<"$OUT" \
+    && grep -qE '^handbumped-repo .* behind$' <<<"$OUT" \
+    && grep -qE '^undeclared-repo .* undeclared$' <<<"$OUT"; then
   printf 'PASS staleness_test: current / behind / undeclared are told apart\n'
   passes=$((passes + 1))
 else
@@ -191,7 +213,7 @@ fi
 # 2. the behind count is measured, not guessed. Two commits separate OLD_SHA and
 #    HEAD_SHA, and a reporter that reported any number at all would be no better
 #    than one that reported "behind".
-if printf '%s\n' "$OUT" | grep -qE '^behind-repo .* +2 +behind$'; then
+if grep -qE '^behind-repo .* +2 +behind$' <<<"$OUT"; then
   printf 'PASS staleness_test: the distance is measured (2 commits)\n'
   passes=$((passes + 1))
 else
@@ -204,7 +226,7 @@ fi
 #    and a reporter that only understood lockfiles would report them as
 #    `undeclared` — which is the failure mode that matters, because `undeclared`
 #    reads as "nothing to do".
-if printf '%s\n' "$OUT" | grep -qE '^handbumped-repo .* CORE_REF'; then
+if grep -qE '^handbumped-repo .* CORE_REF' <<<"$OUT"; then
   printf 'PASS staleness_test: a hand-bumped CORE_REF is read as a pin\n'
   passes=$((passes + 1))
 else
@@ -216,7 +238,7 @@ fi
 # 4. the two pins of a mid-migration repository are compared, not just the first
 #    one found. A repository whose lockfile and workflow name different commits
 #    has bytes under test that are not the bytes on disk.
-if printf '%s\n' "$OUT" | grep -q 'PINS DISAGREE'; then
+if grep -q 'PINS DISAGREE' <<<"$OUT"; then
   printf 'PASS staleness_test: two disagreeing pins are reported\n'
   passes=$((passes + 1))
 else
@@ -226,7 +248,7 @@ else
 fi
 
 # 5. a lockfile's tag is read, so the table can say which release is vendored.
-if printf '%s\n' "$OUT" | grep -qE '^current-repo .* v0\.3\.0'; then
+if grep -qE '^current-repo .* v0\.3\.0' <<<"$OUT"; then
   printf 'PASS staleness_test: the lockfile tag is reported\n'
   passes=$((passes + 1))
 else
@@ -236,7 +258,7 @@ fi
 
 # 6. THE RED PROOF, half one: --fail-on-behind exits 1 on a stale copy.
 run --fail-on-behind
-if [ "$EC" -eq 1 ] && printf '%s\n' "$OUT" | grep -q 'FAIL staleness:'; then
+if [ "$EC" -eq 1 ] && grep -q 'FAIL staleness:' <<<"$OUT"; then
   printf 'PASS staleness_test: --fail-on-behind is RED on a stale copy\n'
   passes=$((passes + 1))
 else
@@ -261,7 +283,7 @@ fi
 # 8. a repository named on the command line that does not exist is an error, not
 #    an empty row. Silence here would make a typo look like a clean fleet.
 run --repo does-not-exist
-if [ "$EC" -eq 1 ] && printf '%s\n' "$OUT" | grep -q 'could not be read'; then
+if [ "$EC" -eq 1 ] && grep -q 'could not be read' <<<"$OUT"; then
   printf 'PASS staleness_test: a named repository that cannot be read is an error\n'
   passes=$((passes + 1))
 else
@@ -275,7 +297,7 @@ fi
 #    header line, which the first version of this assertion did — and which made
 #    the check fail for a header rather than for a row.
 run
-if printf '%s\n' "$OUT" | grep -qE '^core +[^ ]+ +(none|vendir\.lock\.yml|CORE_REF) +'; then
+if grep -qE '^core +[^ ]+ +(none|vendir\.lock\.yml|CORE_REF) +' <<<"$OUT"; then
   printf 'FAIL staleness_test: core is reported as its own consumer\n'
   printf '%s\n' "$OUT" | sed 's/^/       /'
   failures=$((failures + 1))
@@ -289,7 +311,7 @@ fi
 #     directly so the case is never silently skipped.
 if [ -e "$FLEET/behind-worktree/.git" ] && [ ! -d "$FLEET/behind-worktree/.git" ]; then
   run
-  if printf '%s\n' "$OUT" | grep -q '^behind-worktree '; then
+  if grep -q '^behind-worktree ' <<<"$OUT"; then
     printf 'FAIL staleness_test: a git worktree was counted as a second consumer\n'
     failures=$((failures + 1))
   else
@@ -297,7 +319,7 @@ if [ -e "$FLEET/behind-worktree/.git" ] && [ ! -d "$FLEET/behind-worktree/.git" 
     passes=$((passes + 1))
   fi
   run --include-worktrees
-  if printf '%s\n' "$OUT" | grep -q '^behind-worktree '; then
+  if grep -q '^behind-worktree ' <<<"$OUT"; then
     printf 'PASS staleness_test: --include-worktrees opts back in\n'
     passes=$((passes + 1))
   else
@@ -648,8 +670,8 @@ EC=0
 OUT_JSON=$("$PY" "$STALE" --repos-dir "$TPL" --scope templates \
   --allowlist "$TPL/parity-allowlist" --json 2>&1) || EC=$?
 if [ "$EC" -eq 0 ] \
-    && printf '%s\n' "$OUT" | grep -qE '^diverged-svc +mise\.toml +diverged ' \
-    && printf '%s\n' "$OUT" | grep -qE '^absent-svc +bin/dev +absent ' \
+    && grep -qE '^diverged-svc +mise\.toml +diverged ' <<<"$OUT" \
+    && grep -qE '^absent-svc +bin/dev +absent ' <<<"$OUT" \
     && "$PY" - "$OUT_JSON" <<'PY'
 import json, sys
 
@@ -686,9 +708,9 @@ fi
 #     fleet is exactly that case — `docker compose config` is green on five of its
 #     six compose files — so the sentence was wrong about the fleet this reporter
 #     is pointed at, which is the only kind of wrong worth fixing.
-if printf '%s\n' "$OUT" | grep -qE '[0-9]+ absent' \
-    && printf '%s\n' "$OUT" | grep -qE '^absent-svc +compose +absent ' \
-    && printf '%s\n' "$OUT" | grep -qE '^halfstack-svc +compose +diverged .*partially adopted'; then
+if grep -qE '[0-9]+ absent' <<<"$OUT" \
+    && grep -qE '^absent-svc +compose +absent ' <<<"$OUT" \
+    && grep -qE '^halfstack-svc +compose +diverged .*partially adopted' <<<"$OUT"; then
   printf 'PASS staleness_test: an absent artefact is a counted finding, not silence\n'
   passes=$((passes + 1))
 else
@@ -700,8 +722,8 @@ fi
 # 18. A DIVERGED COPY IS REPORTED WITH THE PIN THAT EXPLAINS IT, and a copy with
 #     no pin says so in those words. "report the diff, with the pin that
 #     explains it" — the reason, the owner and the expiry, not a bare state.
-if printf '%s\n' "$OUT" | grep -qE '^diverged-svc +mise\.toml +diverged +[^ ]* .*a service raises the placeholder pins' \
-    && printf '%s\n' "$OUT" | grep -qE 'unpinned'; then
+if grep -qE '^diverged-svc +mise\.toml +diverged +[^ ]* .*a service raises the placeholder pins' <<<"$OUT" \
+    && grep -qE 'unpinned' <<<"$OUT"; then
   printf 'PASS staleness_test: a divergence carries its pin, and a missing pin is named\n'
   passes=$((passes + 1))
 else
@@ -714,7 +736,7 @@ fi
 #     BYTE is `diverged` and needs a pin. A reporter that graded resemblance —
 #     99.9% is close enough — has made "looks like kit's" into "is kit's", and
 #     that is the one inference this must never make.
-if printf '%s\n' "$OUT" | grep -qE '^similar-svc +mise\.toml +diverged '; then
+if grep -qE '^similar-svc +mise\.toml +diverged ' <<<"$OUT"; then
   printf 'PASS staleness_test: a one-byte difference is diverged, never current\n'
   passes=$((passes + 1))
 else
@@ -728,7 +750,7 @@ fi
 #     right today and the arrangement is a bet that the target never moves; a
 #     reporter that hashed whatever it found would call this a copy and it is
 #     not one. It is also the shape a service adopts by accident.
-if printf '%s\n' "$OUT" | grep -qE '^similar-svc +AGENTS\.md +unknown '; then
+if grep -qE '^similar-svc +AGENTS\.md +unknown ' <<<"$OUT"; then
   printf 'PASS staleness_test: a symlink to an identical file is not a copy\n'
   passes=$((passes + 1))
 else
@@ -751,7 +773,7 @@ EC=0
 OUT_JSON=$("$PY" "$STALE" --repos-dir "$TPL" --scope templates \
   --allowlist "$TPL/parity-allowlist" --json 2>&1) || EC=$?
 if [ "$EC" -eq 0 ] \
-    && printf '%s\n' "$OUT" | grep -qE '^undeclared-svc +bin/prime +unknown ' \
+    && grep -qE '^undeclared-svc +bin/prime +unknown ' <<<"$OUT" \
     && "$PY" - "$OUT_JSON" <<'PY'
 import json, sys
 
@@ -785,8 +807,8 @@ fi
 #     so, and the one that matters is the one this proves.
 tpl_run --fail-on-unpinned
 if [ "$EC" -eq 1 ] \
-    && printf '%s\n' "$OUT" | grep -q 'FAIL parity: the fleet' \
-    && printf '%s\n' "$OUT" | grep -qE 'FAIL parity: absent-svc/AGENTS\.md is an unpinned absence'; then
+    && grep -q 'FAIL parity: the fleet' <<<"$OUT" \
+    && grep -qE 'FAIL parity: absent-svc/AGENTS\.md is an unpinned absence' <<<"$OUT"; then
   printf 'PASS staleness_test: --fail-on-unpinned is RED, naming the unpinned absence\n'
   passes=$((passes + 1))
 else
@@ -855,7 +877,7 @@ tpl_run --repo current-svc --allowlist "$TPL/dead-pins" --fail-on-unpinned
 dead_count=$(printf '%s\n' "$OUT" | grep -c 'matches NOTHING')
 if [ "$EC" -eq 1 ] \
     && [ "$dead_count" -eq 3 ] \
-    && ! printf '%s\n' "$OUT" | grep -q 'pinned-svc/AGENTS.md matches NOTHING'; then
+    && ! grep -q 'pinned-svc/AGENTS.md matches NOTHING' <<<"$OUT"; then
   printf 'PASS staleness_test: three dead pins fail; a pin for an unmeasured repo does not\n'
   passes=$((passes + 1))
 else
@@ -926,7 +948,7 @@ fi
 #     the measured core numbers kit's README publishes, which is the cheapest
 #     way to lose the credibility this reporter exists to have.
 run
-if [ "$EC" -eq 0 ] && ! printf '%s\n' "$OUT" | grep -qE 'absent|diverged'; then
+if [ "$EC" -eq 0 ] && ! grep -qE 'absent|diverged' <<<"$OUT"; then
   printf 'PASS staleness_test: the core scope is unchanged by the templates scope\n'
   passes=$((passes + 1))
 else
@@ -981,7 +1003,7 @@ json.dump(table, open(path, "w", encoding="utf-8"), indent=2)
 PY
 EC=0
 OUT=$("$PY" "$STALE" --repos-dir "$TPL" --scope templates --table "$TPL/broken-table.json" 2>&1) || EC=$?
-if [ "$EC" -ne 0 ] && printf '%s\n' "$OUT" | grep -qi 'does not ship'; then
+if [ "$EC" -ne 0 ] && grep -qi 'does not ship' <<<"$OUT"; then
   printf 'PASS staleness_test: a table naming a file kit does not ship is refused\n'
   passes=$((passes + 1))
 else

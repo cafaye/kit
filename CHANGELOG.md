@@ -58,16 +58,24 @@ semver contract — it is consumed by *calling*
     read, and a record that silently omits a cell reads as "handled". **80
     entries**, and the count is printed on every green run because 80 is a bad
     number and everybody should be able to see that it is one.
-  - **Four new self-test breakages (23–27) and a boundary that finally has a
-    check behind it (28).** 23 and 24 are the two directions of one rule: a
-    dead entry, and an entry naming a repository that does not exist (which is
-    *not* the same as a repository out of scope, and the first version could not
-    tell them apart and reported all eighty as dead on a scoped run). 25 is a
-    `{lang}` source kit offers but does not ship — half a language is worse than
-    none. 26 reports an `absent` artefact as `current`, and 27 grades by
-    resemblance; they are separate because they are opposite mistakes, one
-    removing a finding and the other inventing one, and a gate that can only do
-    one of them is half a gate.
+  - **Six new self-test breakages (23–28) and a boundary that finally has a
+    check behind it.** 23 is a dead ledger entry (the ESLint shape) and 24 is an
+    **expired** one — the first time anything in kit has watched a ratchet fire
+    rather than reading that it exists, and it took spending a recipe to find
+    that out. 25 is a `{lang}` source kit offers but does not ship: half a
+    language is worse than none. 26 reports an `absent` artefact as `current`,
+    and 27 grades by resemblance; they are separate because they are opposite
+    mistakes, one removing a finding and the other inventing one, and a gate
+    that can only do one of them is half a gate.
+  - **Two of those six recipes were wrong, and `self_test` is what said so.**
+    23 named an artefact id `artifacts.json` really declares, so the mutation
+    broke nothing; the recipe now asserts its own premise before it mutates.
+    24 asserted that the GATE rejects an entry naming a repository that is not
+    on disk — it cannot, because kit's CI has no sibling checkouts and no gate
+    here knows which repositories exist. The reporter does know, and
+    `staleness_test.sh` proves that case; so 24 was re-pointed at the expiry
+    rule the gate really has, rather than kit gaining a fleet roster so the
+    gate could answer a question nobody asked it.
   - **`carve-out boundary` — a check, and the sentence it found out of date.**
     `AGENTS.md` has said "standard library only" since the carve-out was made
     and nothing verified it. The new check walks the **AST** of both programs —
