@@ -55,8 +55,15 @@ semver contract — it is consumed by *calling*
     pair "makes it check the real thing". The probe now runs a query, against
     the database the container actually has (`$$` escapes compose's own
     interpolation). Measured cold: healthy in 16s.
-  - **`bin/dev pin` no longer writes a malformed `kit.ref`** — a missing newline
-    ran three comment lines together.
+  - **`bin/dev pin` fetches both refs before printing its diff.** It used the ref
+    already on disk, so on a machine that had never run `bin/dev` it said the
+    diff "cannot be computed here" and wrote the pin anyway — the command's
+    entire reason for existing was absent on the run most likely to *be* the
+    upgrade. Offline is honoured rather than attempted, and when one side
+    genuinely cannot be obtained it names the `git diff` to run by hand instead
+    of reporting a success it cannot back. It also no longer writes a malformed
+    `kit.ref`: a missing newline ran three comment lines together. Pinning to the
+    ref already pinned is a no-op and says so.
 
 ### Added
 
@@ -64,11 +71,12 @@ semver contract — it is consumed by *calling*
   It reads the *other* repositories, because nothing else in kit does: a stale
   copy of the stack, a weakened redaction boundary, a collector config nothing
   ever starts, an unpinned ref, and a published port on a service kit already
-  ships. Against this fleet: **6 repositories in scope, 11 findings** — the
-  stale-copy rule catches **billing, courier, darkroom, identity** (and muse,
-  whose file cannot be read), the pin rule catches **all six**, and the port rule
-  catches **darkroom, identity**. It is not softened to make master green: a gate
-  that goes quiet about six copies is the gate that let them exist.
+  ships. Against this fleet: **6 repositories in scope, 13 findings** — the
+  stale-copy rule catches **billing, courier, darkroom, identity**, the pin rule
+  catches **all six**, the port rule catches **darkroom, identity**, and muse is
+  caught as **unreadable** rather than as a copy (which is worse: its stack
+  cannot start at all). It is not softened to make master green: a gate that goes
+  quiet about six copies is the gate that let them exist.
 
   It also found something no check in kit could have: **`muse/docker-compose.yml`
   does not parse.** Line 65 puts a `: ` inside an unquoted YAML scalar;
@@ -78,12 +86,17 @@ semver contract — it is consumed by *calling*
   six call their database `db`, and a name-based check reports the fleet clean
   while every copy stands right there.
 
-- **`tests/fetch_test.sh` — the fetch path, executed.** 14 assertions against a
+- **`tests/fetch_test.sh` — the fetch path, executed.** 17 assertions against a
   local bare remote over `file://`: a pin resolves and the fetched bytes are
   **byte-identical** to the tree pinned; a branch, an abbreviated sha and a
   missing pin are each refused with a message that says why; offline works from
   a warm cache **with the remote moved away**, fails loudly from a cold one, and
   accepts a vendored copy that declares its ref while refusing one that does not.
+  The last four cover `bin/dev pin` — that it fetches **both** refs so its diff
+  is real from a cold cache (the first use, and the one most likely to *be* the
+  upgrade), that the sha is the last line of `kit.ref`, that the comment header
+  is one `#` per line, and that pinning to the current ref is a no-op which says
+  so.
 
 - **`tests/stack_live_test.sh` — the fetched stack, run.** Brings up all eight
   containers, reads the collector's config mount back with `docker inspect`, and
@@ -100,12 +113,17 @@ semver contract — it is consumed by *calling*
   reads the same file — three files, one fact, and their disagreeing is invisible
   from any one of them.
 
-- **Seven new self-test breakages (23–29).** The four failure modes against
-  **fixture** fleets (the real fleet is red by design, so "the gate went red"
-  there is satisfied by two clean repositories), plus the mount regression, the
-  pin moved back into `.env` with a **branch** as its value, and the `ports:`
-  append rule the compose file's own comment promised and the gate did not
-  implement.
+- **Seven new self-test breakages (23–29), each asserting the NAMED check.**
+  The four failure modes against **fixture** fleets (the real fleet is red by
+  design, so "the gate went red" there is satisfied by two clean repositories),
+  plus the mount regression, the pin moved back into `.env.example`, and the
+  `ports:` append rule the compose file's own comment promised and the gate did
+  not implement — now 30 breakages in all, 15 of them name-specific.
+
+  Breakage 28's shape is the one that reads like an improvement: shipping
+  `KIT_STACK_REF=<sha>` in the template means a fresh clone looks configured and
+  needs no setup, and it also puts the pin in a file that becomes `.env` — which
+  is git-ignored, so it decides nothing on any other machine.
 
 ### Fixed
 
@@ -183,17 +201,21 @@ semver contract — it is consumed by *calling*
     derived from core's schemas), an `otel-collector.yml` nothing ever mounts, and
     a pin that is a branch. It reads the **sibling repositories**, not kit's own
     files, because the defect is in the callers — the same shape as D4.
-    **It is red against the current fleet and that is the deliverable**: five
-    repositories carry their own copy of the shared stack, six have no pin, and
-    `muse/docker-compose.yml` does not parse as YAML. The predicate is the image,
+    **It is red against the current fleet and that is the deliverable**: four
+    repositories carry their own copy of the shared stack, six have no pin, two
+    publish a port on a service kit already ships, and `muse/docker-compose.yml`
+    does not parse as YAML. The predicate is the image,
     not the service name, and the image set is read out of kit's own compose file
     rather than a hand-kept list — five of the six copies name their database `db`
     rather than `postgres`, so a name-keyed check would report the fleet clean
     while five copies stood right there.
 
-  - **Six breakages** (23–28), each asserting the **named** check against a
-    **fixture fleet** rather than the real one — which is what makes the assertion
-    mean anything when the real fleet is red by design.
+  - **Seven breakages** (23–29), each asserting the **named** check. The five
+    fleet ones run against a **fixture fleet** rather than the real one — which is
+    what makes the assertion mean anything when the real fleet is red by design.
+    Breakage 29 covers the `ports:` append rule and carries **no `image:`**, so
+    it fires the port rule alone: a breakage that reddened two rules at once
+    would not say which of them is load-bearing.
 
 
 - **kit-07 — the declared tier, and the allowlist that is supposed to shrink.**
