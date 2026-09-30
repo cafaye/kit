@@ -527,4 +527,10 @@ if [ "$skips" -ne 0 ]; then
   echo "FAIL: self_test — $skips breakage(s) skipped for a missing toolchain. A skipped proof is not a proof."
   exit 1
 fi
-echo "PASS: self_test — all 19 breakages went red, and the unbroken tree is green."
+# The count is COUNTED, not written down. Every breakage above calls exactly one
+# of the three red-expecting helpers, so this cannot drift from the recipes the
+# way a hardcoded "all N breakages" does — and the header's list is checked
+# against it by `tests/validate.sh`, so a breakage added without a header entry
+# (or a header entry with no recipe) is a red gate rather than a doc that lies.
+counted=$(grep -cE '^expect_red(_check|_lang)? ' "$0" || true)
+echo "PASS: self_test — all $counted breakages went red, and the unbroken tree is green."

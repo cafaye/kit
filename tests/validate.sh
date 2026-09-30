@@ -3199,7 +3199,94 @@ fi
 
 if [ "$RUN_SELF_TEST" -eq 1 ]; then
   section 'self_test: this gate is able to fail'
-  if check 'tests/self_test.sh  (nineteen breakages, nineteen reds)' \
+  # The number in this label is COUNTED from self_test.sh's recipes rather than
+  # written down. Every breakage calls exactly one of the three red-expecting
+  # helpers, so counting those calls is the breakage count by construction — and
+  # a hardcoded number is exactly the kind of thing that goes stale quietly when
+  # the next packet adds a check. The wording follows from the count so the two
+  # cannot disagree.
+  _st_breakages=$(grep -cE '^expect_red(_check|_lang)? ' "$ROOT/tests/self_test.sh" || true)
+
+  # The header is a promise about what the file proves, and a promise nobody
+  # reads is decoration. Compare the breakage numbers the header NAMES against
+  # the numbers the recipes CARRY, so the two cannot drift:
+  #
+  #   - a recipe with no header entry is a breakage the file proves but does not
+  #     claim, which is how a proof quietly stops being one;
+  #   - a header entry with no recipe is worse — a claim the file does not
+  #     deliver, and the summary line above would be counting the recipes while
+  #     the documentation advertises something else.
+  #
+  # `2b` is parsed as a letter-suffixed continuation of 2 and is expected to
+  # appear on both sides, so it is compared literally rather than dropped.
+  #
+  # EVERYTHING IS A STRING. The first version of this check expanded `7-10` with
+  # `range(int(lo), int(hi) + 1)`, so those entries entered the set as `int` while
+  # the single entries arrived from the regex as `str`. `named - carried` then
+  # reported 7, 8, 9, 10 and every two-digit breakage as both documented-without-
+  # a-recipe AND proven-without-being-documented — which is the check reporting a
+  # disagreement that did not exist, on a tree that was correct. Normalising to
+  # `str` at every point of entry is the whole fix, and the reason it is worth
+  # stating: a set difference over two representations of the same number is
+  # never empty, so the failure mode is a permanently red check, not a missed one.
+  self_test_claims() {
+    "$PY" - "$ROOT/tests/self_test.sh" <<'PY'
+import re
+import sys
+
+src = open(sys.argv[1], encoding="utf-8").read()
+
+# Sort by (number, suffix) so 2b lands next to 2 rather than at the end. The
+# labels are strings so that `2` and `2b` can be told apart at all.
+def breakage_sort(label):
+    m = re.fullmatch(r"(\d+)([a-z]?)", label)
+    return (int(m.group(1)), m.group(2)) if m else (0, label)
+
+
+# The header block, up to the first `set -euo`.
+header = src.split("set -euo pipefail", 1)[0]
+
+# Breakage numbers as WRITTEN, all as `str`. A header line like `7-10.` is one
+# entry naming a range; it is expanded, not counted, so `7-10` in the header is
+# matched by breakages 7, 8, 9 and 10 in the recipes.
+named = set()
+for lo, hi in re.findall(r"^#\s+(\d+)-(\d+)\.", header, re.M):
+    named.update(str(n) for n in range(int(lo), int(hi) + 1))
+# Individually named entries, optionally letter-suffixed (`2b.`).
+named.update(re.findall(r"^#\s+(\d+[a-z]?)\.", header, re.M))
+
+# Breakage numbers as LABELLED, from the recipe invocations.
+carried = set(
+    re.findall(
+        # Either quoting style. Breakage 5's label has always been double-quoted
+        # and breakage 4's single; matching one of them would have reported a
+        # disagreement that does not exist, and the fix belongs in the pattern
+        # rather than in rewriting a working recipe to suit a new check.
+        r"""^expect_red(?:_check|_lang)? ['"]breakage\s+(\d+[a-z]?):""",
+        src,
+        re.M,
+    )
+)
+
+problems = []
+for missing in sorted(named - carried, key=breakage_sort):
+    problems.append(f"header documents breakage {missing} but no recipe carries it")
+for orphan in sorted(carried - named, key=breakage_sort):
+    problems.append(f"recipe proves breakage {orphan} but the header does not document it")
+
+# `sys.exit` rather than `return`: this is a top-level script, not a function
+# body, and the other checks in this file use the same shape. A `return` here is
+# a SyntaxError at import time — which is exactly how this check first failed.
+if problems:
+    for p in problems:
+        print("  -", p)
+    sys.exit(1)
+PY
+  }
+  check 'tests/self_test.sh  (every documented breakage has a recipe, and vice versa)' \
+    self_test_claims
+
+  if check "tests/self_test.sh  ($_st_breakages breakages, $_st_breakages reds)" \
     bash "$ROOT/tests/self_test.sh"; then
     :
   fi
