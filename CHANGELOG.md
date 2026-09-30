@@ -19,10 +19,15 @@ it without a copy (see kit-12 below).
   `lint/` was 249 lines of golangci, rubocop, eslint, yamllint and hadolint
   configuration that **not one service in the fleet had ever copied**, and every
   check in this repository was green the whole time. Adoption correlated
-  *inversely* with how much a file did: `uses: cafaye/kit/...@master` is 8/8
-  because it is live, and `cp lint/golangci.yml` is 0/9 because a snapshot has
+  *inversely* with how much a file did: `uses: cafaye/kit/...@master` is 11/11
+  because it is live, and `cp lint/golangci.yml` is 1/11 because a snapshot has
   no propagation and rots silently. So the config moved to where the step already
-  is, and adoption becomes 9/9 with no per-service action.
+  is, and adoption becomes 11/11 with no per-service action.
+
+  (The brief this packet answered put those at 8/8 and 0/9. The second is
+  stale — `identity` has since landed a `.golangci.yml` of its own on `master`,
+  for a reason recorded in `lint/drift-allowlist`. Writing `0/9` here would have
+  been a number this work had measured and known to be wrong.)
 
   - **`kit-lint-ref` and a sparse `lint/` checkout, in the go, ruby and node
     jobs.** The workflow file and the configs are two different things:

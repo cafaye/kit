@@ -22,7 +22,7 @@ and asserts the linter rejects it — plus a control that must answer differentl
 | linter | mechanism | what was measured |
 |---|---|---|
 | **golangci-lint** | `--config=<repo>/.kit/lint/golangci.yml` | With no config present it does **not** fail and does **not** run nothing: it falls back to its own five-linter default set (`errcheck govet ineffassign staticcheck unused`) and **exits 0 on a file kit's config rejects** (a comment misspelling). |
-| **RuboCop** | `--config=<repo>/.kit/lint/rubocop.yml` | A 13-line method is **green** under kit (`Max: 15`) and **red** on defaults (`Max: 10`); a 17-line method is red under kit. The pair is what proves the flag is read, since 13 lines passes under *both* configs. |
+| **RuboCop** | `--config=<repo>/.kit/lint/rubocop.yml` | A 13-line method is **green** under kit (`Max: 15`) and **red** on RuboCop's default (`Max: 10`). The pair is what proves the flag is read: 13 lines sits *between* the two thresholds, so the two runs can only agree if the second one is not using kit's config at all. |
 | **ESLint** | `--config=<repo>/.kit/lint/eslint.config.mjs` | Works **only** because kit is checked out *inside* the repo. Node resolves an ESM import from the config file's own directory upward; beside the repository the config finds no `@eslint/js` and the run dies `ERR_MODULE_NOT_FOUND` — asserted as a breakage, not a comment. |
 | **yamllint** | `yamllint -c <path> --strict` | Both of kit's retuned rules (`truthy`, `document-start`) are **warnings** by default, so without `--strict` the exit code is 0 and the finding is invisible. `--strict` is load-bearing and asserted. |
 
@@ -40,6 +40,14 @@ from the repo and finds nothing, and golangci-lint does **not** error. It applie
 its default set. That is the finding that makes the flag load-bearing rather than
 decorative, and it is the opposite of what most people expect from a missing
 config.
+
+**And the reverse, which is what `lint drift` rests on:** a repo-root
+`.golangci.yml` does **not** beat `--config`. Both are asserted in
+`tests/lint_test.sh`: a local file that disables `misspell` is *inert* under
+kit's config, and governs the run the moment the flag is gone. So a stale copy
+does not hijack CI — it **splits** the policy, with CI reading kit's and every
+other invocation in that repository reading the copy. Full detail and the
+correction it forced are in §7(a).
 
 ---
 
@@ -164,7 +172,10 @@ copy passes, so the check cannot be satisfied by deleting it.
 `lint/drift-allowlist` carries a difference you cannot delete yet: reason, owner,
 `since`, `until`, and four rules — the fourth being that **an entry which no
 longer describes a real difference fails**, modelled on ESLint's
-`reportUnusedDisableDirectives`. One entry is live: `identity`.
+`reportUnusedDisableDirectives`. Two entries are live, both for one repository:
+`identity`, which carries a `.golangci.yml` that enables no linter at all because
+it exists only to exclude one generated file. Migrating it is `identity`'s change
+to make; kit does not touch other repositories.
 
 ---
 
@@ -195,7 +206,7 @@ measurement becomes a claim.
 
 ### Ran, and it passes
 
-- **`tests/lint_test.sh` — 12 assertions, 0 skips.** All four linters
+- **`tests/lint_test.sh` — 14 assertions, 0 skips.** All four linters
   (golangci-lint 2.6.2, rubocop 1.91.0, ESLint 9 + typescript-eslint 8 on
   Node 22.12.0, yamllint from `tests/requirements.txt`). Every linter ran with
   kit's config, rejected a fixture built to violate it, and its control — same
@@ -331,7 +342,39 @@ either packet's header claims, and the header/recipe check compares them
 mechanically. Whoever lands this second should expect that check to be the thing
 that fails first, and should treat it as information rather than as an obstacle.
 
-## 8. What I could not verify
+## 9. A live defect in the branch this packet merges with, found by this packet's method
+
+`worker/kit-08-merge` (the branch being landed on `master`'s behalf) uses
+`${GITHUB_ACTION_PATH}` **five times** inside `ci.reusable.yml`:
+
+```
+826:  dir="${GITHUB_ACTION_PATH}/templates/otel/…"
+895:  . "${GITHUB_ACTION_PATH}/tests/bootstrap.sh"
+898:  … "$KIT_GITLEAKS_SHA256S" "$GITHUB_ACTION_PATH" …
+914:  run: bash "${GITHUB_ACTION_PATH}/tests/gitleaks_gate.sh" …
+953:  run: bash "${GITHUB_ACTION_PATH}/tests/zizmor_gate.sh" …
+```
+
+GitHub's variables reference states that `GITHUB_ACTION_PATH` "is only supported
+in composite actions", and a reusable workflow is not one. This packet depends
+on the same fact from the other direction — it measures, in `tests/lint_test.sh`,
+that node resolves an ESM config's imports from the config file's own directory
+upward, and that a config outside the service tree therefore cannot work at all
+— so the lint mechanism here is a `uses: actions/checkout` and never
+`$GITHUB_ACTION_PATH`.
+
+So the expectation is that on a real runner those paths expand to nothing and the
+`secrets` and `zizmor` jobs read a file that is not there. **I have not run a
+GitHub runner and cannot confirm it**, so it is filed as a finding rather than a
+verdict — but it is worth more than a note, because those two new jobs are the
+kit-04 deliverable and the whole point of kit is that a gate which cannot fail is
+not a gate. Line 826 is pre-existing in this branch: the `telemetry` job's
+fallback to kit's own copy of the conformance suite has the same problem and has
+had it since kit-02. Nobody noticed for the same reason nobody noticed `lint/`:
+every check in the repository parses YAML, and a variable that expands to the
+empty string parses.
+
+## 10. What I could not verify
 
 - The two claims in `ci.reusable.yml` that only a GitHub runner can settle: the
   sparse checkout's resulting tree, and the action's `args` space-splitting.
