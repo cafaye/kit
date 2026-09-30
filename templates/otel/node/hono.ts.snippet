@@ -14,6 +14,13 @@
 //   - Writes `traceparent` and `tracestate` on every outbound fetch.
 //   - Never rejects a request over a malformed header. §3.2.2.3 says ignore it.
 //
+// OBSERVABILITY IS ON BY DEFAULT (PLAN.md §7b)
+//   `GUARD_OTEL_ENDPOINT` DEFAULTS to the collector that ships with the stack,
+//   so a developer working on this service sees real traces with nothing
+//   switched on. Unsetting the variable is a genuine no-op; pointing it at
+//   somebody else's OTLP endpoint is a supported deployment, not a degraded
+//   mode. The variable is the ONLY contract — see `endpoint()`.
+//
 // SPEC: W3C Trace Context, W3C Recommendation 23 November 2021
 //       https://www.w3.org/TR/trace-context/
 //
@@ -23,6 +30,11 @@
 // bun add @opentelemetry/exporter-trace-otlp-proto@0.57.0
 // bun add @opentelemetry/sdk-trace-node@0.57.0
 // bun add @opentelemetry/core@2.0.0
+// bun add @opentelemetry/resources@2.0.0
+// bun add @opentelemetry/semantic-conventions@1.28.0
+// bun add @opentelemetry/api-logs@0.57.0
+// bun add @opentelemetry/sdk-logs@0.57.0
+// bun add @opentelemetry/exporter-logs-otlp-proto@0.57.0
 // bun add @opentelemetry/auto-instrumentations-node@0.57.0
 //
 // `@opentelemetry/api` before `@opentelemetry/sdk-*`, and the instrumentation
@@ -33,66 +45,181 @@
 // ---------------------------------------------------------------------------
 
 import { context, propagation, SpanStatusCode, trace } from "@opentelemetry/api";
+import { logs, SeverityNumber } from "@opentelemetry/api-logs";
+import { W3CTraceContextPropagator } from "@opentelemetry/core";
+import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
+import { resourceFromAttributes } from "@opentelemetry/resources";
+import { ATTR_SERVICE_NAME, ATTR_SERVICE_VERSION } from "@opentelemetry/semantic-conventions";
 import {
+  AlwaysOnSampler,
   BasicTracerProvider,
   BatchSpanProcessor,
+  ParentBasedSampler,
 } from "@opentelemetry/sdk-trace-base";
-import { OTLPTraceExporter } from "@opentelemetry/exporter-trace-otlp-proto";
-import { W3CTraceContextPropagator } from "@opentelemetry/core";
+import { LoggerProvider, BatchLogRecordProcessor } from "@opentelemetry/sdk-logs";
+import { OTLPLogExporter } from "@opentelemetry/exporter-logs-otlp-proto";
 import { Hono } from "hono";
+import type { Context, Next } from "hono";
 
-const SERVICE_NAME = process.env.OTEL_SERVICE_NAME ?? "<service-name>";
+/** The emitting service. The mandatory prefix on every span name. */
+const SERVICE_NAME = process.env.OTEL_SERVICE_NAME ?? "guard";
 const SERVICE_VERSION = process.env.OTEL_SERVICE_VERSION ?? "0.0.0";
 
 /**
- * Build a tracer provider, or return null when no endpoint is configured.
+ * The collector that ships with the local stack.
  *
- * NO EXPORTER BY DEFAULT, and this is the load-bearing part. OTEL_EXPORTER_OTLP_ENDPOINT
- * is opt-in: unset means spans stay in this process, and we do not fall back to
- * a vendor's default endpoint. A developer who clones this service and runs it
- * locally must not have their spans leave the machine — the same privacy
- * boundary templates/compose/otel-collector.yml enforces, applied in code
- * because a Bun process can be started without compose.
+ * A DEFAULT VALUE, not a constant, and that is the whole of "observability is
+ * on by default" (PLAN.md §7b). A developer with no configuration exports into
+ * a collector on their own machine; a self-hoster who already runs Datadog,
+ * Honeycomb or Grafana Cloud sets the variable and this address goes quiet.
+ * Bring-your-own is a supported deployment, not a degraded mode.
  */
-export function buildTracerProvider(): BasicTracerProvider | null {
-  const endpoint = process.env.OTEL_EXPORTER_OTLP_ENDPOINT;
-  if (endpoint === undefined || endpoint === "") return null;
+const DEFAULT_ENDPOINT = "http://otel-collector:4318";
 
-  const provider = new BasicTracerProvider({
-    resource: resourceFromAttributes({
-      "service.name": SERVICE_NAME,
-      "service.version": SERVICE_VERSION,
-    }),
+/**
+ * The OpenTelemetry spec's OWN kill switch, and the mechanism core's
+ * otel-endpoint schema pins the no-op to.
+ *
+ * Not a cafaye reimplementation: re-implementing "disabled" in six languages is
+ * how six services acquire six different definitions of it, and the difference
+ * between them is somebody's production incident.
+ */
+const SDK_DISABLED = "OTEL_SDK_DISABLED";
+
+/**
+ * The finer-grained half. ALL THREE are checked, not just traces: a no-op that
+ * only covers traces is a service that still phones home for metrics, which is
+ * the failure discovered by a customer's invoice rather than by a test.
+ */
+const PER_SIGNAL = ["OTEL_TRACES_EXPORTER", "OTEL_METRICS_EXPORTER", "OTEL_LOGS_EXPORTER"];
+
+/**
+ * The OTLP endpoint, and the WHOLE of the contract (core D16).
+ *
+ * `GUARD_OTEL_ENDPOINT` wins, then the standard `OTEL_EXPORTER_OTLP_ENDPOINT` so
+ * the service also works with generic OTel tooling, then the shipped collector.
+ * The precedence is written down rather than discovered later: a contract with
+ * an undocumented precedence order is a bug report.
+ */
+export function endpoint(): string {
+  return (
+    process.env.GUARD_OTEL_ENDPOINT ||
+    process.env.OTEL_EXPORTER_OTLP_ENDPOINT ||
+    DEFAULT_ENDPOINT
+  );
+}
+
+/** Whether there is anywhere to export to, for any signal. */
+export function enabled(): boolean {
+  if ((process.env[SDK_DISABLED] ?? "").toLowerCase() === "true") return false;
+  return !PER_SIGNAL.some((name) => (process.env[name] ?? "").toLowerCase() === "none");
+}
+
+/**
+ * One line for the startup log, and only ever on the DISABLED path.
+ *
+ * Silence is the contract there: a warning per export attempt fills the
+ * service's own log store with the fact that telemetry is off, which is how a
+ * self-hoster discovers that turning it off is not supported — the opposite of
+ * the intent. One line at startup is not spam, and it is the difference between
+ * "telemetry is off" and "telemetry is broken", which look identical from
+ * outside.
+ */
+export function noOpReason(): string {
+  if ((process.env[SDK_DISABLED] ?? "").toLowerCase() === "true") return `${SDK_DISABLED}=true`;
+  const off = PER_SIGNAL.filter((name) => (process.env[name] ?? "").toLowerCase() === "none");
+  return off.length > 0 ? `${off.join(",")}=none` : "";
+}
+
+/**
+ * Process identity, attached once per process rather than once per span.
+ *
+ * It is the correct home for `tenant_id` and it is EXEMPT from
+ * OpenTelemetry's 2000-attribute-combination metric cap. Put a tenant on a
+ * MEASUREMENT instead and the moment that stream overflows every per-tenant
+ * breakdown silently undercounts while the total stays right — the worst shape
+ * a bug can have, because the dashboard still renders and nobody reports an
+ * error anywhere.
+ */
+function buildResource() {
+  const attributes: Record<string, string> = {
+    [ATTR_SERVICE_NAME]: SERVICE_NAME,
+    [ATTR_SERVICE_VERSION]: SERVICE_VERSION,
+  };
+  const environment = process.env.DEPLOYMENT_ENVIRONMENT;
+  if (environment) attributes["deployment.environment"] = environment;
+  const tenant = process.env.GUARD_TENANT_ID;
+  if (tenant) attributes["tenant_id"] = tenant;
+  return resourceFromAttributes(attributes);
+}
+
+let provider: BasicTracerProvider | null = null;
+let loggerProvider: LoggerProvider | null = null;
+
+/**
+ * Register the propagator, the tracer provider and the logs pipeline.
+ *
+ * THE DISABLED PATH IS FREE, and that is asserted rather than promised: when
+ * telemetry is off this function builds no exporter, no batch processor and no
+ * queue. Not an exporter pointed at nothing and left to retry.
+ *
+ * A queue that accepts spans and holds them is a memory leak with a
+ * telemetry-shaped trigger — a request that succeeds with unbounded retained
+ * spans in the heap. A retry loop against an endpoint that is not there is a
+ * timer waking for the life of the process, invisible in every dashboard
+ * because nothing is being recorded. A "disabled" path that still dials out is
+ * worse than no telemetry support at all (PLAN.md §7b), so the no-op is the
+ * ABSENCE of the machinery rather than the machinery aimed at nothing.
+ *
+ * The propagator is installed even when telemetry is off, and that is
+ * deliberate: a no-op provider still continues an inbound traceparent, so a
+ * service that has turned telemetry off still serves correct W3C headers to
+ * whatever is in front of it. Turning telemetry off must not break a contract
+ * with a caller.
+ */
+export function installTelemetry(): void {
+  if (!enabled()) {
+    // One line, on the disabled path only, and never a per-span warning.
+    console.info(`telemetry off (${noOpReason()}); spans stay in-process`);
+    return;
+  }
+
+  const target = endpoint();
+
+  provider = new BasicTracerProvider({
+    resource: buildResource(),
+    // A sampler that respects the CALLER's sampled flag rather than re-deciding
+    // per hop: a service that samples independently produces traces with holes,
+    // which are worse to debug than no traces at all. This is ParentBased, and
+    // it is the combination that matters — always-on at the root, and every
+    // downstream hop follows whatever the caller decided.
+    sampler: new ParentBasedSampler({ root: new AlwaysOnSampler() }),
   });
 
   // BatchSpanProcessor, not SimpleSpanProcessor: one export per span makes the
   // collector the bottleneck and drops spans on a slow network.
   provider.addSpanProcessor(
-    new BatchSpanProcessor({
-      exporter: new OTLPTraceExporter({ url: `${endpoint}/v1/traces` }),
-    }),
+    new BatchSpanProcessor({ exporter: new OTLPTraceExporter({ url: `${target}/v1/traces` }) }),
   );
-  return provider;
-}
-
-let provider: BasicTracerProvider | null = null;
-
-/** Register the provider and the W3C propagator. Call once, at startup. */
-export function installTelemetry(): void {
-  provider = buildTracerProvider();
-  if (provider === null) return;
 
   // Named explicitly. The default propagator IS W3C today, but several
-  // instrumentations call register() themselves and a service that depends on a
-  // default it never wrote down breaks silently when one of them changes it.
-  provider.register({
-    propagator: new W3CTraceContextPropagator(),
-  });
+  // instrumentations call register() themselves and a service that depends on
+  // a default it never wrote down breaks silently when one of them changes it.
+  provider.register({ propagator: new W3CTraceContextPropagator() });
+
+  loggerProvider = new LoggerProvider({ resource: buildResource() });
+  loggerProvider.addLogRecordProcessor(
+    new BatchLogRecordProcessor({ exporter: new OTLPLogExporter({ url: `${endpoint()}/v1/logs` }) }),
+  );
+  logs.setGlobalLoggerProvider(loggerProvider);
 }
 
-/** Flush before the process exits, or the last spans are lost. */
+/** Flush before the process exits, or the last batch is lost. */
 export async function shutdownTelemetry(): Promise<void> {
   await provider?.shutdown();
+  await loggerProvider?.shutdown();
+  provider = null;
+  loggerProvider = null;
 }
 
 /**
@@ -103,29 +230,125 @@ export async function shutdownTelemetry(): Promise<void> {
  * response, and it is why this middleware has no try/catch: there is nothing to
  * catch.
  */
-export function traceMiddleware(serviceName: string) {
-  const tracer = trace.getTracer(serviceName);
+export function traceMiddleware() {
+  const tracer = trace.getTracer(SERVICE_NAME);
 
   return async (c: Context, next: Next) => {
     const extracted = propagation.extract(context.active(), c.req.raw.headers);
-    const span = tracer.startSpan(`${c.req.method} ${new URL(c.req.url).pathname}`, {}, extracted);
+
+    // The fleet's span name: <service>.<operation>, the same shape as an event
+    // type. NOT `${method} ${path}`, which is the OTel HTTP convention's form
+    // and puts the route in the NAME — and a name is the grouping key in every
+    // trace UI, so an attribute in the name cannot be filtered out, and a route
+    // with an id in it is a cardinality explosion with a GET attached. core's
+    // span-naming schema caps every segment at fifteen characters, which is
+    // what makes an interpolated id impossible to spell even by accident.
+    //
+    // The ROUTE TEMPLATE goes on as an attribute instead, where it belongs and
+    // where it is bounded to one value per endpoint: `/v1/users/{id}` has one,
+    // `/v1/users/usr_01J9...` has one per request.
+    const route = c.req.routePath ?? "unmatched";
+    const span = tracer.startSpan(`${SERVICE_NAME}.${operationFor(route)}`, {}, extracted);
 
     // context.with is what makes the span current for everything downstream,
     // including an outbound fetch. A span that is started but never made active
     // attributes nothing to the work it was started for.
     return context.with(trace.setSpan(extracted, span), async () => {
       try {
+        span.setAttribute("http.route", route);
+        span.setAttribute("http.request.method", c.req.method);
         await next();
         span.setStatus({ code: SpanStatusCode.OK });
       } catch (err) {
-        span.recordException(err as Error);
-        span.setStatus({ code: SpanStatusCode.ERROR, message: String(err) });
+        // The CLASS, not the message. See `recordFailure` for why.
+        recordFailure(span, errorClassFor(err), staticDescriptionFor(err));
         throw err;
       } finally {
         span.end();
       }
     });
   };
+}
+
+/**
+ * A one-word operation for a route: the last path segment, kebab-cased.
+ *
+ * `/v1/authorize` -> `authorize`. Short on purpose: core's span-naming schema
+ * caps every segment at fifteen characters, and a name that embeds a value is
+ * a span per value.
+ */
+function operationFor(route: string): string {
+  const last = route.split("/").filter(Boolean).pop() ?? "request";
+  return last.replace(/[{}]/g, "").toLowerCase().slice(0, 15) || "request";
+}
+
+/**
+ * Mark a span ERRORED and attach the bounded error CLASS.
+ *
+ * Two decisions, and the second is the point:
+ *
+ * 1. `SpanStatusCode.ERROR` is what makes the span an error AT ALL. The
+ *    predicate for "this is an error" is span status, not `error.type` — the
+ *    fleet dashboard partitions by `service.name`, filters on `status = error`,
+ *    and uses `error.type` only as a drill-down inside a service, because the
+ *    OpenTelemetry semantic conventions expect HIGH cardinality in
+ *    `error.type` when no filter is applied. A span whose status is unset is
+ *    invisible to that filter however many error attributes it carries.
+ *
+ * 2. `error.type` is the CLASS, never the message. `span.recordException` is
+ *    deliberately NOT called: the SDK records `exception.message` and
+ *    `exception.stacktrace`, and a message is unbounded, is a cardinality bomb
+ *    on the metrics side, and on an LLM gateway is a prompt by another route —
+ *    a provider's content-policy rejection quotes the offending content back at
+ *    you. core's redaction schema prohibits those attributes by name, and the
+ *    collector drops them even if something here adds them.
+ *
+ * A handled-and-retried error is not recorded at all. A retry that succeeded is
+ * not an error, and recording it makes the error rate a lie.
+ */
+export function recordFailure(span: { setStatus: (s: { code: SpanStatusCode; message?: string }) => void; setAttribute: (k: string, v: string) => void }, errorType: string, description: string): void {
+  span.setStatus({ code: SpanStatusCode.ERROR, message: description });
+  span.setAttribute("error.type", errorType);
+}
+
+/**
+ * An EXCEPTION LOG RECORD, which is the current convention.
+ *
+ * The `exception` SPAN EVENT is Deprecated in favour of exactly this: a log
+ * record with an event name ending `.exception` and a severity chosen by
+ * EXPECTED IMPACT. The span-event form is a compatibility shim, and a service
+ * still writing it has not migrated (PLAN.md §7b).
+ *
+ * `errorType` goes on the record and `detail` does not: the collector drops
+ * `exception.message` and `exception.stacktrace` because they are on nobody's
+ * allowlist, and a stack trace is unbounded text. The class is what survives a
+ * searchable, retained store; `detail` is for the caller's own application log.
+ */
+export function logException(errorType: string, detail: string, impact: "warning" | "error" | "fatal" = "error"): void {
+  if (loggerProvider === null) return;
+  const severity =
+    impact === "fatal"
+      ? SeverityNumber.FATAL
+      : impact === "warning"
+        ? SeverityNumber.WARN
+        : SeverityNumber.ERROR;
+  loggerProvider.getLogger(SERVICE_NAME).emit({
+    severityNumber: severity,
+    body: detail,
+    eventName: "exception",
+    attributes: { "error.type": errorType, "log.severity": impact },
+  });
+}
+
+/** Map a thrown value onto the fleet's bounded error vocabulary. */
+function errorClassFor(err: unknown): string {
+  if (err instanceof Error && err.name === "AbortError") return "timeout";
+  return "internal";
+}
+
+/** A short STATIC description for a human. Never the error's own message. */
+function staticDescriptionFor(err: unknown): string {
+  return err instanceof Error ? "request failed" : "request failed";
 }
 
 /**
@@ -144,10 +367,16 @@ export async function tracedFetch(input: string | URL | Request, init: RequestIn
   return fetch(input as RequestInfo, { ...init, headers });
 }
 
-/** Assemble the app with tracing on. */
+/**
+ * Assemble the app with tracing on.
+ *
+ * `installTelemetry()` is called here and is safe to call on every import: with
+ * telemetry off it logs one line and does nothing, and with it on it registers
+ * the propagator exactly once.
+ */
 export function buildApp() {
   installTelemetry();
   const app = new Hono();
-  app.use("*", traceMiddleware(SERVICE_NAME));
+  app.use("*", traceMiddleware());
   return app;
 }

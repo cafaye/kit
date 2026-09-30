@@ -28,9 +28,13 @@ build lands in kit once, and reaches the next service in a pull request.
 | `docker/Dockerfile.<lang>` | Seven multi-stage templates. `go` and `rust` finish on distroless; the rest finish on `*-slim`. All run non-root. | Every service |
 | `templates/bin-prime/<lang>.sh` | The worktree primer: one script per language, exit 0 only when the tree is genuinely ready. | Every service, as `bin/prime` |
 | `templates/bin/dev.sh` | The local developer loop: bring the stack up, wait for health, migrate, seed an admin, print the URLs. Idempotent, fails loudly. | Every service, as `bin/dev` |
-| `templates/compose/docker-compose.yml` | Postgres, NATS+JetStream, Redis and the OTel collector. Every port parameterized, every image pinned, every service healthchecked. | Every service, as `docker-compose.yml` |
-| `templates/compose/otel-collector.yml` | The collector: OTLP receiver, batch processor, and a `debug` exporter that writes to stdout. **Ships nothing.** | Every service, as `otel-collector.yml` |
+| `templates/compose/docker-compose.yml` | Postgres, NATS+JetStream, Redis, the OTel collector, and the four LGTM backing services. Every port parameterized inside kit's claimed `15000-15999` block, every image pinned, every service healthchecked and memory-bounded. | Every service, as `docker-compose.yml` |
+| `templates/compose/otel-collector.yml` | The collector: OTLP + container-stderr receivers, the redaction allowlist **derived from core's schemas**, the `spanmetrics` connector, and fan-out to Tempo/Loki/Mimir. Every endpoint a `${env:}`. | Every service, as `otel-collector.yml` |
+| `templates/compose/{tempo,loki,mimir}/` | Vendor **configuration** for the three stores: retention, limits, paths. Read-only mounts over stock images. | Every service, beside its compose file |
+| `templates/compose/grafana/provisioning/` | Datasources, the dashboard provider, the fleet error dashboard and the alert rules — all files, working on first load. Nothing to click together by hand. | Every service, beside its compose file |
 | `templates/compose/.env.example` | Every `${KIT_*}` the stack interpolates, each with a default. | Every service, as `.env.example` |
+| `tests/canary_test.sh` | Plants a canary in ten leak shapes against a real collector and asserts it reaches no exporter. | kit |
+| `tests/no_telemetry_in_readiness.sh` | Kills the collector and proves a service still starts, still serves and still reports healthy. | kit |
 | `templates/otel/<lang>/` | W3C traceparent: a stdlib codec, an executed conformance suite, an SDK snippet, and a README. | Every service, per language |
 | `templates/mise.toml` | Toolchain pins, one per language, commented. | Every service, as `mise.toml` |
 | `templates/AGENTS.md` | Skeleton repo-conventions file. | Every service, as `AGENTS.md` |
@@ -38,12 +42,18 @@ build lands in kit once, and reaches the next service in a pull request.
 
 ## The local stack — `templates/compose/`
 
-Postgres, NATS with JetStream, Redis, and an OpenTelemetry collector. One stack,
-one set of credentials, one command, for every service.
+Postgres, NATS with JetStream, Redis, the OpenTelemetry collector, and the four
+services that make a developer's traces, metrics and errors visible: **Grafana,
+Loki, Tempo and Mimir**. One stack, one set of credentials, one command, for
+every service.
 
 ```sh
 cp <kit>/templates/compose/docker-compose.yml ./docker-compose.yml
 cp <kit>/templates/compose/otel-collector.yml  ./otel-collector.yml
+cp -R <kit>/templates/compose/tempo  ./tempo
+cp -R <kit>/templates/compose/loki   ./loki
+cp -R <kit>/templates/compose/mimir  ./mimir
+cp -R <kit>/templates/compose/grafana ./grafana
 cp <kit>/templates/compose/.env.example        ./.env
 cp <kit>/templates/bin/dev.sh                  ./bin/dev && chmod +x bin/dev
 
@@ -55,23 +65,141 @@ bin/dev nuke       # stop and DELETE the data
 ```
 
 It is a **template with placeholders**, not a fixed stack. Every published port
-is `${KIT_*:default}`, every image is pinned to an exact tag, and every service
-has a healthcheck so `up --wait` can mean something. A service joins by adding a
-`depends_on` and copying the connection URLs into its own `.env`.
+is `${KIT_*:default}` inside kit's claimed block, every image is pinned to an
+exact tag, and every service has a healthcheck so `up --wait` can mean
+something. A service joins by adding a `depends_on` and copying the connection
+URLs into its own `.env`.
 
 `bin/dev` is idempotent — run it twice and nothing changes — and it fails loudly
 rather than half-starting: if the stack does not become healthy it prints what is
 unhealthy and its logs, and stops *before* migrating, so a failed `up` cannot
 leave a half-migrated database behind.
 
-**The collector ships nothing.** Its only exporter is `debug`, which writes spans
-to the collector's own stdout on the machine already running it. It publishes no
-host port, so it is reachable by service name over the compose network and from
-nowhere else. To send spans to a backend you add an exporter block yourself and
-point it at a `${env:...}` endpoint; a literal endpoint fails kit's gate, so it
-cannot reach a repo by accident. This is a privacy boundary, not a preference:
-traces carry request paths, user identifiers, and occasionally a token in a span
-attribute.
+### Observability is on by default
+
+You did not have to install anything. `bin/dev up` brings up the collector and
+the four stores behind it, and a service with nothing configured exports into
+them, because `<SERVICE>_OTEL_ENDPOINT` **defaults to the collector that ships
+with this stack**. Open <http://localhost:15000> and the fleet error dashboard is
+already there.
+
+That is on-by-default-and-worked-on-in-dev, not on-by-default-and-mandatory. The
+escape hatches are first-class:
+
+| You want | You do | What happens |
+|---|---|---|
+| **Your own backend** | set `MUSE_OTEL_ENDPOINT` (or `CAF_OTEL_ENDPOINT`, `BILLING_OTEL_ENDPOINT`, … — `<SERVICE>_OTEL_ENDPOINT`, the name derived from the service) to your Datadog / Honeycomb / Grafana Cloud OTLP endpoint | this service exports there and the shipped stack goes quiet for it. **Bring your own backend is a supported deployment, not a degraded mode** |
+| **No telemetry at all** | unset the variable | a genuine no-op: no queue, no retry loop, no warning per request, no dial at boot |
+| **Still on, quieter** | `KIT_OTEL_DEBUG_VERBOSITY=basic` | the `debug` exporter stops printing every span to the terminal |
+
+`<SERVICE>_OTEL_ENDPOINT` is the ONLY contract. The shipped collector is just
+that variable's default value, which is what makes on-by-default possible without
+making it obligatory. All six language templates implement it — see
+[`templates/otel/README.md`](templates/otel/README.md).
+
+### The port block: 15000-15999
+
+kit claims this range for the whole stack, one hundred per service, and the gate
+asserts every published port is inside it and that no two services reuse one.
+
+| Port | Service | | Port | Service |
+|---|---|---|---|---|
+| 15000 | Grafana | | 15700 | NATS (monitoring) |
+| 15500 | Postgres | | 15800 | Redis |
+| 15600 | NATS (client) | | 15900 | Tempo (traces) |
+| | | | 15901 | Loki (logs + crash layer) |
+| | | | 15902 | Mimir (metrics) |
+
+Not 5432, 4222 or 6379, and that is the point: those are the two or three most
+likely things already listening on a developer's machine. `bin/dev` is the first
+command a new person runs on a repo they just cloned, which is the worst possible
+moment to find out somebody else owns 5432.
+
+The four backends sit in a compose profile named `observability` so a constrained
+machine can opt out; `bin/dev up` includes the profile, so the **default** path
+still gets the whole stack. The collector is deliberately NOT in that profile: it
+is the default value of the endpoint variable, and a service with nothing
+switched on needs somewhere to send.
+
+### The licence, stated plainly
+
+**Grafana, Loki, Tempo and Mimir are AGPL-3.0, and kit ships them UNMODIFIED.**
+Stock `grafana/*` images, pinned, with read-only *configuration* mounted over
+them. Nothing is forked, patched or rebranded — that is the condition the licence
+cares about, and the gate fails on a `build:` stanza on any of the four.
+
+AGPL attaches to the Grafana **server**, not to the applications it observes, so
+this is compatible with cafaye being MIT/Apache. The obligation runs one way: we
+may use these; a self-hoster using our code is not thereby offered a modified
+Grafana. If you believe a change to one of these is necessary, that is a
+`DECISION NEEDED`, not something to do quietly.
+
+Every image is pinned to an exact tag. `latest` for a log store means a
+self-hoster's upgrade path is whatever happened to be cached when their disk
+filled.
+
+### Telemetry is never in a readiness path
+
+A service that hangs on startup because telemetry is down is worse than no
+telemetry at all. So:
+
+- nothing in the compose file `depends_on` the collector or a store, and no
+  healthcheck probes an OTLP port — the gate fails on both;
+- `bin/dev` does not wait on the collector before migrating;
+- the collector's `health_check` reports healthy with all three backends absent,
+  because a collector that has lost spans is not an unhealthy collector;
+- every exporter sets `sending_queue` and `retry_on_failure` to **false**, so a
+  dead Tempo costs you spans rather than a background thread and a queue.
+
+`tests/no_telemetry_in_readiness.sh` proves it against a real collector: it
+starts the collector with Tempo, Loki and Mimir all refusing connections and
+checks it is still healthy, has not restarted, and has not entered a retry loop;
+then it brings up a service with `*_OTEL_ENDPOINT` pointed at a collector that
+does not exist and checks that service comes up healthy, keeps serving, and does
+not restart.
+
+### The redaction boundary, derived from core and proved by canary
+
+The collector applies the allowlist **once, before anything leaves the process**,
+and the allowlist is not written here — it is **derived from core's schemas**, and
+`tests/validate.sh` reads `core/schemas/telemetry/*.json` off disk and compares
+**both** ways:
+
+- every attribute core allows on a signal must be in that signal's
+  `allowed_keys` (a missing one is a span that arrives uselessly and nobody
+  notices);
+- nothing may be in it that core does not allow (an extra one is a leak with a
+  check attached);
+- no allowed name may contain a word core's redaction schema forbids;
+- no resource attribute may appear as a measurement attribute.
+
+The check prints the core commit it compared against, because "it passed" against
+a spec from six weeks ago is a different statement from "it passed".
+
+`tests/canary_test.sh` then proves it **behaves**, not that it is configured. A
+canary string is planted in ten shapes a leak could take — a banned key, an
+SDK-default key, the deprecated `exception` span event, a near-miss key, an
+*allowlisted* key's value, a resource attribute, a bearer token, a metric data
+point, a log attribute, a log body — and the test asserts the canary reaches no
+exporter **and that the allowed data survived**. The second half is the half
+that is easy to fake: a collector that drops everything passes a "no canary" test
+and is useless.
+
+Two things that test found, both of which are in the config because of it:
+
+- **span events are not attributes**, and the redaction processor does not visit
+  them, so `exception.message` on a span event bypassed the allowlist entirely;
+- **`ignored_keys` is one flat list** applied to resource and measurement
+  attributes alike, so exempting `tenant_id` on the resource would also exempt it
+  on every data point — the exact cardinality bomb core's metrics schema exists
+  to prevent. The config therefore stashes and restores the two identity
+  attributes around the redaction processor, and the gate asserts the ordering.
+
+**The log body is the one place free text is expected, and it is NOT scrubbed.**
+core requires a body and bounds it at 2048 characters; the redaction processor is
+specified over attributes. The canary test reports this rather than quietly
+passing, because a reader who assumes the body is scrubbed is exactly the reader
+who puts a prompt in one.
 
 ## Trace propagation — `templates/otel/`
 

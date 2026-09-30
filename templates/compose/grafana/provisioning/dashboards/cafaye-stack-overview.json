@@ -1,0 +1,164 @@
+{
+  "uid": "cafaye-stack-overview",
+  "title": "cafaye — local stack",
+  "description": "The four stores and the collector, from a self-hoster's first question: 'what does this look like when it breaks'. Every panel here is a liveness signal for a component of the stack that ships by default, so the first five minutes after `bin/dev up` answer themselves.",
+  "tags": ["cafaye", "stack"],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "graphTooltip": 1,
+  "refresh": "10s",
+  "time": { "from": "now-15m", "to": "now" },
+  "timepicker": {},
+  "panels": [
+    {
+      "id": 1,
+      "type": "text",
+      "title": "The stack, on by default",
+      "gridPos": { "h": 5, "w": 24, "x": 0, "y": 0 },
+      "options": {
+        "mode": "markdown",
+        "content": "Observability is **on by default and worked on in dev** (PLAN.md §7b). You did not have to install anything: `bin/dev up` brought up the collector and the four stores behind it, and a service with nothing configured exports into them because `<SERVICE>_OTEL_ENDPOINT` defaults to the collector that ships with this stack.\n\n**Telemetry is never in anyone's readiness path.** Kill the collector and every service here keeps serving — you lose spans, not traffic. `tests/no_telemetry_in_readiness.sh` in `kit` proves exactly that, on every commit.\n\n**Grafana, Loki, Tempo and Mimir are AGPL-3.0 and ship unmodified.** Configuration is mounted read-only over the stock images; nothing is forked, patched or rebranded. AGPL attaches to the Grafana *server*, not to the applications it observes, so this is compatible with cafaye being MIT/Apache.\n\n**To bring your own backend**, set `<SERVICE>_OTEL_ENDPOINT` in your service to your Datadog / Honeycomb / Grafana Cloud OTLP endpoint and this stack goes quiet for that service. That is a supported deployment, not a degraded mode. **To turn telemetry off**, unset the variable: the exporter becomes a genuine no-op — no queue, no retry loop, no warning per request, no dial at boot."
+      }
+    },
+    {
+      "id": 2,
+      "type": "row",
+      "title": "Collector — the chokepoint",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 5 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Spans accepted / s",
+      "description": "What the redaction allowlist let through. Everything else was stripped before an exporter saw it, which is why this number is the honest measure of what telemetry is being collected.",
+      "datasource": { "type": "mimir", "uid": "mimir" },
+      "gridPos": { "h": 5, "w": 6, "x": 0, "y": 6 },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate(cafaye_calls[5m]))", "legendFormat": "spans/s" }
+      ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "none", "graphMode": "area" },
+      "fieldConfig": { "defaults": { "unit": "reqps", "decimals": 2 }, "overrides": [] }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "Distinct services reporting",
+      "datasource": { "type": "mimir", "uid": "mimir" },
+      "gridPos": { "h": 5, "w": 6, "x": 6, "y": 6 },
+      "targets": [
+        { "refId": "A", "expr": "count(count by (service_name) (rate(cafaye_calls[5m])))", "legendFormat": "services" }
+      ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "none", "graphMode": "none" },
+      "fieldConfig": { "defaults": { "unit": "short", "decimals": 0 }, "overrides": [] }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "p95 span duration",
+      "datasource": { "type": "mimir", "uid": "mimir" },
+      "gridPos": { "h": 5, "w": 6, "x": 12, "y": 6 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(cafaye_duration_bucket[5m])))",
+          "legendFormat": "p95"
+        }
+      ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "none", "graphMode": "area" },
+      "fieldConfig": { "defaults": { "unit": "s", "decimals": 3 }, "overrides": [] }
+    },
+    {
+      "id": 6,
+      "type": "stat",
+      "title": "Log records / s",
+      "description": "Two sources: an SDK's own records over OTLP, and every container's stderr over syslog — the crash layer, with no per-language SDK.",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 5, "w": 6, "x": 18, "y": 6 },
+      "targets": [
+        { "refId": "A", "expr": "sum(rate({service_name=~\".+\"}[5m]))", "queryType": "range", "legendFormat": "lines/s" }
+      ],
+      "options": { "reduceOptions": { "calcs": ["lastNotNull"], "fields": "", "values": false }, "colorMode": "none", "graphMode": "area" },
+      "fieldConfig": { "defaults": { "unit": "reqps", "decimals": 2 }, "overrides": [] }
+    },
+    {
+      "id": 7,
+      "type": "row",
+      "title": "Traffic by service",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 11 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 8,
+      "type": "timeseries",
+      "title": "Requests / s by service",
+      "description": "Every dimension here is bounded by core's trace allowlist. `http.route` is the TEMPLATE (`/v1/users/{id}`), never the concrete path — a template has one value per endpoint, a concrete path has one per request, and that difference is the whole of core's cardinality argument.",
+      "datasource": { "type": "mimir", "uid": "mimir" },
+      "gridPos": { "h": 8, "w": 12, "x": 0, "y": 12 },
+      "targets": [
+        { "refId": "A", "expr": "sum by (service_name) (rate(cafaye_calls[5m]))", "legendFormat": "{{service_name}}" }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "custom": { "drawStyle": "line", "fillOpacity": 10, "lineWidth": 2, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["sum", "max"] } }
+    },
+    {
+      "id": 9,
+      "type": "timeseries",
+      "title": "p95 duration by service",
+      "datasource": { "type": "mimir", "uid": "mimir" },
+      "gridPos": { "h": 8, "w": 12, "x": 12, "y": 12 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le, service_name) (rate(cafaye_duration_bucket[5m])))",
+          "legendFormat": "{{service_name}}"
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "custom": { "drawStyle": "line", "fillOpacity": 0, "lineWidth": 2, "showPoints": "never" }
+        },
+        "overrides": []
+      },
+      "options": { "legend": { "displayMode": "table", "placement": "right", "calcs": ["max"] } }
+    },
+    {
+      "id": 10,
+      "type": "row",
+      "title": "What the redaction boundary let through",
+      "gridPos": { "h": 1, "w": 24, "x": 0, "y": 20 },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 11,
+      "type": "table",
+      "title": "Attributes on the spans that arrived",
+      "description": "The allowlist, made visible. core's schemas are the source of this list and `tests/validate.sh` in kit reads them off disk and compares both ways against the collector config — a name here that core does not allow, or one core allows and this list lacks, fails the gate. That is what makes 'the collector is the enforcement point' a fact rather than an intention.",
+      "datasource": { "type": "loki", "uid": "loki" },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 21 },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service_name=~\".+\"} | logfmt | label_format __error_type=error_type, __route=http.route, __model=llm.model",
+          "queryType": "instant",
+          "instant": true
+        }
+      ],
+      "transformations": [{ "id": "organize", "options": { "excludeByName": { "Time": true, "__error_type": false, "__route": false, "__model": false } } }],
+      "fieldConfig": { "defaults": {}, "overrides": [] },
+      "options": { "showHeader": true }
+    }
+  ]
+}

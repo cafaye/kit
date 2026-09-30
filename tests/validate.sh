@@ -344,6 +344,35 @@ ruby|rack_middleware.rb.snippet|.rb|ruby -c
 python|fastapi.py.snippet|.py|python3 -m py_compile
 SNIPPETS
 
+  # Elixir, which kit-02 did not check and should have. A `.ex` file compiles at
+  # LOAD time, so `Code.require_file` is a parser for it — and it is the only
+  # thing that could have caught what this packet's rewrite actually contained
+  # before it shipped: a `Logger.log` call with a keyword list followed by a
+  # `"key" => value` pair, which is a hard SyntaxError in Elixir and an entirely
+  # ordinary-looking line in every other language.
+  #
+  # The traceparent codec is required first so the file has no cross-file
+  # dependency, and a load that reports *warnings* about the OTel modules it
+  # cannot find is a PASS: kit has no mix.exs and no deps, and a warning about a
+  # missing `:opentelemetry` is exactly what a dependency-free kit should
+  # produce. Only a real compile error fails — and the two shapes are counted
+  # rather than grepped for the word "error", because the warnings above contain
+  # that word too and a check that cannot tell a warning from an error is a
+  # check that fails on a clean file.
+  if have elixir; then
+    ex_copy="$snippet_dir/phoenix_telemetry.ex"
+    cp "$ROOT/templates/otel/elixir/phoenix_telemetry.ex.snippet" "$ex_copy"
+    ex_out="$(elixir -r "$ROOT/templates/otel/elixir/traceparent.ex" "$ex_copy" 2>&1 || true)"
+    if printf '%s\n' "$ex_out" | grep -qE '\*\* \((Compile|Syntax)Error\)|^\s*error:'; then
+      report FAIL 'otel/elixir/phoenix_telemetry.ex.snippet  (parses as .ex)'
+      printf '%s\n' "$ex_out" | head -8 | sed 's/^/       /'
+    else
+      report PASS 'otel/elixir/phoenix_telemetry.ex.snippet  (parses as .ex)'
+    fi
+  else
+    report SKIP 'otel/elixir/phoenix_telemetry.ex.snippet  (elixir not installed)'
+  fi
+
   # rustc needs its own treatment: --emit=metadata on a file importing
   # opentelemetry fails on unresolved crates (E0432/E0433), which is not a
   # syntax error and is exactly what a dependency-free kit should produce. So
@@ -572,6 +601,18 @@ for signal, pipe in pipelines.items():
             f"{signal} pipeline redacts after batching, which is after the data "
             f"has already left the process"
         )
+    # SPAN EVENTS ARE OUT OF REACH. The redaction processor is specified over
+    # span/log/datapoint ATTRIBUTES; a span event carries its own attribute map
+    # at a different depth which it does not visit. So a service still writing
+    # the DEPRECATED `exception` span event ships `exception.message` and
+    # `exception.stacktrace` straight through a boundary with neither on its
+    # allowlist. Found by the canary test failing, not by reading the docs.
+    if signal == "traces" and not any("span_event" in p for p in raw):
+        problems.append(
+            "the traces pipeline has no span-event transform, so exception.message "
+            "and exception.stacktrace on a span EVENT bypass the redaction "
+            "processor entirely — it does not visit event attributes"
+        )
     if not pipe.get("exporters"):
         problems.append(f"{signal} pipeline has no exporters: it collects and drops")
 
@@ -774,14 +815,146 @@ for name, cfg in (col.get("processors") or {}).items():
 # argument is that identity lives on the resource and is exempt from the 2000
 # cap; a resource name smuggled into allowed_keys is identity moved back onto
 # the measurement. core asserts the two lists are disjoint, and so does this.
-resource_leaks = sorted(
-    (allowed.get("metrics") or set()) & core_resource
-)
+resource_leaks = sorted((allowed.get("metrics") or set()) & core_resource)
 if resource_leaks:
     problems.append(
         "redaction/cafaye_metrics allows resource attributes as measurement "
         "attributes: " + ", ".join(resource_leaks)
     )
+
+# THE RESOURCE EXEMPTION, and this check is the reason the config carries a
+# stash/restore pair at all.
+#
+# The redaction processor's `allowed_keys` and `ignored_keys` are BOTH flat
+# lists, and they are applied to resource attributes and measurement attributes
+# by the same rule - so `ignored_keys: [tenant_id]` exempts the resource AND
+# every data point, and the data point is exactly what core's metrics schema
+# prohibits. Verified against the pinned image rather than assumed, because this
+# is the one place an assumption is completely invisible: the pipeline runs, the
+# dashboard renders, and the breakdown quietly undercounts.
+#
+# WHICH resource attributes can safely go in `ignored_keys` is DERIVED from
+# core, not declared here. A name is safe exactly when core does not also list it
+# on a signal's allowlist. `service.name` qualifies: it is never a measurement
+# attribute, so exempting it cannot weaken the metrics boundary. `tenant_id` and
+# `account_id` are the names core puts in BOTH places, and they are the ones
+# that have to go through the stash.
+#
+# Four things are asserted, and (2) and (3) are the ones that stop the exemption
+# being the bug:
+#   1. every resource attribute core defines is either safely ignorable or
+#      stashed - otherwise it is stripped and the per-tenant totals are lost;
+#   2. no name core lists on BOTH a resource and a signal allowlist appears in
+#      ignored_keys - that single entry is what exempts a data point too;
+#   3. an ignored name core does not define anywhere is reported, because an
+#      exemption nobody reasoned about is how a prohibited identifier gets back
+#      onto a measurement in six months;
+#   4. the stash/restore bracket the redaction processor, positionally.
+pipelines = (col.get("service") or {}).get("pipelines") or {}
+
+# The names that are BOTH a resource attribute and PROHIBITED on a measurement,
+# read out of the `not` clause core already wrote for exactly this purpose.
+#
+# The first version derived this as "appears in the resource schema AND in any
+# signal's allowlist", and that put `service.name` in the set — because core's
+# log schema permits `service.name` as an ATTRIBUTE (a log store fanning several
+# services into one stream needs it as a label). Which is not the hazard at all.
+# The hazard is a name core REFUSES on a measurement, and core refuses those by
+# name in a `not` clause: tenant_id, user_id, account_id, request_id, trace_id,
+# span_id, session_id, message_id, notification_id, email, error.message,
+# error.stacktrace, url.full, url.path. Read from there, so the answer is core's
+# list rather than an inference from file layout.
+prohibited_on_measurement = set()
+for clause in metrics["$defs"]["measurementAttributes"]["not"]["anyOf"]:
+    for key in clause.get("required", []):
+        prohibited_on_measurement.add(key)
+both_places = core_resource & prohibited_on_measurement
+
+# The stash is read out of the config's OWN transform statements rather than
+# assumed to cover a fixed list, so a stash that stops handling `account_id`
+# fails here instead of quietly stripping it.
+stash_src = ""
+for cfg in (col.get("processors") or {}).values():
+    if not isinstance(cfg, dict):
+        continue
+    for key in ("trace_statements", "log_statements", "metric_statements"):
+        for group in cfg.get(key) or []:
+            stash_src += " ".join(str(s) for s in (group or {}).get("statements") or [])
+stashed = {name for name in both_places if f'attributes["{name}"]' in stash_src}
+# `cafaye.stashed.<name>` is a PRIVATE name this config invents, and it is the
+# one entry in ignored_keys that core has never heard of. It is allowed, and
+# only because the stash/restore pair is asserted to bracket the redaction
+# processor below and the restore deletes it — a private name that outlived the
+# restore would be an attribute in every export, and the unknown-ignored-keys
+# check below would otherwise (correctly) report it.
+private_stash = {f"cafaye.stashed.{n}" for n in both_places}
+
+for signal in ("traces", "metrics", "logs"):
+    proc = f"redaction/cafaye_{signal}"
+    cfg = (col.get("processors") or {}).get(proc) or {}
+    ignored = set(cfg.get("ignored_keys") or [])
+
+    missing = sorted(core_resource - ignored - stashed)
+    if missing:
+        problems.append(
+            f"{proc}: resource attributes core defines are neither ignored nor "
+            f"stashed, so they are stripped: {', '.join(missing)}. Strip "
+            f"service.name and the fleet dashboard has nothing to partition by; "
+            f"strip tenant_id and the per-tenant totals core requires are lost, "
+            f"silently."
+        )
+    if not stashed:
+        problems.append(
+            f"{proc}: no resource attribute core PROHIBITS on a measurement is "
+            f"stashed, so tenant_id/account_id are either stripped from every "
+            f"resource or exempted on every data point. core's metrics schema "
+            f"requires the first to happen not to and the second not to happen "
+            f"at all."
+        )
+    both_in_ignored = sorted(ignored & both_places)
+    if both_in_ignored:
+        problems.append(
+            f"{proc}: ignored_keys contains {', '.join(both_in_ignored)}, which "
+            f"core lists as a resource attribute AND as a prohibited measurement "
+            f"attribute. ignored_keys is one flat list applied to both, so this "
+            f"exempts the data point too - the cardinality bomb core's metrics "
+            f"schema exists to prevent. Use the stash/restore pair instead."
+        )
+    unknown = sorted(ignored - core_resource - private_stash)
+    if unknown:
+        problems.append(
+            f"{proc}: ignored_keys names {', '.join(unknown)}, which core's "
+            f"resource schema does not define. An exemption nobody reasoned "
+            f"about is how a prohibited identifier gets back onto a measurement."
+        )
+
+# The stash and the restore must bracket the redaction processor in EVERY
+# pipeline, in that order. Checked positionally, because a pipeline that
+# restores first is a pipeline that exports the private name.
+for signal, pipe in pipelines.items():
+    procs = pipe.get("processors") or []
+    try:
+        stash = procs.index("transform/cafaye_resource_stash")
+        restore = procs.index("transform/cafaye_resource_restore")
+        # Named `boundary_at`, not `redaction`: `redaction` is the loaded
+        # core policy document, and shadowing it with an integer means the
+        # summary line at the end of this script dies with a TypeError on
+        # `redaction['version']` — after every check has already reported. A
+        # check whose failure mode is a traceback is a check that reports the
+        # wrong thing at the worst possible moment.
+        boundary_at = next(i for i, p in enumerate(procs) if p.startswith("redaction/"))
+    except (ValueError, StopIteration):
+        problems.append(
+            f"{signal} pipeline: the resource stash/restore pair is missing or "
+            f"incomplete — without it, tenant_id is stripped from the resource"
+        )
+        continue
+    if not (stash < boundary_at < restore):
+        problems.append(
+            f"{signal} pipeline: order is {procs}. It must be stash < redaction < "
+            f"restore; the other way round exports the private stash name instead "
+            f"of tenant_id."
+        )
 
 # Every spanmetrics dimension is a trace attribute the allowlist keeps. A
 # dimension the redaction processor has already stripped produces a metric with
@@ -937,8 +1110,14 @@ if not services:
     problems.append("no services")
 
 # The shared infra every cafaye service joins. Half a platform is worse than
-# none: a service that adopts the stack needs all four or none.
-for required in ("postgres", "nats", "redis", "otel-collector"):
+# none: a service that adopts the stack needs all of these or none of them.
+# The four backing services are in the required set because observability is ON
+# BY DEFAULT (PLAN.md §7b) — they are the answer to "what does this look like
+# when it breaks", and the answer must not be "install four more services
+# first". They are in a compose PROFILE so a constrained machine can opt out;
+# the default `bin/dev up` path brings them up, and that is a property of
+# bin/dev, which the readiness and profile checks below hold to account.
+for required in ("postgres", "nats", "redis", "otel-collector", "tempo", "loki", "mimir", "grafana"):
     if required not in services:
         problems.append(f"missing service: {required}")
 
@@ -979,13 +1158,24 @@ for name, svc in services.items():
 if published:
     problems.extend(published)
 
-# Nothing in the stack may name a cafaye service: hostnames are the service's
+# Nothing in the stack may name a cafaye SERVICE: hostnames are the service's
 # own to choose, and a template that picks them for you is a template six repos
-# disagree with.
+# disagree with. Infrastructure is fine — that is what this file is — and the
+# observability backends are infrastructure, which is why they are named
+# explicitly rather than allowed through by the exclusion below.
+INFRASTRUCTURE = (
+    "postgres",
+    "nats",
+    "redis",
+    "otel-collector",
+    "tempo",
+    "loki",
+    "mimir",
+    "grafana",
+)
 for name in services:
-    if name in ("postgres", "nats", "redis", "otel-collector"):
-        continue
-    problems.append(f"unexpected service: {name}")
+    if name not in INFRASTRUCTURE:
+        problems.append(f"unexpected service: {name}")
 
 if problems:
     sys.exit("; ".join(problems))
@@ -1235,13 +1425,71 @@ snippets = {
     "node": "hono.ts.snippet",
 }
 
+# Comments are removed before anything is asserted, and the marker is
+# PER LANGUAGE. The first version of this check stripped on `#` only, which
+# does nothing to a Go, Rust or TypeScript comment — and every one of those
+# snippets explains *why* `error.message` is prohibited in a comment, so the
+# check reported all six languages for mentioning the very attribute it exists
+# to keep out. A check whose fix is to delete the explanation is a check that
+# trains people to delete explanations.
+LINE_COMMENT = {"go": "//", "rust": "//", "node": "//", "ruby": "#", "elixir": "#", "python": "#"}
+
+# Docstring syntaxes, per language. A docstring is prose wearing code's
+# punctuation, and a check that reads one as code reports a file for explaining
+# itself.
+DOCSTRINGS = {
+    "python": (('"""', '"""'), ("'''", "'''")),
+    "elixir": (('"""', '"""'),),
+    "ruby": (),
+    "go": (),
+    "rust": (),
+    "node": (("`", "`"),),
+}
+
+
+def strip_comments(body, marker):
+    out, in_block = [], False
+    for line in body.splitlines():
+        cleaned, i = [], 0
+        while i < len(line):
+            if in_block:
+                end = line.find("*/", i)
+                if end == -1:
+                    i = len(line)
+                else:
+                    in_block, i = False, end + 2
+                continue
+            if line.startswith("/*", i):
+                in_block, i = True, i + 2
+                continue
+            if line.startswith(marker, i):
+                break
+            cleaned.append(line[i])
+            i += 1
+        out.append("".join(cleaned))
+    return "\n".join(out)
+
+
+def strip_prose(code, lang):
+    """Remove docstrings, so a check cannot fail on a file's own explanation."""
+    pairs = DOCSTRINGS.get(lang, ())
+    if not pairs:
+        return code
+    out = code
+    for open_q, close_q in pairs:
+        out = re.sub(
+            rf"{re.escape(open_q)}.*?{re.escape(close_q)}", "", out, flags=re.S
+        )
+    return out
+
+
 problems = []
 for lang, name in snippets.items():
     path = os.path.join(root, "templates", "otel", lang, name)
     if not os.path.isfile(path):
         continue  # artifact presence is another check's job
     body = open(path, encoding="utf-8").read()
-    stripped = "\n".join(line.split("#", 1)[0] for line in body.splitlines())
+    stripped = strip_comments(body, LINE_COMMENT[lang])
     where = f"otel/{lang}/{name}"
 
     # 1. It must read the cafaye variable, not only the OTel standard one.
@@ -1277,21 +1525,40 @@ for lang, name in snippets.items():
         )
 
     # 4. The four negatives from otel-endpoint.schema.json, asserted on the
-    #    code rather than the prose: no warning on the disabled path, no retry
-    #    loop, no queue, no dial at boot.
-    low = stripped.lower()
-    for bad, why in (
-        ("retry", "no retry loop against a dead endpoint"),
-        ("retry_on_failure", "no retry loop against a dead endpoint"),
-    ):
-        if re.search(rf"\b{bad}\b", low):
-            problems.append(f"{where}: configures {bad!r}; the no-op path must have {why}")
+    #    CODE and not on the prose.
+    #
+    #    This took a second pass to get right, and the first version is worth
+    #    recording because it is the same mistake the artifact-presence check
+    #    made: it looked for the WORD `retry`, and every one of these snippets
+    #    has to EXPLAIN why there is no retry — so all six were reported for
+    #    containing the sentence "a retry loop against a dead endpoint is a
+    #    background thread". A check whose fix is to delete the explanation is a
+    #    check that trains people to delete explanations.
+    #
+    #    So it matches retry and queue CONFIGURATION — an identifier a runtime
+    #    reads — and nothing else. `max_queue_size` is a number in a struct
+    #    literal; the sentence about a memory leak is not.
+    #
+    #    Docstrings are stripped too, for the same reason comments are: Python's
+    #    `"""…"""` and Elixir's `@moduledoc` are prose, and treating a docstring
+    #    as code is how a snippet ends up with a check that fails on its own
+    #    documentation.
+    code = strip_prose(stripped, lang)
     for pat, why in (
-        (r"\b(console\.warn|log\.warning|Logger\.warn|logger\.warn)\b", "no warning spam"),
-        (r"sending_queue|max_queue_size|enqueue", "no buffering"),
+        (r"retry_on_failure|RetryConfig|retry_after|retry_delay|max_retries|retries\s*[:=]\s*\d|retry\s*:", "no retry loop against a dead endpoint"),
+        (r"sending_queue|max_queue_size|queue_size|enqueue|Enqueue|batch_size\s*[:=]", "no buffering"),
     ):
-        if re.search(pat, stripped):
-            problems.append(f"{where}: {why} on the disabled path (matched {pat})")
+        hit = re.search(pat, code)
+        if hit:
+            problems.append(
+                f"{where}: {why} on the disabled path (matched {hit.group(0)!r})"
+            )
+    for pat in (r"console\.warn\b", r"log\.warning\b", r"Logger\.warn\b", r"logger\.warn\b", r"Rails\.logger\.warn\b", r"log\.Warn\b"):
+        hit = re.search(pat, code)
+        if hit:
+            problems.append(
+                f"{where}: no warning spam on the disabled path (matched {hit.group(0)!r})"
+            )
 
     # 5. `error.message` is prohibited by name. An SDK adds it by default, so a
     #    snippet that does not say so ships a leak by default rather than by
@@ -1737,12 +2004,20 @@ for path in (
     "templates/compose/.env.example",
     "templates/bin/dev.sh",
     "templates/otel/README.md",
-    "templates/compose/grafana/provisioning/dashboards",
-    "templates/compose/grafana/provisioning/datasources/datasources.yml",
-    "templates/compose/grafana/provisioning/alerting",
+    # Directory paths, and checked with exists() rather than isfile() — these are
+    # trees, and asking isfile() about a directory reports a missing doc for a
+    # directory that is right there.
+    #
+    # The grafana tree is one entry, not three. Three entries with a file inside
+    # each would make the README carry three near-identical table rows so that a
+    # check could be satisfied by pasting the paths in, and the thing a reader
+    # needs is the tree, not its leaves.
+    "templates/compose/grafana/provisioning",
     "templates/compose/loki",
     "templates/compose/tempo",
     "templates/compose/mimir",
+    "tests/canary_test.sh",
+    "tests/no_telemetry_in_readiness.sh",
 ):
     if path not in readme:
         problems.append(f"README.md never mentions {path}")
@@ -1757,14 +2032,25 @@ for phrase, why in (
     ("AGPL", "the licence of the four backing services must be named"),
     ("unmodified", "the unmodified condition is the whole point of the licence note"),
     ("bring your own", "bring-your-own is a supported deployment, not a degraded mode"),
+    ("not a degraded mode", "the phrase itself is the claim being made"),
 ):
     if phrase.lower() not in readme.lower():
         problems.append(f"README.md does not state {why} (looked for {phrase!r})")
 
 # The escape hatch, and the ports. A self-hoster reads the README and not the
 # code, so the variable name has to be in the README and so does the block.
-if not re.search(r"[A-Z]+_OTEL_ENDPOINT", readme):
-    problems.append("README.md never names the *_OTEL_ENDPOINT contract")
+#
+# The pattern requires a real service-shaped prefix before `_OTEL_ENDPOINT`.
+# `_OTEL_ENDPOINT` on its own is the shape of a variable that has not been
+# derived from anything, and the whole point of core's D16 is that the name
+# comes from the service name so it is knowable without reading code.
+if not re.search(r"`?[A-Z][A-Z0-9]*_OTEL_ENDPOINT`?", readme):
+    problems.append(
+        "README.md never names the <SERVICE>_OTEL_ENDPOINT contract. A reader who "
+        "has to grep the source to learn the variable name is a reader who never "
+        "sets it, and a self-hoster who never sets it runs with the shipped stack "
+        "by accident."
+    )
 if "15000" not in readme or "15999" not in readme:
     problems.append("README.md does not state the host port range the stack claims")
 
