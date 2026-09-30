@@ -41,6 +41,13 @@ defmodule KitOtel.TraceparentTest do
     KitOtel.Traceparent.server_hop(headers(pairs), span)
   end
 
+  # Elixir spells booleans `sampled?`, which is correct in isolation and wrong
+  # here: a six-language suite with six spellings for one concept is a suite
+  # nobody keeps in sync. Both accessors below read like the other five
+  # templates' `sampled(hop)` / `outbound(hop)`.
+  defp sampled(%{flags: flags}), do: Bitwise.band(flags, 0x01) == 0x01
+  defp outbound(%{} = hop), do: KitOtel.Traceparent.ServerHop.outbound_headers(hop)
+
   test "known traceparent is continued" do
     # The headline promise: a known traceparent comes out the other side with its
     # trace identity intact and a fresh span id (§3.4).
@@ -50,14 +57,14 @@ defmodule KitOtel.TraceparentTest do
     assert hop.continued, "a valid inbound traceparent must be continued, not restarted"
     assert hop.span_id == @fixed_span
     refute hop.span_id == @known_parent, "span id must not be the inbound parent-id"
-    assert hop.sampled, "sampled flag (§3.2.2.5.1) must survive the hop"
+    assert sampled(hop), "sampled flag (§3.2.2.5.1) must survive the hop"
 
-    out = hop.outbound_headers
+    out = outbound(hop)
     {:ok, tp} = KitOtel.Traceparent.parse(out["traceparent"])
 
     assert tp.trace_id == @known_trace
     assert tp.parent_id == @fixed_span, "outbound parent-id is this hop's span id"
-    assert tp.sampled, "outbound trace-flags lost the sampled bit"
+    assert sampled(tp), "outbound trace-flags lost the sampled bit"
     assert tp.version == 0, "we emit the version we implement"
   end
 
@@ -65,15 +72,15 @@ defmodule KitOtel.TraceparentTest do
     # §3.2.2.5.1: sampled is a recommendation, not a rule.
     hop = hop(%{"traceparent" => "00-#{@known_trace}-#{@known_parent}-00"})
 
-    refute hop.sampled, "sampled flag must not be invented on an unsampled trace"
+    refute sampled(hop), "sampled flag must not be invented on an unsampled trace"
     assert hop.trace_id == @known_trace
-    assert String.ends_with?(hop.outbound_headers["traceparent"], "-00")
+    assert String.ends_with?(outbound(hop)["traceparent"], "-00")
   end
 
   test "second hop keeps the same trace id" do
     # Three services, one trace: hop N+1 keeps the trace-id hop N produced.
     first = hop(%{"traceparent" => @known_header}, "2222222222222222")
-    second = KitOtel.Traceparent.server_hop(first.outbound_headers, "3333333333333333")
+    second = KitOtel.Traceparent.server_hop(outbound(first), "3333333333333333")
 
     assert second.trace_id == @known_trace, "trace broken across hops"
     assert second.continued, "a traceparent we just emitted must parse on the way back in"
@@ -103,7 +110,7 @@ defmodule KitOtel.TraceparentTest do
       refute hop.trace_id == @known_trace, "#{name}: an invalid traceparent contributed its trace-id"
       assert String.length(hop.trace_id) == 32, "#{name}"
       refute hop.trace_id == String.duplicate("0", 32), "#{name}: trace-id must not be all zeroes (§3.2.2.3)"
-      assert {:ok, _} = KitOtel.Traceparent.parse(hop.outbound_headers["traceparent"]),
+      assert {:ok, _} = KitOtel.Traceparent.parse(outbound(hop)["traceparent"]),
              "#{name}: the restarted trace must be valid on the way out"
     end
   end
@@ -115,14 +122,14 @@ defmodule KitOtel.TraceparentTest do
     refute hop.continued
     assert String.length(hop.trace_id) == 32
     refute hop.trace_id == String.duplicate("0", 32)
-    refute hop.sampled, "a trace we started defaults to not-sampled (§3.2.2.5.1)"
+    refute sampled(hop), "a trace we started defaults to not-sampled (§3.2.2.5.1)"
   end
 
   test "tracestate is forwarded" do
     # §3.3: tracestate is opaque to us and MUST travel with the trace.
     hop = hop(%{"traceparent" => @known_header, "tracestate" => "congo=t61rcWkgMzE"})
 
-    assert hop.outbound_headers["tracestate"] == "congo=t61rcWkgMzE"
+    assert outbound(hop)["tracestate"] == "congo=t61rcWkgMzE"
   end
 
   test "tracestate is truncated at whole entries" do
@@ -134,7 +141,7 @@ defmodule KitOtel.TraceparentTest do
 
     long = Enum.join(entries, ",")
     hop = hop(%{"traceparent" => @known_header, "tracestate" => long})
-    out = hop.outbound_headers["tracestate"]
+    out = outbound(hop)["tracestate"]
 
     assert String.length(out) <= 512, "§3.3.1.5 caps a combined header at 512"
     assert out != "", "truncating dropped the whole header"
@@ -150,7 +157,7 @@ defmodule KitOtel.TraceparentTest do
     # §3.3.1.5: "Entries larger than 128 characters long SHOULD be removed first."
     oversized = "huge=#{String.duplicate("y", 200)}"
     hop = hop(%{"traceparent" => @known_header, "tracestate" => "#{oversized},small=1"})
-    out = hop.outbound_headers["tracestate"]
+    out = outbound(hop)["tracestate"]
 
     refute String.contains?(out, "huge="), "an entry over 128 characters is removed first"
     assert out == "small=1"
@@ -162,7 +169,7 @@ defmodule KitOtel.TraceparentTest do
     for value <- ["", "not-a-traceparent"] do
       hop = hop(%{"traceparent" => value, "tracestate" => "congo=t61rcWkgMzE"})
 
-      refute Map.has_key?(hop.outbound_headers, "tracestate"),
+      refute Map.has_key?(outbound(hop), "tracestate"),
              "tracestate must be discarded when traceparent is #{inspect(value)}"
     end
   end
@@ -203,8 +210,8 @@ defmodule KitOtel.TraceparentTest do
     # §3.2.2.5: mask on read, rebuild on write; §3.2.2.5.2: reserved bits zero.
     hop = hop(%{"traceparent" => "00-#{@known_trace}-#{@known_parent}-03"})
 
-    assert hop.sampled, "bit 0 set means sampled; reading flags as a number is the classic bug"
-    assert String.ends_with?(hop.outbound_headers["traceparent"], "-01"),
+    assert sampled(hop), "bit 0 set means sampled; reading flags as a number is the classic bug"
+    assert String.ends_with?(outbound(hop)["traceparent"], "-01"),
            "reserved bits must be zeroed on the way out (§3.2.2.5.2)"
   end
 

@@ -55,7 +55,7 @@ test("known traceparent is continued", () => {
   assert.ok(hop.continued, "a valid inbound traceparent must be continued, not restarted");
   assert.equal(hop.spanId, FIXED_SPAN);
   assert.notEqual(hop.spanId, KNOWN_PARENT, "span id must not be the inbound parent-id");
-  assert.ok(hop.sampled, "sampled flag (§3.2.2.5.1) must survive the hop");
+  assert.equal(hop.sampled, true, "sampled flag (§3.2.2.5.1) must survive the hop");
 
   const out = hop.outboundHeaders;
   const parsed = parseTraceparent(out.traceparent);
@@ -184,7 +184,7 @@ test("trace-flags are a bit field", () => {
   // §3.2.2.5: mask on read, rebuild on write; §3.2.2.5.2: reserved bits zero.
   const hop = serverHop({ traceparent: `00-${KNOWN_TRACE}-${KNOWN_PARENT}-03` }, FIXED_SPAN);
 
-  assert.ok(hop.sampled, "bit 0 set means sampled; reading flags as a number is the classic bug");
+  assert.equal(hop.sampled, true, "bit 0 set means sampled; reading flags as a number is the classic bug");
   assert.ok(
     hop.outboundHeaders.traceparent.endsWith("-01"),
     "reserved bits must be zeroed on the way out (§3.2.2.5.2)",

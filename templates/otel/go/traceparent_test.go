@@ -58,7 +58,7 @@ func TestKnownTraceparentIsContinued(t *testing.T) {
 	if hop.SpanID == knownParent {
 		t.Fatal("span id must not be the inbound parent-id: that is not a new span")
 	}
-	if !hop.Sampled {
+	if !hop.Sampled() {
 		t.Fatal("sampled flag (§3.2.2.5.1) must survive the hop")
 	}
 
@@ -73,7 +73,7 @@ func TestKnownTraceparentIsContinued(t *testing.T) {
 	if tp.ParentID != fixedSpanID {
 		t.Fatalf("outbound parent-id = %q, want this hop's span id %q", tp.ParentID, fixedSpanID)
 	}
-	if !tp.Sampled {
+	if !tp.Sampled() {
 		t.Fatal("outbound trace-flags lost the sampled bit")
 	}
 	if tp.Version != 0 {
@@ -87,7 +87,7 @@ func TestUnsampledFlagIsPreserved(t *testing.T) {
 	unsampled := "00-" + knownTraceID + "-" + knownParent + "-00"
 	hop := ServerHopFrom(headers("traceparent", unsampled), fixedSpanID)
 
-	if hop.Sampled {
+	if hop.Sampled() {
 		t.Fatal("sampled flag must not be invented on an unsampled trace")
 	}
 	if hop.TraceID != knownTraceID {
@@ -165,7 +165,7 @@ func TestMissingTraceparentStartsANewTrace(t *testing.T) {
 	}
 	// §3.2.2.5.1: "It should be set to 0 as the default option when the trace is
 	// initiated by this component."
-	if hop.Sampled {
+	if hop.Sampled() {
 		t.Fatal("a trace this service started must default to not-sampled")
 	}
 }
@@ -307,7 +307,7 @@ func TestTraceFlagsAreABitField(t *testing.T) {
 	both := "00-" + knownTraceID + "-" + knownParent + "-03"
 
 	hop := ServerHopFrom(headers("traceparent", both), fixedSpanID)
-	if !hop.Sampled {
+	if !hop.Sampled() {
 		t.Fatal("bit 0 set means sampled; reading flags as a number is the classic bug")
 	}
 	out := hop.OutboundHeaders()["traceparent"]

@@ -1,0 +1,147 @@
+---
+# kit template — the local infrastructure every cafaye service joins.
+#
+#   cp <kit>/templates/compose/docker-compose.yml ./docker-compose.yml
+#   cp <kit>/templates/compose/.env.example               ./.env   # then edit
+#   cp <kit>/templates/bin/dev.sh                         ./bin/dev && chmod +x bin/dev
+#
+# WHAT THIS IS
+#   Postgres, NATS with JetStream, Redis, and the OpenTelemetry collector. One
+#   stack, one set of credentials, one command. A service joins it by adding a
+#   `depends_on` and copying its connection URLs into .env.
+#
+# WHAT THIS IS NOT
+#   It is not production. Volumes are named, not replicated; passwords are the
+#   development defaults in .env.example; nothing is exposed outside the host
+#   loopback. It exists so `bin/dev` is one command and CI is one image.
+#
+# STRICTNESS NOTES — READ BEFORE EDITING
+#   - EVERY published port is a ${KIT_*:default} substitution. A literal port in
+#     this file is a collision the second developer on the machine hits, and the
+#     gate fails on one. Change the port in .env, not here.
+#   - EVERY image is pinned to an exact tag. Never `latest`: a stack that
+#     changes under you between two runs of the same command is not a dev
+#     environment, it is a coin flip. Bump the pin in .env.example when you
+#     bump the tag.
+#   - EVERY service has a healthcheck. `docker compose up --wait` can only mean
+#     something if there is a health signal to wait for, and the gate fails on
+#     a service without one.
+#   - The collector publishes NO host port on purpose. Services reach it over
+#     the compose network by service name; a host port would expose an OTLP
+#     receiver to anything else on the machine.
+#   - Service names here are infrastructure names, not cafaye service names.
+#     Hostnames are the adopting repo's business — a template that picks them is
+#     a template six repos disagree with.
+#   - Credentials live in .env (git-ignored), never in this file. .env.example
+#     documents every placeholder with a default, so a fresh clone runs without
+#     a hand-written .env.
+
+name: ${KIT_STACK_NAME:-cafaye}
+
+networks:
+  platform:
+    # `internal: true` would cut the stack off from the internet, which a
+    # container build or an apt install inside one would need. Not set: the
+    # stack is on the developer's machine, and the collector ships nothing.
+
+volumes:
+  postgres-data:
+  nats-data:
+  redis-data:
+
+services:
+  # ------------------------------------------------------------------ postgres
+  postgres:
+    image: postgres:${KIT_POSTGRES_TAG:-16.6-alpine}
+    environment:
+      POSTGRES_USER: ${KIT_POSTGRES_USER:-cafaye}
+      POSTGRES_PASSWORD: ${KIT_POSTGRES_PASSWORD:-cafaye}
+      # Every service owns its own database (one container, several databases).
+      # A service that reaches into another's database is a bug in review, not a
+      # config problem to solve here.
+      POSTGRES_DB: ${KIT_POSTGRES_DB:-cafaye_platform}
+    ports:
+      # Host side is parameterized; the container side is not, because the image
+      # is what fixes it. Only the host side is ever a collision.
+      - "${KIT_POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      # `pg_isready` alone returns true before the init scripts finish, which is
+      # the classic "migrations failed against a database that was not ready"
+      # flake. The -U/-d pair makes it check the real thing.
+      test: ["CMD-SHELL", "pg_isready -U ${KIT_POSTGRES_USER:-cafaye} -d ${KIT_POSTGRES_DB:-cafaye_platform}"]
+      interval: 5s
+      timeout: 3s
+      # retries * interval is the readiness budget: 30s to accept connections,
+      # 10s to become visibly unhealthy. Long enough for a first-time initdb on a
+      # cold volume, short enough that a hung postgres fails the stack quickly.
+      retries: 6
+      start_period: 10s
+    networks: [platform]
+
+  # ----------------------------------------------------------------- nats + js
+  nats:
+    # JetStream is the `-js` flag. Without it a service that publishes and then
+    # crashes loses the message, and courier's at-least-once guarantee quietly
+    # becomes at-most-once.
+    image: nats:${KIT_NATS_TAG:-2.10.24-alpine}
+    command:
+      - "-js"
+      - "-sd"
+      - "/data"
+      - "-m"
+      - "8222"
+    ports:
+      - "${KIT_NATS_CLIENT_PORT:-4222}:4222"
+      - "${KIT_NATS_MONITOR_PORT:-8222}:8222"
+    volumes:
+      - nats-data:/data
+    healthcheck:
+      # The monitoring port answers 200 only once the server is up, which is a
+      # stronger signal than a TCP connect to the client port.
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8222/healthz"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    networks: [platform]
+
+  # --------------------------------------------------------------------- redis
+  redis:
+    image: redis:${KIT_REDIS_TAG:-7.4.1-alpine}
+    # Appendonly on: a cache that loses its writes on restart is fine, but the
+    # rate limiter and the idempotency keys in billing are not, and one flag here
+    # is cheaper than debugging a duplicate charge.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${KIT_REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 6
+      start_period: 5s
+    networks: [platform]
+
+  # -------------------------------------------------------- otel collector
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:${KIT_OTEL_COLLECTOR_TAG:-0.115.1}
+    # No `ports:` on purpose. OTLP receivers accept spans from anything that can
+    # reach them; keeping this one off the host loopback is the whole privacy
+    # posture of the local stack. Services use
+    # http://otel-collector:${KIT_OTEL_HTTP_PORT:-4318} instead.
+    command: ["--config=/etc/otel/otel-collector.yml"]
+    volumes:
+      - ./otel-collector.yml:/etc/otel/otel-collector.yml:ro
+    healthcheck:
+      # The health_check extension, not a port probe: it reports healthy only
+      # once the pipeline is actually wired, which is what we are waiting for.
+      test: ["CMD", "/otelcol-contrib", "components"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 10s
+    networks: [platform]
