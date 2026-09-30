@@ -5,20 +5,28 @@
 # repo copies or calls actually parses, and that the telemetry templates
 # actually propagate a traceparent.
 #
-#   bash tests/validate.sh                     # the gate: static + telemetry
+#   bash tests/validate.sh                     # the gate: every phase
 #   bash tests/validate.sh --static-only       # parse/semantic checks only (fast)
 #   bash tests/validate.sh --language=go       # one telemetry language (CI matrix)
 #   bash tests/validate.sh --no-self-test      # skip the "can this go red" proof
+#   bash tests/validate.sh --no-observability  # skip the two docker-requiring proofs
 #
-# Three phases, all of which must pass:
-#   static     every artifact parses, and the strictness decisions are still
-#              what we wrote them down to be (no exporter on by default, every
-#              compose port parameterized, every placeholder documented).
-#   telemetry  the W3C traceparent templates are EXECUTED, one suite per
-#              language. This is the phase that is easy to fake and so is the
-#              one that runs the code rather than greps it.
-#   self_test  breaks a throwaway copy of this tree four ways and asserts the
-#              gate goes red each time. A gate that cannot fail is not a gate.
+# Four phases, all of which must pass:
+#   static         every artifact parses, and the strictness decisions are still
+#                  what we wrote them down to be (env-substituted endpoints, every
+#                  compose port parameterized, every placeholder documented, and
+#                  the collector's redaction allowlist DERIVED FROM core's
+#                  schemas rather than transcribed beside them).
+#   telemetry      the W3C traceparent templates are EXECUTED, one suite per
+#                  language. This is the phase that is easy to fake and so is
+#                  the one that runs the code rather than greps it.
+#   observability  the two claims that are worth nothing unexercised: that a
+#                  canary secret in a prompt-shaped attribute reaches no
+#                  exporter, and that a service starts and serves with the
+#                  collector killed. Both need a real collector, so both SKIP
+#                  loudly without docker — never pass silently.
+#   self_test      breaks a throwaway copy of this tree and asserts the gate
+#                  goes red each time. A gate that cannot fail is not a gate.
 #
 # One line per check: PASS, FAIL, or SKIP. Any FAIL exits 1. A SKIP is always
 # reported in the summary — never hidden.
@@ -44,6 +52,7 @@ PY="${KIT_PYTHON:-$ROOT/.venv/bin/python}"
 RUN_STATIC=1
 RUN_TELEMETRY=1
 RUN_SELF_TEST=1
+RUN_OBSERVABILITY=1
 LANGS=()
 
 while [ "$#" -gt 0 ]; do
@@ -51,13 +60,15 @@ while [ "$#" -gt 0 ]; do
     --static-only)
       RUN_TELEMETRY=0
       RUN_SELF_TEST=0
+      RUN_OBSERVABILITY=0
       ;;
     --no-self-test) RUN_SELF_TEST=0 ;;
+    --no-observability) RUN_OBSERVABILITY=0 ;;
     --language=*)
       LANGS+=("${1#*=}")
       ;;
     -h | --help)
-      sed -n '2,24p' "$0"
+      sed -n '2,26p' "$0"
       exit 0
       ;;
     *)
@@ -471,13 +482,28 @@ PY
   check 'templates/mise.toml  (a [tools] pin per language)' mise_check
 
   # -------------------------------------------------------------------------
-  section 'static: compose — nothing hardcoded, nothing shipped'
-  # Privacy boundary, enforced. The collector template a developer clones onto
-  # a laptop must not be able to send a span anywhere on its own. Asserted on
-  # the parsed document *and* on the comment-stripped source, because a
-  # commented-out exporter that someone uncomments later must never have been
-  # a literal endpoint in the first place.
-
+  section 'static: compose — the observability chokepoint'
+  # Privacy boundary, enforced. REWRITTEN in kit-03, and the change is recorded
+  # here rather than smuggled. The boundary used to be "the only exporter is
+  # `debug`, which cannot leave the machine". Observability being ON BY DEFAULT
+  # (PLAN.md §7b) means the shipped collector now fans out to Tempo, Loki and
+  # Mimir, so "ships nothing" is no longer the claim this file can make.
+  #
+  # The claim that CAN be made, and is asserted on the parsed document:
+  #
+  #   1. every exporter endpoint is a ${env:...} substitution, never a literal.
+  #      A literal endpoint is an endpoint some laptop will use by default, and
+  #      it is the one shape that turns a privacy boundary into an incident.
+  #   2. every pipeline runs a redaction processor, BEFORE batch and therefore
+  #      before every exporter. Filter before export, never after: a redaction
+  #      step that runs after an exporter has already handed the data off is a
+  #      comment, and the comment is what a future reader trusts.
+  #   3. the exporter set is exactly the three backends plus the local `debug`.
+  #
+  # (1) is kit-02's rule and is unchanged. (2) and (3) are new, and (3) is why
+  # a self-hoster's bring-your-own backend is a variable they set rather than an
+  # exporter a reviewer has to read: <SERVICE>_OTEL_ENDPOINT points their service
+  # somewhere else entirely and this stack goes quiet.
   collector_check() {
     "$PY" - "$ROOT" <<'PY'
 import re
@@ -496,22 +522,64 @@ pipelines = (doc.get("service") or {}).get("pipelines") or {}
 if not pipelines:
     problems.append("no service.pipelines in the collector config")
 
-traces = pipelines.get("traces")
-if not isinstance(traces, dict):
-    problems.append("no service.pipelines.traces pipeline")
-else:
-    # `debug` writes spans to the collector's own stdout on the developer's
-    # machine. Anything else in this list moves data off it.
-    exporters = traces.get("exporters") or []
-    offmachine = [e for e in exporters if e != "debug"]
-    if offmachine:
+exporters = doc.get("exporters") or {}
+for name, cfg in exporters.items():
+    if not isinstance(cfg, dict):
+        continue
+    for key in ("endpoint", "traces_endpoint", "metrics_endpoint", "logs_endpoint"):
+        value = cfg.get(key)
+        if isinstance(value, str) and "${env:" not in value:
+            problems.append(f"exporter {name}.{key} is a literal endpoint, not an ${{env:}} substitution")
+
+# The allowed set is exactly the three backends plus the local `debug`. Anything
+# else is an exporter a reviewer did not read, and `otlp` with a *defaulted*
+# endpoint is the exact shape of that mistake.
+ALLOWED_EXPORTERS = {"otlp/tempo", "otlp/loki", "otlp/mimir", "debug"}
+unknown = sorted(set(exporters) - ALLOWED_EXPORTERS)
+if unknown:
+    problems.append(
+        "unexpected exporter(s): "
+        + ", ".join(unknown)
+        + " — the shipped stack is tempo, loki, mimir and the local debug. A "
+        "bring-your-own backend is an ${env:} endpoint, never a new exporter."
+    )
+
+# The ordering, per pipeline. "The config has a redaction processor somewhere"
+# is exactly the check that passes while the metrics pipeline ships unredacted,
+# so the assertion is per pipeline and positional.
+for signal, pipe in pipelines.items():
+    if not isinstance(pipe, dict):
+        continue
+    if not pipe.get("receivers"):
+        problems.append(f"{signal} pipeline has no receivers")
+    raw = pipe.get("processors") or []
+    if "memory_limiter" not in raw:
+        problems.append(f"{signal} pipeline has no memory_limiter")
+    elif raw[0] != "memory_limiter":
         problems.append(
-            "traces pipeline ships to a non-local exporter(s): " + ", ".join(offmachine)
+            f"{signal} pipeline starts with {raw[0]!r}, not memory_limiter"
         )
-    if not traces.get("receivers"):
-        problems.append("traces pipeline has no receivers")
-    if "batch" not in (traces.get("processors") or []):
-        problems.append("traces pipeline has no batch processor")
+    if "batch" not in raw:
+        problems.append(f"{signal} pipeline has no batch processor")
+    redactions = [i for i, p in enumerate(raw) if p.startswith("redaction/")]
+    if not redactions:
+        problems.append(
+            f"{signal} pipeline has no redaction processor: a signal with no "
+            f"boundary reads as a signal that has one"
+        )
+    if redactions and "batch" in raw and min(redactions) > raw.index("batch"):
+        problems.append(
+            f"{signal} pipeline redacts after batching, which is after the data "
+            f"has already left the process"
+        )
+    if not pipe.get("exporters"):
+        problems.append(f"{signal} pipeline has no exporters: it collects and drops")
+
+# All three signals. Traces and metrics without logs means no crash layer, and
+# logs without metrics means a log store nobody has a dashboard for.
+for signal in ("traces", "metrics", "logs"):
+    if signal not in pipelines:
+        problems.append(f"no {signal} pipeline: the stack is a partial observability story")
 
 # No literal URL anywhere outside a comment: an endpoint that is not an
 # ${env:...} substitution is an endpoint somebody's laptop will use by default.
@@ -524,7 +592,332 @@ if problems:
     sys.exit("; ".join(problems))
 PY
   }
-  check 'templates/compose/otel-collector.yml  (local-only, batch, no URL)' collector_check
+  check 'templates/compose/otel-collector.yml  (redaction first, env endpoints, no URL)' collector_check
+
+  # -------------------------------------------------------------------------
+  # THE REDACTION BOUNDARY, DERIVED FROM core's SCHEMAS.
+  #
+  # This is the check that makes "kit's collector is the enforcement point" a
+  # fact rather than an intention. core owns the allowlist
+  # (schemas/telemetry/traces.schema.json, metrics.schema.json, logs.schema.json
+  # and redaction.schema.json); this repo's collector config is supposed to be a
+  # projection of it. A projection that disagrees is not a style difference: it
+  # is either an attribute core says may not be recorded, shipping anyway, or an
+  # attribute a service is allowed to record being dropped on the floor.
+  #
+  # The comparison is BIDIRECTIONAL on purpose, and that is the part worth
+  # defending:
+  #
+  #   core -> kit   every attribute name core allows on a signal appears in that
+  #                 signal's `redaction/*` allowed_keys. A missing one is a
+  #                 silently-attribute-less span, which is the failure nobody
+  #                 notices because the span still arrives.
+  #   kit -> core   every name in allowed_keys is either on core's list for that
+  #                 signal or on core's fleet-wide redaction allowlist, and
+  #                 carries no word core's schema forbids. An extra one is a
+  #                 leak with a check attached to it.
+  #
+  # One direction would be a check that passes on an empty allowlist. Both
+  # directions together is a check that fails on a wrong one.
+  #
+  # A DERIVED rather than a hand-maintained claim: the comparison is computed
+  # from core's files on disk at gate time, so the day core changes an allowlist
+  # the gate goes red here and names the name. The resolved core commit is
+  # printed, because "it passed" against a spec from six weeks ago is not the
+  # same statement as "it passed".
+  #
+  # core is a sibling checkout, not a vendored copy (AGENTS.md: `../core` is a
+  # read-only reference; kit does not depend on it). When it is absent this
+  # check SKIPs loudly and the summary says so — a security check that is
+  # silently absent is worse than one that is loudly absent, and hiding the skip
+  # is what makes it silently absent.
+  core_repo() {
+    local cand
+    if [ -n "${KIT_CORE:-}" ]; then
+      printf '%s' "$KIT_CORE"
+      return 0
+    fi
+    for cand in "$ROOT/../core" "$ROOT/../../core" "$ROOT/../cafaye/core"; do
+      if [ -f "$cand/schemas/telemetry/traces.schema.json" ]; then
+        (cd "$cand" && pwd)
+        return 0
+      fi
+    done
+    return 1
+  }
+
+  core_check() {
+    local core
+    core="$(core_repo)" || {
+      echo "core not found: set KIT_CORE=<path to a core checkout>"
+      return 1
+    }
+    "$PY" - "$ROOT" "$core" <<'PY'
+import json
+import os
+import re
+import subprocess
+import sys
+
+root, core = sys.argv[1], sys.argv[2]
+
+def load(path):
+    with open(path, encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def core_commit(path):
+    try:
+        return subprocess.run(
+            ["git", "-C", path, "rev-parse", "--short", "HEAD"],
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+sch = f"{core}/schemas/telemetry"
+traces = load(f"{sch}/traces.schema.json")
+metrics = load(f"{sch}/metrics.schema.json")
+logs = load(f"{sch}/logs.schema.json")
+redaction = load(f"{core}/examples/valid/telemetry/redaction.json")
+
+# core's per-signal attribute sets, read out of the schemas rather than
+# transcribed here. A transcription is a second copy of a contract, and the
+# whole point of this check is that there is only one.
+core_traces = set(traces["$defs"]["tracesAttributes"]["properties"])
+core_metrics = set(metrics["$defs"]["measurementAttributes"]["properties"])
+core_logs = set(logs["$defs"]["logsAttributes"]["properties"])
+core_resource = set(traces["$defs"]["resource"]["properties"])
+core_fleet = set(redaction["allowed"])
+core_prohibited = set(redaction.get("prohibited", []))
+# The content-word vocabulary is a `not.pattern` list inside
+# redaction.schema.json, not prose. Read it out of the schema itself so the
+# vocabulary this check enforces is core's and cannot drift from it.
+rs = load(f"{sch}/redaction.schema.json")
+# core writes each pattern as `(?i)word`. Concatenated as-is they would be
+# `(?i)a|(?i)b`, and Python rejects a global flag anywhere but position 0 — so
+# the flag is stripped and applied once, which is also what it means.
+core_content_words = [
+    re.sub(r"^\(\?i\)", "", p["pattern"])
+    for p in rs["properties"]["allowed"]["items"]["not"]["anyOf"]
+    if "pattern" in p
+]
+content_re = re.compile("|".join(f"(?:{w})" for w in core_content_words), re.I)
+
+import yaml
+
+with open(f"{root}/templates/compose/otel-collector.yml", encoding="utf-8") as fh:
+    col = yaml.safe_load(fh)
+
+problems = []
+# The per-signal allowlists, and the pipelines that carry each signal.
+allowed = {
+    name.rsplit("/", 1)[-1].replace("cafaye_", ""): set(cfg.get("allowed_keys") or [])
+    for name, cfg in (col.get("processors") or {}).items()
+    if name.startswith("redaction/")
+}
+expected = {"traces": core_traces, "metrics": core_metrics, "logs": core_logs}
+for signal, core_set in expected.items():
+    got = allowed.get(signal)
+    if got is None:
+        problems.append(f"no redaction/cafaye_{signal} processor: signal is not allowlisted")
+        continue
+    missing = sorted(core_set - got)
+    if missing:
+        problems.append(
+            f"redaction/cafaye_{signal} drops attributes core allows on {signal}: "
+            + ", ".join(missing)
+        )
+    extra = sorted(got - core_set)
+    if extra:
+        # An extra name is only legitimate if core's fleet-wide redaction
+        # allowlist carries it — that is the `llm.*` half, which core's
+        # redaction schema allows and whose absence from the per-signal schema
+        # is core's own gap (raised in kit's report as a DECISION NEEDED).
+        unbacked = [n for n in extra if n not in core_fleet]
+        if unbacked:
+            problems.append(
+                f"redaction/cafaye_{signal} allows attributes core does not: "
+                + ", ".join(unbacked)
+            )
+    for name in sorted(got):
+        if content_re.search(name):
+            problems.append(
+                f"redaction/cafaye_{signal} allows {name!r}, whose name contains a "
+                f"word core's redaction schema forbids on an allowed name"
+            )
+    for name in sorted(got & core_prohibited):
+        problems.append(
+            f"redaction/cafaye_{signal} allows {name!r}, which core's redaction "
+            f"schema names as prohibited"
+        )
+
+# The three signals must all be present. Two of three is a partial boundary and
+# a partial boundary reads as a whole one.
+if sorted(allowed) != ["logs", "metrics", "traces"]:
+    problems.append(f"redaction processors are {sorted(allowed)}; a signal with no boundary reads as one with")
+
+# `allow_all_keys: true` disables the allowlist entirely while still looking
+# configured. It is the single most dangerous line in the file and it is worth
+# its own check rather than a footnote.
+for name, cfg in (col.get("processors") or {}).items():
+    if name.startswith("redaction/") and cfg.get("allow_all_keys") is not False:
+        problems.append(
+            f"{name}: allow_all_keys must be explicitly false — true disables the "
+            f"allowlist while still looking configured"
+        )
+
+# A resource attribute is NOT a span attribute. core's whole cardinality
+# argument is that identity lives on the resource and is exempt from the 2000
+# cap; a resource name smuggled into allowed_keys is identity moved back onto
+# the measurement. core asserts the two lists are disjoint, and so does this.
+resource_leaks = sorted(
+    (allowed.get("metrics") or set()) & core_resource
+)
+if resource_leaks:
+    problems.append(
+        "redaction/cafaye_metrics allows resource attributes as measurement "
+        "attributes: " + ", ".join(resource_leaks)
+    )
+
+# Every spanmetrics dimension is a trace attribute the allowlist keeps. A
+# dimension the redaction processor has already stripped produces a metric with
+# an always-empty label: a dashboard column that is permanently blank, which
+# looks like "no traffic" and is really "your filter ran first".
+conn = (col.get("connectors") or {}).get("spanmetrics") or {}
+for dim in conn.get("dimensions") or []:
+    name = dim.get("name") if isinstance(dim, dict) else dim
+    if name not in (allowed.get("traces") or set()):
+        problems.append(
+            f"spanmetrics dimension {name!r} is not in redaction/cafaye_traces' "
+            f"allowed_keys, so the metric's label will always be empty"
+        )
+
+commit = core_commit(core)
+if problems:
+    sys.exit("; ".join(problems))
+print(f"derived from core@{commit} (spec {redaction['version']})")
+PY
+  }
+  if core_repo >/dev/null 2>&1; then
+    check 'otel-collector allowlist  (derived from core schemas/telemetry)' core_check
+  else
+    report SKIP 'otel-collector allowlist vs core (core checkout not found — set KIT_CORE)'
+  fi
+
+  # exceptions-as-logs. PLAN.md §7b and the semconv: the `exception` span-event
+  # convention is Deprecated, the replacement is an exception LOG RECORD, and
+  # the switch is OTEL_SEMCONV_EXCEPTION_SIGNAL_OPT_IN=logs. The collector half
+  # of that is: the spanmetrics connector must not mint the deprecated
+  # exceptions counter, and there must be a logs pipeline for the record to
+  # arrive on. Checked, because "we migrated" is a claim and a connector that
+  # still counts span events is a migration that did not happen.
+  exception_signal_check() {
+    "$PY" - "$ROOT" <<'PY'
+import sys
+
+import yaml
+
+root = sys.argv[1]
+with open(f"{root}/templates/compose/otel-collector.yml", encoding="utf-8") as fh:
+    col = yaml.safe_load(fh)
+
+problems = []
+conn = (col.get("connectors") or {}).get("spanmetrics") or {}
+events = conn.get("events")
+if not isinstance(events, dict) or events.get("enabled") is not False:
+    problems.append(
+        "spanmetrics events.enabled must be explicitly false: the `exceptions` "
+        "counter it mints is the DEPRECATED exception span-event convention, and "
+        "the replacement is an exception log record on the logs pipeline"
+    )
+
+pipelines = ((col.get("service") or {}).get("pipelines") or {})
+logs = pipelines.get("logs") or {}
+if not logs.get("receivers"):
+    problems.append(
+        "no logs pipeline, so there is nowhere for an exception log record to "
+        "arrive — migrating from span events to logs means having the logs half"
+    )
+if not logs.get("exporters"):
+    problems.append("no logs exporter: the crash layer would be collected and dropped")
+
+# The signal that receives exceptions has to receive them from somewhere other
+# than a span. `otlp` is how an SDK sends a log record; `syslog`/`filelog` is
+# how a container's stderr becomes one with no per-language SDK (PLAN.md §7b
+# layer 2). Neither alone is the whole contract.
+if "otlp" not in (logs.get("receivers") or []):
+    problems.append("the logs pipeline does not receive otlp, so an SDK cannot send an exception log record")
+if not any(r.startswith(("syslog", "filelog")) for r in (logs.get("receivers") or [])):
+    problems.append(
+        "the logs pipeline tails no container stdout/stderr, so PLAN.md §7b's "
+        "zero-SDK crash layer is not implemented"
+    )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check 'otel-collector signals  (exceptions as logs, not span events)' exception_signal_check
+
+  # No buffering, no retry, no warning storm. Same three properties core's
+  # otel-endpoint.schema.json pins to `none` for a service's own SDK, asserted
+  # here for the collector that every service exports into. A queue with
+  # retry_on_failure is a background thread waking on a timer for the life of
+  # the process while Tempo is down, and it is invisible in every dashboard
+  # because nothing is being recorded.
+  degrade_honestly_check() {
+    "$PY" - "$ROOT" <<'PY'
+import sys
+
+import yaml
+
+root = sys.argv[1]
+with open(f"{root}/templates/compose/otel-collector.yml", encoding="utf-8") as fh:
+    col = yaml.safe_load(fh)
+
+problems = []
+for name, cfg in (col.get("exporters") or {}).items():
+    cfg = cfg or {}
+    queue = cfg.get("sending_queue")
+    if isinstance(queue, dict) and queue.get("enabled") is not False:
+        problems.append(
+            f"exporter {name}: sending_queue must be explicitly disabled — a queue "
+            f"that accepts spans while Tempo is down is a memory leak with a "
+            f"telemetry-shaped trigger"
+        )
+    retry = cfg.get("retry_on_failure")
+    if isinstance(retry, dict) and retry.get("enabled") is not False:
+        problems.append(
+            f"exporter {name}: retry_on_failure must be explicitly disabled — a "
+            f"retry loop against a dead endpoint is a thread waking on a timer "
+            f"for the life of the process"
+        )
+
+pipelines = ((col.get("service") or {}).get("pipelines") or {})
+for signal, pipe in pipelines.items():
+    procs = pipe.get("processors") or []
+    if procs and procs[0] != "memory_limiter":
+        problems.append(
+            f"{signal} pipeline starts with {procs[0]!r}, not memory_limiter: "
+            f"without a limiter a runaway service takes the collector down and "
+            f"every other service loses its telemetry at the same moment"
+        )
+
+if not ((col.get("extensions") or {}).get("health_check")):
+    problems.append(
+        "no health_check extension, so the compose healthcheck has nothing real "
+        "to probe and `up --wait` cannot mean anything"
+    )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check 'otel-collector degradation  (no queue, no retry, limiter first, health_check)' degrade_honestly_check
 
   compose_check() {
     "$PY" - "$ROOT" <<'PY'
@@ -599,6 +992,511 @@ if problems:
 PY
   }
   check 'templates/compose/docker-compose.yml  (pinned, healthy, parameterized)' compose_check
+
+  # The four backing services. Grafana, Loki, Tempo and Mimir are AGPL-3.0 and
+  # are shipped UNMODIFIED, which is the condition the licence cares about and
+  # the one this check can actually hold: no `build:` (a build is a fork), no
+  # image from a cafaye-owned registry, no volume overlaying anything into the
+  # vendor's own tree. Configuration is fine and is what the flags are; a
+  # modified binary is not, and `build:` is the only way that gets here.
+  #
+  # They are also bounded, because a dev machine running six services plus four
+  # more needs bounded memory or the whole thing gets killed and blamed on
+  # something else.
+  backing_check() {
+    "$PY" - "$ROOT" <<'PY'
+import sys
+
+import yaml
+
+root = sys.argv[1]
+with open(f"{root}/templates/compose/docker-compose.yml", encoding="utf-8") as fh:
+    doc = yaml.safe_load(fh)
+services = doc.get("services") or {}
+
+BACKING = {
+    "grafana": "grafana/grafana",
+    "loki": "grafana/loki",
+    "tempo": "grafana/tempo",
+    "mimir": "grafana/mimir",
+}
+problems = []
+
+for name, upstream in BACKING.items():
+    svc = services.get(name)
+    if not isinstance(svc, dict):
+        problems.append(f"missing service: {name}")
+        continue
+    if "build" in svc:
+        problems.append(
+            f"{name}: has a build: stanza, which is a fork. AGPL-3.0 covers the "
+            f"Grafana SERVER; shipping it unmodified is the condition, and "
+            f"rebuilding the image is how that condition gets broken quietly."
+        )
+    image = svc.get("image") or ""
+    if not image.startswith(upstream + ":"):
+        problems.append(
+            f"{name}: image {image!r} is not an unmodified upstream {upstream} image"
+        )
+    if not svc.get("healthcheck"):
+        problems.append(f"{name}: no healthcheck, so `up --wait` cannot gate on it")
+    if not svc.get("mem_limit"):
+        problems.append(
+            f"{name}: no mem_limit. Six services plus four more on one laptop "
+            f"needs a bound, or the stack is killed and the cause is attributed "
+            f"to whatever was running when the machine ran out of memory."
+        )
+    profiles = svc.get("profiles") or []
+    if "observability" not in profiles:
+        problems.append(
+            f"{name}: not in the `observability` profile. The four backends are "
+            f"the expensive half of the stack, and an escape hatch that does not "
+            f"exist is not an escape hatch — but they must still be what the "
+            f"DEFAULT bin/dev path brings up, which is a property of bin/dev, "
+            f"not of the profile."
+        )
+
+# The collector is NOT in that profile, deliberately: it is the default value
+# of <SERVICE>_OTEL_ENDPOINT, so a service with nothing switched on has
+# somewhere to send. Without the collector running, a service's exporter has a
+# dead endpoint, and the collector is what makes that dead endpoint cheap.
+if "observability" in ((services.get("otel-collector") or {}).get("profiles") or []):
+    problems.append(
+        "otel-collector is in the `observability` profile, so a developer who "
+        "turns the backends off also loses the endpoint every service points at "
+        "by default"
+    )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check 'docker-compose.yml  (four AGPL backends, unmodified, pinned, bounded)' backing_check
+
+  # The port range. kit-02 was moving the stack onto a high range so two
+  # checkouts — or a developer's own postgres — do not collide; this check is
+  # what makes that a rule rather than an intention.
+  #
+  # Asserted as a RANGE and as UNIQUENESS, not as a list of approved ports: a
+  # list would have to be edited every time a service is added, and a check
+  # that must be edited is a check that gets skipped. Every published host port
+  # must sit in the documented block, must be a ${KIT_*:default} (the existing
+  # check covers that) and must not be used twice.
+  port_range_check() {
+    "$PY" - "$ROOT" <<'PY'
+import os
+import sys
+
+import yaml
+
+root = sys.argv[1]
+# The block kit claims for the whole stack, one hundred per service. Declared
+# here and in .env.example; the check reads the declared block so widening it is
+# a deliberate edit in two visible places.
+LOW, HIGH = 15000, 15999
+BLOCK = f"{LOW}-{HIGH}"
+
+with open(f"{root}/templates/compose/docker-compose.yml", encoding="utf-8") as fh:
+    services = (yaml.safe_load(fh).get("services") or {})
+
+problems = []
+seen = {}
+for name, svc in services.items():
+    for entry in (svc or {}).get("ports") or []:
+        if isinstance(entry, dict):
+            host = str(entry.get("published", ""))
+        else:
+            host = str(entry).partition(":")[0]
+        if "${" in host:
+            # Read the DEFAULT, which is what a fresh clone binds.
+            host = host.split(":-", 1)[1].rstrip("}") if ":-" in host else host
+        if not host.isdigit():
+            continue
+        port = int(host)
+        if not (LOW <= port <= HIGH):
+            problems.append(
+                f"{name}: published host port {port} is outside the {BLOCK} block "
+                f"kit claims. 5432 and 6379 are the two most likely things on a "
+                f"developer machine already, and a dev stack that loses to them "
+                f"is a dev stack nobody runs."
+            )
+        if port in seen:
+            problems.append(f"{name}: host port {port} is already published by {seen[port]}")
+        seen[port] = name
+
+# The block has to be written down, or "claim" means nothing to the next person.
+example = open(f"{root}/templates/compose/.env.example", encoding="utf-8").read()
+if BLOCK not in example:
+    problems.append(
+        f"templates/compose/.env.example does not state the {BLOCK} block this "
+        f"check enforces: a port range nobody can read is a range nobody respects"
+    )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check "docker-compose.yml  (host ports all in the 15000-15999 block, no reuse)" port_range_check
+
+  # TELEMETRY IS NEVER IN THE READINESS PATH.
+  #
+  # A service that hangs on startup because the collector is down is worse than
+  # no telemetry at all, and the way it happens is always the same shape: one
+  # `depends_on: [otel-collector]` added for convenience, then a readiness probe
+  # that transitively waits on it, then a deploy that will not roll out because
+  # a dev-local collector is not running in the cluster.
+  #
+  # This is the static half of the proof; tests/no_telemetry_in_readiness.sh is
+  # the live half. Neither alone is enough: the static check cannot see a probe
+  # that checks a collector over the network, and the live check only sees the
+  # one topology it builds.
+  readiness_check() {
+    "$PY" - "$ROOT" <<'PY'
+import os
+import re
+import sys
+
+import yaml
+
+root = sys.argv[1]
+with open(f"{root}/templates/compose/docker-compose.yml", encoding="utf-8") as fh:
+    services = (yaml.safe_load(fh).get("services") or {})
+
+problems = []
+for name, svc in services.items():
+    if name == "otel-collector":
+        continue
+    depends = svc.get("depends_on") or []
+    if isinstance(depends, dict):
+        depends = list(depends)
+    for dep in depends:
+        if "otel" in str(dep):
+            problems.append(
+                f"{name}: depends_on {dep!r}. Telemetry must never be in anyone's "
+                f"readiness path: a service that waits for the collector serves "
+                f"no traffic while the collector is down, which is strictly worse "
+                f"than serving traffic with no traces."
+            )
+    probe = svc.get("healthcheck") or {}
+    test = " ".join(str(probe.get("test", [])))
+    for target in ("otel-collector", "4317", "4318", "13133"):
+        if target in test:
+            problems.append(
+                f"{name}: its healthcheck probes {target}. core's probes schema "
+                f"wants /healthz to consult NOTHING and /readyz to check real "
+                f"dependencies — the collector is not one."
+            )
+
+# bin/dev is the other half: if it waits on the collector before migrating, then
+# a dead collector is a dead dev machine even though nothing depends on it.
+dev = open(f"{root}/templates/bin/dev.sh", encoding="utf-8").read()
+up_body = dev.split("\nup() {", 1)[-1].split("\n}\n", 1)[0]
+for needle, why in (
+    ("healthz", "bin/dev must not probe a telemetry endpoint"),
+    ("4317", "bin/dev must not wait on an OTLP port"),
+    ("4318", "bin/dev must not wait on an OTLP port"),
+):
+    if needle in up_body:
+        problems.append(f"{why} (found {needle!r} in bin/dev's up path)")
+
+# And the rule has to reach the service repos, not just this file: a service
+# adopting kit is where a probe would actually be written.
+agents = open(f"{root}/templates/AGENTS.md", encoding="utf-8").read()
+if "OTEL" not in agents and "telemetry" not in agents:
+    problems.append(
+        "templates/AGENTS.md says nothing about telemetry and readiness, so the "
+        "rule never reaches the service repo where a probe would be written"
+    )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check 'compose + bin/dev  (telemetry is never in a readiness path)' readiness_check
+
+  # The escape hatch is first-class, so it is checked like one. `<SERVICE>_
+  # OTEL_ENDPOINT` is the ONLY contract (core D16) and the shipped collector is
+  # its default value — not a requirement. The second half is the property that
+  # is easy to lose: a "disabled" path that still dials out is worse than no
+  # telemetry support at all.
+  escape_hatch_check() {
+    "$PY" - "$ROOT" <<'PY'
+import os
+import re
+import sys
+
+root = sys.argv[1]
+snippets = {
+    "go": "otelhttp.go.snippet",
+    "ruby": "rack_middleware.rb.snippet",
+    "elixir": "phoenix_telemetry.ex.snippet",
+    "rust": "otel_client.rs.snippet",
+    "python": "fastapi.py.snippet",
+    "node": "hono.ts.snippet",
+}
+
+problems = []
+for lang, name in snippets.items():
+    path = os.path.join(root, "templates", "otel", lang, name)
+    if not os.path.isfile(path):
+        continue  # artifact presence is another check's job
+    body = open(path, encoding="utf-8").read()
+    stripped = "\n".join(line.split("#", 1)[0] for line in body.splitlines())
+    where = f"otel/{lang}/{name}"
+
+    # 1. It must read the cafaye variable, not only the OTel standard one.
+    #    core D16: `<SERVICE>_OTEL_ENDPOINT`, derived from the service name so
+    #    it is knowable without reading any code.
+    if not re.search(r'"?[A-Z][A-Z0-9]*_OTEL_ENDPOINT"?', stripped):
+        problems.append(
+            f"{where}: reads no *_OTEL_ENDPOINT variable. That variable is the "
+            f"only contract (core D16) and the shipped collector is just its "
+            f"default value."
+        )
+
+    # 2. On by default. The default endpoint is the collector that ships with
+    #    the stack, NOT "no exporter". A snippet that returns a no-op provider
+    #    when the variable is absent has made telemetry opt-in, which is the
+    #    exact thing the user directive reversed.
+    if not re.search(r"OTEL_EXPORTER_OTLP_ENDPOINT|otel-collector:431", stripped):
+        problems.append(
+            f"{where}: does not name the shipped collector as the default value "
+            f"of the endpoint variable, so telemetry is opt-in rather than on by "
+            f"default (PLAN.md §7b)"
+        )
+
+    # 3. The free no-op is pinned to the OpenTelemetry spec's own switch, not to
+    #    a cafaye reimplementation. Six reimplementations of "disabled" is how
+    #    six services acquire six definitions of it, and the difference between
+    #    them is somebody's production incident.
+    if "OTEL_SDK_DISABLED" not in stripped:
+        problems.append(
+            f"{where}: does not honour OTEL_SDK_DISABLED. core pins the no-op to "
+            f"the OTel spec's own switch; a cafaye-specific one is the thing D16 "
+            f"was decided against."
+        )
+
+    # 4. The four negatives from otel-endpoint.schema.json, asserted on the
+    #    code rather than the prose: no warning on the disabled path, no retry
+    #    loop, no queue, no dial at boot.
+    low = stripped.lower()
+    for bad, why in (
+        ("retry", "no retry loop against a dead endpoint"),
+        ("retry_on_failure", "no retry loop against a dead endpoint"),
+    ):
+        if re.search(rf"\b{bad}\b", low):
+            problems.append(f"{where}: configures {bad!r}; the no-op path must have {why}")
+    for pat, why in (
+        (r"\b(console\.warn|log\.warning|Logger\.warn|logger\.warn)\b", "no warning spam"),
+        (r"sending_queue|max_queue_size|enqueue", "no buffering"),
+    ):
+        if re.search(pat, stripped):
+            problems.append(f"{where}: {why} on the disabled path (matched {pat})")
+
+    # 5. `error.message` is prohibited by name. An SDK adds it by default, so a
+    #    snippet that does not say so ships a leak by default rather than by
+    #    decision — and core's metrics schema refuses the OTel spelling as well
+    #    as the dotted one for exactly that reason.
+    if re.search(r"error[._]message", stripped):
+        problems.append(
+            f"{where}: records error.message. core prohibits it BY NAME: a "
+            f"provider's content-policy rejection quotes the offending content "
+            f"back at you, so the message is a prompt by another route."
+        )
+    if "error.type" not in stripped and "error_type" not in stripped:
+        problems.append(
+            f"{where}: never records error.type, which is the bounded class that "
+            f"answers 'one place to see all errors' (PLAN.md §7b, core D14)"
+        )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check 'templates/otel/*/*.snippet  (cafaye endpoint, on by default, free no-op)' escape_hatch_check
+
+  # -------------------------------------------------------------------------
+  # Grafana provisioning. "A dashboard a self-hoster has to rebuild is not a
+  # dashboard we shipped" (PLAN.md §7b), so everything is a file and the files
+  # are parsed here rather than clicked together by hand.
+  #
+  # The second check is the research constraint, and it is the one that matters:
+  # the predicate for "this is an error" is span STATUS, not error.type. The
+  # semconv expects high cardinality in error.type when no filter is applied, so
+  # a fleet-wide breakdown grouped by error.type is wrong however good it looks.
+  grafana_provisioning_check() {
+    "$PY" - "$ROOT" <<'PY'
+import json
+import os
+import sys
+
+import yaml
+
+root = sys.argv[1]
+base = f"{root}/templates/compose/grafana"
+problems = []
+
+if not os.path.isdir(base):
+    sys.exit("templates/compose/grafana/ is missing: a dashboard a self-hoster has to rebuild is not a dashboard we shipped")
+
+ds_path = f"{base}/provisioning/datasources/datasources.yml"
+if not os.path.isfile(ds_path):
+    sys.exit(f"missing {ds_path}")
+with open(ds_path, encoding="utf-8") as fh:
+    datasources = (yaml.safe_load(fh).get("datasources") or [])
+
+uids = {}
+for ds in datasources:
+    uid = ds.get("uid")
+    if not uid:
+        problems.append(f"datasource {ds.get('name')!r} has no uid; a dashboard that points at a datasource by uid cannot survive a rename")
+        continue
+    uids[uid] = ds.get("type")
+for need, kind in (("tempo", "tempo"), ("loki", "loki"), ("mimir", "prometheus")):
+    if need not in uids:
+        problems.append(f"no {kind} datasource with uid {need!r}: traces, logs and metrics are the three layers of §7b")
+    elif uids[need] != kind:
+        problems.append(f"datasource uid {need!r} is type {uids[need]!r}, expected {kind!r}")
+
+dash_dir = f"{base}/provisioning/dashboards"
+provider = f"{dash_dir}/dashboards.yml"
+if not os.path.isfile(provider):
+    problems.append(f"missing {provider}: without a provider stanza Grafana loads no dashboard at all")
+else:
+    with open(provider, encoding="utf-8") as fh:
+        opts = ((yaml.safe_load(fh).get("providers") or [{}])[0]).get("options") or {}
+    path = opts.get("path")
+    if not path:
+        problems.append(f"{provider} names no path, so the provider watches nothing")
+    elif not os.path.isabs(path):
+        # Grafana resolves a relative path against its own working directory,
+        # which in the image is /var/lib/grafana and nowhere a reader expects.
+        problems.append(f"{provider} path {path!r} is relative; Grafana resolves it against its own cwd and finds nothing")
+
+dashboards = sorted(
+    f for f in os.listdir(dash_dir) if f.endswith(".json") if os.path.isdir(dash_dir)
+) if os.path.isdir(dash_dir) else []
+if not dashboards:
+    problems.append("no dashboard JSON under provisioning/dashboards: the fleet error view is the centrepiece of §7b and it is a file")
+
+seen_uids = set()
+for name in dashboards:
+    with open(f"{dash_dir}/{name}", encoding="utf-8") as fh:
+        try:
+            dash = json.load(fh)
+        except Exception as exc:
+            problems.append(f"{name}: not valid JSON ({exc})")
+            continue
+    uid = dash.get("uid")
+    if not uid:
+        problems.append(f"{name}: no uid, so it is unaddressable and unlinkable")
+    elif uid in seen_uids:
+        problems.append(f"{name}: duplicate dashboard uid {uid!r}")
+    seen_uids.add(uid)
+    blob = json.dumps(dash)
+    for target in uids:
+        if f'"datasource": {{"type": "prometheus", "uid": "{target}"}}' in blob or f'"{target}"' in blob:
+            break
+    else:
+        problems.append(f"{name}: references none of the provisioned datasource uids {sorted(uids)}")
+
+# At least one alert rule, as a file.
+alerting = f"{base}/provisioning/alerting"
+if not os.path.isdir(alerting) or not [f for f in os.listdir(alerting) if f.endswith(".yml")]:
+    problems.append("no alert rule file: a stack that can render a dashboard but cannot page is half a stack")
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check 'grafana provisioning  (3 datasources, dashboards, alerting — all files)' grafana_provisioning_check
+
+  # The error predicate. PLAN.md §7b and the semconv, verbatim:
+  #
+  #   The predicate for "this is an error" is span status Error, not error.type.
+  #   error.type is a classification BENEATH the predicate, never the predicate.
+  #   Consumers are explicitly expected to see high cardinality in error.type
+  #   when no filter is applied, so a fleet-wide breakdown grouped by error.type
+  #   is valid only under a service.name filter.
+  #
+  # That is a sentence a dashboard author reads once and forgets, so it is
+  # asserted on the dashboard JSON: every panel that groups by an error class
+  # must be scoped to a service, and at least one panel must filter on status.
+  # A "fix" that makes this go red is a dashboard that looks better and answers
+  # the wrong question.
+  error_predicate_check() {
+    "$PY" - "$ROOT" <<'PY'
+import json
+import os
+import re
+import sys
+
+root = sys.argv[1]
+dash_dir = f"{root}/templates/compose/grafana/provisioning/dashboards"
+if not os.path.isdir(dash_dir):
+    sys.exit("no dashboard directory")
+
+problems = []
+grouped_by_class_globally = 0
+status_filtered = 0
+service_partitioned = 0
+
+def walk_targets(node):
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key in ("expr", "query", "rawSql", "definition", "jsonData"):
+                yield value
+            yield from walk_targets(value)
+    elif isinstance(node, list):
+        for item in node:
+            yield from walk_targets(item)
+
+for name in sorted(f for f in os.listdir(dash_dir) if f.endswith(".json")):
+    with open(f"{dash_dir}/{name}", encoding="utf-8") as fh:
+        dash = json.load(fh)
+    targets = [t for t in walk_targets(dash) if isinstance(t, str)]
+    blob = "\n".join(targets)
+
+    # `by (error_type)` / `group by ... error.type` with no service filter is
+    # the exact failure the research named. Note the `service_name` allowance
+    # below: the rule is "error.type is a drill-down INSIDE a service", and a
+    # template variable that selects the service is that drill-down.
+    for match in re.finditer(r"by\s*\(([^)]*)\)", blob):
+        clause = match.group(1)
+        if "error_type" in clause or "error\\.type" in clause:
+            window = blob[max(0, match.start() - 400) : match.end() + 200]
+            if not re.search(r"service_name\s*[=!~]+", window):
+                grouped_by_class_globally += 1
+                problems.append(
+                    f"{name}: groups by an error class with no service filter. The "
+                    f"predicate for 'this is an error' is span STATUS; error.type is "
+                    f"a drill-down inside a service, and the semconv expects high "
+                    f"cardinality there when no filter is applied."
+                )
+
+    if re.search(r"status(_\.?code)?\s*[=!]+\s*\"?STATUS_CODE_ERROR", blob) or \
+       re.search(r'status\s*=\s*error', blob) or re.search(r"\{\s*status\s*=", blob):
+        status_filtered += 1
+    if re.search(r"by\s*\(\s*service_name\s*\)", blob) or "service_name" in blob:
+        service_partitioned += 1
+
+if not status_filtered:
+    problems.append(
+        "no panel filters on span status error. Grouping by error.type without "
+        "the status predicate answers 'which classes exist' rather than 'what "
+        "failed' — a request that failed without an error.type is invisible to it."
+    )
+if not service_partitioned:
+    problems.append(
+        "no panel partitions by service.name. §7b's answer is 'partition by "
+        "resource.service.name, filter on status = error'; a single undifferentiated "
+        "total is the wall of ungrouped text the user asked whether cafaye could avoid."
+    )
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check 'grafana dashboards  (status is the predicate, error.type is a drill-down)' error_predicate_check
 
   # The wiring check that YAML parsing cannot do, and the one that caught a real
   # bug. otel-collector.yml interpolates ${env:NAME}, which the collector
@@ -705,10 +1603,15 @@ PY
   YAMLLINT="${KIT_YAMLLINT:-$ROOT/.venv/bin/yamllint}"
   if [ -x "$YAMLLINT" ]; then
     section 'static: compose templates are yamllint clean'
-    for f in otel-collector.yml docker-compose.yml; do
-      check "templates/compose/$f  (yamllint -c lint/yamllint.yml)" \
-        "$YAMLLINT" -c "$ROOT/lint/yamllint.yml" "$ROOT/templates/compose/$f"
-    done
+    # Every YAML under templates/compose, nested ones included. The provisioning
+    # tree is three directories deep and a glob of `templates/compose/*` reaches
+    # none of it, so a dashboard provider with a syntax error would ship
+    # unlinted while the two top-level files stayed clean.
+    while IFS= read -r f; do
+      [ -f "$f" ] || continue
+      path="${f#"$ROOT"/}"
+      check "$path  (yamllint -c lint/yamllint.yml)" "$YAMLLINT" -c "$ROOT/lint/yamllint.yml" "$f"
+    done <<<"$(find "$ROOT/templates/compose" -name '*.yml' -o -name '*.yaml' | sort)"
   else
     report SKIP 'yamllint (not installed: pip install -r tests/requirements.txt)'
   fi
@@ -822,6 +1725,7 @@ PY
   readme_check() {
     "$PY" - "$ROOT" <<'PY'
 import os
+import re
 import sys
 
 root = sys.argv[1]
@@ -833,11 +1737,37 @@ for path in (
     "templates/compose/.env.example",
     "templates/bin/dev.sh",
     "templates/otel/README.md",
+    "templates/compose/grafana/provisioning/dashboards",
+    "templates/compose/grafana/provisioning/datasources/datasources.yml",
+    "templates/compose/grafana/provisioning/alerting",
+    "templates/compose/loki",
+    "templates/compose/tempo",
+    "templates/compose/mimir",
 ):
     if path not in readme:
         problems.append(f"README.md never mentions {path}")
-    if not os.path.isfile(os.path.join(root, path)):
+    if not os.path.exists(os.path.join(root, path)):
         problems.append(f"README.md documents {path}, which does not exist")
+
+# The licence condition is the kind of sentence that gets edited away by a
+# copy-paste, and it is the one sentence in this file that is a legal statement
+# rather than a technical one. Asserted, because "ship them unmodified" only
+# helps anybody if the README says it.
+for phrase, why in (
+    ("AGPL", "the licence of the four backing services must be named"),
+    ("unmodified", "the unmodified condition is the whole point of the licence note"),
+    ("bring your own", "bring-your-own is a supported deployment, not a degraded mode"),
+):
+    if phrase.lower() not in readme.lower():
+        problems.append(f"README.md does not state {why} (looked for {phrase!r})")
+
+# The escape hatch, and the ports. A self-hoster reads the README and not the
+# code, so the variable name has to be in the README and so does the block.
+if not re.search(r"[A-Z]+_OTEL_ENDPOINT", readme):
+    problems.append("README.md never names the *_OTEL_ENDPOINT contract")
+if "15000" not in readme or "15999" not in readme:
+    problems.append("README.md does not state the host port range the stack claims")
+
 if problems:
     sys.exit("; ".join(problems))
 PY
@@ -1061,6 +1991,28 @@ if [ "$RUN_TELEMETRY" -eq 1 ]; then
     fi
     check "templates/otel/$lang  ($tool test suite)" "run_$lang"
   done
+fi
+
+# ===========================================================================
+# phase: observability — the two proofs that need a real collector
+# ===========================================================================
+
+if [ "$RUN_OBSERVABILITY" -eq 1 ]; then
+  section 'observability: the redaction boundary, against a real collector'
+
+  # Not skippable by preference. A dev machine with no docker gets a reported
+  # SKIP, because the alternative — running the suite and reporting PASS while
+  # the security claim went unexercised — is the shape of a proof nobody ran.
+  if ! have docker; then
+    report SKIP 'observability proofs (docker not installed)'
+  elif ! docker info >/dev/null 2>&1; then
+    report SKIP 'observability proofs (docker daemon not reachable)'
+  else
+    check 'tests/canary_test.sh  (a canary secret reaches no exporter)' \
+      bash "$ROOT/tests/canary_test.sh"
+    check 'tests/no_telemetry_in_readiness.sh  (collector killed, service still serves)' \
+      bash "$ROOT/tests/no_telemetry_in_readiness.sh"
+  fi
 fi
 
 # ===========================================================================
