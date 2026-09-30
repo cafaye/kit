@@ -21,7 +21,7 @@ build lands in kit once, and reaches the next service in a pull request.
 | Path | What it is | Who uses it |
 |------|-----------|-------------|
 | `.github/workflows/ci.reusable.yml` | One reusable GitHub Actions workflow. Input `language` picks one of seven jobs — install, lint, test, coverage gate. Opt-in `telemetry` input adds the traceparent conformance job; opt-in `required-tier` demands a tier by gate-variable name. **Plus two security jobs: `secrets` (no opt-in) and `zizmor` (opt-in).** No job builds or pushes an image. | Every service, via a 6-line `.github/workflows/ci.yml` |
-| `.gitleaks.toml` | The secret-scanner allowlist, and nothing else. `extend.useDefault = true`, so the rules stay gitleaks'. Every entry carries a `description`. | Copied verbatim by every service |
+| `.gitleaks.toml` | The secret-scanner allowlist, and nothing else. `extend.useDefault = true`, so the rules stay gitleaks'. Every entry carries a `description`. One entry is here for kit's own test fixture — **delete it when you copy this file**. | Copied verbatim by every service |
 | `.github/zizmor.yml` | zizmor's reasoned baselines. One entry. `unpinned-uses` is deliberately **absent** — see `DECISIONS.md`. | Every service, copied verbatim |
 | `lint/yamllint.yml` | YAML style, with the three rules Actions forces us to retune. | Any repo that lints its own YAML; kit's gate uses it on itself |
 | `lint/golangci.yml` | golangci-lint v2, correctness linters on, `errcheck` excluded only for `Close`/`Flush`. | Go services |
@@ -476,6 +476,16 @@ In order:
    why. A description under 40 characters fails the check, and an entry with
    none fails harder: an allowlist that grows and is never pruned is not an
    allowlist, it is a deferred disclosure.
+   - **Delete the entry kit's file already carries.** kit's own allowlist has one
+     entry, for a JWT-shaped test fixture at `tests/deploy_test.sh` — a path your
+     repository does not have. An allowlist that matches nothing excuses nothing,
+     so leaving it cannot weaken your scan, but it is a justification written about
+     somebody else's file, and that is the thing to not copy. Write yours for what
+     *your* finding actually is.
+   - Scope it as narrowly as gitleaks allows: `targetRules` to name the one rule,
+     `paths` to name the one file, and `condition = "AND"` **written out** —
+     gitleaks' default is `OR`, so an entry with two criteria silently becomes a
+     union the day a second one is added.
 3. **Never** add `continue-on-error` to the `secrets` job, and **never** create a
    `.gitleaksignore`. Both fail `tests/validate.sh`, and both are the two ways a
    security job becomes a report while the badge stays green.

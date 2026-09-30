@@ -36,12 +36,19 @@
 #   secret.
 #
 # THE ENTRIES
-#   There are none. kit's own history scans clean (verified: 33 commits, no
-#   findings, with these rules), and the canary harness deliberately never
-#   commits a credential-shaped string — the fake credential is BUILT at run
-#   time from a prefix, precisely so that it needs no allowlist entry here. A
-#   test fixture that had to be allowlisted would be a test fixture that had
-#   taught the reader of this file that allowlisting a credential is normal.
+#   There is exactly one, and it is the narrowest thing the config format
+#   allows. kit's own history scans clean apart from it (verified with these
+#   rules), and the canary harness deliberately never commits a
+#   credential-shaped string — the fake credential is BUILT at run time from a
+#   prefix, precisely so that it needs no allowlist entry here.
+#
+#   What forced the first entry is the same principle arriving from outside:
+#   kit-16's deploy story proves its redactor catches a JWT **by shape** — a
+#   value the redactor cannot know by name, which is the only kind of canary
+#   that can fail. To assert that, the token has to exist in the test file, and
+#   a JWT-shaped string committed to a repository IS a gitleaks finding. So the
+#   fixture is real, the finding is real, and the two facts are reconciled here
+#   rather than by weakening the scanner or by weakening the test.
 #
 #   An adopting service will have entries. The check that requires a reason per
 #   entry ships in tests/validate.sh, which is the file a service copies, so the
@@ -67,6 +74,78 @@ useDefault = true
 #   description = "why this is a false positive, in one sentence"
 #   paths = ['''^fixtures/known-fake-credentials\.txt$''']
 #
-# Zero entries is a valid state, and it is the state kit is in. The reason the
-# check below is not vacuous is that it runs in every adopting service too,
-# where entries exist.
+# `condition = "AND"` is written out rather than left to the default, and the
+# reason is a trap worth naming: gitleaks' default is **OR**
+# (`config/allowlist.go` — an empty `condition` parses to `AllowlistMatchOr`).
+# With only `paths` populated, OR and AND happen to agree — there is no second
+# criterion for OR to escape through — so the line below is currently doing
+# nothing at all. It is there so that the day somebody adds `regexes` or
+# `commits` to this entry, the entry cannot silently become a union and excuse
+# more than it says. A scoping line that only works while nobody edits it is not
+# a scoping line.
+
+[[allowlists]]
+# WHAT THIS ACCEPTS, EXACTLY: the `jwt` rule's finding on the file
+# `tests/deploy_test.sh`. Nothing else.
+#
+#   - `targetRules = ["jwt"]` — one rule, gitleaks' own, unmodified. This is
+#     routing, not a criterion: it decides which rules consult this allowlist at
+#     all. Every other rule still fires on that file — a `generic-api-key`
+#     planted in `tests/deploy_test.sh` is still reported with this entry in
+#     place (verified in a throwaway repository, both directions). And
+#     `targetRules` on its own is not available as a looser option: gitleaks
+#     rejects an entry with no `commits`/`paths`/`regexes`/`stopwords` outright
+#     (verified — it refuses to load the config), so a bare "ignore jwt
+#     everywhere" is not something this file can say even by accident.
+#   - `paths` — the one path kit-16's redactor proof lives at, which is the only
+#     criterion this entry actually has. The same JWT-shaped string in any other
+#     file is still reported (verified the same way), which is the property that
+#     makes this an allowlist rather than a blanket.
+#   - `condition = "AND"` — inert today, and deliberately so; see the note above
+#     this entry.
+#
+# WHY IT IS NOT A SECRET. `JWT_CANARY` in `tests/deploy_test.sh` is a fixture
+# whose three base64url segments decode, in full, to: `{"alg":"HS256"}`,
+# `{"sub":"kit16"}`, and the signature `CYNaRYLFAKRESULTTESQL` plus one stray
+# non-printable byte. That third segment is a misspelled reading of "canary,
+# fake" and nothing else — there is no key, no issuer, no subject a token could
+# authenticate. It was planted by kit-16, and the scanner caught it working
+# exactly as intended: this rule fires on any three-segment `eyJ…` string it was
+# never told about, in a commit (`924b725`) whose own message records that the
+# work was recovered from a killed process. The finding is the scanner being
+# right about the SHAPE. And the name is load-bearing in the other direction:
+# `JWT_CANARY` as a variable name is what tells the next reader this string is
+# a fixture rather than a leak.
+#
+# WHAT WOULD MAKE THIS ENTRY WRONG, AND HOW IT WAS CHECKED. Allowlisting a
+# canary is only honest if the canary still proves what it proved. The
+# redactor's JWT pattern was broken in a scratch copy
+# (`eyJ…\.[A-Za-z0-9_-]{4,}` → `{99,}`, so it cannot match an ordinary
+# signature) and `tests/deploy_test.sh` went red on exactly one line — "the
+# redactor left a JWT in the output" — with its other 16 claims still green.
+# The assertion is load-bearing after this entry, not merely present. Reverted,
+# and the scratch copy matches the branch byte for byte.
+#
+# THE ALTERNATIVE, RECORDED BECAUSE IT WAS THE OBVIOUS ONE. kit-16 could make
+# the canary not JWT-shaped — build it at run time from a prefix, the way
+# `templates/secrets/` already does. That is a strictly better answer and it is
+# kit-16's call, not this packet's: that branch is not merged here, and an
+# allowlist entry that stops matching when the fix lands is the correct thing to
+# leave behind in the meantime. If the entry ever matches nothing, that is the
+# signal it is stale — delete it, do not leave it decaying.
+#
+# AND WHAT A SERVICE THAT COPIES THIS FILE INHERITS. This file is copied verbatim
+# into thirteen repositories, and the entry below names `tests/deploy_test.sh`,
+# which none of them has. A `paths` allowlist that matches nothing excuses
+# nothing — the scan is unaffected — but it is a line in a security config that
+# explains itself in terms of a repository it is not in, and an entry whose reason
+# is only true of the file it came from is how the next reader learns that
+# descriptions are optional in practice. **A service that copies this file should
+# delete the entry below, and add its own when it has a reason.** gitleaks cannot
+# report a dead allowlist entry the way `templates/tier/skip-allowlist`'s hygiene
+# rules report a dead one there, so the obligation is the reader's; saying so is
+# the only place it can be said.
+description = "the jwt rule on tests/deploy_test.sh only: kit-16's JWT_CANARY is a deliberate fixture proving the deploy redactor catches JWT-shaped input it was never told about, so the finding is the scanner working"
+condition = "AND"
+targetRules = ["jwt"]
+paths = ['''^tests/deploy_test\.sh$''']

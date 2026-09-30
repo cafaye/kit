@@ -196,6 +196,20 @@ which is what this repository's own scanner reports, and allowlisting it teaches
 the next reader that allowlisting a credential is normal. Two checks enforce it:
 one inside the Go suite, one over the whole tree.
 
+**`.gitleaks.toml` now has one entry, and it is not that.** kit-16's deploy suite
+proves the redactor scrubs a JWT **by shape** — a value the filter cannot know by
+name, which is the only canary that can fail — so that token is committed and the
+`jwt` rule fires on it. The entry is scoped to `targetRules = ["jwt"]` **and**
+`paths = ['''^tests/deploy_test\.sh$''']`, measured in both directions: a
+`generic-api-key` in that same file and a `jwt` in a different file are both still
+reported. The distinguishing property is not the scoping, it is that the string is
+a **fixture whose name says so** (`JWT_CANARY`, and its own comment says a value
+the redactor cannot know by name is half the test) rather than a credential-shaped
+blob wearing a descriptive variable name. `templates/secrets/`'s canary does not
+have that option: a redactor can be taught nothing and still be defeated by a
+string it does not recognise, but a leaked credential does not become safe because
+a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
+
 - **observability** — the two claims that are worth nothing unexercised: a
   canary secret in ten leak shapes reaches no exporter (and the allowed data
   survives), and a service starts, serves and reports healthy with the collector
@@ -394,4 +408,7 @@ an `option` with no `job` is a green build that ran nothing.
 - [ ] `CHANGELOG.md` has an entry
 - [ ] You did not weaken a check, a threshold, or a pin to get green
 - [ ] If you touched the secret scanner, you did not add an allowlist entry
-      without a reason, and you did not add one to `continue-on-error`
+      without a reason, you did not add one to `continue-on-error`, and if you
+      added one you **proved the thing it excuses can still fail** — an allowlist
+      entry that silences a live proof is not an allowlist entry, it is a deleted
+      test with a comment attached

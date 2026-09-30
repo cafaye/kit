@@ -67,6 +67,62 @@ semver contract — it is consumed by *calling*
 
 ### Fixed
 
+- **The gitleaks gate was red on kit-16's JWT canary, and the allowlist was empty
+  by design.** `.gitleaks.toml` carried no `[[allowlists]]` entry because kit's own
+  history scanned clean — but the gate runs `git log --all`, and every worker in
+  this fleet is a worktree of one shared repository, so `--all` reaches
+  `worker/kit-16-deploy`'s commit `924b725`: a `jwt` finding on
+  `tests/deploy_test.sh` line 155. It is a fixture. kit-16's deploy story proves
+  the redactor scrubs a token the deploy never supplied, and a canary built from a
+  name the filter already knows would prove nothing — so the token is committed
+  and the `jwt` rule fires on it. **The scanner did the one thing it is for.**
+  The entry is the narrowest the config format allows — `targetRules = ["jwt"]`
+  with `paths = ['''^tests/deploy_test\.sh$''']`, and `condition = "AND"`
+  written out rather than left to the default, which is **OR**
+  (`config/config.go`, `parseAllowlist`: an empty `condition` maps to
+  `AllowlistMatchOr`) and would silently make the entry a union the day somebody
+  adds a second criterion. Measured in a throwaway repository, both directions: a
+  `jwt` in that file is suppressed, while a `generic-api-key` in the **same file**
+  and a `jwt` in a **different file** are both still reported.
+  - **The canary was re-proved after the entry was added**, because allowlisting a
+    canary is only honest if the canary can still fail. `redact.py`'s JWT pattern
+    weakened from `\.[A-Za-z0-9_-]{4,}` to `{99,}` in a scratch export of
+    `worker/kit-16-deploy`, and `tests/deploy_test.sh` went red on **exactly one**
+    claim — "the redactor left a JWT in the output" — with its other 16 green.
+    Reverted, and the scratch copy is byte-identical to the branch.
+  - **The better fix is kit-16's, and it is recorded as such.** The canary could
+    be assembled at run time from a prefix, the way `templates/secrets/` already
+    does, which is the pattern that exists so this file never needs an entry. That
+    branch is not merged here. The entry is written so it decays: if kit-16 stops
+    committing the string it matches nothing, and the next reader deletes it.
+  - **The scan was not narrowed.** `--all` is what catches a secret that only ever
+    existed on a branch, and it is the reason this finding was ever visible: on a
+    single-branch clone the canary is invisible and the gate is green.
+  - **README now says to delete the entry when copying the file.** kit's config is
+    copied verbatim into thirteen repositories, and this entry names
+    `tests/deploy_test.sh`, which none of them has. A `paths` allowlist matching
+    nothing excuses nothing, so it cannot weaken a service's scan — but an entry
+    whose reason is only true of the repository it came from is how the next reader
+    learns that descriptions are optional in practice. gitleaks cannot report a
+    dead allowlist entry the way `templates/tier/skip-allowlist` reports a dead one
+    there, so the obligation is the reader's, and the README is the only place it
+    can be stated.
+- **`templates/otel/ruby` is red on master, and this merge neither caused nor
+  fixed it.** Three `NoMethodError`s for `Array#filter_map` (Ruby 2.7+,
+  `traceparent.rb:278`) under `/usr/bin/ruby` 2.6.10. Re-derived rather than
+  inherited: `run_ruby` is byte-identical to master's, `git diff master --
+  templates/otel/ruby/` is empty, and `git archive master` into a clean directory
+  reproduces `3 errors` with master's own template and master's own runner —
+  while the pinned `ruby 4.0.1` gives `1407 assertions, 0 errors`. The
+  1370-vs-1407 gap is the tell: an interpreter too old to define a method does not
+  skip assertions, it aborts the three tests that reach it. kit-14 has the real fix
+  on `worker/kit-14-stale` (a `toolchain_floor_ruby` feature probe that FAILs
+  naming the toolchain, proven by its breakage 30); that branch is not merged here.
+  Not fixed here: it is pre-existing, it does not reproduce on this box's `PATH`,
+  and a fix for a red I cannot see is a change I cannot verify. Rewriting
+  `traceparent.rb` to avoid `filter_map` is recorded as the fix that is not the fix
+  — it makes the gate green on an old interpreter by removing what the suite
+  exists to exercise.
 - **`expect_red_check` reported a proof as failing when the check it named was
   the one that fired.** The matcher was `printf '%s\n' "$out" | grep -qF`, and
   under `set -o pipefail` a writer that takes SIGPIPE makes the whole pipeline
