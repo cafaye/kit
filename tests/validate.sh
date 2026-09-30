@@ -114,6 +114,15 @@ check() { # check <label> <command...>
   shift
   if out="$("$@" 2>&1)"; then
     report PASS "$label"
+    # A check that reports WHICH SPEC it verified is a different statement from
+    # one that only reports that it passed. core_check prints the resolved core
+    # commit and the spec version precisely so "it passed" is anchored to
+    # something a future reader can re-run — and swallowing its output on PASS
+    # made that line unreachable in the only case it matters. Most checks print
+    # nothing when they succeed, so this is silent for everything else.
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out" | sed 's/^/       /'
+    fi
   else
     report FAIL "$label"
     printf '%s\n' "$out" | sed 's/^/       /'
@@ -560,11 +569,31 @@ for name, cfg in exporters.items():
         if isinstance(value, str) and "${env:" not in value:
             problems.append(f"exporter {name}.{key} is a literal endpoint, not an ${{env:}} substitution")
 
-# The allowed set is exactly the three backends plus the local `debug`. Anything
+# The shipped stack is EXACTLY the three backends plus the local `debug`. Anything
 # else is an exporter a reviewer did not read, and `otlp` with a *defaulted*
 # endpoint is the exact shape of that mistake.
-ALLOWED_EXPORTERS = {"otlp/tempo", "otlp/loki", "otlp/mimir", "debug"}
-unknown = sorted(set(exporters) - ALLOWED_EXPORTERS)
+#
+# The backend set and the component type are asserted SEPARATELY, and the second
+# one was wrong as first written. This check originally pinned the literal set
+# {"otlp/tempo", "otlp/loki", "otlp/mimir", "debug"} — all three gRPC — and went
+# red against a correct config, because the three backends do NOT agree on wire
+# protocol: Tempo accepts OTLP over gRPC on :4317, while Loki's and Mimir's native
+# OTLP receivers are HTTP-only, mounted at `/otlp` on :3100 and :8080. A gRPC
+# exporter pointed at either of them fails to connect, which is a broken stack
+# that still satisfies "the only exporter is debug".
+#
+# So the claim under test is "these three backends and nothing else", and the
+# transport is a property of the backend rather than part of the name. Asserting
+# `(otlp|otlphttp)/<one of the three>` keeps that claim exactly as tight while
+# letting each backend be spoken to in the dialect it speaks.
+BACKENDS = {"tempo", "loki", "mimir"}
+unknown = []
+for name in exporters:
+    if name == "debug":
+        continue
+    kind, sep, backend = name.partition("/")
+    if not sep or kind not in ("otlp", "otlphttp") or backend not in BACKENDS:
+        unknown.append(name)
 if unknown:
     problems.append(
         "unexpected exporter(s): "
@@ -572,6 +601,21 @@ if unknown:
         + " — the shipped stack is tempo, loki, mimir and the local debug. A "
         "bring-your-own backend is an ${env:} endpoint, never a new exporter."
     )
+
+# ...and the converse, which the literal set above never checked. A config whose
+# exporters are only `debug` satisfies "nothing unexpected" while shipping no
+# observability at all, so a check written as a set difference alone passes on a
+# stack that collects everything and prints it. Asserted per signal below that
+# every pipeline has exporters, but that is a different claim: a pipeline can
+# point at `debug` alone and still be a pipeline. This is the one that says the
+# three backends are actually wired.
+for backend in sorted(BACKENDS):
+    if not any(n.partition("/")[2] == backend for n in exporters):
+        problems.append(
+            f"no exporter for {backend}: the shipped stack is three backends, and a "
+            "config with only `debug` is a stack that collects everything and "
+            "prints it rather than storing it"
+        )
 
 # The ordering, per pipeline. "The config has a redaction processor somewhere"
 # is exactly the check that passes while the metrics pipeline ships unredacted,
