@@ -1,0 +1,8 @@
+# kit's test suite needs a python with PyYAML (yaml.safe_load over every YAML)
+# and, optionally, yamllint (dogfoods lint/yamllint.yml against our own files).
+# shellcheck and node are used when present on PATH; both are optional.
+#
+#   python3 -m venv .venv && .venv/bin/pip install -r tests/requirements.txt
+#
+pyyaml
+yamllint

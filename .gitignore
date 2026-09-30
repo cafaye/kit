@@ -1,0 +1,5 @@
+# Local test aid for tests/validate.sh (see tests/requirements.txt).
+.venv/
+__pycache__/
+*.pyc
+.DS_Store
