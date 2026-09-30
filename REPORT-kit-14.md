@@ -530,6 +530,17 @@ Stated here rather than in a footnote.
    and `hadolint` — run inside **kit**, over **kit's** files; nothing in the
    fleet runs them over a service's copies, which is a gap this packet does not
    close and should not pretend to.
+10. **The machine OOM'd mid-run and the work was committed by a recovery step,
+    not by me.** The first `git log` on this branch shows
+    `recover(worker/kit-14-stale): uncommitted work left when the machine OOM'd`,
+    which correctly says that any conclusion I had drawn is void and that a
+    re-dispatch must re-run the gate. I re-ran it: `bash tests/validate.sh` is
+    green, and the §6 numbers were re-measured after the restart and are
+    unchanged (108 cells, 9/43/32/5/19, 80 pins, 0 unpinned, `--fail-on-unpinned`
+    exit 0 for each of the nine services individually). **The gate output at the
+    bottom of this report is from that re-run, not from before the restart** —
+    the house rule that a red control blocks the packet is also a rule about
+    *whose* run it was.
 
 ---
 
@@ -545,4 +556,25 @@ Stated here rather than in a footnote.
 | `tests/self_test.sh` | 23 → 29 breakages |
 | `AGENTS.md` | the layout tree, the count of breakages, a new section on the reporter and the ledger, `difflib`/`glob` added to the allowed-import list and the sentence made enforceable |
 | `README.md` | [what the fleet actually adopted](#what-the-fleet-actually-adopted) at the top, the templates half, the pin format |
-| `CHANGELOG.md` | the entry, and the three corrections to the brief's numbers |
+| `CHANGELOG.md` | the entry, and the corrections to the brief's numbers — including the one where I was wrong about the compose stacks |
+
+## 9. The gate
+
+Pasted from the run described in §7.10 — after the OOM restart, on the tree as
+committed.
+
+```
+$ bash tests/validate.sh
+```
+
+**pass and skip counts, separately, as the house rules require:**
+
+| | |
+| --- | --- |
+| checks failed | **0** |
+| checks skipped | **2** |
+
+The two skips are master's known-correct ones, unchanged by this packet: the
+Docker-dependent observability proofs (`canary_test.sh`,
+`no_telemetry_in_readiness.sh`) need a real collector and report a loud SKIP
+without one. `shellcheck` and `node` ran, so they are not among them.
