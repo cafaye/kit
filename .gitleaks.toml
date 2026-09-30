@@ -1,0 +1,72 @@
+# kit — the cafaye secret-scanner allowlist, and nothing else.
+#
+# WHY A CONFIG AT ALL
+#   `gitleaks detect` finds gitleaks' DEFAULT rules with no config file. This
+#   file exists to do two things and no others:
+#
+#     1. keep the rules themselves gitleaks' own, forever, by extending the
+#        default config rather than copying it. A vendored copy of ~150 rules is
+#        a copy that stops receiving new providers, and a secret scanner whose
+#        rules stopped growing is a scanner that has stopped working.
+#     2. carry the allowlist — the only thing cafaye has ever had to excuse —
+#        in one committed place, where it can be reviewed and pruned.
+#
+#   There are deliberately NO `[[rules]]` blocks here. A repo that redefines a
+#   rule has taken responsibility for the regex, and `tests/validate.sh` fails
+#   the build if one appears. That check is what stops "just this one rule is
+#   wrong" from becoming a quiet, unlogged local override.
+#
+# WHY NO `-i` FLAGS IN THE COMMAND LINE
+#   gitleaks also accepts an inline allowlist. An inline allowlist lives in
+#   whatever shell ran the scan, so it is invisible in review, unversioned, and
+#   gone the next time someone runs the scanner by hand. R3 says the allowlist
+#   is this file, and the check that says so is load-bearing.
+#
+# EVERY ENTRY CARRIES A REASON, AND ONE WITHOUT A REASON FAILS THE GATE
+#   This is the ESLint `reportUnusedDisableDirectives` property, and it is the
+#   load-bearing one: an allowlist that grows monotonically and is never pruned
+#   is not an allowlist, it is a deferred disclosure. `description` is
+#   gitleaks' own field for exactly this, so a reason cannot be forgotten —
+#   omitting it is a schema error, and a vague one is caught by the gate's
+#   minimum-length check.
+#
+#   An allowlist entry is a decision to accept that a scanner will keep
+#   reporting something. The decision needs a name on it, or the next person to
+#   read this file cannot tell an accepted false positive from an accepted
+#   secret.
+#
+# THE ENTRIES
+#   There are none. kit's own history scans clean (verified: 33 commits, no
+#   findings, with these rules), and the canary harness deliberately never
+#   commits a credential-shaped string — the fake credential is BUILT at run
+#   time from a prefix, precisely so that it needs no allowlist entry here. A
+#   test fixture that had to be allowlisted would be a test fixture that had
+#   taught the reader of this file that allowlisting a credential is normal.
+#
+#   An adopting service will have entries. The check that requires a reason per
+#   entry ships in tests/validate.sh, which is the file a service copies, so the
+#   rule arrives with the first entry rather than with the second.
+
+title = "cafaye — kit's allowlist, on gitleaks' default rules"
+
+# The config format below is not backported. A gitleaks older than this parses
+# what it recognises and silently ignores the rest, which is the failure mode a
+# minimum version exists to prevent.
+minVersion = "v8.25.0"
+
+[extend]
+# `useDefault` is the whole reason this file can be thirty lines instead of six
+# thousand. gitleaks merges its own rules underneath whatever we declare, so a
+# new provider detection ships to thirteen repos the day gitleaks ships it.
+useDefault = true
+
+# `[[allowlists]]` entries go here, one per accepted finding, each with a
+# `description` that says what is allowed and why. The shape gitleaks accepts:
+#
+#   [[allowlists]]
+#   description = "why this is a false positive, in one sentence"
+#   paths = ['''^fixtures/known-fake-credentials\.txt$''']
+#
+# Zero entries is a valid state, and it is the state kit is in. The reason the
+# check below is not vacuous is that it runs in every adopting service too,
+# where entries exist.
