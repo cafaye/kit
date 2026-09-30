@@ -124,9 +124,23 @@ copy_name=""
 
 # A fresh throwaway copy per breakage: one breakage must never mask the next,
 # and no breakage may touch the worktree this script was invoked from.
+# `copies/$name`, NOT `$WORK/$name`, and the reason is a proof that passes for the
+# wrong reason.
+#
+# Every `expect_red_check` runs `validate.sh` inside a throwaway copy, and
+# `validate.sh` asks `fleet_check.py` about `$ROOT/..` — the copy's PARENT. If
+# that parent is `$WORK`, then every fixture fleet an earlier breakage built
+# (`$WORK/fleet-<name>/{alpha,beta}`, each with a `.git`) is a repository the
+# gate can see, and the first one's `svcbad` is still broken. So breakage 23's
+# defect makes EVERY LATER breakage go red, and breakages 24-26 would pass on
+# `FAIL fleet` whether or not the mutation they applied was the defect they name.
+#
+# Three proofs asserting nothing, caused by a directory that was one level too
+# high. `copies/` is a directory that holds copies and nothing else, so a copy's
+# parent contains exactly one entry — itself — and that entry has no `.git`.
 fresh_copy() {
   copy_name="$1"
-  local dst="$WORK/$copy_name"
+  local dst="$WORK/copies/$copy_name"
   mkdir -p "$dst"
   # `.github` is in this list and not an afterthought: the reusable workflow it
   # holds is the artifact every check that reads the workflow's inputs reads by
@@ -378,14 +392,19 @@ expect_red_lang() {
 # worktrees — a fixture that looked like a worktree would be skipped and every
 # breakage below would pass vacuously.
 fixture_fleet() {
-  # Two `local`s and not one. `local name="$1" root="$WORK/fleet-$name"` reads
-  # `name` while it is still being assigned, so `root` is built from whatever
-  # `name` happened to be — empty on the first call, so every fixture would be
-  # written to `$WORK/fleet-` and the four breakages would share one directory
-  # and mask each other. shellcheck says so (SC2318), and the symptom is four
-  # proofs that all pass or all fail together.
+  # Two `local`s and not one. `local name="$1" root="…$name"` reads `name` while
+  # it is still being assigned, so `root` is built from whatever `name` happened
+  # to be — empty on the first call, so every fixture would be written to one
+  # directory and the breakages would share it and mask each other. shellcheck
+  # says so (SC2318), and the symptom is four proofs that all pass or all fail
+  # together.
   local name="$1"
-  local root="$WORK/fleet-$name"
+  # `fixtures/`, not `$WORK` directly — for the reason `fresh_copy` writes to
+  # `copies/`. A fixture fleet is a fleet of REPOSITORIES, each with a `.git`;
+  # anywhere a later `expect_red_check` can discover one, an earlier breakage's
+  # still-broken `alpha` makes the next breakage red for the wrong reason. Only
+  # the four fleet breakages set `KIT_FLEET`, and they point it here.
+  local root="$WORK/fixtures/$name"
   rm -rf "$root"
   mkdir -p "$root/alpha" "$root/beta"
   local svc
