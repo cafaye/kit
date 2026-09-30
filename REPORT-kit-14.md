@@ -3,15 +3,19 @@
 **Worktree:** `worker/kit-14-stale` · **Base:** `41f8bcb` (master, not rebased — see
 §7.12) · **Date:** 2026-09-30
 
-> **Read §9 before trusting anything here.** This packet was interrupted by an
-> OOM restart, so the code on this branch arrived as a `recover(...)` commit
-> whose own message says its conclusions are void. I re-measured rather than
-> re-read, and **four of the recovered report's numbers were false** — all four
-> in the direction that made the reporter look better than it is. They are
-> corrected throughout, with the wrong version quoted beside the correction.
-> Separately, I have **not** observed a completed `self_test` on this branch:
-> the machine was at load 111 with four other workers running gates, and my run
-> was killed. §9 says exactly what I did and did not see.
+> **Read §9 before trusting anything here. The self-test control went RED on
+> this branch, and that blocks the packet.** This work was interrupted by an OOM
+> restart, so the code arrived as a `recover(...)` commit whose own message says
+> its conclusions are void. I re-measured rather than re-read, and **four of the
+> recovered report's numbers were false** — all four in the direction that made
+> the reporter look better than it is. They are corrected throughout, with the
+> wrong version quoted beside the correction. A later run then took the
+> **self-test control red**: the reporter had been handed a smaller fleet than
+> the fixture holds, one case failed, and its text blamed the reporter. The
+> harness now says `this is NOT a reporter result` and names the service it lost
+> (§9, breakage 29). **I have still not observed a completed 30-breakage
+> `self_test`** — the machine ran at load 90–160 with four other workers
+> building and my runs were killed. §9 says exactly what I did and did not see.
 
 **The three things the packet asked for, and where they are:**
 
@@ -664,21 +668,53 @@ its assertions, and the collector-kill proof ran too. The skip count is the same
 either way, which is exactly why a misattributed skip is worth correcting: the
 number survived, the meaning did not.
 
-**Why self_test is not reported as green.** My first re-run reached
-`-- self_test: this gate is able to fail` and was then killed: the machine was
-carrying load average **111** with at least four other workers running full gate
-runs of their own, and the harness reaped the wrapper. The `validate.sh` process
-survived and kept running until I stopped it, by which point its log file had
-been deleted out from under it, so the per-breakage output is unrecoverable.
-**I therefore have not observed a completed `self_test` on this branch**, and
-under the house rule that a red control blocks the packet I am not going to
-report a pass I did not see. What I did observe is that all 29 breakage recipes
-and the unbroken-tree control are present and accounted for, that the
-`self_test_claims` reciprocity check passes (every documented breakage has a
-recipe and every recipe is documented), and that `staleness_test.sh` — which
-carries this packet's own red proof, breakage 26 — passes all 26 cases
-including that proof. Re-run `bash tests/validate.sh` on a machine with room
-before trusting this packet.
+**THE CONTROL WENT RED. Stated here, at the top, because D13 is the whole
+reason this section exists.** A later run did reach `self_test`, and it reported:
+
+```
+FAIL self_test: unbroken tree — the gate is RED on an unbroken tree
+FAIL: staleness_test — 1 case(s) failed, 25 passed.
+```
+
+**Diagnosis, as far as I could get it.** The reporter had measured **8
+repositories and 96 cells** where the fixture holds **9 and 108** — one service,
+twelve cells, silently not counted. Exactly one case failed and 25 passed,
+because the cases read a table row for a service the reporter never emitted. The
+failing case's text named **the reporter**, which is the one thing it must not do
+when the reporter was handed a smaller fleet rather than misreading a full one.
+
+So the reporter fails closed about artefacts and **the harness was failing open
+about its own inputs** — the same defect one layer down, and the layer nobody
+checks. `staleness_test.sh` now verifies, before any case asserts on it, that
+every service the cases name has a cell the reporter actually measured, and exits
+with `this is NOT a reporter result` naming the missing service. Breakage 29
+proves that check load-bearing, asserting the *wording* as well as the exit
+status, because a red that blames the wrong file sends the next reader to the
+wrong place.
+
+**What I could not confirm: the underlying cause.** The run's log was deleted out
+from under the process before I could read it, and `staleness_test.sh` runs
+`set -euo pipefail`, so a failed `git init` would have *aborted* the suite rather
+than skipping a repository silently — which rules out the obvious suspect and
+leaves the cause open. The fix deliberately does not depend on the diagnosis: it
+asserts the discrepancy, so the next occurrence is named rather than
+misattributed. **A second, subtler possibility I also cannot exclude is that the
+machine was simply failing under load** (90–162 across these runs) in a way that
+cost one fixture repository; that is a property of the machine, not of this
+packet, but I did not prove it and am not claiming it.
+
+**Why self_test is still not reported as green.** I have not observed a
+completed 30-breakage `self_test` on this branch. The runs that reached it were
+killed by the harness with the machine at load average 90–160 and at least four
+other workers running full gates concurrently; one of those runs lost its log
+file entirely. What I did verify, and can be checked without a quiet machine:
+the static phase is **135 pass / 0 fail / 2 skip**; `staleness_test.sh` passes
+**26 cases** including this packet's red proof, on a good tree and inside a
+`self_test`-style copy; the new fixture check **fires** when a fixture service is
+made invisible and names exactly the right service; and the header/recipe
+reciprocity check reports **30 documented / 30 recipes**. **Re-run
+`bash tests/validate.sh` on a machine with room before trusting this packet** —
+and read this section as a blocker that is open, not as a caveat.
 
 **A note on this branch's history, so nobody is misled by an earlier commit.**
 Commit `0e92622` — *"the report's final section — the gate re-run after the
