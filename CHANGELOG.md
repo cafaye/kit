@@ -176,6 +176,34 @@ semver contract — it is consumed by *calling*
 
 ### Fixed
 
+- **`tests/validate.sh` — the heavy tiers carry a time BOUND, and a bound is its
+  own verdict.** The gate grew past what one process finishes on a loaded box:
+  three docker stacks, and a self-test that is *n* whole gates in sequence (32 on
+  this branch, growing with every check added). The previous full run was
+  **SIGKILLed (exit 137 — the OOM killer, not a test failure)** inside the
+  observability collector tier, which means it reported **nothing** about every
+  tier it never reached. A killed gate's green is a claim about how far it got.
+
+  `bounded_check` wraps the four heavy tiers and adds a fourth outcome:
+
+  | verdict | about | meaning |
+  |---|---|---|
+  | `PASS` / `FAIL` | the tree | as before |
+  | `SKIP` | the environment | no docker, no toolchain — nothing ran |
+  | **`BOUND`** | **the run** | the tier started, this box was too busy to finish it, and the claim it exists to prove is **unexercised** |
+
+  A bound reported as a PASS is the silent skip this repository's own rules
+  forbid; a bound reported as a FAIL is indistinguishable from a defect in the
+  tree. `BOUND` carries the tier, the bound and the tail of what it had printed,
+  and the summary now states **how many tiers ran under a bound** and **how many
+  reached one** — two counters, because one line cannot say both, and a summary
+  that overstates a machine problem is the fastest way to make a reader ignore
+  it. `timeout` is **resolved**, not assumed: GNU coreutils ships `timeout`,
+  macOS has no `/usr/bin/timeout`, Homebrew's installs `gtimeout`, and a machine
+  with neither runs unbounded and says so rather than pretending a ceiling
+  applied. `--kill-after=30s`, because a bound that is only a SIGTERM is a
+  request.
+
 - **`tests/validate.sh` — the fleet gate's SKIP decision is now the script's.**
   The first wiring guarded the call with its own "are there any sibling
   entries?" test. A self-test throwaway directory *has* sibling entries and none

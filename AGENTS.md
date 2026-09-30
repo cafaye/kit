@@ -152,9 +152,12 @@ Three phases, and all three must pass:
   wave turns them into failures one repository at a time.** It SKIPs loudly
   when there is no fleet, because "no fleet was found" is not "the fleet is
   clean" — the same `unknown` vs `current` confusion `staleness.py` avoids.
-- **self_test** — twenty-nine breakages of a throwaway copy, asserting the gate
-  goes red each time. Six of them are a semantic mutation of one language each,
-  so **every suite is proven able to fail** rather than assumed to. Fifteen assert
+- **self_test** — thirty-two breakages of a throwaway copy. Thirty-one assert
+  the gate goes red; **one asserts it stays GREEN while still naming the
+  finding**, which is the adoption ceiling's other side and the only proof that
+  a ceiling is a ceiling rather than a deletion. Six of them are a semantic
+  mutation of one language each, so **every suite is proven able to fail** rather
+  than assumed to. Fifteen assert
   that one *named* check reported `FAIL`, so a check written for a specific
   defect is proven still load-bearing. Two assert that a *proof* goes red: one
   inverts the classifier's fail-closed property, and one makes the staleness
@@ -162,7 +165,7 @@ Three phases, and all three must pass:
   break is a property nobody has tested.
 - **A self-test control that is red BLOCKS the packet.** If the unbroken tree is
   already failing, every breakage below it proves nothing, so that run is a
-  failed run even when all twenty-nine mutations went red as intended.
+  failed run even when all thirty-two mutations went as intended.
 - Tests are written **first** and watched fail before the artifacts exist. A
   config written from documentation instead of from the pinned image is a config
   that breaks on the first `bin/dev up`: Tempo, Loki and Mimir all reject keys
@@ -183,6 +186,20 @@ Three phases, and all three must pass:
   A required check whose tool path is hardcoded to a directory the resolver may
   have skipped is a gate that fails on arrival; that is a bug this file has
   already had once.
+- **Four counts, because they are four different claims.** `PASS` and `FAIL`
+  are verdicts about the tree. `SKIP` is a verdict about the **environment** —
+  no docker, no toolchain, nothing ran. `BOUND` is a verdict about the **run** —
+  the tier started, this machine was too busy to finish it, and the claim it
+  exists to prove is therefore unexercised. The heavy tiers (three docker stacks,
+  and the self-test, which is *n* whole gates in sequence) carry a time bound for
+  exactly this reason: a gate SIGKILLed by the OOM killer reports nothing about
+  the tiers it never reached, so its green is a claim about how far it got. A
+  bound that is reported as a PASS is the silent skip this file forbids; a bound
+  reported as a FAIL is indistinguishable from a defect in the tree. It is its
+  own verdict, and the summary prints both the number that ran under a bound and
+  the number that reached one. `timeout` is **resolved**, not assumed — GNU
+  coreutils calls it `timeout`, macOS has no `/usr/bin/timeout`, Homebrew's
+  installs `gtimeout`.
 - **A skip is a gap, and the summary line is how you find it.** The seven
   Dockerfiles sat behind `SKIP ... (no parser for this file type)` for the whole
   life of kit-02, and the only reason anyone knew is that the summary printed

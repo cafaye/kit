@@ -4,6 +4,153 @@
 
 ---
 
+## 0a. The finish pass: the adoption ceiling
+
+The dispatch for this packet's second half was one sentence: *the fleet gate is
+red because the fleet has not adopted; give it the adoption ceiling.* The gate
+was red with **13 findings across 6 repositories**, and every single one of them
+was a repository that had adopted nothing.
+
+### What was wrong with a permanently red gate
+
+Nothing, for about a release. Then it decays, and the decay is silent:
+
+- A red that means the same thing every day is **not information**. The day a
+  repository adopts and then breaks something new, the red is
+  indistinguishable from the standing noise.
+- A gate that cannot go green is a gate people learn to re-run without reading,
+  which is precisely how the state this packet exists to remove survived a full
+  round of CI the first time.
+- The 13 findings are true and they are **nobody's agreed work**. `identity` has
+  adopted and still runs its own `postgres:17-alpine` — that is a defect in a
+  repository that accepted the standard. `billing` has adopted nothing and runs
+  the same image — that is the cost of a fleet that has not taken it up.
+
+So the two are separated by **who owns the debt**, not by how bad it is.
+
+### The ceiling
+
+| | has a `kit.ref` | has no `kit.ref` |
+|---|---|---|
+| stale copy | **FAIL** | **WARN** + adoption path |
+| weakened redaction boundary | **FAIL** | **WARN** + adoption path |
+| dead / service-owned collector config | **FAIL** | **WARN** + adoption path |
+| published port in a merging file | **FAIL** | **WARN** + adoption path |
+| pin absent, branch, abbreviated, empty, multi-valued | **FAIL** | **WARN** + adoption path |
+
+**The same four checks, the same predicates, the same messages, the same
+severity. Nothing was deleted and nothing was relaxed — the strictness MOVED to
+where adoption exists.** It is a **wave, not a discount**: the first repository
+to commit one line finds its own findings are failures, with no change to this
+repository and no re-review.
+
+> **A warning is a debt with a name. The adoption wave turns them into failures
+> one repository at a time.**
+
+The ceiling is stated in three places on purpose, because a ceiling that exists
+only in an exit code is a ceiling nobody knows is there: in `fleet_check.py`'s
+own output (a `CEILING fleet:` line printed on **every** run, including a clean
+one), in `tests/validate.sh`'s PASS label (which carries the debt's count and
+names the six repositories), and here.
+
+### The six named repositories
+
+| repository | findings | what they are |
+|---|---|---|
+| **billing** | 2 | no `kit.ref`; own `postgres:17-alpine` |
+| **courier** | 2 | no `kit.ref`; own `postgres:17-alpine` |
+| **darkroom** | 3 | no `kit.ref`; own `postgres:17-alpine`; **publishes `5432:5432`** on a service kit already ships |
+| **guard** | 1 | no `kit.ref` only — **correctly not caught by the stale-copy rule**; it declares one service, its own, and no database |
+| **identity** | 3 | no `kit.ref`; own `postgres:17-alpine`; **publishes `${POSTGRES_PORT:-5432}:5432`** |
+| **muse** | 2 | no `kit.ref`; own `postgres:17-alpine` |
+
+**13 findings, 6 repositories, and every one is currently a warning. Zero
+failures.** That is the state to beat, and it is a state the gate is now *able to
+leave*: the first commit of a `kit.ref` moves that repository's row.
+
+### The adoption path, as the gate prints it
+
+```
+  the adoption path, for every repository named above:
+    1. git -C ../kit rev-parse HEAD > kit.ref      # ONE committed line, and the only thing that decides which bytes of kit your machine runs
+    2. your docker-compose.yml becomes an OVERRIDE beside the fetched stack, not a copy of it: delete your own postgres service and point at kit's by overriding its environment (POSTGRES_DB / POSTGRES_USER). The collector config is never yours to own.
+    3. move a published port with its VARIABLE (KIT_POSTGRES_PORT=…), because a second compose file's `ports:` list is APPENDED rather than substituted, so a `ports:` block buys you both ports
+```
+
+### Three decisions inside it, each argued
+
+**Adoption is read from `read_kit_ref` — the same function every finding message
+already assumes — and only `absent` counts as unadopted.** An empty,
+multi-valued or unreadable `kit.ref` is a repository that **adopted and wrote
+the pin wrong**, and it fails. Reading adoption from "the file exists" is
+simpler and wrong in one specific way: it would make a broken pin a *warning* in
+exactly the case where somebody was trying to fix the previous warning. That is
+a ratchet that turns one way, which is the failure mode `breakage 19` exists to
+catch in a different file.
+
+**Findings are collected per repository and routed once, at the end.** A check
+that appended straight into the failure list would be choosing its own severity.
+A check that short-circuited on an unreadable compose file would be **exempt
+from the ceiling in precisely the case where the file is most wrong** — and
+`muse`'s did-not-parse compose file is the reason that matters, because it is
+the one time this fleet has had an unreadable stack.
+
+**The ceiling is printed by the CHECK.** A caller that decides whether to print
+the rule is a caller that can be pointed at a fixture fleet where it does not,
+and the rule stops being a property of the check. It prints on every run
+including a clean one, and it prints **above** the findings — a rule stated after
+the thing it governs reads as an epilogue.
+
+One wording was corrected after reading the first output: the failure summary
+counted *adopting* repositories rather than *defective* ones, so
+`FAIL fleet: 1 problem(s) across 2 adopting repository(ies)` described two
+repositories when one was clean. A summary that overstates the blast radius is
+the first thing a reader stops trusting.
+
+### Proved from both sides, over one mutation
+
+A ceiling with only one side proved is a deleted check. So:
+
+| | fixture | expected | result |
+|---|---|---|---|
+| **breakage 30** | the stale copy, **no `kit.ref` anywhere in the fleet** | gate stays **GREEN**, finding still **PRINTED** | `PASS self_test: breakage 30: an UNADOPTED service copies the stack — green, and named` |
+| **breakage 31** | the identical mutation, **`kit.ref` committed** | gate goes **RED** on the identical finding | `PASS self_test: breakage 31: the same copy in an ADOPTING service is a hard FAIL` |
+
+**Breakage 31 is breakage 23 plus one committed line.** That single diff is the
+entire argument for the ceiling, and it is why the mutation is factored into one
+`break_stale_copy` helper shared by 23, 30 and 31 — two hand-written copies of a
+nine-line YAML mutation would drift, and the drift would read as "31 proved the
+ceiling is airtight" when 31 had stopped testing the same thing 23 tests.
+
+Breakage 30's assertion is a **literal substring of the finding**
+(`which is the image kit's stack already ships`), not the word `WARN`. A gate
+that printed `WARN` and nothing else would satisfy the weaker assertion; so
+would a gate that deleted the finding and left the string in a comment. That is
+the assertion that catches a **removed** ceiling rather than a missing one.
+
+`unadopt` removes `kit.ref` from **every** repository in the fixture, not just
+`alpha`: the ceiling is per-repository, and a half-adopted fixture cannot tell a
+failure of the unadopted side from a failure of the clean-adopting side.
+
+Both verified directly before the suite was run, over the same mutation:
+
+```
+30  exit 0   PASS fleet  (adopting repositories clean; 3 finding(s) across 2 repository(ies) ...)
+             the finding's own words present in the output
+31  exit 1   FAIL fleet  (no stale copy, no weakened boundary, no dead config, every ref pinned)
+```
+
+### What the ceiling does NOT do
+
+It does not make the fleet clean, and it does not make the checks smaller. It
+does not weaken anything inside an adopting repository — that is what breakage 31
+is for. And it is **not permanent**: this is the deliberate, named, temporary
+state core-16 applied to a missing OpenAPI document, for the same reason and with
+the same exit condition — the fleet adopts, and the debt becomes a failure
+without anyone editing this repository.
+
+---
+
 ## 0. What was inherited, and what I changed about it
 
 The dispatch said the previous worker was killed by an OOM restart and that its
@@ -228,9 +375,20 @@ out-of-scope count is **printed**, never dropped.
 | weakened boundary | 0 | nobody |
 | dead / service-owned collector config | 0 | nobody |
 
-**13 findings, 6 repositories. It is red, and it stays red.** The first gate in
-the packet's list is red against the current fleet, and softening it to make
-master green is exactly what the packet refuses.
+**13 findings, 6 repositories.** Under the adoption ceiling (§0a) every one of
+them is currently a **warning**, because every one of those six repositories has
+no `kit.ref` — so the gate is **0 failures and 13 named debts**, and the debt
+count is printed in the gate's own summary line rather than buried here. The
+checks are unchanged and the fleet is unmigrated; what changed is that the gate
+is now red about a repository that has *accepted* the standard, and merely loud
+about one that has not.
+
+That is the difference between this run and the run the dispatch handed me, and
+it is worth being precise about, because "the fleet gate went green" is the
+sentence that would be written by somebody skimming: **the gate went green
+without any finding being deleted, and the findings are all still there.** The
+first repository to commit `git -C ../kit rev-parse HEAD > kit.ref` puts two or
+three of them back into FAIL.
 
 Three details worth stating:
 
@@ -261,29 +419,54 @@ Three details worth stating:
 
 ### 5.2 Gate results, reported separately
 
-**Pass and skip counted separately, because conflating them is how a gap survives.**
+**Pass, skip and bound counted separately, because conflating them is how a gap
+survives.** They are three different claims: a verdict about the tree, a verdict
+about the environment, and a verdict about the run.
 
-| Run | PASS | FAIL | SKIP |
-|---|---|---|---|
-| `tests/validate.sh --static-only` | **138** | **1** | **2** |
-| `tests/validate.sh` (everything, self-test included) | **151** | **1** | **2** |
+| Run | PASS | FAIL | SKIP | BOUND |
+|---|---|---|---|---|
+| `tests/validate.sh --static-only` | **140** | **0** | **2** | **0** |
+| `tests/validate.sh` (everything, self-test included) | **153** | **0** | **2** | **0** |
 
-**The one FAIL is `fleet (no stale copy, no weakened boundary, no dead config,
-every ref pinned)`, and it is red by design** — §5.1 names all six repositories
-and all thirteen findings. A reader who sees only `FAIL: 1 check(s) failed`
-cannot tell a designed failure from a regression, so it is named here rather than
-left to the summary line. Every other phase of the full run is green:
+**The full run is the one that matters and the one the earlier partial runs were
+not.** The dispatch handed me a run that died with exit 137 partway through the
+observability collector tier; the run in the row above **reached the end**,
+printed `PASS: every check passed.`, and exercised every tier:
 
 | Phase | Result |
 |---|---|
-| static (artifacts, YAML, shellcheck, hadolint, compose, fleet, core, tiers) | green except the fleet gate |
+| static (artifacts, YAML, shellcheck, hadolint, compose, fleet, core, tiers) | green |
 | telemetry — six W3C suites, executed | green |
 | observability — the redaction boundary against a real collector | green |
 | readiness — a service with a dead dependency and a dead OTLP endpoint | green |
 | `stack_live_test.sh` — the fetched stack, **all 15** | green |
 | `fetch_test.sh` — **all 17** | green |
 | `classify_test.sh` (19) · `staleness_test.sh` (12) | green |
-| `self_test.sh` — **30 breakages, all red, unbroken tree green** | green |
+| `self_test.sh` — **32 breakages (31 red, 1 green-expecting), unbroken tree green** | green |
+
+**What the full uninterrupted run showed that the partial runs did not** — the
+question the dispatch actually asked:
+
+1. **It reached the tiers the killed run never got to.** The exit-137 run had
+   142 PASS lines and died in the observability collector tier. This run has
+   **153** and printed a verdict, so the fetch tier, the staleness tier and the
+   entire self-test are now *measured* rather than inferred.
+2. **The self-test's self-test ran.** `self_test_claims` — the check that
+   compares the header's breakage list against the recipes the file carries — is
+   inside the `RUN_SELF_TEST` block, so it had never executed in any partial run
+   this branch produced. It is green, which is the check saying the two halves
+   of `self_test.sh` cannot have drifted apart.
+3. **Two breakages exist that no previous run had.** 30 and 31 are the adoption
+   ceiling's two sides; a run that stops before the self-test proves neither, and
+   in particular cannot distinguish "the ceiling holds" from "the checks are
+   gone".
+4. **The gate can finish on this machine**, which the exit-137 run said it could
+   not. That turned out to be true and was about contention rather than about
+   size — but it is not a claim anyone could make from a killed log, which is
+   why the bounds in §5.3 exist at all.
+5. **No tier was skipped.** Two SKIPs, the same two `node --check` TypeScript
+   files, unchanged by this pass. Nothing new was skipped and nothing was
+   un-skipped.
 
 **The two SKIPs are the two known-correct ones on master**, unchanged by this
 packet: `templates/tier/bun/tier.test.ts` and `templates/tier/node/tier.test.ts`,
@@ -296,17 +479,73 @@ SKIP with the `FLEET-ABSENT` marker, because "no fleet was found" is not "the
 fleet is clean". That is the same `unknown` vs `current` confusion
 `tests/staleness.py` exists to avoid.
 
+### 5.3 The bound: the tier that was killed, and the verdict for a tier that times out
+
+The run I inherited **died with exit 137** — the kernel's OOM killer, not a test
+failure — partway through the observability collector tier. Exit 137 means the
+gate reported **nothing** about every tier it never reached, so its 142 PASS
+lines were a claim about how far it got rather than a verdict on the tree. That
+is a worse failure than a red gate, because it looks like a pass in a log.
+
+Four tiers now carry a time bound, and a bound is **its own verdict**:
+
+| verdict | about | meaning |
+|---|---|---|
+| `PASS` / `FAIL` | the tree | as before |
+| `SKIP` | the **environment** | no docker, no toolchain — nothing ran |
+| **`BOUND`** | **the run** | the tier started, this box was too busy to finish it, and the claim it exists to prove is **unexercised** |
+
+| tier | bound | quiet-machine cost |
+|---|---|---|
+| `tests/canary_test.sh` | 900s | ~1 min |
+| `tests/no_telemetry_in_readiness.sh` | 900s | ~2 min |
+| `tests/stack_live_test.sh` | 900s | ~2 min |
+| `tests/self_test.sh` | 5400s | ~25 min (32 whole gates in sequence) |
+
+**Why `BOUND` and not one of the two verdicts that already exist.** A bound
+reported as a PASS is the silent skip this repository's own rules forbid — it is
+the `SKIP` case that does not announce itself, which is the one shape of skip
+that survives. A bound reported as a FAIL is worse in a different way: it puts a
+loaded machine into the same bucket as a defect in the tree, and the reader who
+goes looking for a defect that is not there stops reading the summary line at
+all. So it carries the tier, the bound, and the tail of what it had printed, and
+the summary states **how many tiers ran under a bound** and **how many reached
+one** — two counters, because one line cannot say both, and the first version of
+this used one counter for both and printed "4 tier(s) hit their time bound" for a
+run in which exactly one did.
+
+**`timeout` is resolved, not assumed.** GNU coreutils ships `timeout`; macOS has
+no `/usr/bin/timeout` at all; Homebrew's coreutils installs `gtimeout`. A
+machine with neither runs the tier unbounded and says so, because a bound that
+silently did not apply is worse than no bound — the reader is told a ceiling
+exists and there is not one. `--kill-after=30s`, because a bound that is only a
+SIGTERM is a request.
+
+**On this run, no bound was reached** — `BOUND` is 0 and the summary says
+`4 tier(s) ran under a time bound; none was reached`. That line is printed
+*because* none was reached. A ceiling the reader has never been told about is a
+ceiling they cannot rely on, and a bound report that only appears when it fires
+is indistinguishable, from the outside, from not having one.
+
 ---
 
 ## 6. Every gate proven able to fail
 
 `tests/self_test.sh` breaks a throwaway copy once per check and asserts it goes
-red. **Fifteen of the 29 assert the NAMED check**, because "the gate went red" is
-a weak claim when a hundred checks can make it red.
+red. **Thirty-two breakages: thirty-one red, one green-expecting.**
+**Fifteen assert the NAMED check**, because "the gate went red" is a weak claim
+when a hundred checks can make it red.
+
+**One does not assert red at all**, and that is the load-bearing one for this
+pass: **breakage 30 asserts the gate stays GREEN while still printing the
+finding** (§0a). A suite made only of red-expecting recipes cannot tell a ceiling
+from a deletion — every one of them would still pass if the whole fleet check
+had been reduced to printing the word `WARN`.
 
 Breakages **23–26** are the four failure modes, each against a **fixture
-fleet**. That is not a convenience: the real fleet is red by design, so "the
-gate went red" there is satisfied by two clean repositories. Each fixture is two
+fleet**. That is not a convenience: the real fleet's findings are warnings, so
+"the gate went red" there would have to be distinguished from the ceiling, and a
+fixture fleet is what makes the distinction unnecessary. Each fixture is two
 repositories, `alpha` (correct) and `beta` (correct), and the breakage mutates
 only `alpha` — so a check that only ever looks at the first repository is caught,
 and a check that reported *everything* as broken would fail the control.
@@ -320,6 +559,12 @@ and a check that reported *everything* as broken would fail the control.
 | 27 | `${KIT_COMPOSE_DIR:-.}/tempo/tempo.yaml` → `./tempo/tempo.yaml` | `every vendor config mounts from the fetched tree` |
 | 28 | `KIT_STACK_REF=<sha>` added to `.env.example` (and `kit.ref` removed, which is a no-op on kit's own root — the pin belongs to the adopting service) | `the pin is kit.ref, and the gate reads the same file` |
 | 29 | `alpha` publishes a port on `postgres`, which kit already ships | `fleet` |
+| 30 | the same stale copy, **with every `kit.ref` removed** | **must stay GREEN** and print the finding — the ceiling |
+| 31 | that same mutation, **`kit.ref` committed** | `fleet` — the same finding, back to a hard FAIL |
+
+Breakages 30 and 31 are argued in full in §0a, because they are the only two
+recipes in this file that are about the **gate's policy** rather than about a
+defect in a repository — and a policy proved from one side is not proved.
 
 Breakage 28's shape is the one that reads like an improvement: shipping
 `KIT_STACK_REF=<sha>` in `.env.example` means a fresh clone looks configured and
@@ -443,6 +688,57 @@ Running it produced `# …a 40-character commit# sha, or a v<semver> tag…` —
 comment lines run together by a missing newline in the `printf`. Found by
 running the command and reading the file it wrote, which is the only way.
 
+### 8.3 `FAIL templates/otel/ruby` — not this packet, re-attributed on a clean clone
+
+The dispatch listed two FAILs. One was mine (§0a). The second was
+`FAIL templates/otel/ruby (ruby test suite)`, which kit-14 attributed as H1 and
+which the dispatch told me to attribute in writing again. Doing that again, and
+**reproducing it rather than inheriting the attribution:**
+
+```
+$ /usr/bin/ruby templates/otel/ruby/test_traceparent.rb
+13 runs, 1370 assertions, 0 failures, 3 errors, 0 skips
+   NoMethodError: undefined method `filter_map' for #<Array:…>
+     traceparent.rb:278:in 'usable_tracestate_entries'
+```
+
+Three errors, one cause: `traceparent.rb` calls `Array#filter_map`, which is
+Ruby 2.7+. `/usr/bin/ruby` on this machine is **2.6.10**; the pinned toolchain
+(**4.0.1**, behind a mise shim) passes the same suite **13 runs, 1407 assertions,
+0 failures, 0 errors**.
+
+Reproduced on a clean clone, because the attribution is only worth anything if it
+does not depend on this branch:
+
+```
+$ git clone … && git checkout 41f8bcb        # master's own commit
+$ git diff --stat 41f8bcb -- templates/otel/ruby   # (empty — byte-identical to master)
+$ /usr/bin/ruby templates/otel/ruby/test_traceparent.rb
+13 runs, 1370 assertions, 0 failures, 3 errors, 0 skips
+```
+
+**Master's own files, master's own commit, no work of mine present — same three
+errors.** The template is correct; the interpreter is not.
+
+And reproduced *through this branch's gate*, with the shim directory off `PATH`
+so the system interpreter wins:
+
+```
+$ PATH=/usr/bin:/bin:/usr/sbin:/sbin bash tests/validate.sh --no-self-test --no-observability
+FAIL templates/otel/ruby  (ruby test suite)
+```
+
+which is exactly what the manager's run saw, and is why the run I did on this
+machine shows ruby **green**: `ruby` here resolves to the 4.0.1 shim.
+
+**So it is not reproduced by the standard invocation, it is reproduced by an
+old interpreter, and it is not mine.** kit-14 owns the fix — a toolchain floor
+consulted before the suite runs, since ruby is the one language where an old
+toolchain makes the suite **run and lie** rather than refusing to parse
+(`go.mod` refuses go, `rustc --edition` refuses rust, `from __future__` refuses
+python). I have not taken that fix: it is kit-14's file to change, and two
+packets editing one gate is how each half can be wrong.
+
 ---
 
 ## 9. What I could not verify
@@ -461,10 +757,21 @@ running the command and reading the file it wrote, which is the only way.
    this report states a measurement and its moment rather than a property of the
    fleet. Re-running `tests/fleet_check.py` is the only way to know the current
    answer.
+4. **That the bounds in §5.3 are the right numbers.** They are ~3x the durations
+   measured on *this* machine, which is evidence and not proof: no bound was
+   reached on this run, so nothing here demonstrates that 900s is enough for a
+   slower box. What it does demonstrate is that a bound that is reached is
+   **reported as its own verdict** rather than killing the run, which was the
+   actual failure.
 5. **`kit.ref` against a real GitHub remote**, including whether GitHub serves a
    `--depth 1` fetch of an arbitrary sha without `uploadpack.allowReachableSHA1InWant`.
 6. **Nothing was rebased.** Master was still `41f8bcb`, this branch's base, when
    I finished; the dispatch told me not to rebase or merge it myself.
+7. **Whether the ruby failure will be seen again.** §8.3 reproduces it only with
+   an old interpreter on `PATH`. On the documented invocation, with the pinned
+   toolchain, it does not occur — which means the manager's run and mine disagree
+   about the same tree, and the disagreement is `PATH`, not code. kit-14's floor
+   is the durable answer and it is not mine to land.
 
 ---
 
@@ -484,19 +791,40 @@ defects and are not, and both are recorded because the next reader will hit them
   diagnosis of the diagnostic. One run, captured. And a missing tree is now
   reported as the environment failure it is, distinct from a red gate.
 - Under that pressure the whole suite was eventually run to completion on an idle
-  machine: **30 breakages, all red, unbroken tree green, exit 0**. The claims in
-  §6 do not rest on partial runs.
+  machine: **32 breakages — 31 red, 1 green-expecting while naming its finding —
+  unbroken tree green, exit 0**. The claims in §6 do not rest on partial runs.
 - The self-test was `SIGTERM`ed mid-run on memory pressure twice before this.
   It was then run to completion on an idle machine, so the partial-run caveat is
   retired rather than argued around.
+- **This pass inherited an exit-137 run and did not reproduce it.** The manager's
+  run died inside the observability collector tier with 142 PASS lines and no
+  verdict. The full run here reached the end: **153 PASS, 0 FAIL, 2 SKIP,
+  0 BOUND**, `PASS: every check passed.` — on a machine with load average 3–5
+  and, at the time, four other packets' workers live. So the kill was
+  contention, not size, and the gate finishes. The bounds in §5.3 are still
+  there, because "it finished once here" is not a property of a gate that has to
+  finish on a box running eight workers.
+- **The `timeout` resolution is a real portability question on this machine, not
+  a hypothetical one.** `/usr/bin/timeout` does not exist on macOS; `timeout` here
+  comes from Homebrew's coreutils, and the same package installs `gtimeout`.
+  Writing `timeout` into the gate unguarded would have made it work on exactly
+  the machine it was written on and fail on a clean CI runner — the same class of
+  defect as this packet's own port rule.
 
 **Isolation, verified directly and separately.** Each of the seven new breakages
 was run against the real gate with a fresh throwaway copy each, because a suite
 that only passes when run in sequence has proved less than it appears to:
 
-- **23, 24, 25, 26, 29** — `expect_red_check` against a **fixture fleet**. All
-  five went red via the named `fleet` check, and a clean fixture fleet left the
-  gate green, which is the control that makes the other five mean anything.
+- **23, 24, 25, 26, 29, 31** — `expect_red_check` against a **fixture fleet**.
+  All six went red via the named `fleet` check, and a clean fixture fleet left
+  the gate green, which is the control that makes the other six mean anything.
+- **30** — `expect_green_check` against a fixture fleet with **no `kit.ref` in
+  it**. Verified directly against the real gate before the suite ran, not only
+  inside it: exit 0, the `PASS fleet (adopting repositories clean; 3 finding(s)
+  across 2 repository(ies) …)` label, and the finding's own sentence present in
+  the output. All three are asserted — a green run that named nothing, or a named
+  finding under a check that did not report PASS, each fail this recipe
+  separately.
 - **27 and 28** — the two kit-side checks, each mutation applied to a tree with
   everything else held constant:
 
@@ -508,6 +836,16 @@ that only passes when run in sequence has proved less than it appears to:
 
   Each mutation is caught by its own check and **not** by the other, which is
   the discipline `expect_red_check` exists to enforce.
+
+**30 and 31 share one mutation on purpose**, and that is the one isolation
+caveat worth stating plainly: they are not independent fixtures, they are the
+same fixture with one file changed. That is deliberate — the claim is that the
+*only* difference between a warning and a failure is a committed `kit.ref`, and a
+claim like that cannot be proved by two different fixtures, only by two states of
+one. The cost is that a defect in `break_stale_copy` would move both recipes
+together, which is why the helper is a single definition and why breakage 23
+(the fixture's own red proof) runs the same mutation: if the helper broke, 23 goes
+green first and says so.
 
 ### 10.1 The defect that fix found
 

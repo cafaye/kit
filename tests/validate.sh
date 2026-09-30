@@ -173,6 +173,96 @@ section() { printf '\n-- %s\n' "$1"; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# ---------------------------------------------------------------------------
+# bounded_check <label> <bound-seconds> <command...>
+# ---------------------------------------------------------------------------
+#
+# `check` with a CEILING on how long it may take, and — this is the part that
+# matters — a fourth, named outcome when the ceiling is reached.
+#
+# WHY IT EXISTS. The gate grew past what one process can finish on a loaded
+# box: three docker stacks brought up and torn down, and thirty-two throwaway
+# copies of a 193 KB script each running their own bootstrap. The previous full
+# run on this branch was SIGKILLed (exit 137 — the kernel's OOM killer, not a
+# test failure) partway through the observability collector tier, which means
+# the gate reported *nothing* about the tiers it had not reached. A gate that is
+# killed is a gate whose green is a claim about however far it got.
+#
+# `timeout N` alone would fix the symptom and hide the disease in a new place:
+# a timed-out `check` prints FAIL with a two-word diagnostic that names neither
+# the tier nor the bound, and the next reader files it under "flaky". So the
+# bound is a verdict of its own — `BOUND` — carrying the tier, the bound and the
+# tail of what it had printed. It is counted separately in the summary, because
+# a bound that is reported as a PASS is exactly the silent skip the gate's own
+# rules forbid, and one reported as a FAIL is indistinguishable from a defect
+# in the tree.
+#
+# WHY IT IS NOT A SKIP. Nothing about a timed-out tier is unknown: we know it
+# did not finish, and the claim it exists to prove is therefore unexercised. A
+# SKIP is for a check that CANNOT run (no docker, no toolchain) and says so
+# about the environment. A bound is this machine being too busy, which is a
+# fact about the run and not about the tree — and it is the reason the gate
+# carries a bound at all rather than being allowed to be killed.
+#
+# `timeout` IS NOT PORTABLE and pretending otherwise would be the same class of
+# defect as the port rules this packet writes about: GNU coreutils ships it as
+# `timeout`, macOS has no `/usr/bin/timeout` at all, and Homebrew's coreutils
+# installs `gtimeout`. So it is RESOLVED, and a machine with neither runs the
+# tier unbounded and says so in the summary — a bound that silently did not
+# apply is worse than no bound, because the reader is told a ceiling exists.
+bounded_ran=0
+# Tiers that actually REACHED their bound. A separate counter from `bounded_ran`
+# on purpose: the summary line has to say "N tiers ran under a bound, M hit it",
+# and one counter cannot state both. An earlier version incremented one variable
+# in both places and printed "4 tier(s) hit their time bound" for a run in which
+# exactly one did — a summary that overstates a machine problem by 4x is the
+# fastest way to make a reader ignore the line entirely.
+bounded_hit=0
+_timeout_bin() {
+  for candidate in timeout gtimeout; do
+    if have "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+bounded_check() {
+  local label="$1" bound="$2"
+  shift 2
+  local runner out ec=0
+  if runner="$(_timeout_bin)"; then
+    bounded_ran=$((bounded_ran + 1))
+    # `--kill-after` so a tier that ignores SIGTERM is still ended: without it
+    # the bound is only a request, and the whole point is that the run ENDS.
+    out="$("$runner" --kill-after=30s "$bound" "$@" 2>&1)" || ec=$?
+  else
+    out="$("$@" 2>&1)" || ec=$?
+  fi
+  if [ "$ec" -eq 0 ]; then
+    report PASS "$label"
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out" | sed 's/^/       /'
+    fi
+  elif [ "$ec" -eq 124 ]; then
+    # 124 is `timeout`'s own code for "the bound was reached", and it is the
+    # only status here that means the command's verdict is unknown.
+    bounded_hit=$((bounded_hit + 1))
+    printf '%-4s %s\n' BOUND "$label"
+    printf '       exceeded its %ss bound on this machine. The tier did not finish, so\n' "$bound"
+    printf '       the claim it exists to prove is UNEXERCISED — this is not a defect in\n'
+    printf '       the tree, and it is not a pass. Re-run on a quieter box; every tier is\n'
+    printf '       bounded, so a run that reaches the end has exercised all of them.\n'
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out" | tail -12 | sed 's/^/       /'
+    fi
+  else
+    report FAIL "$label"
+    printf '%s\n' "$out" | sed 's/^/       /'
+  fi
+}
+
 # ===========================================================================
 # phase: static
 # ===========================================================================
@@ -4161,15 +4251,27 @@ if [ "$RUN_OBSERVABILITY" -eq 1 ]; then
   # Not skippable by preference. A dev machine with no docker gets a reported
   # SKIP, because the alternative — running the suite and reporting PASS while
   # the security claim went unexercised — is the shape of a proof nobody ran.
+  #
+  # BOUNDED, each tier with its own. Three docker stacks, eight containers apiece,
+  # brought up and torn down in sequence, on a machine that may also be running
+  # five other workers' gates. This is the tier the previous full run was
+  # SIGKILLed inside, and a kill costs the reader every tier after it — so each
+  # of these three carries a bound generous enough for a loaded box and a verdict
+  # of its own if it is reached.
+  #
+  # The numbers are ~3x the quiet-machine durations recorded in REPORT-kit-13.md
+  # §7, not a guess: a bound set at the observed quiet duration is a bound that
+  # fires on any contention at all, and a bound that fires is a tier that proved
+  # nothing.
   if ! have docker; then
     report SKIP 'observability proofs (docker not installed)'
   elif ! docker info >/dev/null 2>&1; then
     report SKIP 'observability proofs (docker daemon not reachable)'
   else
-    check 'tests/canary_test.sh  (a canary secret reaches no exporter)' \
-      bash "$ROOT/tests/canary_test.sh"
-    check 'tests/no_telemetry_in_readiness.sh  (collector killed, service still serves)' \
-      bash "$ROOT/tests/no_telemetry_in_readiness.sh"
+    bounded_check 'tests/canary_test.sh  (a canary secret reaches no exporter)' \
+      900 bash "$ROOT/tests/canary_test.sh"
+    bounded_check 'tests/no_telemetry_in_readiness.sh  (collector killed, service still serves)' \
+      900 bash "$ROOT/tests/no_telemetry_in_readiness.sh"
     # THE STACK, RUN. Every claim in this file about the observability platform
     # being usable is a claim about YAML until this one runs: that the FETCHED
     # stack comes up healthy, that a trace arrives in Tempo, that a metric
@@ -4177,12 +4279,12 @@ if [ "$RUN_OBSERVABILITY" -eq 1 ]; then
     # neither. `docker compose config` proved a stack that could not start, twice,
     # in this repository's own history — once because the collector's environment
     # block was missing and once because Mimir's healthcheck named a directory.
-    check 'tests/stack_live_test.sh  (the fetched stack runs; a trace and a metric land)' \
-      bash "$ROOT/tests/stack_live_test.sh"
+    bounded_check 'tests/stack_live_test.sh  (the fetched stack runs; a trace and a metric land)' \
+      900 bash "$ROOT/tests/stack_live_test.sh"
   fi
 fi
-# phase: classifier + staleness — the two runnable pieces, executed
 # ===========================================================================
+# phase: classifier + staleness — the two runnable pieces, executed
 #
 # Separate from `static` and run unconditionally, because both are the property
 # rather than the shape: classify_test asserts that the classifier FAILS on an
@@ -4340,22 +4442,54 @@ PY
 
   # The label carries both numbers and, deliberately, does not sum them into
   # "N breakages, N reds" the way it did while every recipe was red-expecting.
-  # Thirty-one breakages of which thirty must go red and one must stay green is a
-  # *stronger* suite than thirty-one that must all go red, and a label that
+  # Thirty-two breakages of which thirty-one must go red and one must stay green
+  # is a *stronger* suite than thirty-two that must all go red, and a label that
   # flattened the two would hide the only fact that distinguishes them.
-  if check "tests/self_test.sh  ($_st_breakages breakages: $_st_reds red, $((_st_breakages - _st_reds)) green-expecting — the ceiling has both sides proved)" \
-    bash "$ROOT/tests/self_test.sh"; then
-    :
-  fi
+  #
+  # BOUNDED, and this is the tier that most needs it. Every recipe above builds a
+  # fresh throwaway copy of the tree and runs the whole static gate inside it, so
+  # the self-test is _n_ gates in sequence: 32 on this branch, and the number
+  # grows with every check this repository adds. On a quiet box it is the
+  # longest phase in the run by a wide margin, and it is the one that grows
+  # silently — nothing in it announces that the gate just got slower.
+  #
+  # 5400s is measured, not chosen. The uninterrupted run recorded in
+  # REPORT-kit-13.md §5.2 took ~44 minutes end to end, of which the self-test
+  # phase was the majority; 5400 leaves room for a box three times busier than
+  # this one without being a number so large it never binds. A bound that never
+  # binds is the correct answer here — the point is that the run REACHES THE END
+  # and says so, not that it fails sooner.
+  bounded_check "tests/self_test.sh  ($_st_breakages breakages: $_st_reds red, $((_st_breakages - _st_reds)) green-expecting — the ceiling has both sides proved)" \
+    5400 bash "$ROOT/tests/self_test.sh"
 fi
 
 # ---------------------------------------------------------------------------
 
 printf '\n'
+# FOUR COUNTS, and the reason there are four is the reason this summary exists
+# at all. `PASS` and `FAIL` are verdicts about the tree. `SKIP` is a verdict
+# about the ENVIRONMENT: the check could not run here. `BOUND` is a verdict
+# about the RUN: the check started, this machine was too busy to finish it, and
+# the claim it exists to prove is therefore unexercised.
+#
+# Collapsing BOUND into FAIL would report a loaded box as a defect in the tree,
+# and collapsing it into PASS would be a lie with a green word on it. Either way
+# the reader loses the one thing they need: which failures to go and fix, and
+# which to go and re-run. The count is printed whenever it is non-zero, exactly
+# like the skip count, so a run that hit a bound cannot end quietly.
 if [ "$fails" -ne 0 ]; then
   echo "FAIL: $fails check(s) failed."
   [ "$skips" -eq 0 ] || echo "note: $skips check(s) skipped (reported above)."
+  [ "$bounded_hit" -eq 0 ] || echo "note: $bounded_hit tier(s) hit their time bound — the proof was unexercised, not passed (reported above)."
   exit 1
 fi
 echo "PASS: every check passed."
 [ "$skips" -eq 0 ] || echo "note: $skips check(s) skipped — reported above, never hidden."
+[ "$bounded_hit" -eq 0 ] || echo "note: $bounded_hit tier(s) hit their time bound — reported above, never hidden."
+# And the bound itself, on the runs where it did NOT bind, because a ceiling the
+# reader has never been told about is a ceiling they cannot rely on. Only
+# printed when a bound was actually applied, so a machine with no `timeout` at
+# all is not told about bounds it never had.
+if [ "$bounded_ran" -gt 0 ]; then
+  echo "note: $bounded_ran tier(s) ran under a time bound; none was reached."
+fi
