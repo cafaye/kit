@@ -16,23 +16,63 @@
 
 ```
 kit/
-├── README.md                     # what kit is, how a repo adopts it
-├── workflows/ci.reusable.yml     # the workflow six repos call
-├── lint/                         # configs a service copies verbatim
-├── docker/                       # Dockerfile.<lang> templates
+├── README.md                             # what kit is, how a repo adopts it
+├── .github/workflows/
+│   ├── ci.reusable.yml                   # the workflow six repos call
+│   └── ci.yml                            # kit calling its own workflow
+├── lint/                                 # configs a service copies verbatim
+│   ├── yamllint.yml  golangci.yml
+│   ├── rubocop.yml   eslint.config.mjs
+│   └── hadolint.yaml                      # argues the one rule it ignores
+├── docker/                               # Dockerfile.<lang> templates
 ├── templates/
-│   ├── bin-prime/<lang>.sh       # the worktree primer
-│   ├── bin/dev.sh                # the local developer loop
-│   ├── compose/                  # postgres + nats + redis + collector + LGTM
-│   │   ├── grafana/provisioning/ # datasources, dashboards, alert rules (files)
-│   ├── otel/<lang>/              # W3C traceparent: codec, suite, snippet
-│   ├── mise.toml                 # toolchain pin template
-│   └── AGENTS.md                 # skeleton for a service repo
-└── tests/validate.sh             # THE gate
+│   ├── bin-prime/<lang>.sh               # the worktree primer
+│   ├── bin/dev.sh                        # the local developer loop
+│   ├── compose/                          # postgres + nats + redis + collector + LGTM
+│   │   ├── grafana/provisioning/         # datasources, dashboards, alert rules (files)
+│   ├── otel/<lang>/                      # W3C traceparent: codec, suite, snippet
+│   ├── mise.toml                         # toolchain pin template
+│   └── AGENTS.md                         # skeleton for a service repo
+└── tests/validate.sh                     # THE gate
 ```
 
 Flat on purpose. `grep -r` finds everything; there is no plugin system to
 learn.
+
+The reusable workflow is at `.github/workflows/ci.reusable.yml` and nowhere
+else. That is not a style choice: GitHub documents that **subdirectories of the
+workflows directory are not supported**, so a `uses:` line reading
+`cafaye/kit/workflows/ci.reusable.yml@master` resolves to nothing, and every
+caller who copied it has a red build. A repo that holds the file in a convenient
+place and documents a `uses:` string is a repo whose documentation and layout
+have silently disagreed — which is the class of defect the `callable path`
+check in `tests/validate.sh` exists to catch. The same reasoning forbids a
+second copy: one file, and if you ever mirror it, the gate must fail when the
+copies differ.
+
+A caller writes exactly this, and nothing else:
+
+```yaml
+---
+name: ci
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  ci:
+    uses: cafaye/kit/.github/workflows/ci.reusable.yml@master
+    with:
+      language: go
+```
+
+`kit` itself calls it with the local form instead, which is the whole point of
+having the file here at all:
+
+```yaml
+    uses: ./.github/workflows/ci.reusable.yml
+    with:
+      language: none
+```
 
 ## The gate
 
@@ -40,9 +80,19 @@ learn.
 test suite — kit has no other tests, because kit has no code.
 
 ```sh
-python3 -m venv .venv && .venv/bin/pip install -r tests/requirements.txt
 bash tests/validate.sh
 ```
+
+**One command, on a clean clone, is the whole procedure.** The gate installs its
+own dependencies into the gitignored `.venv/` on first run and prints a `note:`
+line saying so. There is no prerequisite step, and a prerequisite step that is
+documented rather than automated is a prerequisite that gets skipped by exactly
+the machine you most wanted to hear from — a CI runner, or anyone who cloned
+without reading this file.
+
+That was the second time this bit. It used to exit 1 with `no python with
+PyYAML` because it preferred `.venv/bin/python`, fell back to `python3`, and
+`.venv` is gitignored, so **every fresh clone and every CI runner** hit it.
 
 Three phases, and all three must pass:
 
@@ -63,9 +113,11 @@ Three phases, and all three must pass:
   survives), and a service starts, serves and reports healthy with the collector
   killed. Both need a real collector, so both SKIP loudly without docker —
   never pass silently.
-- **self_test** — twelve breakages of a throwaway copy, asserting the gate goes
+- **self_test** — nineteen breakages of a throwaway copy, asserting the gate goes
   red each time. Six of them are a semantic mutation of one language each, so
-  **every suite is proven able to fail** rather than assumed to.
+  **every suite is proven able to fail** rather than assumed to. Six assert
+  that one *named* check reported `FAIL`, so a check written for a specific
+  defect is proven still load-bearing.
 
 - Tests are written **first** and watched fail before the artifacts exist. A
   config written from documentation instead of from the pinned image is a config
@@ -74,9 +126,25 @@ Three phases, and all three must pass:
   config in this repo was verified by loading it into its image.
 - **Never weaken a check to make the gate green.** If a check is wrong, fix the
   check and say so in the commit message.
-- `shellcheck` and `node` run when installed and are skipped when not; PyYAML
-  is required. A skip is reported in the summary, never hidden — and a *skip in
-  self_test* fails the run, because a proof nobody ran is not a proof.
+- `shellcheck` and `node` run when installed and are skipped when not. A skip is
+  reported in the summary, never hidden — and a *skip in self_test* fails the
+  run, because a proof nobody ran is not a proof.
+- **PyYAML, yamllint and hadolint are required and are bootstrapped, not
+  required of you.** `tests/bootstrap.sh` resolves an interpreter, builds
+  `.venv`, pip installs `tests/requirements.txt`, and fetches a pinned hadolint
+  release verified against hadolint's published `checksums.sha256`. Resolve
+  order: `$KIT_PYTHON` (an override is a promise — if it cannot import yaml
+  the gate says so rather than silently substituting a different one), then
+  `.venv`, then any `python3` on PATH that already has PyYAML, then bootstrap.
+  A required check whose tool path is hardcoded to a directory the resolver may
+  have skipped is a gate that fails on arrival; that is a bug this file has
+  already had once.
+- **A skip is a gap, and the summary line is how you find it.** The seven
+  Dockerfiles sat behind `SKIP ... (no parser for this file type)` for the whole
+  life of kit-02, and the only reason anyone knew is that the summary printed
+  `note: 7 check(s) skipped`. A skip that is honest is still a check that ran
+  nothing — and a new file type with no parser is reported, never quietly
+  ignored. If you add a file type, add the parser in the same commit.
 - When adding an artifact, add the check that would catch its absence. A
   validator nobody extends is a validator that quietly rots.
 - **Parse what you hand out.** A file a service copies has to parse in its own
@@ -90,17 +158,17 @@ Three phases, and all three must pass:
   rubocop ran on kit's own Ruby with kit's own config. That is the only way an
   obsolete key surfaces before six repos inherit it.
 - The suite must be able to fail: `self_test` breaks a throwaway copy of the
-  tree twelve ways and asserts the run goes red. If you change the suite, keep
+  tree nineteen ways and asserts the run goes red. If you change the suite, keep
   that true.
 
 ## Adding a language
 
 1. Add `<lang>` to the `language` input's `options` in
-   `workflows/ci.reusable.yml` **first**, and watch the suite go red. That one
-   edit is the whole trigger: `validate.sh` reads the options out of the
-   workflow and, for each one, requires a Dockerfile, a `bin/prime` and a
+   `.github/workflows/ci.reusable.yml` **first**, and watch the suite go red.
+   That one edit is the whole trigger: `validate.sh` reads the options out of
+   the workflow and, for each one, requires a Dockerfile, a `bin/prime` and a
    `[tools]` pin. There is no second list to keep in step — that is the point.
-2. Add the job: `workflows/ci.reusable.yml`, guarded by
+2. Add the job: `.github/workflows/ci.reusable.yml`, guarded by
    `if: ${{ inputs.language == '<lang>' }}`.
 3. Add the other three artifacts: `docker/Dockerfile.<lang>`,
    `templates/bin-prime/<lang>.sh`, and a `[tools]` entry in
@@ -114,6 +182,15 @@ artifacts landed with it, in one commit.
 
 Half a language is worse than none: the whole point of kit is that every repo
 that adopts it gets the same thing.
+
+`none` is not a language and is deliberately exempt from the four-artifacts
+rule: it is the option for a repository with no service manifest, and it runs
+that repository's own `tests/validate.sh`. It exists because without it `kit`
+could not call this workflow — every `language` value named a toolchain this
+repository does not have, which left the repository that defines the standard
+structurally excluded from using it. If you add a job for a new option, the
+`ci_check` block in `tests/validate.sh` must know about it in the same commit:
+an `option` with no `job` is a green build that ran nothing.
 
 ## Rules
 

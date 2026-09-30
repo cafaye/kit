@@ -11,20 +11,31 @@
 #   *different* check, so a passing self_test means the checks are independent
 #   and not one lucky assertion standing in for all of them.
 #
-# THE TWELVE BREAKAGES
-#   1.  delete a language template   -> the artifact-presence check goes red
-#   2.  add a collector exporter    -> the privacy check goes red
+# THE NINETEEN BREAKAGES
+#   1. delete a language template   -> the artifact-presence check goes red
+#   2. add a collector exporter    -> the privacy check goes red
 #   2b. DELETE the tempo exporter   -> the same check goes red from the other
 #        side. A set difference only catches the extra; this catches the
 #        missing, which is the mistake that ships a stack that collects
 #        everything and prints it.
-#   3.  corrupt the python codec    -> the executed test suite goes red
-#   4.  hardcode a compose port     -> the parameterization check goes red
-#   5.  flip the CI input default   -> the "consumers stay green" check goes red
-#   6-11. one semantic mutation per language implementation -> THAT language's
+#   3. corrupt the python codec    -> the executed test suite goes red
+#   4. hardcode a compose port     -> the parameterization check goes red
+#   5. flip the CI input default   -> the "consumers stay green" check goes red
+#   6. ungate the `none` job       -> the option/job agreement check goes red
+#   7-10. break the agreement between the documented `uses:` string and the
+#         real path, in the four ways it can break -> the callable-path check
+#         goes red
+#   11-12. break a Dockerfile -> the hadolint check, and the non-root check that
+#         exists because hadolint has no rule for a missing USER
+#   13-18. one semantic mutation per language implementation -> THAT language's
 #         suite goes red. A suite that has never failed has never been proven to
 #         test anything, and six suites that only one language's mutation covers
 #         is five suites that might assert nothing at all.
+#
+#   Seven of them (7-12) additionally assert WHICH check went red. Every other
+#   breakage only proves the gate can fail; those prove the check written for
+#   that defect is still load-bearing, which is a different claim and the one
+#   that decays silently.
 #
 #   Breakages 2 and 4 were both REWRITTEN in kit-03, for the same reason and it
 #   is worth recording: their recipes named strings that no longer exist. 2
@@ -48,8 +59,19 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-PY="${KIT_PYTHON:-$ROOT/.venv/bin/python}"
-[ -x "$PY" ] || PY=python3
+# Standalone runs bootstrap too, and `validate.sh` exports KIT_PYTHON so the
+# nested copies use the same interpreter. Self-bootstrapping here is not
+# redundancy: `bash tests/self_test.sh` is a documented command, and a
+# documented command that only works after a different documented command has
+# been run is two commands wearing one name.
+if [ ! -r "$ROOT/tests/bootstrap.sh" ]; then
+  echo "self_test.sh: tests/bootstrap.sh is missing — cannot resolve a python" >&2
+  exit 1
+fi
+# shellcheck source=tests/bootstrap.sh
+. "$ROOT/tests/bootstrap.sh"
+kit_bootstrap_python "$ROOT"
+export KIT_PYTHON="$PY"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/kit-self-test.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
@@ -64,7 +86,10 @@ fresh_copy() {
   copy_name="$1"
   local dst="$WORK/$copy_name"
   mkdir -p "$dst"
-  for entry in AGENTS.md README.md CHANGELOG.md docker lint templates tests workflows; do
+  # `.github` is in this list and not an afterthought: the reusable workflow it
+  # holds is the artifact every check that reads the workflow's inputs reads by
+  # path, so a copy without it cannot fail the same way the real tree does.
+  for entry in .github AGENTS.md README.md CHANGELOG.md docker lint templates tests; do
     [ -e "$ROOT/$entry" ] && cp -R "$ROOT/$entry" "$dst/"
   done
   chmod +x "$dst"/tests/validate.sh "$dst"/tests/self_test.sh 2>/dev/null || true
@@ -95,6 +120,36 @@ expect_red() {
     failures=$((failures + 1))
   else
     printf 'PASS self_test: %s — the gate went red\n' "$label"
+  fi
+}
+
+# expect_red_check <label> <dir> <check-label> <validate.sh args...>
+#
+# The stronger form of expect_red, and the one the layout/documentation checks
+# need. `the gate went red` is a weak proof when forty checks can make it red:
+# a breakage can be caught by the wrong check and still read as a pass, and the
+# check it was written for can be dead code forever. This asserts that ONE
+# named check reported FAIL, so a check that stops being load-bearing fails
+# here rather than being discovered months later by the defect it missed.
+#
+# The check label is matched as a literal prefix of the FAIL line, so it is the
+# exact label validate.sh prints. A rename on either side breaks this loudly,
+# which is the intended behaviour: a renamed check and a stale proof are the
+# same defect.
+expect_red_check() {
+  local label="$1" dir="$2" want="$3"
+  shift 3
+  local out ec=0
+  out=$(cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" 2>&1) || ec=$?
+  if printf '%s\n' "$out" | grep -qF "FAIL $want"; then
+    printf 'PASS self_test: %s — caught by `%s`\n' "$label" "$want"
+  elif [ "$ec" -eq 0 ]; then
+    printf 'FAIL self_test: %s — the gate stayed GREEN\n' "$label"
+    failures=$((failures + 1))
+  else
+    printf 'FAIL self_test: %s — the gate went red, but NOT via `%s`\n' "$label" "$want"
+    printf '%s\n' "$out" | grep '^FAIL' | sed 's/^/       /'
+    failures=$((failures + 1))
   fi
 }
 
@@ -211,7 +266,7 @@ expect_red_lang() {
 
 printf -- '-- self_test: a gate that cannot fail is not a gate\n'
 
-# The control. If the unbroken tree is already red, the four breakages below
+# The control. If the unbroken tree is already red, the breakages below
 # prove nothing, so this runs first and the run is meaningless without it.
 base="$(fresh_copy base)"
 expect_green 'unbroken tree' "$base" --static-only
@@ -302,10 +357,114 @@ expect_red 'breakage 4: docker-compose.yml hardcodes a published port' "$four" -
 # 5. a kit change that would break every consumer's CI. The opt-in job must stay
 #    opt-in and the six original jobs must stay gated on their language.
 five="$(fresh_copy ci-not-opt-in)"
-edit "$five/workflows/ci.reusable.yml" "default: 'false'" "default: 'true'"
+edit "$five/.github/workflows/ci.reusable.yml" "default: 'false'" "default: 'true'"
 expect_red "breakage 5: the telemetry CI job is no longer opt-in" "$five" --static-only
 
-# 6-11. One semantic mutation per language implementation, each against a
+# 6. the option with no job. A caller can pass `language: none` — the value
+#    that lets a repository with no service manifest (kit among them) call this
+#    workflow at all — and get a green build that ran nothing, because the job
+#    is no longer guarded by the input that selects it. The drift AGENTS.md
+#    calls out for any new `language` option, proven on the one option whose
+#    absence is a broken call rather than a missing toolchain.
+six="$(fresh_copy ungated-config-job)"
+edit "$six/.github/workflows/ci.reusable.yml" \
+  "if: \${{ inputs.language == 'none' }}" \
+  "if: \${{ inputs.language == 'go' }}"
+expect_red 'breakage 6: the `none` job is no longer gated on its own input' "$six" --static-only
+
+# 7-10. The four ways the layout and the documentation can drift apart. These
+#      are the class of defect this packet exists to make detectable: a stated
+#      fact — "callers write `uses: cafaye/kit/.github/workflows/...`" — that
+#      stops being true while every other check stays green. Each names the
+#      specific check that must catch it, because "the gate went red" is a weak
+#      claim when the callable check is one of forty that could have gone red.
+CALLABLE='.github/workflows/ci.reusable.yml  (callable: exists, on: workflow_call, docs agree)'
+
+# 7. The documented call points at a file that EXISTS. `ci.yml` is right there
+#    in the same directory, so a typo that resolves to a real path is invisible
+#    to any check that only asks "is there a file at the documented path" — and
+#    a `uses:` line naming `ci.yml` gets a caller a workflow that is not
+#    reusable at all. Only a comparison against the real path catches it.
+seven="$(fresh_copy doc-points-elsewhere)"
+edit "$seven/README.md" \
+  'uses: cafaye/kit/.github/workflows/ci.reusable.yml@master' \
+  'uses: cafaye/kit/.github/workflows/ci.yml@master'
+expect_red_check 'breakage 7: README documents a `uses:` path that is not the reusable workflow' \
+  "$seven" "$CALLABLE" --static-only
+
+# 8. The file is in the right place and still cannot be called. `on:
+#    workflow_call` removed is a legal-looking workflow that GitHub rejects
+#    before it reads one input, so every caller gets a red build with no
+#    explanation. Parseable is not callable.
+eight="$(fresh_copy not-callable)"
+edit "$eight/.github/workflows/ci.reusable.yml" \
+  '  workflow_call:' '  workflow_dispatch:'
+expect_red_check 'breakage 8: the workflow no longer declares `on: workflow_call`' \
+  "$eight" "$CALLABLE" --static-only
+
+# 9. A second copy, parked where the documented path does not point. This is the
+#    other layout the packet offered — canonical file plus a thin callable
+#    copy — and it is only acceptable with a check that fails when the copies
+#    differ. kit chose the move, so the gate refuses to find a second one at
+#    all. Two CI standards is the drift this repository exists to prevent.
+nine="$(fresh_copy divergent-copy)"
+mkdir -p "$nine/workflows"
+cp "$nine/.github/workflows/ci.reusable.yml" "$nine/workflows/ci.reusable.yml"
+expect_red_check 'breakage 9: a second copy of the reusable workflow, out of reach' \
+  "$nine" "$CALLABLE" --static-only
+
+# 10. kit's own CI stops calling itself locally, and reaches across the network
+#     to some other ref instead. The job still runs and still goes green, so
+#     this is invisible — but the job was the proof. A self-proof that fetches
+#     `master` proves that master's path works, not that this commit's does.
+#
+#     The `edit` anchor includes the job name, and not because the job name is
+#     interesting. The bare `uses:` line occurs twice in that file — once in the
+#     comment explaining why the self-call exists, once in the job — and a
+#     first-match replacement hit the comment, left the job alone, and reported
+#     the gate stayed GREEN. Which was the check being right and the mutation
+#     being sloppy: a `uses:` line inside a comment is documentation, and the
+#     callable check deliberately does not read it.
+ten="$(fresh_copy self-call-not-local)"
+edit "$ten/.github/workflows/ci.yml" \
+  '    name: gate
+    uses: ./.github/workflows/ci.reusable.yml' \
+  '    name: gate
+    uses: cafaye/kit/.github/workflows/ci.reusable.yml@master'
+expect_red_check 'breakage 10: kit CI calls a remote ref instead of its own local copy' \
+  "$ten" "$CALLABLE" --static-only
+
+# 11-12. The Dockerfiles. These are one of the four artifacts every adopting
+#       service inherits, and until this packet they were the only artifact in
+#       the tree with no parser at all — seven `SKIP ... (no parser for this
+#       file type)` lines that nobody had to look at twice because the summary
+#       said "note: 7 skipped".
+#
+#       A skipped check proves nothing (PLAN.md §1), so each breakage asserts a
+#       NAMED check went red, and the two breakages target the two different
+#       claims: the linter, and the rules the linter does not cover.
+DOCKERLINT='docker/Dockerfile.*  (non-root final stage, no :latest, no ADD)'
+
+# 11. A Dockerfile defect only hadolint can see. `pip install uv` with no
+#     version is DL3013, and it was in the tree the whole time — a resolver
+#     whose version silently decides what your lockfile resolves to.
+eleven="$(fresh_copy unpinned-pip)"
+edit "$eleven/docker/Dockerfile.python" \
+  'RUN pip install "uv==${UV_VERSION}" \' 'RUN pip install uv \'
+expect_red_check 'breakage 11: a Dockerfile pins nothing (hadolint DL3013)' \
+  "$eleven" 'docker/Dockerfile.python  (hadolint)' --static-only
+
+# 12. A Dockerfile defect hadolint does NOT see: the final stage dropped its
+#     USER, so the image would run as root. hadolint has no rule for this —
+#     DL3002 ("last USER should not be root") only fires when a USER is
+#     present and wrong, and a missing USER is silence. This is the check that
+#     has to exist precisely because the real parser cannot cover it.
+twelve="$(fresh_copy dockerfile-as-root)"
+edit "$twelve/docker/Dockerfile.go" 'USER nonroot:nonroot' '# USER removed'
+expect_red_check 'breakage 12: a Dockerfile final stage runs as root' \
+  "$twelve" "$DOCKERLINT" --static-only
+
+# 13-18. One semantic mutation per language implementation, each against a
 # different spec rule, and each asserting THAT language's suite goes red.
 #
 # These all read from the same throwaway copy as breakage 1 rather than taking a
@@ -315,7 +474,7 @@ base="$(fresh_copy language-mutants)"
 
 #   go    §3.2.2.5  stop masking trace-flags on read. Still compiles, still runs,
 #                  and quietly forwards reserved bits to the next service.
-expect_red_lang 'breakage  6: go stops masking trace-flags (§3.2.2.5)' \
+expect_red_lang 'breakage 13: go stops masking trace-flags (§3.2.2.5)' \
   "$base" go traceparent.go \
   'Flags:      tp.Flags & sampledFlag,' \
   'Flags:      tp.Flags,'
@@ -323,7 +482,7 @@ expect_red_lang 'breakage  6: go stops masking trace-flags (§3.2.2.5)' \
 #   ruby  §3.2.2  widen the alphabet to accept uppercase hex. The classic bug:
 #                one service folds case, the next rejects the header, and a trace
 #                breaks at the hop between them.
-expect_red_lang 'breakage  7: ruby accepts uppercase hex (§3.2.2)' \
+expect_red_lang 'breakage 14: ruby accepts uppercase hex (§3.2.2)' \
   "$base" ruby traceparent.rb \
   '!str.empty? && str.match?(/\A[0-9a-f]+\z/)' \
   '!str.empty? && str.match?(/\A[0-9a-fA-F]+\z/)'
@@ -331,21 +490,21 @@ expect_red_lang 'breakage  7: ruby accepts uppercase hex (§3.2.2)' \
 #   elixir §3.2.2.2  stop rejecting trailing data on a version-00 header. Nothing
 #                   crashes; the header is just no longer the format we claim to
 #                   implement.
-expect_red_lang 'breakage  8: elixir accepts trailing junk on version 00 (§3.2.2.2)' \
+expect_red_lang 'breakage 15: elixir accepts trailing junk on version 00 (§3.2.2.2)' \
   "$base" elixir traceparent.ex \
   'defp check_trailing(value, 0), do: if(byte_size(value) == @min_header_len, do: :ok, else: {:error, :invalid})' \
   'defp check_trailing(_value, 0), do: :ok'
 
 #   node  §3.3.1.5  raise the tracestate limit until truncation never fires. A
 #                   limit nobody enforces is a limit nobody wrote on purpose.
-expect_red_lang 'breakage  9: node never truncates tracestate (§3.3.1.5)' \
+expect_red_lang 'breakage 16: node never truncates tracestate (§3.3.1.5)' \
   "$base" node traceparent.mjs \
   'const TRACESTATE_LIMIT = 512;' \
   'const TRACESTATE_LIMIT = 100000;'
 
 #   rust  §3.2.2.3  accept an all-zero trace-id. The spec forbids it outright; a
 #                   codec that allows it merges unrelated traces into one.
-expect_red_lang 'breakage 10: rust accepts an all-zero trace-id (§3.2.2.3)' \
+expect_red_lang 'breakage 17: rust accepts an all-zero trace-id (§3.2.2.3)' \
   "$base" rust traceparent.rs \
   'if trace_id == ZERO_TRACE_ID || parent_id == ZERO_SPAN_ID {' \
   'if parent_id == ZERO_SPAN_ID {'
@@ -353,7 +512,7 @@ expect_red_lang 'breakage 10: rust accepts an all-zero trace-id (§3.2.2.3)' \
 #   python §3.2.2.5  the same dropped mask as go, in a different language, on
 #                   purpose: a rule asserted in one suite and not the other is a
 #                   rule two services will disagree about.
-expect_red_lang 'breakage 11: python stops masking trace-flags (§3.2.2.5)' \
+expect_red_lang 'breakage 18: python stops masking trace-flags (§3.2.2.5)' \
   "$base" python traceparent.py \
   'flags=parsed.flags & SAMPLED,' \
   'flags=parsed.flags,'
@@ -368,4 +527,4 @@ if [ "$skips" -ne 0 ]; then
   echo "FAIL: self_test — $skips breakage(s) skipped for a missing toolchain. A skipped proof is not a proof."
   exit 1
 fi
-echo "PASS: self_test — all 12 breakages went red, and the unbroken tree is green."
+echo "PASS: self_test — all 19 breakages went red, and the unbroken tree is green."

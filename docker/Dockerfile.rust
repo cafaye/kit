@@ -12,6 +12,10 @@
 #     the build, so two builds of the same commit are not the same binary.
 #   - The runtime copies CA certificates in because a service that calls Stripe
 #     or an OIDC provider fails TLS without them; distroless ships none.
+#   - The final stage runs non-root, as `nonroot:nonroot` (uid 65532) — the user
+#     the distroless image ships. A container running as root is a container
+#     where a bug is a host compromise, and a static binary gains nothing from
+#     root.
 ARG RUST_VERSION=1.84
 
 FROM rust:${RUST_VERSION}-slim-bookworm AS build
