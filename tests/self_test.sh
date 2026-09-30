@@ -903,12 +903,24 @@ expect_red_check 'breakage 27: a vendor config mount stopped resolving from the 
   "$twentyseven" "$MOUNTCHECK" --static-only
 
 # 28. THE PIN MOVED BACK INTO `.env`, where it is git-ignored. The shape is
-#     subtler than "the pin is wrong": `kit.ref` is deleted and
-#     `KIT_STACK_REF=` is added to `.env.example`, which reads correctly, passes
-#     review, and decides nothing at run time — because `bin/dev` reads
-#     KIT_STACK_REF from the ENVIRONMENT only, as a one-run override. A gate that
-#     checked "is the pin pinned?" would still be green; it has to check WHERE the
-#     pin lives, which is a different question and a different check.
+#     subtler than "the pin is wrong": the template ships
+#     `KIT_STACK_REF=<sha>` in `.env.example`, so a fresh clone looks configured
+#     and needs no setup. It also means the pin lives in a file that becomes
+#     `.env`, and `.env` is git-ignored — so the pin exists on the laptop of
+#     whoever ran the command last and on no CI runner and no teammate's
+#     checkout. "One command, always current" quietly becomes "one command,
+#     whatever this checkout last fetched".
+#
+#     `bin/dev` reads KIT_STACK_REF from the ENVIRONMENT only, as a one-run
+#     override, so the shipped line decides nothing at run time. A gate that asked
+#     "is the pin pinned?" would still be green; it has to ask WHERE the pin
+#     lives, which is a different question and a different check.
+#
+#     `rm -f kit.ref` is here for the shape a SERVICE sees, not for kit: kit's own
+#     root has no `kit.ref` — the pin belongs to the adopting service. Removing it
+#     is a no-op on this tree, and the red comes entirely from the `.env.example`
+#     line. Kept because the recipe should read as the defect it is proving
+#     rather than as the minimum needed to trip a check.
 PINCHECK='templates/bin/dev.sh + .env.example  (the pin is kit.ref, and the gate reads the same file)'
 
 twentyeight="$(fresh_copy pin-back-in-env)"

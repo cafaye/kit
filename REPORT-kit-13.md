@@ -290,15 +290,16 @@ and a check that reported *everything* as broken would fail the control.
 | 25 | an `otel-collector.yml` nothing mounts | `fleet` |
 | 26 | `kit.ref` holding `master` | `fleet` |
 | 27 | `${KIT_COMPOSE_DIR:-.}/tempo/tempo.yaml` → `./tempo/tempo.yaml` | `every vendor config mounts from the fetched tree` |
-| 28 | `kit.ref` **deleted** and `KIT_STACK_REF=` added to `.env.example` | `the pin is kit.ref, and the gate reads the same file` |
+| 28 | `KIT_STACK_REF=<sha>` added to `.env.example` (and `kit.ref` removed, which is a no-op on kit's own root — the pin belongs to the adopting service) | `the pin is kit.ref, and the gate reads the same file` |
 | 29 | `alpha` publishes a port on `postgres`, which kit already ships | `fleet` |
 
-Breakage 28's shape is the one that reads like an improvement: deleting `kit.ref`
-and adding a pin to `.env` looks tidier than a committed one-line file, and it
-**decides nothing** — `bin/dev` reads `KIT_STACK_REF` from the environment only,
-as a one-run override. A gate that asked "is the pin pinned?" would still be
-green; it has to ask **where the pin lives**, which is a different question and a
-different check.
+Breakage 28's shape is the one that reads like an improvement: shipping
+`KIT_STACK_REF=<sha>` in `.env.example` means a fresh clone looks configured and
+needs no setup. It also puts the pin in a file that becomes `.env`, which is
+git-ignored, so it **decides nothing** in CI and nothing on anyone else's
+checkout — `bin/dev` reads `KIT_STACK_REF` from the environment only, as a one-run
+override. A gate that asked "is the pin pinned?" would still be green; it has to
+ask **where the pin lives**, which is a different question and a different check.
 
 Breakage 29 deliberately omits `image:`, so it fires the ports rule alone and
 the stale-copy rule stays quiet: a breakage that reddened both would not say
