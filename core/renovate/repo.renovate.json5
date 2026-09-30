@@ -1,0 +1,18 @@
+{
+  // The per-repository stub. This is the WHOLE file a consuming repository adds,
+  // and it is four lines, because the point of `inheritConfig` is that the policy
+  // is not here.
+  //
+  // A repository that copies this file and then edits it has forked the policy,
+  // which is the drift `inheritConfig` exists to prevent. If a repository needs a
+  // rule the shared config does not have, the rule goes in the shared config.
+  //
+  // `enabled: false` until the repository has a `vendir.yml` and a committed
+  // `vendir.lock.yml`. Renovate on a repository with no lockfile finds the vendir
+  // manager's artifacts step returns `null` — a log warning, and a PR that moves
+  // the pin without re-copying the bytes. Starting disabled and being switched on
+  // by the PR that adds the lockfile is the ordering that cannot produce that.
+  $schema: 'https://docs.renovatebot.com/renovate-schema.json',
+  extends: ['local>cafaye/renovate-config'],
+  enabled: false,
+}

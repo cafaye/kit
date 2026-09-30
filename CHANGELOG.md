@@ -13,6 +13,104 @@ semver contract — it is consumed by *calling*
 
 ### Added
 
+- **`core/` — the `cafaye/core` fan-out standard.** Six repositories copy bytes
+  out of `core` and nothing makes the copy reach them. This ships the standard
+  that does, plus the two runnable pieces that make it enforceable:
+  - `core/vendir/vendir.yml.{muse,pantry,caf}` — the three real consumers, in
+    three languages. `muse` and `pantry` are **proven byte-identical (sha256)**
+    to what those repositories have committed today, by running vendir 0.46.2
+    against the real `cafaye/core`. `caf` **cannot migrate as-is** and its banner
+    says why: vendir has no rename, `caf` holds the bytes as
+    `manifest-0.2.json`, and core publishes them as
+    `cafaye.manifest.schema.json`.
+  - `core/vendir/vendir.yml.template` — the onboarding template. Four things to
+    change, each marked, each with the reason it is easy to get wrong.
+  - `core/renovate/renovate.json5` and `core/renovate/SETUP.md` — one
+    `inheritConfig` policy for the fleet, and the ordered steps to stand it up
+    **including what to verify before onboarding a second repository**.
+  - `core/release/release.yml` — what `core` needs to be taggable. Ships here;
+    belongs in `core/.github/workflows/`.
+- **`tests/classify.py` + `tests/rules.json` — a change classifier that fails
+  closed.** `self_test.sh` proves twenty-one synthetic breakages go red; it
+  cannot prove a future change to `event-envelope.schema.json` is one of them. So
+  a difference between two vendored schema sets is classified into
+  `FILE`/`PACKAGE`/`WIRE_JSON`/`WIRE` (buf's four tiers, because *pick the
+  category that matches what your consumers actually depend on*), and **anything
+  the catalogue does not name is `UNRECOGNISED`, which is the strictest tier**.
+  A new JSON Schema keyword arriving in core cannot be auto-merged green by
+  omission. The escape hatch is fenced: a rule may set `breaking: false` only for
+  an operation in the closed `advisoryOps` list, or the catalogue refuses to
+  load.
+- **`tests/staleness.py` — the fleet staleness reporter.** Reads every consuming
+  repository's recorded pin — a `vendir.lock.yml` sha *or* the hand-bumped
+  `CORE_REF`, because three repositories still use the second — resolves where
+  `core` is now, and prints the distance. `--fail-on-behind` makes it a gate;
+  `--fail-on-behind` is *off* by default because a stale copy is legal and a
+  scheduled report that is red every week is a report that gets muted. Run
+  against the real working tree it reports the first measured fleet fact:
+  **`muse` is nineteen commits behind**, and `caf` and `pantry` hold vendored
+  bytes with **no recorded origin at all**.
+- **Three new self-test breakages (18 → 21).** `includePaths` nested under
+  `git:`; the classifier made to **fail open**; the staleness reporter calling an
+  undeclared pin `current`. The second is the sharpest proof in the file: it
+  inverts the fail-closed property and asserts the suite notices.
+- **A check for a file type kit was already shipping unlinted.** The vendir
+  templates are YAML under non-`.yml` names, so the `git ls-files '*.yml'
+  '*.yaml'` sweep skipped them — and a service that copies one greets its first
+  CI run with a failure nobody authored. They are linted by name now.
+- **Two new `classify_test.sh` cases that exist to keep the gate honest rather
+  than red.** An advisory change must be *reported and not fail*, and a
+  reordered `required`/`enum` must not break `FILE` — JSON Schema defines both as
+  sets, so a reorder is provably not a semantic change. A gate that goes red on a
+  cosmetic edit trains the first person who hits it to reach for the gate rather
+  than the cause, which is how a fail-closed gate becomes a fail-open one.
+- `core/README.md` records what the fan-out measurement actually found, which is
+  **not** what the design was briefed on, and states plainly what stays unproven
+  until the first real tag moves.
+
+### Fixed
+
+- A `pipefail` bug in the new staleness test, where a successful `grep` was
+  masked by the classifier command's own deliberate non-zero exit. The output is
+  captured to a variable and the status read from the command, never from a pipe:
+  **a piped exit code is the exit of the last stage.** The same trap, one level
+  down from the one `self_test.sh` already documents at breakage 6.
+- The fail-closed tier was stated in **two** places — a string in `classify.py`
+  and a rule in `rules.json` — and the self-test breakage written to invert it
+  left the suite **green**, because the headline case never reached the line that
+  was broken. A property asserted in two places is asserted in zero. Both facts
+  now live in `rules.json` alone, and the counterexample is one token.
+- A `current`-at-head pin was reported as `unknown`. That is the state a reader
+  learns to ignore, which makes it the expensive direction to get wrong.
+
+### Changed
+
+- `AGENTS.md` records that the classifier **fails closed** as a rule about code
+  and not about data, and carves `core/`'s two programs out of the config-only
+  rule explicitly — stdlib only, nothing imports them, no committed output — so
+  that the exception is bounded rather than the start of a trend.
+- `AGENTS.md` and `README.md` describe twenty-one breakages rather than
+  eighteen, and the phase list gains the classifier and staleness phases.
+
+### Not done, and why
+
+- **No repository was migrated.** `vendir.yml` files for `muse`, `pantry` and
+  `caf` are shipped as templates with the exact steps in
+  `core/renovate/SETUP.md`; applying them is thirteen pull requests in thirteen
+  repositories, and this change is scoped to `kit`.
+- **`oasdiff` is not wired in.** It is the right tool for the OpenAPI half — a
+  static Go binary, a live GitHub Action, and **755 level-tagged checks** measured
+  by running `oasdiff checks changelog` at v1.32.1 — but `core`'s fan-out is raw
+  JSON Schema, and adding a pinned binary would make `kit` a repository with a
+  dependency, which `AGENTS.md` forbids.
+- **`expectOperations` is untouched and stays in `cafaye-ts`.** vendir has no
+  opinion about whether a copy should have been allowed to change size, and a
+  guard moved into a tool that cannot enforce it is a guard deleted.
+- **Three of the fleet's five parity guards still skip** when the core checkout
+  they compare against is absent. Fixing that is independent of vendir, more
+  urgent than vendir, and belongs to the repositories that own them.
+
+
 - A **`callable path` check** in `tests/validate.sh`: the reusable workflow
   exists at the path callers are documented to use, it declares
   `on: workflow_call`, every real `uses:` that names kit — in `README.md`,

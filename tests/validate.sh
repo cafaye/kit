@@ -957,6 +957,20 @@ PY
   }
   check 'templates/compose/.env.example  (every placeholder documented)' env_example_check
 
+  # ------------------------------------------------------------------ core
+  # The fan-out standard: vendir templates, the shared Renovate policy, and the
+  # two runnable pieces (the change classifier and the staleness reporter).
+  #
+  # `core_fanout_check` is a real parser over four file types and its failure
+  # modes are specific enough to be worth reading in one place, so it lives in
+  # tests/core_fanout_check.py rather than inlined here.
+  section 'static: the core fan-out standard'
+  core_fanout_check() {
+    "$PY" "$ROOT/tests/core_fanout_check.py" "$ROOT"
+  }
+  check 'core/vendir/ + core/renovate/  (structurally what Renovate and vendir need)' \
+    core_fanout_check
+
   # Dogfood lint/yamllint.yml on every YAML in the tree, not just the two
   # compose templates. kit ships the config and a repo that copies it lints its
   # own CI against it on day one, so a YAML that breaks the config is a YAML
@@ -1005,6 +1019,24 @@ PY
       check "$rel  (yamllint -c lint/yamllint.yml)" \
         "$YAMLLINT" -c "$ROOT/lint/yamllint.yml" "$ROOT/$rel"
     done < <(yamls_of_the_tree)
+
+    # The glob above only reaches `*.yml` and `*.yaml`, and kit now ships YAML
+    # under other names: the vendir templates are `vendir.yml.<service>` so that
+    # a repository that copies one to `vendir.yml` gets a file Renovate's
+    # `managerFilePatterns` can find, while kit's own tree is never itself a
+    # vendir target.
+    #
+    # A file a service copies that breaks kit's own lint config greets its first
+    # CI run with a failure nobody authored, which is the `rack_middleware.rb.snippet`
+    # defect in AGENTS.md arriving in a different costume. So they are linted
+    # here by name, and the name list is explicit: a glob over
+    # `core/vendir/vendir.yml.*` would also catch a backup file.
+    for rel in core/vendir/vendir.yml.template core/vendir/vendir.yml.muse \
+               core/vendir/vendir.yml.pantry core/vendir/vendir.yml.caf; do
+      [ -f "$ROOT/$rel" ] || continue
+      check "$rel  (yamllint -c lint/yamllint.yml, under a non-.yml name)" \
+        "$YAMLLINT" -c "$ROOT/lint/yamllint.yml" "$ROOT/$rel"
+    done
   fi
 
   # The CI workflow gains a job; assert the job exists, is opt-in, and that the
@@ -1615,12 +1647,35 @@ if [ "$RUN_TELEMETRY" -eq 1 ]; then
 fi
 
 # ===========================================================================
+# phase: classifier + staleness — the two runnable pieces, executed
+# ===========================================================================
+#
+# Separate from `static` and run unconditionally, because both are the property
+# rather than the shape: classify_test asserts that the classifier FAILS on an
+# unrecognised change, and staleness_test asserts that the reporter tells
+# `current` from `unknown` from `undeclared`. A check that only parses those two
+# files would pass on a classifier that waves every change through.
+#
+# Both scripts build their own fixtures in a temp directory, so neither depends
+# on a repository being checked out or on the network.
+
+if [ "$RUN_STATIC" -eq 1 ]; then
+  section 'classifier: the change classifier fails closed'
+  check 'tests/classify_test.sh  (19 cases, incl. the fail-closed property)' \
+    bash "$ROOT/tests/classify_test.sh"
+
+  section 'staleness: the fleet reporter tells the states apart'
+  check 'tests/staleness_test.sh  (12 cases, incl. the red proof)' \
+    bash "$ROOT/tests/staleness_test.sh"
+fi
+
+# ===========================================================================
 # phase: self_test — prove the gate can go red
 # ===========================================================================
 
 if [ "$RUN_SELF_TEST" -eq 1 ]; then
   section 'self_test: this gate is able to fail'
-  if check 'tests/self_test.sh  (eighteen breakages, eighteen reds)' \
+  if check 'tests/self_test.sh  (twenty-one breakages, twenty-one reds)' \
     bash "$ROOT/tests/self_test.sh"; then
     :
   fi

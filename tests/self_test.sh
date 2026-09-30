@@ -11,7 +11,7 @@
 #   *different* check, so a passing self_test means the checks are independent
 #   and not one lucky assertion standing in for all of them.
 #
-# THE EIGHTEEN BREAKAGES
+# THE TWENTY-ONE BREAKAGES
 #   1. delete a language template   -> the artifact-presence check goes red
 #   2. ship a collector exporter   -> the privacy check goes red
 #   3. corrupt the python codec    -> the executed test suite goes red
@@ -27,11 +27,22 @@
 #         suite goes red. A suite that has never failed has never been proven to
 #         test anything, and six suites that only one language's mutation covers
 #         is five suites that might assert nothing at all.
+#   19. nest `includePaths` under `git:` -> the core fan-out check goes red. The
+#         shape reads correctly, syncs successfully, and vendors the entire
+#         upstream repository; it was run before it was written down.
+#   20. make the change classifier FAIL OPEN -> classify_test.sh goes red. This
+#         is the sharpest proof here: it inverts the fail-closed property and
+#         asserts the suite notices, so the property is a counterexample rather
+#         than a claim in a comment.
+#   21. report an undeclared core pin as `current` -> staleness_test.sh goes red.
+#         Two real repositories are in that state today, which is what makes the
+#         difference between `undeclared` and `current` load-bearing.
 #
-#   7-10 additionally assert WHICH check went red. Every other breakage only
-#         proves the gate can fail; those four prove the check written for that
-#         defect is still load-bearing, which is a different claim and the one
-#         that decays silently.
+#   7-10 and 19 additionally assert WHICH check went red. Every other breakage
+#         only proves the gate can fail; those five prove the check written for
+#         that defect is still load-bearing, which is a different claim and the
+#         one that decays silently. 20 and 21 assert the same thing about the
+#         two scripts that are themselves proofs.
 #
 # WHAT IT IS NOT
 #   This is not exhaustive mutation testing. Each implementation gets exactly one
@@ -74,7 +85,10 @@ fresh_copy() {
   # `.github` is in this list and not an afterthought: the reusable workflow it
   # holds is the artifact every check that reads the workflow's inputs reads by
   # path, so a copy without it cannot fail the same way the real tree does.
-  for entry in .github AGENTS.md README.md CHANGELOG.md docker lint templates tests; do
+  # `core` is here for the same reason `.github` is: the breakages below mutate
+  # files in it, and a copy without it would fail on a missing path rather than
+  # on the defect under test — which is a self_test that proves nothing.
+  for entry in .github AGENTS.md README.md CHANGELOG.md core docker lint templates tests; do
     [ -e "$ROOT/$entry" ] && cp -R "$ROOT/$entry" "$dst/"
   done
   chmod +x "$dst"/tests/validate.sh "$dst"/tests/self_test.sh 2>/dev/null || true
@@ -135,6 +149,24 @@ expect_red_check() {
     printf 'FAIL self_test: %s — the gate went red, but NOT via `%s`\n' "$label" "$want"
     printf '%s\n' "$out" | grep '^FAIL' | sed 's/^/       /'
     failures=$((failures + 1))
+  fi
+}
+
+# expect_red_script <label> <dir> <script> <args...>
+#
+# For the two scripts that ARE a proof rather than a gate over a tree:
+# classify_test.sh asserts the classifier fails closed, staleness_test.sh asserts
+# the reporter tells the states apart. Breaking one of them and asserting THAT
+# script goes red is the same claim expect_red_check makes — the check written
+# for this defect is still load-bearing — expressed over a script.
+expect_red_script() {
+  local label="$1" dir="$2" script="$3"
+  shift 3
+  if (cd "$dir" && KIT_PYTHON="$PY" bash "$script" "$@" >/dev/null 2>&1); then
+    printf 'FAIL self_test: %s — the proof stayed GREEN\n' "$label"
+    failures=$((failures + 1))
+  else
+    printf 'PASS self_test: %s — the proof went red\n' "$label"
   fi
 }
 
@@ -449,6 +481,69 @@ expect_red_lang 'breakage 18: python stops masking trace-flags (§3.2.2.5)' \
   'flags=parsed.flags & SAMPLED,' \
   'flags=parsed.flags,'
 
+# 19-21. The core fan-out. Three breakages, and the middle one is the sharpest
+#       proof in this file: it INVERTS the fail-closed property and asserts the
+#       suite notices. Every other breakage proves a check can fail; this one
+#       proves the property is load-bearing rather than asserted in a comment.
+
+# 19. The trap that is not loud. `includePaths` nested under `git:` is dropped
+#     silently by vendir's unmarshalling, and the sync then vendors the ENTIRE
+#     upstream repository while exiting 0. It was run before it was written down;
+#     see core/vendir/README.md. A config that reads correctly and does the
+#     opposite of what it says is the worst class of defect to ship, so the gate
+#     names the specific check.
+COREFANOUT='core/vendir/ + core/renovate/  (structurally what Renovate and vendir need)'
+
+nineteen="$(fresh_copy include-paths-under-git)"
+edit "$nineteen/core/vendir/vendir.yml.pantry" \
+  '        newRootPath: schemas
+        git:
+          url: https://github.com/cafaye/core.git
+          ref: master' \
+  '        newRootPath: schemas
+        git:
+          url: https://github.com/cafaye/core.git
+          ref: master
+          includePaths:
+          - schemas/cafaye.manifest.schema.json'
+expect_red_check 'breakage 19: includePaths nested under `git:` (vendors everything, exits 0)' \
+  "$nineteen" "$COREFANOUT" --static-only
+
+# 20. THE SHARPEST ONE. Break the classifier so an UNRECOGNISED change is
+#     reported as WIRE instead of FILE — that is, make it fail OPEN. Every test
+#     in classify_test.sh that asserts a failure is now asserting nothing, and
+#     the suite must go red rather than quietly reporting 16 passes.
+#
+#     This is the difference between "the classifier fails closed" as a claim in
+#     a README and as a property with a counterexample. The counterexample is
+#     here, in the gate, and it is one line long: which is the point. The
+#     fail-closed property is one `if` returning `"FILE"`, and the only thing
+#     standing between that `if` and a fleet-wide silent break is this test.
+#
+#     It edits `unrecognisedIsBreaking` in tests/rules.json rather than a string in
+#     Python, and that is the entire reason the value lives there. The first
+#     version of this breakage inverted a hardcoded "FILE" inside classify.py and
+#     the suite stayed GREEN - because the same tier was ALSO a rule in
+#     rules.json, so the headline case never reached the line that was broken.
+#     A property stated in two places is a property stated in neither, and the
+#     duplication was invisible until something tried to break it.
+twenty="$(fresh_copy classifier-fails-open)"
+edit "$twenty/tests/rules.json" \
+  '"unrecognisedIsBreaking": true' '"unrecognisedIsBreaking": false'
+expect_red_script 'breakage 20: the classifier FAILS OPEN on an unrecognised change' \
+  "$twenty" tests/classify_test.sh
+
+# 21. The opposite error, and it is the expensive direction. Reporting a
+#     repository with no recorded core pin as `current` makes the fleet look
+#     clean. Two of the real repositories are in exactly that state today —
+#     `caf` and `pantry` hold vendored bytes with no recorded origin — so the
+#     difference between `undeclared` and `current` is the difference between a
+#     report and a rumour.
+twentyone="$(fresh_copy undeclared-reads-current)"
+edit "$twentyone/tests/staleness.py" '    return UNDECLARED' '    return CURRENT'
+expect_red_script 'breakage 21: the staleness reporter calls an undeclared pin current' \
+  "$twentyone" tests/staleness_test.sh
+
 printf '\n'
 if [ "$failures" -ne 0 ]; then
   echo "FAIL: self_test — $failures breakage(s) the gate did not catch."
@@ -459,4 +554,4 @@ if [ "$skips" -ne 0 ]; then
   echo "FAIL: self_test — $skips breakage(s) skipped for a missing toolchain. A skipped proof is not a proof."
   exit 1
 fi
-echo "PASS: self_test — all 18 breakages went red, and the unbroken tree is green."
+echo "PASS: self_test — all 21 breakages went red, and the unbroken tree is green."
