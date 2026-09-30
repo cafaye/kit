@@ -89,7 +89,7 @@
 #               merge appends rather than substitutes, so nothing errors and the
 #               port the developer meant to move is still bound.
 #
-#   Ten of them (7-10, 11, 12, 19, 20, 23-26, 27-29) additionally assert WHICH check
+#   Fifteen of them (7-12, 19, 20, 23-29) additionally assert WHICH check
 #         went red. Every other breakage only proves the gate can fail; those
 #         prove the check written for that defect is still load-bearing, which is
 #         a different claim and the one that decays silently. 21 and 22 assert
@@ -860,60 +860,11 @@ export KIT_FLEET="$twentysix_fixture"
 expect_red_check 'breakage 26: a service pins a BRANCH rather than a ref' \
   "$base" "$FLEETCHECK" --static-only
 
-# 27. A VENDOR CONFIG MOUNT THAT STOPPED RESOLVING FROM THE FETCHED TREE.
-#      This is the defect `tests/stack_live_test.sh` found by RUNNING the stack,
-#      and it is the one this packet's own static checks had nothing to say about:
-#      `docker compose config` renders the same project either way, because the
-#      variable's VALUE is not a property of the YAML. At run time the mount
-#      resolves to a path that does not exist, Docker creates a DIRECTORY there,
-#      and the collector exits naming a file type:
-#
-#        failed to read configFile /etc/tempo/tempo.yaml: is a directory
-#
-#      which says nothing about the mount that is wrong. Re-introducing it must
-#      not be possible between one live run and the next, which is what the check
-#      is for.
-MOUNTCHECK='templates/compose/ + bin/dev  (every vendor config mounts from the fetched tree)'
-
-twentyseven="$(fresh_copy mount-not-fetched)"
-edit "$twentyseven/templates/compose/docker-compose.yml" \
-  '${KIT_COMPOSE_DIR:-.}/otel-collector.yml:/etc/otel/otel-collector.yml:ro' \
-  './otel-collector.yml:/etc/otel/otel-collector.yml:ro'
-expect_red_check 'breakage 27: a vendor config mount stopped resolving from the fetched tree' \
-  "$twentyseven" "$MOUNTCHECK" --static-only
-
-# 28. THE PIN MOVED BACK INTO `.env`. The subtle one, because it looks like an
-#      improvement: a template that ships the ref means a fresh clone works with
-#      no setup. It also means the ref lives in a git-ignored file, so it exists on
-#      the laptop of whoever ran `bin/dev` last and on no CI runner and no
-#      teammate's checkout — and "one command, always current" quietly becomes
-#      "one command, whatever this checkout last fetched".
-#
-#      Broken with a BRANCH rather than a sha, so the breakage would also fail the
-#      runtime validator: a check that only notices the shape of the value would
-#      pass on a file whose value is the one thing it must never be.
-PINCHECK='templates/bin/dev.sh + .env.example  (the pin is kit.ref, and the gate reads the same file)'
-
-twentyeight="$(fresh_copy pin-back-in-env)"
-edit "$twentyeight/templates/compose/.env.example" \
-  'KIT_STACK_URL=https://github.com/cafaye/kit.git' \
-  'KIT_STACK_REF=master
-KIT_STACK_URL=https://github.com/cafaye/kit.git'
-expect_red_check 'breakage 28: the pin is back in `.env`, where it is git-ignored' \
-  "$twentyeight" "$PINCHECK" --static-only
-
-# Cleared, because `export` is not scoped to a command the way `VAR=v cmd` is,
-# and every breakage after this one would otherwise run against the last
-# fixture. The alternative — a `VAR=v` prefix per call — puts `expect_red_check`
-# at column 30, where the breakage counter and validate.sh's header/recipe check
-# (both `grep -cE '^expect_red...'`) stop being able to see it, and a breakage the
-# counter cannot see is a breakage the header is not proved against.
-unset KIT_FLEET
-
-# 27-28. THE TWO KIT-SIDE HALVES OF THE SAME PACKET. The four above are about the
-#         fleet; these are about kit's own tree, and they are the halves that make
-#         the fleet half mean anything. A gate that only checks its callers is
-#         checking that they call it correctly and not that it works.
+# 27-29. THE KIT-SIDE AND OVERRIDE RULES. The four above are about the fleet;
+#         these are about kit's own tree, and about what a second `-f` file is
+#         allowed to do to it. They are the halves that make the fleet half mean
+#         anything: a gate that only checks its callers is checking that they call
+#         it correctly, not that it works.
 #
 # 27. A VENDOR CONFIG MOUNT THAT STOPPED RESOLVING FROM THE FETCHED TREE. One
 #     `${KIT_COMPOSE_DIR:-.}` prefix dropped from one mount. The stack still
@@ -949,6 +900,43 @@ ENTRY
 expect_red_check 'breakage 28: the pin is back in .env, where nothing reads it' \
   "$twentyeight" "$PINCHECK" --static-only
 
+# 29. A PORT PUBLISHED ON A SERVICE KIT ALREADY SHIPS. The quietest of the three,
+#     because nothing errors. `ports:` is a LIST, a second `-f` file's list is
+#     APPENDED rather than substituted, and a service that writes
+#
+#         services:
+#           postgres:
+#             ports: ["15433:5432"]
+#
+#     gets postgres listening on kit's 15500 AND on 15433. `docker compose config`
+#     renders both and warns about neither, so the file reads like the override it
+#     was written to be while doing something else — and the port it meant to move
+#     is still bound. The documented way to move a published port is the VARIABLE
+#     in `.env`, which replaces.
+#
+#     No `image:` on the mutation, deliberately: the rule keys on the service NAME
+#     kit ships, not on an image, so this fires the ports rule alone and the
+#     stale-copy rule stays quiet. A breakage that reddened both would not say
+#     which one is load-bearing.
+twentynine_fixture="$(fixture_fleet published-port)"
+cat >>"$twentynine_fixture/alpha/docker-compose.yml" <<'YAML'
+  postgres:
+    ports:
+      - "15433:5432"
+YAML
+export KIT_FLEET="$twentynine_fixture"
+expect_red_check 'breakage 29: a service publishes a port on a service kit already ships' \
+  "$base" "$FLEETCHECK" --static-only
+
+# Cleared, because `export` is not scoped to a command the way `VAR=v cmd` is, and
+# the final recipe above would otherwise leave the fixture in the environment for
+# whatever runs next. The alternative — a `VAR=v` prefix per call — puts
+# `expect_red_check` at column 30, where the breakage counter and validate.sh's
+# header/recipe check (both `grep -cE '^expect_red...'`) stop being able to see it,
+# and a breakage the counter cannot see is a breakage the header is not proved
+# against.
+unset KIT_FLEET
+
 printf '\n'
 if [ "$failures" -ne 0 ]; then
   echo "FAIL: self_test — $failures breakage(s) the gate did not catch."
@@ -960,7 +948,7 @@ if [ "$skips" -ne 0 ]; then
   exit 1
 fi
 # The count is COUNTED, not written down. Every breakage above calls exactly one
-# of the three red-expecting helpers, so this cannot drift from the recipes the
+# of the four red-expecting helpers, so this cannot drift from the recipes the
 # way a hardcoded "all N breakages" does — and the header's list is checked
 # against it by `tests/validate.sh`, so a breakage added without a header entry
 # (or a header entry with no recipe) is a red gate rather than a doc that lies.

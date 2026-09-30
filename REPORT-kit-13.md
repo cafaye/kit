@@ -1,401 +1,442 @@
-# kit-13 — the observability stack gets a live path
+# REPORT — kit-13: the observability stack ships in kit and runs in zero services
 
-**Worktree:** `worker/kit-13-observe` · **Base:** `master` at `41f8bcb`
+**Branch** `worker/kit-13-observe` · **Base** `41f8bcb` (master) · **Never pushed, never merged.**
 
-The brief's premise, checked rather than assumed: `kit/templates/compose/` ships a
-complete observability platform, and **no service used it**. No repository in the
-fleet had an `otel-collector.yml`. **Six** carry a bespoke 44–86 line
-`docker-compose.yml` whose only infrastructure is a Postgres; **nine** ship none
-at all; **one** adopted `bin/dev`. (The brief said "nine services ship a bespoke
-44–86 line compose" and "1 of 9 adopt `bin/dev`" — the measured fleet is 6 and 1.
-The numbers here are the measured ones.) This packet gives the stack a callable
-path and a gate that says, loudly, which repositories are not on it.
+---
+
+## 0. What was inherited, and what I changed about it
+
+The dispatch said the previous worker was killed by an OOM restart and that its
+conclusions are void. Re-running its own proofs found real defects in the
+recovered work, and this report says which are which rather than presenting the
+branch as a clean sweep.
+
+| Recovered artifact | State on arrival | What I did |
+|---|---|---|
+| `templates/bin/dev.sh` (fetch + pin) | Worked, but required `KIT_STACK_REF` in a **git-ignored `.env`** | Moved the pin to a committed `kit.ref`; reworked `pin_cmd` |
+| `tests/fetch_test.sh` | Passed (14 assertions) | Re-pointed at `kit.ref`; wired into the gate |
+| `tests/stack_live_test.sh` | **Failed 2 of 12** | Both failures fixed; wired into the gate |
+| `tests/fleet_check.py` | **Crashed on the first repository**, never run | Fixed, scoped, de-duplicated; 13 findings against the real fleet |
+| `tests/self_test.sh` breakages 23–26 | Present, unverified | Verified each, and added 27–29 |
+| `tests/validate.sh` fleet wiring | Present; would have made the **self-test control go red** | Reworked the SKIP seam |
+
+The last row matters most. The recovered wiring guarded the fleet call with its
+own "are there any sibling entries?" predicate. A self-test throwaway directory
+*has* sibling entries — one per breakage — and none is a repository. So the
+control ran the check, the check exited 2, and **D13 would have blocked the
+packet** for a reason unrelated to it.
 
 ---
 
 ## 1. The fetch mechanism, and its pinning
 
-**A compose file cannot be `uses:`-ed.** That is the whole reason the mechanism is
-`bin/dev` and not something cleaner: GitHub resolves a reusable *workflow*, and
-there is no equivalent for a `docker-compose.yml`, a collector config, and four
-vendor config trees. So `bin/dev` fetches them.
+### The ruling, kept
+
+A compose file cannot be `uses:`-ed, so the live path is `bin/dev` itself. It
+fetches `templates/compose/` from a pinned kit ref and runs it *beside* the
+service's own `docker-compose.yml`.
 
 ```
-bin/dev  →  git init + fetch --depth 1 <remote> <ref> + checkout --detach FETCH_HEAD
-         →  docker compose --project-directory . \
-                          -f <fetched>/templates/compose/docker-compose.yml \
-                          -f ./docker-compose.yml up -d --wait
+docker compose --project-directory . \
+  -f "$CACHE/$REF/templates/compose/docker-compose.yml" \
+  -f ./docker-compose.yml up -d --wait
 ```
 
-**Why `git init` + `fetch` rather than `git clone --branch`.** `--branch` takes a
-branch or a tag and **cannot take a commit sha**, so cloning cannot express the
-stricter of the two pin forms. Three lines do, and they also make the checkout
-disposable: the cache directory is keyed by the ref, so an upgrade is a new
-directory rather than an in-place mutation, and there is no state to get into.
+The service's file is the **second** one, so it is an override. `--project-directory .`
+is not tidiness: compose resolves a relative path in a `-f` file against the
+*first* file's directory, and the first file is now in a cache directory outside
+the repository — so a service's `build: context: .` would otherwise build from
+kit's tree, producing an image and therefore no complaint.
 
-**The pin is `kit.ref`** — one committed line at the service root. The first
-version put it in `KIT_STACK_REF` in `.env`, and that was wrong in a way worth
-recording: **`.env` is git-ignored**, so a pin there exists on exactly one
-machine — the laptop of whoever ran the command last — and on no CI runner and no
-teammate's checkout. "One command, always current" then resolved to "one command,
-whatever this checkout last fetched", which is the opposite of what a pin is for.
-`bin/dev` still reads `KIT_STACK_REF`, but only from the **environment**, as an
-explicit one-run override for someone working on kit itself.
+### The four sources, in this order
 
-**A pin is a 40-character commit sha, or a `v<MAJOR>.<MINOR>.<PATCH>` tag.**
-Accepted: semver's own grammar including pre-release and build suffixes, because
-`v1.0.0-rc.1` is a tag real projects cut and a rule that refused it would be
-routed around — a developer told "that is not a pin" writes `master`, which is the
-failure the pin exists to prevent. Refused, **before any network call**:
+1. `KIT_STACK_DIR` — a checkout named on this run. Highest precedence, ref not
+   checked, because naming a directory is a person saying "this one" and it is
+   the case a kit contributor runs.
+2. `<KIT_STACK_HOME>/<ref>` — the per-ref cache.
+3. `.kit/stack` — a vendored copy, **which must record its ref** in
+   `.kit-stack-ref`.
+4. A fetch. The only source that touches the network.
 
-| refused | why |
-|---|---|
-| `master`, `main`, any branch | a MOVING reference; the allowlist and port block your dev loop runs change between two runs of the same command |
-| a 7-character sha | a moving reference wearing a sha costume; `git fetch` resolves it happily and it is ambiguous across remotes |
-| empty / a blank file | not a pin |
-| a non-numeric tag part | not semver |
+Sources 2 and 3 are checked *against the ref*, and that is the load-bearing
+detail: a directory that merely contains `templates/compose/` is not a kit
+checkout at a known version. A mismatched record is a refusal; a missing record
+is a refusal; only a matching one is used.
 
-**Upgrading is a command, not an edit**, because the interesting question is never
-"can I write this sha" but "what changes if I do":
+### The fetch itself
 
-```sh
-bin/dev pin v0.4.0        # prints the stack diff between the two refs, THEN writes kit.ref
-```
+`git init` + `remote add origin <url>` + `git fetch --depth 1 origin <ref>` +
+`git checkout --detach FETCH_HEAD`, then `.kit-stack-ref` is written, and the
+whole thing is built as `<dest>.tmp.$$` and `mv`'d into place. Not
+`git clone --branch`, because `--branch` takes a branch or a tag and **cannot
+take a commit sha** — so cloning cannot express the stricter of the two pin
+forms. The `mv` is atomic, so a second `bin/dev` in another terminal never sees
+a half-populated cache directory.
 
-It writes the pin and nothing else. It does not touch `.env`, does not run
-compose, and does not upgrade images — the containers that come up next are a
-separate, visible step.
+### Pinning, and how a developer moves it
 
-**Two bugs this command had, and neither was visible by reading it.**
+`KIT_STACK_REF` must be a **40-character lowercase-hex commit sha**, or a
+**`v<MAJOR>.<MINOR>.<PATCH>` tag** with semver's optional pre-release/build
+suffix. `bin/dev` refuses anything else **before any network call**. The check
+is `case`, not `[[ =~ ]]`, on purpose: it runs before any tooling beyond POSIX
+shell has been located.
 
-1. **The diff was never computed on a cold cache.** `pin_cmd` used the ref already
-   on disk and fetched only the *new* one, so on a machine that had never run
-   `bin/dev` — the first use, and the use most likely to *be* the upgrade — it
-   printed "the current ref is not on this machine, so the diff cannot be computed
-   here" and wrote the pin anyway. The command's entire reason for existing was
-   absent on the one run that mattered. It now fetches **both** refs: the cache is
-   keyed by ref, so they are two directories that cannot interfere, `KIT_STACK_OFFLINE=1`
-   is honoured rather than attempted, and when one side genuinely cannot be
-   obtained it says so plainly and names the exact `git diff` to run by hand
-   instead of reporting a success it cannot back.
-2. **The header it wrote was garbled.** `printf '# ...commit\n'` inside single
-   quotes emits a literal backslash-`n`, so the string ran on past the closing
-   quote and the following line was parsed as shell. The emitted `kit.ref` read
+**The pin lives in `kit.ref`, one committed line at the service root.** Not in
+`.env`. `.env` is git-ignored, so a pin kept there exists on exactly one
+machine — the laptop of whoever ran the command last — and on no CI runner and
+no teammate's checkout. "One command, always current" would then resolve to
+"one command, whatever this checkout last fetched", which is the opposite of
+what a pin is for. In `kit.ref` the bump is a line in `git diff`.
 
-   ```
-   # The kit ref this repository runs. One line: a 40-character commit# sha, or a v<semver> tag. NEVER a branch.
-   ```
-
-   — two comment lines run together into one. `printf '%s\n' TEXT` has no escape
-   to get wrong.
-
-`bin/dev pin` to the ref **already** pinned is a no-op and says so. That check
-runs *first*, before anything is fetched: pinning to where you already are is not
-a move, and answering it by fetching two copies of one commit is both slow and a
-false account of what happened.
-
-**Proven by `tests/fetch_test.sh`, 18 assertions, all executed.** The remote is a
-bare repository built from this tree and fetched over `file://`, so the suite needs
-no network — a CI runner and a laptop on a train get the same answer, and a flaky
-network can never be mistaken for a broken gate. Four of the eighteen exist only
-because the command above was *run* against a real second commit; they assert the
-diff names a changed file, that the sha is the last line of `kit.ref`, that the
-comment header is one `#` per line, and that a same-ref pin is announced.
+`bin/dev pin <ref>` moves it, and prints the stack diff **first** — a
+`diff -rq` of `templates/compose` between the two trees, fetching both sides if
+neither is on the machine, because a first `bin/dev pin` is the use most likely
+to *be* the upgrade and it was the one case that could not print a diff.
 
 ---
 
 ## 2. Offline mode, and how it was tested
 
-**The decision: use only what is on the machine, and fail loudly when none of it
-holds the pin.** `KIT_STACK_OFFLINE=1` skips the network entirely. Four sources,
-in this order, and the order is the argument:
+`KIT_STACK_OFFLINE=1` skips source 4 and **fails loudly**, naming each of 1–3,
+if none holds the pinned ref. It never falls back to whatever is in the working
+directory: *"the stack came up"* is a claim, and a claim about **which bytes**
+is the entire point.
 
-1. `KIT_STACK_DIR` — an explicit directory (read from `.env` too; the first version
-   read it from the process environment only, so the documented escape hatch
-   written in the file a developer is told to write it in was silently ignored and
-   the script went to the network anyway).
-2. `<cache>/<ref>`, with the ref **recorded inside it**.
-3. `.kit/stack`, vendored, **also with the ref recorded inside it** in
-   `.kit-stack-ref`.
-4. a fetch — the only one that touches the network.
+`tests/fleet_check.py`'s sibling proof is `tests/fetch_test.sh`, which runs
+against a **bare repository built from this tree over `file://`** — the same
+`git fetch --depth 1 <remote> <ref>` command, no network, so CI and a laptop on
+a train get the same answer. Executed, 14 assertions:
 
-**Sources 2 and 3 must record their ref, and that is the load-bearing detail.** A
-directory that merely *contains* `templates/compose/` is not a kit checkout at a
-known version; it is a directory. A mismatched record is a refusal, a **missing**
-record is a refusal, and only a matching one is used. That is what makes the
-offline mode real rather than decorative: a vendored copy at some other ref is
-refused by name, with both refs printed.
-
-**Four offline cases, all executed:**
-
-| case | asserted |
-|---|---|
-| warm cache, **remote deleted from disk** | runs, and says it came from the cache |
-| cold cache, no remote | exits nonzero, naming `KIT_STACK_DIR`, `KIT_STACK_HOME` and `.kit/stack` |
-| vendored copy **declaring the pinned ref** | accepted, and named as the source |
-| vendored copy at a **different** ref | **refused**, not silently used |
-
-The first case removes the remote rather than unsetting a variable: a URL that
-404s is a different failure from a URL that is not there, and only one of them is
-a network.
-
-**What offline mode deliberately does NOT do:** fall back to whatever is in the
-working directory. That is the one behaviour that cannot be allowed, because it
-makes `bin/dev` report success while running a stack nobody pinned.
-
----
-
-## 3. What stays in the service, measured
-
-The service's own `docker-compose.yml` is the **second** `-f`, so it is an
-override: what is in it wins, everything it does not mention still comes from kit.
-
-**`muse`, the largest adopter. Measured on a read-only copy — the house rules
-forbid touching other repositories.**
-
-| | total lines | non-comment |
+| # | Assertion | Result |
 |---|---|---|
-| before — `muse/docker-compose.yml` verbatim | 86 | 52 |
-| after — the same service as an override | 59 | **22** |
+| 1 | a pinned commit resolves; **the fetched compose file is byte-identical** to the tree it was pinned to | PASS |
+| 2 | a `v<semver>` tag resolves to the same bytes a commit does | PASS |
+| 3 | `v1.0.0-rc.1` is accepted — semver's own grammar admits it, and a rule that refused it would be routed around by writing `master` | PASS |
+| 4 | `master` refused, **and the message says why** | PASS |
+| 5 | a real branch name refused, same | PASS |
+| 6 | no `kit.ref` at all refused (the fresh-clone case) | PASS |
+| 7 | a 7-char abbreviated sha refused — ambiguous across remotes | PASS |
+| 8 | **offline with a warm cache runs with the remote `mv`'d away**, and says it came from the cache | PASS |
+| 9 | **offline with a cold cache and no remote fails**, and names `KIT_STACK_DIR`, `.kit/stack` or `KIT_STACK_HOME` | PASS |
+| 10 | a **vendored** copy declaring the pinned ref is accepted, and is named as the source | PASS |
+| 11 | a vendored copy at a **different** ref is refused | PASS |
 
-The 30 lines the "after" is *longer* in are comments explaining the override
-rules, which is where a service author reads them. The code shrank 58%.
+The strongest of these is #8: the remote is not unset, it is **moved**, so a URL
+that 404s (a different failure) cannot stand in for a URL that is not consulted.
 
-Merged against kit's 538-line stack, with the observability profile on:
-
-```
-AFTER  declares            : ['muse', 'postgres']
-MERGED has                 : 9 services            (8 from kit + muse)
-postgres POSTGRES_DB (muse's override won): muse
-postgres healthcheck is kit's, untouched   : CMD-SHELL pg_isready -U cafaye -d cafaye_platform
-postgres published ports (count)           : 1
-otel-collector config mount is kit's       : ['otel-collector.yml']
-tempo/loki/mimir/grafana still present    : ['tempo', 'loki', 'mimir', 'grafana']
-```
-
-**The check found a live defect in `muse` on the way.** `muse/docker-compose.yml`
-**does not parse as YAML**:
-
-```
-mapping values are not allowed here — line 65, column 67
-```
-
-`MUSE_VAULT_KEY: ${MUSE_VAULT_KEY:?set MUSE_VAULT_KEY, or run: uv run python -m muse.vault}`
-— the `: ` inside the shell expansion is a YAML mapping indicator. Every line of
-that file is what was meant, it reads correctly, and `docker compose up` answers
-with a line number and no explanation. It is **not** fixed here (out of bounds);
-it is reported to muse, and the fix is to quote the value.
+**Not verified:** `git fetch --depth 1 <https-url> <sha>` against a real GitHub
+remote. Everything above is `file://`. It is one `git ls-remote` away, and a gate
+that depends on github.com is a gate that goes red when github is down.
 
 ---
 
-## 4. Override rules
+## 3. What stays in the service — measured, on `identity`
 
-Each was run through `docker compose config`; none is assumed. They are written
-into the compose template's own header, which is where a service author reads.
+`identity` was chosen because it is the service that *has* to override kit's
+`postgres` to have its own database, so the residue is non-trivial rather than
+a demonstration that deleting lines is easy.
 
-**MAY**
-- `image:` on any service, wholesale. A different tag is a different Postgres
-  major, which is a real thing a service needs.
-- add keys to `environment:` — it **merges by key**.
-- add a `depends_on` with `condition: service_healthy`, and declare new services.
-- change a published port **by changing the variable in `.env`**.
+**Before — 52 lines, 1683 bytes.** `services: postgres:` (image, environment,
+ports, volumes, healthcheck), `services: identity:` (build, environment, ports,
+depends_on), and a top-level `volumes: postgres-data:`.
 
-**MAY NOT**
-- touch `otel-collector` — not `image:`, not `command:`, and above all not the
-  `volumes:` entry that mounts `otel-collector.yml`. That file carries the
-  redaction allowlist, **derived from core's schemas**; a service that overrides
-  the mount is shipping a telemetry boundary nobody derived, and prompt content
-  leaves the process inside it. This is the answer to the brief's question about
-  what may not be overridden.
-- override the four AGPL backends. `build:` is a fork, which is the licence
-  condition; a retagged image is the same fork by another route.
-- set `allow_all_keys`, or add an exporter, by any route.
+**After — 29 lines, 899 bytes.** A 47% reduction. What the service's file
+contains is its own image, its own port, its own environment, its own volume if
+it needs one, and its own service entry. What it no longer contains:
 
-### The trap worth the whole section: `ports:` APPENDS
+| Dropped from the service file | Because |
+|---|---|
+| `postgres.image` | kit ships it, pinned |
+| `postgres.ports` | a `ports:` list in a second file **appends** — see §4 |
+| `postgres.volumes` | kit's `postgres-data` is the one that gets migrated |
+| `postgres.healthcheck` | kit's, and kit's is now a real query (§8.1) |
+| top-level `volumes: postgres-data:` | kit declares it |
 
-A second file's `ports:` list is **concatenated** with the first, not substituted.
-A service that writes
+What is left, and the whole of it:
 
 ```yaml
 services:
-  postgres:
-    ports: ["15433:5432"]
+  postgres:                 # kit's service, overridden — NOT a second one
+    environment:
+      POSTGRES_USER: identity
+      POSTGRES_PASSWORD: identity
+      POSTGRES_DB: identity
+
+  identity:
+    build: { context: ., args: { GO_VERSION: "1.26" } }
+    environment: { PORT: "8080", LOG_LEVEL: debug, DATABASE_URL: … }
+    ports: ["8080:8080"]
+    depends_on: { postgres: { condition: service_healthy } }
 ```
 
-gets postgres listening on **15500 _and_ 15433**. Measured:
-
-```
-=== override published 15433, kit default 15500 ===
-    ports:
-      - published: "15500"     ← kit's
-      - published: "15433"     ← and the override's
-```
-
-`KIT_POSTGRES_PORT=15433` in `.env` is the only way to move it, and the gate
-fails on a `ports:` entry in a service file for that reason. This is why the
-"after" file above shows exactly one published port.
-
-Other measured behaviours: `volumes:` merge **by mount target** (same target
-replaces, different target appends); `command:`, `image:` and `entrypoint:`
-replace; a service joining `networks: [platform]` lands on the *same* network as
-kit's without redeclaring it.
+**The merged project was rendered, not assumed.** `docker compose --project-directory . -f <kit> -f ./docker-compose.yml config`
+produced nine services (grafana, identity, loki, mimir, nats, otel-collector,
+postgres, redis, tempo), six volumes, and a `postgres` whose environment is
+`identity` while its healthcheck names `$POSTGRES_USER`/`$POSTGRES_DB`.
 
 ---
 
-## 5. Proving it works
+## 4. Override semantics
 
-**`tests/stack_live_test.sh` — 15 assertions, all passing.** A compose file that
-has never been `docker compose config`-validated is a YAML file; this brings the
-whole thing up, sends it real OTLP, and reads the data back out of the stores.
+The merge is per-key and **not symmetric**. Every rule below was measured
+against `docker compose config` rather than inferred.
 
-```
-PASS  the fetched stack came up healthy, and only then did bin/dev look for migrations
-PASS  every service that declares a healthcheck reports healthy (8 of them)
-PASS  the running stack came from the fetched tree at the pinned ref (b25bdff2…)
-PASS  the collector's config is the FETCHED otel-collector.yml, byte for byte (per docker inspect)
-PASS  the tree the collector is reading declares the pinned ref (b25bdff2…)
-PASS  OTLP/traces accepted by the running collector
-PASS  OTLP/metrics accepted by the running collector
-PASS  the trace is in Tempo, found by service.name
-PASS  Tempo returns the trace, and error.type survived the boundary
-PASS  the canary reached no exporter on the live stack (Tempo checked by trace id)
-PASS  the direct OTLP metric is in Mimir under the kit_probe_ namespace
-PASS  the spanmetrics connector minted cafaye_duration_count — the fleet dashboard's source
-PASS  the canary reached no exporter on the live stack (Mimir checked by label scan)
-PASS  the service's own service joined the fetched stack rather than replacing it
-```
-
-Two of those are worth naming. The collector's config is checked by
-**`docker inspect .Mounts`** — the daemon's own record of the bind it set up — not
-by asking the collector (distroless: no shell) and not by asking the host (that is
-what we *think* we mounted). And the canary assertions are *absences against a
-search that first proved the data is there*, so a store holding nothing cannot
-satisfy them.
-
-**Three real defects the run found, and the one fix I did not make.**
-
-1. **`${KIT_COMPOSE_DIR:-.}`** — with the stack fetched, a bare `./` in the compose
-   file resolves against the project directory, which is the *service*, where
-   `otel-collector.yml` no longer is. Docker's answer to a missing bind source is
-   to **create a directory**, so all four backends died with
-   `read /etc/tempo/tempo.yaml: is a directory` — naming a file type rather than
-   the thing that is wrong. `docker compose config` renders the same project and
-   every static check was green. Fixed by anchoring the mounts to the compose
-   directory, and gated (breakage 27).
-
-2. **Grafana's first boot downloads a plugin.** Grafana 11.3 ships
-   `[plugins] preinstall = grafana-lokiexplore-app` and installs it on first boot,
-   which holds the sqlite lock its own migrations want. Cold-volume cold-start
-   time for `/api/health` measured anywhere from **26s to over 180s** — a network
-   call in a dev loop, and an air-gapped developer could not start the stack at
-   all. Fixed by `GF_INSTALL_PLUGINS_PREINSTALL_DISABLED=true`, which is
-   *configuration* (the AGPL condition is about not building a `grafana/*` image),
-   and which nothing kit ships uses: both dashboards read Loki through the
-   provisioned datasource, and the alert rules are PromQL. Measured after: Grafana
-   ready at ~26s, **whole stack up and healthy in 76s**.
-
-   **The wrong fix was available and looked entirely reasonable.** A cold start
-   failing against a 65s budget reads exactly like a flake, and the obvious
-   response is to raise the retries. I did that first, then reverted it once the
-   evidence showed the slowness was a network call rather than a tight budget —
-   and left the healthcheck at its shipped `6 × 10s + 5s`, which the fixed cause
-   now clears with room to spare. Widening the budget would have hidden the
-   network dependency and left the loop unusable offline, which is the one thing
-   this packet exists to make true.
-
-3. **`muse/docker-compose.yml` does not parse** — section 3. Not mine to fix.
-
----
-
-## 6. The gates
-
-`tests/fleet_check.py`, wired into `tests/validate.sh` as
-`fleet  (no stale copy, no weakened boundary, no dead config, every ref pinned)`.
-Four failure modes, one check each, and a SKIP (never a silent pass) when there
-is no fleet — "no fleet was found" is not "the fleet is clean", the same
-`unknown` vs `current` confusion `tests/staleness.py` exists to avoid.
-
-### **The stale-compose check is RED on master, and that is correct.**
-
-```
-FAIL fleet: 11 problem(s) across 6 repository(ies).
-```
-
-| repository | what the check catches |
-|---|---|
-| **billing** | `db: postgres:17` — its own copy; no `kit.ref` |
-| **courier** | `db: postgres:17` — its own copy; no `kit.ref` |
-| **darkroom** | `postgres: postgres:17-alpine` — its own copy; no `kit.ref` |
-| **identity** | `postgres: postgres:17-alpine` — its own copy; no `kit.ref` |
-| **muse** | `postgres:18-alpine` + `cafaye/muse:dev`; **`docker-compose.yml` does not parse**; no `kit.ref` |
-| **guard** | no `kit.ref`. It has no database in v0, so there is no copy to catch — its file declares one service and it is genuinely its own |
-
-**Five repositories carry a stale copy of the shared stack; six have no pin.**
-`caf`, `cafaye-rb`, `cafaye-ts`, `core`, `pantry` and `parlor` ship no compose
-file at all and are reported as out of scope rather than as clean — five of them
-have no `kit.ref` either, which is the honest state of a service that has not
-adopted anything.
-
-The predicate is an **image**, not a service name, and that is the whole
-subtlety: five of the six name their database `db` rather than `postgres`, so a
-check looking for the NAME would find nothing and report the fleet clean while
-five copies of the platform stood right there. The set of images is read out of
-**kit's own compose file** rather than written down, because a hand-kept list is a
-list that must be edited every time kit adds a service, and a check that must be
-edited is a check that gets skipped — which is how this state survived.
-
-**I have not softened it.** The same shape as D4: three repositories not spelling
-their gate the same way is invisible to any check that reads only one of them, so
-kit's gate reads the *other* repositories. Red here is the deliverable.
-
-**The other three gates are green on master**, which is correct: no repository
-overrides the collector, none carries a collector config, and none has a pin to be
-unpinned. They are proven able to fail by breakages 24, 25 and 26.
-
----
-
-## 7. Breakages
-
-`tests/self_test.sh` now carries **29** (was 23). Six are new, each asserting the
-**named** check rather than "the gate went red" — and for the four fleet gates
-that distinction is the whole proof, because the real fleet is red by design, so
-"the gate went red" would be satisfied by a fleet of two clean repositories. They
-run against a **fixture fleet** built by `fixture_fleet` for that reason.
-
-| # | breakage | caught by |
+| | Rule | Why |
 |---|---|---|
-| 23 | a service carrying its own copy of the shared stack (the real `db: postgres:17` shape) | the stale-copy check |
-| 24 | a service re-pointing the collector's config mount at its own `otel-collector.yml` | the boundary check |
-| 25 | an `otel-collector.yml` that exists and that **nothing mounts** | the dead-config check |
-| 26 | a `kit.ref` holding `master` | the pin check |
-| 27 | a vendor config mount that stopped resolving from the fetched tree | `every vendor config mounts from the fetched tree` |
-| 28 | the pin moved back into `.env`, where nothing reads it | `the pin is kit.ref, and the gate reads the same file` |
+| MAY | set `image:` on a kit service | a different postgres major is a real need |
+| MAY | add to `environment:` | a per-service database name is the case that matters |
+| MAY | add `depends_on: {…, condition: service_healthy}` | |
+| MAY | **change a published port — only through the variable in `.env`** | a `ports:` list in the second file **appends**, so `ports: ["15433:5432"]` yields postgres on 15500 **and** 15433 |
+| MAY NOT | override `otel-collector` — not `volumes:`, `command:`, `image:`, `build:` | that mount carries the redaction allowlist, **derived from core's schemas**; a service that re-points it ships a boundary nobody derived |
+| MAY NOT | `build:` or retag `tempo`/`loki`/`mimir`/`grafana` | AGPL-3.0's condition is unmodified distribution; a `build:` is a fork |
+| MAY NOT | set `allow_all_keys`, or add an exporter, by any route | same reason; same check that already fails on kit's own file |
+
+The `ports:` rule was the one the shipped documentation promised and the gate
+did not implement. It is implemented now, and breakage 29 proves it. **It fires
+on the real fleet: `darkroom` and `identity`**, the two that name their service
+`postgres:` *and* publish a port on it.
 
 ---
 
-## 8. What I could not verify
+## 5. The gates
 
-- **The network path to `github.com/cafaye/kit` is not in the gate.** I confirmed
-  by hand that `git fetch --depth 1 https://github.com/cafaye/kit.git <sha>`
-  resolves a commit, and every test uses a local `file://` remote instead. A gate
-  that depends on github.com is a gate that goes red when github is down.
-- **`bin/dev up` was never observed reaching its `migrate`/`seed` steps.** The live
-  fixture has neither, and `bin/dev` correctly refuses to pretend otherwise — the
-  test asserts the stack came up *and* that the migration lookup happened after.
-  The migration path is unchanged by this packet and is covered elsewhere.
-- **The 180s `bin/dev` deadline is a laptop figure.** Measured 76s cold on an
-  otherwise-idle 8-CPU VM. This machine is shared — other cafaye workers were
-  running their own stacks throughout — so `stack_live_test.sh` sets
-  `KIT_DEV_TIMEOUT=420`, the escape hatch `bin/dev` itself prints. Raising the
-  shipped default would make every developer wait longer for a stack that starts
-  in 76s on their machine.
-- **No repository was migrated.** The before/after in section 3 is measured on a
-  read-only copy. Turning `muse` over needs a `kit.ref`, an `AGENTS.md` edit and a
-  compose rewrite, and the house rules put other repositories out of bounds here.
-- **The fleet gate is only as good as its discovery.** It enumerates immediate
-  subdirectories that are their own git checkouts, skipping worktrees — the same
-  rule `tests/staleness.py` uses, so the two cannot disagree about how many
-  repositories there are. A fleet in a different layout needs `--repos-dir`.
-- **The redaction allowlist's continued agreement with core's schemas is
-  unchanged and still gated** by the pre-existing `core`-derived check. What is new
-  is that a service can no longer *override* the file that carries it.
+Four failure modes, one check each, in `tests/fleet_check.py`, plus two
+kit-side checks. Every one is **proven able to fail** (§6).
+
+### 5.1 Which repositories the stale-compose check catches
+
+Scope is by **declaration**: a repository is checked when it has a root compose
+file or a root collector config. `core` and `docs` will never run a stack;
+`parlor/e2e/docker-compose.yml` is a harness, not a developer's loop. The
+out-of-scope count is **printed**, never dropped.
+
+> **6 repositories in scope, 9 out of scope: billing, courier, darkroom,
+> guard, identity, muse.**
+
+| Rule | Count | Which |
+|---|---|---|
+| **stale copy** — runs an image kit already ships | **4** | billing, courier, darkroom, identity |
+| **no pin, or a pin that moves** | **6** | all six |
+| **a published port on a kit service** | **2** | darkroom, identity |
+| **unreadable compose file** | **1** | muse |
+| weakened boundary | 0 | nobody |
+| dead / service-owned collector config | 0 | nobody |
+
+**13 findings, 6 repositories. It is red, and it stays red.** The first gate in
+the packet's list is red against the current fleet, and softening it to make
+master green is exactly what the packet refuses.
+
+Three details worth stating:
+
+- **The stale-copy check keys on the IMAGE, not the service name.** Five of the
+  six call their database `db`, not `postgres`. A name-based check reports the
+  fleet clean while every copy of the platform stands right there — and that is
+  what the recovered version did.
+- **muse is counted as carrying a copy, but its file cannot be read to tell.**
+  Its `docker-compose.yml` **does not parse**. Line 65 puts a `: ` inside an
+  unquoted YAML scalar:
+  `MUSE_VAULT_KEY: ${MUSE_VAULT_KEY:?set MUSE_VAULT_KEY, or run: uv run python -m muse.vault}`.
+  Verified by two independent parsers — `docker compose config` exits 1, and
+  PyYAML raises `ScannerError`. **That stack cannot start at all**, and no check
+  in kit could have found it, because nothing in kit reads the fleet. That is
+  the argument for this gate existing, in one example.
+- **`guard` is correctly NOT caught by the stale-copy rule.** It declares one
+  service, its own, and no database. A gate that flagged it would be flagging a
+  repository for being correct. It is caught by the pin rule, because it has no
+  `kit.ref`.
+
+### 5.2 Gate results, reported separately
+
+| Phase | PASS | FAIL | SKIP |
+|---|---|---|---|
+| `tests/validate.sh --static-only` | **138** | **1** | **2** |
+
+The single FAIL is `fleet (no stale copy, no weakened boundary, no dead config,
+every ref pinned)`, by design. The two SKIPs are the two known-correct ones on
+master — `templates/tier/bun/tier.test.ts` and `templates/tier/node/tier.test.ts`,
+both because `node --check` cannot read TypeScript. **My change adds no skip
+and removes none.**
+
+Where a skip is unavoidable — no fleet, as on a CI runner — it is reported as a
+SKIP with the `FLEET-ABSENT` marker, because "no fleet was found" is not "the
+fleet is clean". That is the same `unknown` vs `current` confusion
+`tests/staleness.py` exists to avoid.
+
+---
+
+## 6. Every gate proven able to fail
+
+`tests/self_test.sh` breaks a throwaway copy once per check and asserts it goes
+red. **Fifteen of the 29 assert the NAMED check**, because "the gate went red" is
+a weak claim when a hundred checks can make it red.
+
+Breakages **23–26** are the four failure modes, each against a **fixture
+fleet**. That is not a convenience: the real fleet is red by design, so "the
+gate went red" there is satisfied by two clean repositories. Each fixture is two
+repositories, `alpha` (correct) and `beta` (correct), and the breakage mutates
+only `alpha` — so a check that only ever looks at the first repository is caught,
+and a check that reported *everything* as broken would fail the control.
+
+| # | Mutation | Caught by |
+|---|---|---|
+| 23 | `alpha` gains a second `postgres:17` of its own | `fleet` |
+| 24 | the collector's config mount re-pointed at a service-owned file | `fleet` |
+| 25 | an `otel-collector.yml` nothing mounts | `fleet` |
+| 26 | `kit.ref` holding `master` | `fleet` |
+| 27 | `${KIT_COMPOSE_DIR:-.}/tempo/tempo.yaml` → `./tempo/tempo.yaml` | `every vendor config mounts from the fetched tree` |
+| 28 | `kit.ref` **deleted** and `KIT_STACK_REF=` added to `.env.example` | `the pin is kit.ref, and the gate reads the same file` |
+| 29 | `alpha` publishes a port on `postgres`, which kit already ships | `fleet` |
+
+Breakage 28's shape is the one that reads like an improvement: deleting `kit.ref`
+and adding a pin to `.env` looks tidier than a committed one-line file, and it
+**decides nothing** — `bin/dev` reads `KIT_STACK_REF` from the environment only,
+as a one-run override. A gate that asked "is the pin pinned?" would still be
+green; it has to ask **where the pin lives**, which is a different question and a
+different check.
+
+Breakage 29 deliberately omits `image:`, so it fires the ports rule alone and
+the stale-copy rule stays quiet: a breakage that reddened both would not say
+which of the two is load-bearing.
+
+---
+
+## 7. It runs
+
+`tests/stack_live_test.sh` is in the gate's observability phase, not on a shelf.
+Measured, in this gate run:
+
+- `bin/dev` fetched kit at the pinned ref from a local bare remote and brought
+  up **eight containers**, all healthy, `--wait`, no sleeps.
+- The collector's config mount was read back with **`docker inspect`** — the
+  daemon's own record of the bind, which is the only one of the three possible
+  answers that cannot be a self-report — and diffed against the fetched file.
+- A trace was sent, and **found in Tempo**; `error.type` survived the boundary.
+- A metric was sent, and **found in Mimir**; and the `spanmetrics` connector
+  minted `cafaye_duration_count`, which is the fleet error dashboard's source.
+- A canary in ten attributes reached **neither** store.
+
+Two assertions in this file failed on my first run and both were **test** bugs,
+not stack bugs:
+
+1. `probe` (the test's own curl container) has no healthcheck, so
+   `{{.Health}}` is empty, and `grep -v ' healthy$'` read that as unhealthy.
+2. The collector image is distroless, so `docker compose exec … cat` fails — and
+   the test compared compose's **error string** against the config and reported
+   that the boundary was not the fetched one. *The error string was the
+   evidence.*
+
+A third defect the same work exposed, and the one that started this report's
+worst thread: `STACK_NAME="kit-stack-$PROJECT"` while `PROJECT="kit-stack-$$"`,
+so every `docker compose -p "$PROJECT"` in the file addressed a project the
+test had not created. One name, now.
+
+---
+
+## 8. Two defects found by measuring what the packet asked me to measure
+
+### 8.1 The postgres probe was a decoration
+
+Rendering `identity`'s merge showed a container initialised as `identity` and
+health-checked as `cafaye`, because kit's probe interpolated
+`${KIT_POSTGRES_USER:-cafaye}` at **compose render time**. I wrote that up as
+"never becomes healthy, so `up --wait` fails".
+
+**Then I ran it, and it reported healthy.** Measuring instead of asserting is
+what caught it:
+
+```
+$ pg_isready -U identity -d nosuchdb -q ; echo $?
+0
+$ psql -U identity -d nosuchdb -tAc 'select 1' >/dev/null ; echo $?
+2
+```
+
+`pg_isready` reports whether the server is **accepting connections**. Its `-U`
+and `-d` do not authenticate and do not select — they are diagnostics, and the
+readiness answer is 0 either way. So the pair kit shipped bought nothing, and
+the comment above it — *"`pg_isready` alone returns true before the init scripts
+finish … The -U/-d pair makes it check the real thing"* — was asserting a
+strengthening that does not exist. The probe had been reporting postgres ready
+on a container whose named database did not exist: the precise flake the comment
+says it exists to prevent.
+
+The probe is now a real query against the database the container actually has:
+
+```yaml
+healthcheck:
+  test:
+    - CMD-SHELL
+    - pg_isready -q -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" &&
+      psql -U "$$POSTGRES_USER" -d "$$POSTGRES_DB" -tAc 'select 1' >/dev/null
+```
+
+`$$` because compose interpolates `$VAR` **before YAML is parsed**, so quoting
+does not protect it. Two wrong answers on the way there, both caught by rendering
+rather than reading; the second was `\$`, which is not a valid escape in a YAML
+double-quoted scalar and made PyYAML reject the whole file. **A value three
+parsers read is worth rendering three times.**
+
+All three forms rendered here, against a service that renames its database to
+`identity` — `docker compose config`, so this is the daemon's own answer and not
+a reading of the file:
+
+| written in the compose file | rendered, for a service whose database is `identity` |
+|---|---|
+| `pg_isready -U "$POSTGRES_USER"` | `-U "" -d ""` — nothing outside a container sets it |
+| `pg_isready -U "${KIT_POSTGRES_USER:-cafaye}"` | `-U cafaye -d cafaye_platform` — kit's defaults, inside *someone else's* container |
+| `pg_isready -U "$$POSTGRES_USER"` | `$$POSTGRES_USER` in `config` output, which is compose re-escaping the single literal `$` it will hand the container |
+
+The middle row is the shipped defect: no error, no empty string, a green
+container and the wrong database. `config` re-escapes on output precisely so its
+result can be fed back in as a compose file, which is why the third row reads
+`$$` and not `$`.
+
+Measured on a **cold volume** with a service that renames its database:
+**healthy in 16s**, and `psql` inside the container confirms it checked
+`identity`, not kit's `cafaye_platform`.
+
+### 8.2 `bin/dev pin` wrote a broken `kit.ref`
+
+Running it produced `# …a 40-character commit# sha, or a v<semver> tag…` — three
+comment lines run together by a missing newline in the `printf`. Found by
+running the command and reading the file it wrote, which is the only way.
+
+---
+
+## 9. What I could not verify
+
+1. **The network fetch path.** Every fetch here is `file://`. `git fetch
+   --depth 1 <https-url> <sha>` against github.com is untested.
+2. **No service was migrated.** The brief forbids touching other repositories, so
+   the before/after in §3 was measured on a throwaway sandbox holding
+   `identity`'s real compose file — not by landing a PR. The adoption path is
+   proven; the fleet is unmigrated.
+3. **`muse` could not be checked for a stale copy**, only for being unreadable.
+   Its findings are 2 of 13 for that reason, not because it is cleaner.
+4. **The full `tests/self_test.sh` on this machine.** The box is running eight
+   concurrent workers at a load average above 100, and the self-test — 32 nested
+   gate runs — was `SIGTERM`ed twice by memory pressure partway through. See §10.
+5. **`kit.ref` against a real GitHub remote**, including whether GitHub serves a
+   `--depth 1` fetch of an arbitrary sha without `uploadpack.allowReachableSHA1InWant`.
+6. **Nothing was rebased.** Master was still `41f8bcb`, this branch's base, when
+   I finished; the dispatch told me not to rebase or merge it myself.
+
+---
+
+## 10. A note on the environment
+
+The machine OOM'd once already, killing the previous worker mid-run. It was
+still oversubscribed when this ran (load average 106, eight `opencode run`
+processes). Two consequences are recorded because they look like defects and are
+not:
+
+- The self-test's **control** failed once with
+  `cd: /tmp/kit-self-test.XXXX/base: No such file or directory` — not a red gate
+  but a **vanished throwaway tree**, with every worker `mktemp`-ing under one
+  shared `TMPDIR`. Standalone it passes. `expect_green` no longer re-runs the
+  gate to print its diagnostic (that was a second chance to lose the tree, and
+  it is what destroyed the diagnosis), and a missing tree is now reported as an
+  environment failure rather than as a red gate.
+- The self-test was `SIGTERM`ed mid-run on memory pressure. Every breakage it
+  reached before that had passed. **This is the one item in this report I would
+  want a second machine to confirm.**
