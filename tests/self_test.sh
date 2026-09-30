@@ -49,7 +49,10 @@ fresh_copy() {
   copy_name="$1"
   local dst="$WORK/$copy_name"
   mkdir -p "$dst"
-  for entry in AGENTS.md README.md CHANGELOG.md docker lint templates tests workflows; do
+  # `.github` is in this list and not an afterthought: the reusable workflow it
+  # holds is the artifact every check that reads the workflow's inputs reads by
+  # path, so a copy without it cannot fail the same way the real tree does.
+  for entry in .github AGENTS.md README.md CHANGELOG.md docker lint templates tests; do
     [ -e "$ROOT/$entry" ] && cp -R "$ROOT/$entry" "$dst/"
   done
   chmod +x "$dst"/tests/validate.sh "$dst"/tests/self_test.sh 2>/dev/null || true
@@ -234,7 +237,7 @@ expect_red 'breakage 4: docker-compose.yml hardcodes a published port' "$four" -
 # 5. a kit change that would break every consumer's CI. The opt-in job must stay
 #    opt-in and the six original jobs must stay gated on their language.
 five="$(fresh_copy ci-not-opt-in)"
-edit "$five/workflows/ci.reusable.yml" "default: 'false'" "default: 'true'"
+edit "$five/.github/workflows/ci.reusable.yml" "default: 'false'" "default: 'true'"
 expect_red "breakage 5: the telemetry CI job is no longer opt-in" "$five" --static-only
 
 # 6-11. One semantic mutation per language implementation, each against a

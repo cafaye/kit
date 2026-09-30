@@ -34,6 +34,12 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/kit-validate.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
+# The one path the whole repo agrees on, read by every check that looks at the
+# reusable workflow. It is a variable rather than a literal repeated in a dozen
+# heredocs because the path being wrong is exactly the defect this packet
+# exists to fix — see the `callable path` check below.
+WORKFLOW='.github/workflows/ci.reusable.yml'
+
 PY="${KIT_PYTHON:-$ROOT/.venv/bin/python}"
 [ -x "$PY" ] || PY=python3
 "$PY" -c 'import yaml' 2>/dev/null || {
@@ -120,7 +126,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 if [ "$RUN_STATIC" -eq 1 ]; then
   section 'static: every artifact parses'
 
-  for f in "$ROOT"/workflows/* "$ROOT"/lint/* "$ROOT"/docker/* \
+  for f in "$ROOT"/.github/workflows/* "$ROOT"/lint/* "$ROOT"/docker/* \
     "$ROOT"/templates/bin-prime/* "$ROOT"/templates/compose/* \
     "$ROOT"/templates/bin/* "$ROOT"/tests/*.sh; do
     [ -f "$f" ] || continue
@@ -406,12 +412,15 @@ SNIPPETS
     # Kept in step with ci_check's `languages` list below. Both read the CI
     # workflow's `language` options, so there is exactly one place to add a
     # language and the workflow cannot claim one the tree does not have.
-    "$PY" - "$ROOT" <<'PY'
+    #
+    # The path arrives as argv[2] rather than being written out again here: a
+    # second copy of this string is a second thing to forget to move.
+    "$PY" - "$ROOT" "$WORKFLOW" <<'PY'
 import sys
 
 import yaml
 
-with open(f"{sys.argv[1]}/workflows/ci.reusable.yml", encoding="utf-8") as fh:
+with open(sys.argv[2], encoding="utf-8") as fh:
     doc = yaml.safe_load(fh)
 triggers = doc.get("on") or doc.get(True) or {}
 call = (triggers.get("workflow_call") or {}).get("inputs") or {}
@@ -433,12 +442,12 @@ PY
   # grepping, so a key that appears in a comment does not count as a pin — a
   # check that can be satisfied by a comment is not a check.
   mise_check() {
-    "$PY" - "$ROOT" <<'PY'
+    "$PY" - "$ROOT" "$WORKFLOW" <<'PY'
 import re
 import sys
 
 root = sys.argv[1]
-with open(f"{root}/workflows/ci.reusable.yml", encoding="utf-8") as fh:
+with open(sys.argv[2], encoding="utf-8") as fh:
     import yaml
 
     doc = yaml.safe_load(fh)
@@ -717,14 +726,13 @@ PY
   # default call still runs exactly the six original jobs. A kit change that
   # breaks every consumer's CI is a kit change that does not ship.
   ci_check() {
-    "$PY" - "$ROOT" <<'PY'
+    "$PY" - "$ROOT" "$WORKFLOW" <<'PY'
 import re
 import sys
 
 import yaml
 
-root = sys.argv[1]
-with open(f"{root}/workflows/ci.reusable.yml", encoding="utf-8") as fh:
+with open(sys.argv[2], encoding="utf-8") as fh:
     doc = yaml.safe_load(fh)
 
 problems = []
@@ -787,7 +795,7 @@ else:
 # broken in review — an expression that never resolves, and a `${{` that opens a
 # block it never closes — are caught by reading the source as text. A file
 # needing this check is a file that needed it.
-source = open(f"{root}/workflows/ci.reusable.yml", encoding="utf-8").read()
+source = open(sys.argv[2], encoding="utf-8").read()
 for match in re.finditer(r"\$\{\{", source):
     lineno = source[: match.start()].count("\n") + 1
     tail = source[match.start() :]
@@ -815,7 +823,7 @@ if problems:
     sys.exit("; ".join(problems))
 PY
   }
-  check 'workflows/ci.reusable.yml  (opt-in telemetry job, defaults intact)' ci_check
+  check "$WORKFLOW  (opt-in telemetry job, defaults intact)" ci_check
 
   # Every README section a reader is told to copy must exist. A doc that points
   # at a path that was renamed is worse than no doc.
@@ -846,13 +854,13 @@ PY
 
   # The README's own examples must call the workflow the README says it does.
   #
-  # Every yaml block in the README that contains `uses: cafaye/kit/workflows/`
-  # is a caller. A caller passing an input the workflow does not declare fails at
+  # Every yaml block in the README that contains `uses: cafaye/kit/` is a
+  # caller. A caller passing an input the workflow does not declare fails at
   # run time on the adopting repo's first push — thirteen repos, one stale
   # sentence in this file. So the examples are parsed and checked against the
   # workflow's real inputs, and a doc that lies fails the gate.
   caller_check() {
-    "$PY" - "$ROOT" <<'PY2'
+    "$PY" - "$ROOT" "$WORKFLOW" <<'PY2'
 import re
 import sys
 
@@ -863,11 +871,11 @@ readme = open(f"{root}/README.md", encoding="utf-8").read()
 
 # Fenced yaml blocks only, and only the ones that are actually calling kit.
 blocks = re.findall(r"```yaml\n(.*?)```", readme, re.S)
-callers = [b for b in blocks if "uses: cafaye/kit/workflows/" in b]
+callers = [b for b in blocks if "uses: cafaye/kit/" in b]
 if not callers:
     sys.exit("no documented caller of the reusable workflow found in README.md")
 
-with open(f"{root}/workflows/ci.reusable.yml", encoding="utf-8") as fh:
+with open(sys.argv[2], encoding="utf-8") as fh:
     doc = yaml.safe_load(fh)
 triggers = doc.get("on") or doc.get(True) or {}
 declared = ((triggers.get("workflow_call") or {}).get("inputs")) or {}
@@ -916,7 +924,7 @@ for n, block in enumerate(callers, 1):
         problems.append(f"documented caller #{n} is not valid YAML: {exc}")
         continue
     for job_name, job in (doc_n.get("jobs") or {}).items():
-        if not isinstance(job, dict) or "cafaye/kit/workflows/" not in str(job.get("uses", "")):
+        if not isinstance(job, dict) or "cafaye/kit/" not in str(job.get("uses", "")):
             continue
         passed = set(job.get("with") or {})
         unknown = sorted(passed - set(declared))

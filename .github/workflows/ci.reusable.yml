@@ -10,10 +10,17 @@
 #     contents: read
 #   jobs:
 #     ci:
-#       uses: cafaye/kit/workflows/ci.reusable.yml@master
+#       uses: cafaye/kit/.github/workflows/ci.reusable.yml@master
 #       with:
 #         language: go
 #         working-dir: .
+#
+# The `.github/workflows/` in that path is not decoration. GitHub resolves a
+# reusable workflow at `{owner}/{repo}/.github/workflows/{file}@{ref}` and
+# documents that subdirectories of the workflows directory are not supported, so
+# this file has no reachable path from anywhere else in the tree. It is also the
+# only place a workflow may live at all if the repository that defines it is to
+# call it with `uses: ./.github/workflows/ci.reusable.yml`.
 #
 # One job per language exists on purpose: six services, six toolchains, and a
 # `language` x `version` matrix would multiply CI minutes the org cannot spend.

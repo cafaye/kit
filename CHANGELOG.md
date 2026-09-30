@@ -1,8 +1,12 @@
 # Changelog
 
 All notable changes to `kit` are recorded here. kit has no releases yet and no
-semver contract — it is consumed by *calling* `workflows/ci.reusable.yml@master`
-and by *copying* files out of `lint/`, `docker/`, and `templates/`.
+semver contract — it is consumed by *calling*
+`.github/workflows/ci.reusable.yml@master` and by *copying* files out of
+`lint/`, `docker/`, and `templates/`.
+
+> Entries under **Earlier** record the path the file had *at the time*. It was
+> `workflows/ci.reusable.yml` until the move recorded in Unreleased/Changed.
 
 ## Unreleased
 
@@ -55,6 +59,12 @@ and by *copying* files out of `lint/`, `docker/`, and `templates/`.
 
 ### Changed
 
+- **The reusable workflow moved to `.github/workflows/ci.reusable.yml`.** It was
+  at `workflows/ci.reusable.yml`, and GitHub documents that subdirectories of
+  the workflows directory are not supported — so the `uses: cafaye/kit/workflows/
+  ci.reusable.yml@master` line in the README resolved to nothing. No repository
+  in the fleet was calling it. It is now a **move, not a mirror**: one file, at
+  the only path GitHub will resolve, so there is no second copy to diverge.
 - `self_test.sh` grew from 5 breakages to 11. Six are new: one semantic
   mutation per language implementation, each against a different W3C section, so
   **every** suite is proven able to fail rather than assumed to. A mutant that

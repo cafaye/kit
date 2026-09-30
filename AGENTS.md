@@ -16,22 +16,34 @@
 
 ```
 kit/
-├── README.md                     # what kit is, how a repo adopts it
-├── workflows/ci.reusable.yml     # the workflow six repos call
-├── lint/                         # configs a service copies verbatim
-├── docker/                       # Dockerfile.<lang> templates
+├── README.md                             # what kit is, how a repo adopts it
+├── .github/workflows/
+│   ├── ci.reusable.yml                   # the workflow six repos call
+│   └── ci.yml                            # kit calling its own workflow
+├── lint/                                 # configs a service copies verbatim
+├── docker/                               # Dockerfile.<lang> templates
 ├── templates/
-│   ├── bin-prime/<lang>.sh       # the worktree primer
-│   ├── bin/dev.sh                # the local developer loop
-│   ├── compose/                  # postgres + nats + redis + otel collector
-│   ├── otel/<lang>/              # W3C traceparent: codec, suite, snippet
-│   ├── mise.toml                 # toolchain pin template
-│   └── AGENTS.md                 # skeleton for a service repo
-└── tests/validate.sh             # THE gate
+│   ├── bin-prime/<lang>.sh               # the worktree primer
+│   ├── bin/dev.sh                        # the local developer loop
+│   ├── compose/                          # postgres + nats + redis + otel collector
+│   ├── otel/<lang>/                      # W3C traceparent: codec, suite, snippet
+│   ├── mise.toml                         # toolchain pin template
+│   └── AGENTS.md                         # skeleton for a service repo
+└── tests/validate.sh                     # THE gate
 ```
 
 Flat on purpose. `grep -r` finds everything; there is no plugin system to
 learn.
+
+The reusable workflow is at `.github/workflows/ci.reusable.yml` and nowhere
+else. That is not a style choice: GitHub documents that **subdirectories of the
+workflows directory are not supported**, so `uses: cafaye/kit/workflows/...`
+does not resolve and every caller who copied it has a red build. A repo that
+holds the file in a convenient place and documents a `uses:` string is a repo
+whose documentation and layout have silently disagreed — which is the class of
+defect the `callable path` check in `tests/validate.sh` exists to catch. The
+same reasoning forbids a second copy: one file, and if you ever mirror it, the
+gate must fail when the copies differ.
 
 ## The gate
 
@@ -80,11 +92,11 @@ Three phases, and all three must pass:
 ## Adding a language
 
 1. Add `<lang>` to the `language` input's `options` in
-   `workflows/ci.reusable.yml` **first**, and watch the suite go red. That one
-   edit is the whole trigger: `validate.sh` reads the options out of the
-   workflow and, for each one, requires a Dockerfile, a `bin/prime` and a
+   `.github/workflows/ci.reusable.yml` **first**, and watch the suite go red.
+   That one edit is the whole trigger: `validate.sh` reads the options out of
+   the workflow and, for each one, requires a Dockerfile, a `bin/prime` and a
    `[tools]` pin. There is no second list to keep in step — that is the point.
-2. Add the job: `workflows/ci.reusable.yml`, guarded by
+2. Add the job: `.github/workflows/ci.reusable.yml`, guarded by
    `if: ${{ inputs.language == '<lang>' }}`.
 3. Add the other three artifacts: `docker/Dockerfile.<lang>`,
    `templates/bin-prime/<lang>.sh`, and a `[tools]` entry in

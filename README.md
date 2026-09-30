@@ -20,7 +20,7 @@ build lands in kit once, and reaches the next service in a pull request.
 
 | Path | What it is | Who uses it |
 |------|-----------|-------------|
-| `workflows/ci.reusable.yml` | One reusable GitHub Actions workflow. Input `language` picks one of seven jobs — install, lint, test, coverage gate. Opt-in `telemetry` input adds the traceparent conformance job. No job builds or pushes an image. | Every service, via a 6-line `.github/workflows/ci.yml` |
+| `.github/workflows/ci.reusable.yml` | One reusable GitHub Actions workflow. Input `language` picks one of seven jobs — install, lint, test, coverage gate. Opt-in `telemetry` input adds the traceparent conformance job. No job builds or pushes an image. | Every service, via a 6-line `.github/workflows/ci.yml` |
 | `lint/yamllint.yml` | YAML style, with the three rules Actions forces us to retune. | Any repo that lints its own YAML; kit's gate uses it on itself |
 | `lint/golangci.yml` | golangci-lint v2, correctness linters on, `errcheck` excluded only for `Close`/`Flush`. | Go services |
 | `lint/rubocop.yml` | RuboCop, `NewCops: enable`, Metrics left on. | Ruby services |
@@ -170,11 +170,26 @@ permissions:
   contents: read
 jobs:
   ci:
-    uses: cafaye/kit/workflows/ci.reusable.yml@master
+    uses: cafaye/kit/.github/workflows/ci.reusable.yml@master
     with:
       language: go          # go | ruby | elixir | python | node | bun | rust
       working-dir: .        # the dir holding go.mod / Gemfile / pyproject.toml
 ```
+
+That path is the whole contract. GitHub resolves a reusable workflow at
+`{owner}/{repo}/.github/workflows/{file}@{ref}` and documents that
+**subdirectories of the workflows directory are not supported** — so the file
+lives at `.github/workflows/ci.reusable.yml` and nowhere else, and `kit`'s gate
+asserts that the `uses:` line above is the path the file is actually at, that
+the file declares `on: workflow_call`, and that there is no second copy of it
+anywhere in the tree. A `uses:` line that does not resolve fails at run time on
+the adopting repo's first push, which is thirteen repos and one stale sentence
+away.
+
+`{owner}/{repo}/.github/workflows/{file}@{ref}` resolves in **private**
+repositories too, so a repo that adopts kit before kit is public is not
+blocked; `secrets: inherit` in a caller reaches a private kit from inside the
+organization.
 
 Two jobs for two languages? Call it twice with two different `language` values.
 
@@ -257,7 +272,7 @@ bash <kit>/tests/validate.sh
 
 ### Adoption checklist
 
-- [ ] `.github/workflows/ci.yml` calls `cafaye/kit/workflows/ci.reusable.yml@master`
+- [ ] `.github/workflows/ci.yml` calls `cafaye/kit/.github/workflows/ci.reusable.yml@master`
 - [ ] `working-dir` points at the dir holding the manifest
 - [ ] Linter config copied to the repo root, unmodified
 - [ ] `docker/Dockerfile` copied, binary/application name set
