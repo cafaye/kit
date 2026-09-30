@@ -657,6 +657,44 @@ Stated here rather than in a footnote.
     and `git status --porcelain` is empty in all nine service repositories
     afterwards. Recorded because the rule is "read every repository, touch none",
     and I touched one for a few seconds before noticing.
+14. **Something else was writing into this worktree, and one of my commits
+    swallowed it.** Between 00:24 and 00:43 local, while my gate runs were in
+    flight, five files in `kit-worker-kit-14-stale` changed underneath me:
+    `AGENTS.md`, `CHANGELOG.md`, `REPORT-kit-14.md`, `tests/validate.sh` and
+    `tests/self_test.sh`. I did not write them. The clearest evidence is
+    **breakage 30** — a "toolchain floor defined but never consulted" recipe for
+    the ruby suite — which is not in my brief, is not a number I had reached,
+    and appeared complete, header and recipe together, between two of my
+    commits. I could not attribute it: there are four or five other workers on
+    this machine in sibling worktrees, and I have no way to see which one wrote
+    here.
+
+    Three consequences, and I would rather state them than tidy them away:
+
+    - **Commit `90f606a` is misattributed.** Its message describes the
+      `pipefail` broken-pipe fix, and it also contains another writer's changes
+      to `AGENTS.md`, `CHANGELOG.md`, `REPORT-kit-14.md`, `validate.sh` and
+      breakage 30. I used `git add -A`, which is how that happened. The pipefix
+      itself is separable and real (36 here-strings across five scripts, verified
+      by the suites and by `shellcheck`); the extra content is not mine and
+      should be reviewed as its own work. I have not rewritten the history to
+      split it, because I cannot cleanly separate two writers' edits to
+      `self_test.sh` and `validate.sh`, and a confident wrong split is worse than
+      a disclosed one.
+    - **One gate run failed on a torn read, not on a defect.**
+      `header documents breakage 30 but no recipe carries it` — the header had
+      landed and the recipe had not, or the file was read mid-write. The same
+      check reports 31 documented / 31 carried now, and the tree's hashes have
+      been stable since. I mention it because "the gate went red" and "the tree
+      changed under the gate" are different findings and only one of them is a
+      defect in this packet.
+    - **A gate run on this worktree is only evidence if the tree held still.**
+      That is the real cost, and it is the same cost as the load: it is why §9
+      reports what was observed rather than a clean green.
+
+    I have not deleted or reverted any of it. It is someone else's work until
+    proven otherwise, and this repo's own rule about unfamiliar changes applies
+    to a worker's commits exactly as it applies to a contributor's.
 
 ---
 
@@ -669,7 +707,7 @@ Stated here rather than in a footnote.
 | `tests/staleness.py` | `--scope templates`, five states, `--fail-on-unpinned`, `difflib` diff summaries |
 | `tests/staleness_test.sh` | 12 → 26 cases |
 | `tests/validate.sh` | three new named checks; the header/recipe check picks up 23–28 automatically |
-| `tests/self_test.sh` | 23 → 30 breakages |
+| `tests/self_test.sh` | 23 → 31 breakages (29 of them this packet's; 30 is not mine — see §7.14) |
 | `AGENTS.md` | the layout tree, the count of breakages, a new section on the reporter and the ledger, `difflib`/`glob` added to the allowed-import list and the sentence made enforceable |
 | `README.md` | [what the fleet actually adopted](#what-the-fleet-actually-adopted) at the top, the templates half, the pin format |
 | `CHANGELOG.md` | the entry, and the corrections to the brief's numbers — including the one where I was wrong about the compose stacks |
@@ -687,7 +725,7 @@ $ bash tests/validate.sh
 | phase reached | pass | fail | skip |
 | --- | --- | --- | --- |
 | static, telemetry, observability, staleness | **145** | **0** | **2** |
-| self_test (30 breakages + 1 control) | *see below* | — | — |
+| self_test (31 breakages + 1 control) | *see below* | — | — |
 
 The two skips are the two `node --check` cannot read TypeScript
 (`templates/tier/bun/tier.test.ts`, `templates/tier/node/tier.test.ts`), which

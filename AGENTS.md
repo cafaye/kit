@@ -135,7 +135,7 @@ Three phases, and all three must pass:
   guard: a check that only parsed those two files would pass on a classifier
   that waves every change through. They stay runnable when static analysis is
   skipped, because a gate that skips is not green.
-- **self_test** — thirty breakages of a throwaway copy, asserting the gate
+- **self_test** — thirty-one breakages of a throwaway copy, asserting the gate
   goes red each time. Six of them are a semantic mutation of one language each,
   so **every suite is proven able to fail** rather than assumed to. Twelve assert
   that one *named* check reported `FAIL`, so a check written for a specific
