@@ -11,7 +11,123 @@ semver contract — it is consumed by *calling*
 
 ## Unreleased
 
+### Changed
+
+- **The stack is fetched from a pinned kit ref. A service no longer carries a
+  copy of it.** `templates/compose/` shipped a complete local observability
+  platform — the collector with a redaction allowlist **derived from core's
+  schemas**, plus Tempo, Loki, Mimir and a provisioned Grafana — and **no
+  service used it**. Six repositories shipped a bespoke 44–86 line
+  `docker-compose.yml` carrying a Postgres and little else, each ~450 lines
+  from kit's, and **none** of them adopted `bin/dev`. (billing's `bin/dev` is
+  Rails' `bin/rails server`; the brief's "1 of 9" is 0 of 6 by measurement.)
+
+  A compose file cannot be `uses:`-ed, so `bin/dev` is the only callable path:
+  it fetches `templates/compose/` from the ref in **`kit.ref`** and runs it
+  *beside* the service's own file, which is therefore an override rather than a
+  fork. A service with nothing to add needs no compose file at all.
+
+  - **`kit.ref` — the pin, in a COMMITTED file, not in `.env`.** A 40-character
+    commit sha or a `v<semver>` tag; a branch is refused **before any network
+    call**, because `bin/dev` decides whether a redaction allowlist is in force
+    and a service whose gate resolves differently on Tuesday than on Monday has
+    a telemetry boundary nobody can state. It is committed because `.env` is
+    git-ignored: a pin there exists on one laptop and on no CI runner, so "one
+    command, always current" resolves to "one command, whatever this checkout
+    last fetched". `bin/dev pin <ref>` prints the stack diff **first**.
+  - **Offline is real.** `KIT_STACK_OFFLINE=1` uses only `KIT_STACK_DIR`, the
+    per-ref cache, or a vendored `.kit/stack` that **records its ref**. A
+    directory that merely contains `templates/compose/` is refused; a mismatched
+    or missing record is refused; with none available it fails loudly, naming
+    each. It never falls back to the working directory.
+  - **`templates/compose/docker-compose.yml` mounts every vendor config through
+    `${KIT_COMPOSE_DIR:-.}`,** which `bin/dev` sets to the *fetched* tree.
+    Without it the mount resolves to a path that does not exist, Docker creates a
+    **directory** there, and the collector exits naming a file type.
+    `docker compose config` renders the same project either way, because the
+    variable's *value* is not a property of the YAML.
+  - **The postgres healthcheck was a decoration, and is now a real query.**
+    `pg_isready -U identity -d nosuchdb` exits **0** against a database that does
+    not exist; `psql … -tAc 'select 1'` exits **2**. The shipped probe used
+    `pg_isready` with `${KIT_POSTGRES_USER:-cafaye}`, interpolated at *compose
+    render* time, so a service that renamed its own database was health-checked
+    for a role that did not exist — and the comment above it claimed the `-U/-d`
+    pair "makes it check the real thing". The probe now runs a query, against
+    the database the container actually has (`$$` escapes compose's own
+    interpolation). Measured cold: healthy in 16s.
+  - **`bin/dev pin` no longer writes a malformed `kit.ref`** — a missing newline
+    ran three comment lines together.
+
 ### Added
+
+- **`tests/fleet_check.py` — the gate on the FLEET, and it is RED on master.**
+  It reads the *other* repositories, because nothing else in kit does: a stale
+  copy of the stack, a weakened redaction boundary, a collector config nothing
+  ever starts, an unpinned ref, and a published port on a service kit already
+  ships. Against this fleet: **6 repositories in scope, 11 findings** — the
+  stale-copy rule catches **billing, courier, darkroom, identity** (and muse,
+  whose file cannot be read), the pin rule catches **all six**, and the port rule
+  catches **darkroom, identity**. It is not softened to make master green: a gate
+  that goes quiet about six copies is the gate that let them exist.
+
+  It also found something no check in kit could have: **`muse/docker-compose.yml`
+  does not parse.** Line 65 puts a `: ` inside an unquoted YAML scalar;
+  `docker compose config` exits 1 on it, so that stack cannot start at all.
+
+  The stale-copy rule keys on the **image**, not the service name — five of the
+  six call their database `db`, and a name-based check reports the fleet clean
+  while every copy stands right there.
+
+- **`tests/fetch_test.sh` — the fetch path, executed.** 14 assertions against a
+  local bare remote over `file://`: a pin resolves and the fetched bytes are
+  **byte-identical** to the tree pinned; a branch, an abbreviated sha and a
+  missing pin are each refused with a message that says why; offline works from
+  a warm cache **with the remote moved away**, fails loudly from a cold one, and
+  accepts a vendored copy that declares its ref while refusing one that does not.
+
+- **`tests/stack_live_test.sh` — the fetched stack, run.** Brings up all eight
+  containers, reads the collector's config mount back with `docker inspect`, and
+  proves a trace reaches Tempo, a metric reaches Mimir, the `spanmetrics`
+  connector mints the fleet dashboard's source, and a canary in ten attributes
+  reaches neither. Two assertions failed on the first run and both were bugs in
+  the test: a container with no healthcheck read as unhealthy, and a distroless
+  image's failed `exec` was compared against the config — *the error string was
+  the evidence*.
+
+- **Two kit-side gates.** Every vendor config mounts from the fetched tree (a
+  check over the **agreement** of the compose file and `bin/dev`, because the
+  defect is in their agreement); and the pin is `kit.ref` and the fleet gate
+  reads the same file — three files, one fact, and their disagreeing is invisible
+  from any one of them.
+
+- **Seven new self-test breakages (23–29).** The four failure modes against
+  **fixture** fleets (the real fleet is red by design, so "the gate went red"
+  there is satisfied by two clean repositories), plus the mount regression, the
+  pin moved back into `.env` with a **branch** as its value, and the `ports:`
+  append rule the compose file's own comment promised and the gate did not
+  implement.
+
+### Fixed
+
+- **`tests/validate.sh` — the fleet gate's SKIP decision is now the script's.**
+  The first wiring guarded the call with its own "are there any sibling
+  entries?" test. A self-test throwaway directory *has* sibling entries and none
+  is a repository, so the control ran the check, the check exited 2, and the
+  self-test's control went red for a reason unrelated to the packet. One
+  predicate now, answering with a machine-readable `FLEET-ABSENT` marker.
+- **`dev_escape_hatch_check` was red.** Its fixture carried five empty files that
+  `require_files` demanded; this packet deleted `require_files`, so the fixture
+  stopped reaching `up` at all and the check died on the pin lookup before the
+  trap it exists to catch could fire. It now builds a service sandbox with no
+  stack of its own and a stub kit tree behind `KIT_STACK_DIR`.
+- **`tests/fetch_test.sh` and `tests/stack_live_test.sh` ran by nothing.** Both
+  are in the gate now — the fetch test outside the `RUN_STATIC` guard with the
+  classifier and the staleness reporter, because it is a property and not a shape.
+- **`expect_green` no longer re-runs the gate to print its diagnostic.** That was
+  a second chance to lose the throwaway tree, and on the run where it mattered
+  it lost it — the control was reported as a `cd:` error, which is a diagnosis of
+  the diagnosis. One run, captured.
+
 
 - **kit-13 — the observability stack gets a live path, and a gate that says which
   repositories are not on it.** `templates/compose/` shipped a complete local

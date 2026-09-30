@@ -44,7 +44,8 @@ kit/
 └── tests/
     ├── validate.sh                       # THE gate
     ├── classify.py  rules.json           # the change classifier, failing closed
-    └── staleness.py                      # the fleet staleness reporter
+    ├── staleness.py                      # the fleet staleness reporter
+    └── fleet_check.py                    # reads the OTHER repos: copy vs. adopt
 ```
 
 Flat on purpose. `grep -r` finds everything; there is no plugin system to
@@ -128,11 +129,23 @@ Three phases, and all three must pass:
   survives), and a service starts, serves and reports healthy with the collector
   killed. Both need a real collector, so both SKIP loudly without docker —
   never pass silently.
-- **classifier + staleness** — the change classifier and the staleness reporter
-  are *executed*, not parsed, and deliberately **outside** the `RUN_STATIC`
-  guard: a check that only parsed those two files would pass on a classifier
-  that waves every change through. They stay runnable when static analysis is
-  skipped, because a gate that skips is not green.
+- **classifier + staleness + fetch** — the change classifier, the staleness
+  reporter and `bin/dev`'s fetch path are *executed*, not parsed, and
+  deliberately **outside** the `RUN_STATIC` guard: a check that only parsed
+  those files would pass on a classifier that waves every change through, and on
+  a `bin/dev` that fetches nothing. They stay runnable when static analysis is
+  skipped, because a gate that skips is not green. All three use a local
+  `file://` remote built from this tree, so none of them needs the network — a
+  gate that goes red when github is down is a gate people learn to re-run
+  without.
+- **fleet** — `tests/fleet_check.py` reads the **other** repositories: a stale
+  copy of the stack, a weakened redaction boundary, a collector config nothing
+  ever starts, an unpinned `kit.ref`. It is deliberately **red on this fleet**
+  and must not be softened to make it green: five of the six repositories that
+  declare local infrastructure carry their own `postgres` today, and a gate that
+  went quiet about that is the gate that let the state exist. It SKIPs loudly
+  when there is no fleet, because "no fleet was found" is not "the fleet is
+  clean" — the same `unknown` vs `current` confusion `staleness.py` avoids.
 - **self_test** — twenty-nine breakages of a throwaway copy, asserting the gate
   goes red each time. Six of them are a semantic mutation of one language each,
   so **every suite is proven able to fail** rather than assumed to. Fifteen assert
@@ -265,10 +278,12 @@ that is usually true:
   current" into "one command, whatever this checkout last fetched".
 - **`tests/fleet_check.py` reads the CALLERS, not this repository.** A defect in
   the standard is invisible to a gate that only reads the standard, which is the
-  same argument as D4. It is **red against the current fleet on purpose**: five
-  repositories carry their own copy of the shared stack and six have no pin. Do
-  not soften it to make this repository green; report it and name the
-  repositories.
+  same argument as D4. It is **red against the current fleet on purpose**. As
+  measured: six repositories declare local infrastructure, **four** carry their
+  own copy of the shared stack (a fifth, `muse`, cannot be read to tell — its
+  compose file does not parse), **all six** have no pin, and **two** publish a
+  port on a service kit already ships. Do not soften any of it to make this
+  repository green; report it and name the repositories.
 
 `README.md` carries the override rules, and one of them is a trap worth knowing
 before you write a service compose file: **a second file's `ports:` list is
