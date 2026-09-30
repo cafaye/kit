@@ -253,15 +253,33 @@ Three details worth stating:
 
 ### 5.2 Gate results, reported separately
 
-| Phase | PASS | FAIL | SKIP |
+**Pass and skip counted separately, because conflating them is how a gap survives.**
+
+| Run | PASS | FAIL | SKIP |
 |---|---|---|---|
 | `tests/validate.sh --static-only` | **138** | **1** | **2** |
+| `tests/validate.sh` (everything, self-test included) | **151** | **1** | **2** |
 
-The single FAIL is `fleet (no stale copy, no weakened boundary, no dead config,
-every ref pinned)`, by design. The two SKIPs are the two known-correct ones on
-master — `templates/tier/bun/tier.test.ts` and `templates/tier/node/tier.test.ts`,
-both because `node --check` cannot read TypeScript. **My change adds no skip
-and removes none.**
+**The one FAIL is `fleet (no stale copy, no weakened boundary, no dead config,
+every ref pinned)`, and it is red by design** — §5.1 names all six repositories
+and all thirteen findings. Every other phase of the full run is green:
+
+| Phase | Result |
+|---|---|
+| static (artifacts, YAML, shellcheck, hadolint, compose, fleet, core, tiers) | green except the fleet gate |
+| telemetry — six W3C suites, executed | green |
+| observability — the redaction boundary against a real collector | green |
+| readiness — a service with a dead dependency and a dead OTLP endpoint | green |
+| `stack_live_test.sh` — the fetched stack, **all 15** | green |
+| `fetch_test.sh` — **all 17** | green |
+| `classify_test.sh` (19) · `staleness_test.sh` (12) | green |
+| `self_test.sh` — **30 breakages, all red, unbroken tree green** | green |
+
+**The two SKIPs are the two known-correct ones on master**, unchanged by this
+packet: `templates/tier/bun/tier.test.ts` and `templates/tier/node/tier.test.ts`,
+both because `node --check` cannot read TypeScript. **This change adds no skip
+and removes none** — the count is 2 before and 2 after, and they are the same
+two files.
 
 Where a skip is unavoidable — no fleet, as on a CI runner — it is reported as a
 SKIP with the `FLEET-ABSENT` marker, because "no fleet was found" is not "the
