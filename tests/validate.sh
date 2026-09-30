@@ -479,12 +479,28 @@ for name, svc in services.items():
 
 # Every published port is a ${KIT_*} substitution. A literal host port in this
 # file is a port collision waiting for the second service a developer runs.
-source = open(path, encoding="utf-8").read()
-for lineno, line in enumerate(source.splitlines(), 1):
-    if line.lstrip().startswith("#"):
-        continue
-    for mapping in re.findall(r"[\"']?\d+:\d+[\"']?", line):
-        problems.append(f"line {lineno}: hardcoded port mapping {mapping}")
+#
+# Read from the PARSED document's `ports:` lists rather than by grepping lines.
+# A line-based scan flags anything shaped like `host:container`, which includes
+# the collector's bind addresses (`0.0.0.0:4317` under `environment:`) — those
+# are endpoints inside the network, not published ports, and a check that cannot
+# tell the two apart is a check everyone learns to ignore.
+published = []
+for name, svc in services.items():
+    for entry in (svc or {}).get("ports") or []:
+        if isinstance(entry, dict):
+            # long form: {target: 5432, published: "5432"}
+            host = str(entry.get("published", ""))
+            target = str(entry.get("target", ""))
+        else:
+            host, _, target = str(entry).partition(":")
+        if not host or not target:
+            continue
+        if "${" not in host:
+            published.append(f"{name}: published host port {host} is not a ${{KIT_*}} substitution")
+
+if published:
+    problems.extend(published)
 
 # Nothing in the stack may name a cafaye service: hostnames are the service's
 # own to choose, and a template that picks them for you is a template six repos
@@ -526,11 +542,22 @@ with open(f"{root}/templates/compose/docker-compose.yml", encoding="utf-8") as f
 
 problems = []
 
-# Every ${env:NAME} the collector reads, over the whole document rather than a
-# fixed path: the value can sit at any depth (a processor arg, an exporter's
-# verbosity, an extension endpoint), and a check that only knew the three it
-# was written against would miss the fourth.
-raw = open(f"{root}/templates/compose/otel-collector.yml", encoding="utf-8").read()
+# Every env-substituted name the collector reads, over the whole document
+# rather than a fixed path: the value can sit at any depth (a processor arg, an
+# exporter's verbosity, an extension endpoint), and a check that only knew the
+# three it was written against would miss the fourth.
+#
+# Comment lines are excluded. A prose example of the syntax — which this file
+# needs, because the whole point of the rule is to state it — otherwise
+# registers as a variable the collector needs, and a check that fails on its own
+# documentation is a check people delete.
+raw = "\n".join(
+    line
+    for line in open(
+        f"{root}/templates/compose/otel-collector.yml", encoding="utf-8"
+    ).read().splitlines()
+    if not line.lstrip().startswith("#")
+)
 needed = set(re.findall(r"\$\{env:([A-Z0-9_]+)\}", raw))
 
 svc = (compose.get("services") or {}).get("otel-collector")
@@ -539,10 +566,14 @@ if not isinstance(svc, dict):
 else:
     provided = set(svc.get("environment") or {})
     for name in sorted(needed - provided):
+        # Assembled rather than an f-string: `${env:NAME}` is not a valid Python
+        # f-string expression, and a check whose failure message raises is a
+        # check that reports the wrong thing at the exact moment it matters.
+        placeholder = "$" + "{env:" + name + "}"
         problems.append(
-            f"otel-collector.yml reads " + "$" + "{env:" + name + "} but "
-            f"docker-compose.yml does not pass {name} into the container; it "
-            f"resolves empty and the collector refuses to start"
+            f"otel-collector.yml reads {placeholder} but docker-compose.yml does "
+            f"not pass {name} into the container; it resolves empty and the "
+            f"collector refuses to start"
         )
 
 if problems:
@@ -815,7 +846,7 @@ fi
 
 if [ "$RUN_SELF_TEST" -eq 1 ]; then
   section 'self_test: this gate is able to fail'
-  if check 'tests/self_test.sh  (four breakages, four reds)' \
+  if check 'tests/self_test.sh  (eleven breakages, eleven reds)' \
     bash "$ROOT/tests/self_test.sh"; then
     :
   fi

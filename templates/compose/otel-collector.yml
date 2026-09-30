@@ -19,8 +19,8 @@
 #     network.
 #   - To ship spans to a backend you add an exporter block yourself and point
 #     the pipeline at it. Every endpoint MUST come from an environment variable
-#     (${env:NAME}); a literal endpoint in this file fails the gate, so it can
-#     never reach a repo by accident.
+#     (the collector's own env-substitution syntax); a literal endpoint in this
+#     file fails the gate, so it can never reach a repo by accident.
 #   - The `debug` exporter is intentionally verbose and NOT sampled. It is a
 #     development affordance, not observability. Real sampling belongs in a
 #     backend the platform picks deliberately.
@@ -84,5 +84,5 @@ service:
       receivers: [otlp]
       processors: [memory_limiter, batch]
       # Nothing ships. To add a backend exporter, define it above and append it
-      # here — with a ${env:...} endpoint, never a literal one.
+      # here — with an env-substituted endpoint, never a literal one.
       exporters: [debug]

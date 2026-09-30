@@ -138,24 +138,36 @@ expect_red_lang() {
     return
   fi
 
-  # Captured immediately, with no `&&`/`||` between the run and the read: a
-  # compound command there reports the exit code of the *last* branch, which is
-  # how a broken suite once read as a passing gate.
-  local out ec
+  # Captured immediately, with no `&&` between the run and the read, and each
+  # capture guarded by `|| ec=$?`.
+  #
+  # Both halves of that matter, and the first version of this function got the
+  # first one wrong in a way that made the whole self_test exit 1 silently at
+  # breakage 6, printing nothing at all:
+  #
+  #   - `out=$(cmd)` on its own line is an ASSIGNMENT. When `cmd` fails, the
+  #     assignment's status is `cmd`'s status, so `set -e` kills the script on
+  #     that line — before the `ec=$?` beneath it ever runs. The failing suite
+  #     was never observed; the harness simply vanished. Guarding with `||`
+  #     makes the command part of a list, which `set -e` does not apply to, so
+  #     the run completes and its status can be read. This is the same failure
+  #     PLAN.md's gate-discipline rule is about, one level down: a gate whose
+  #     exit code was not observed is unrun, not green.
+  #   - `&& ec=0 || ec=$?` is the obvious wrong fix: it reports the status of
+  #     the `||` branch rather than the run's.
+  local out ec=0
   case "$lang" in
     go)
-      out=$(cd "$work" && GOFLAGS=-mod=mod GOPROXY=off GOTOOLCHAIN=local go test ./... 2>&1)
-      ec=$?
+      out=$(cd "$work" && GOFLAGS=-mod=mod GOPROXY=off GOTOOLCHAIN=local go test ./... 2>&1) || ec=$?
       ;;
-    ruby) out=$(ruby "$work/test_traceparent.rb" 2>&1); ec=$? ;;
-    elixir) out=$(elixir -r "$work/traceparent.ex" "$work/test_traceparent.exs" 2>&1); ec=$? ;;
-    python) out=$(python3 "$work/test_traceparent.py" 2>&1); ec=$? ;;
-    node) out=$(node --test "$work/traceparent.test.mjs" 2>&1); ec=$? ;;
+    ruby) out=$(ruby "$work/test_traceparent.rb" 2>&1) || ec=$? ;;
+    elixir) out=$(elixir -r "$work/traceparent.ex" "$work/test_traceparent.exs" 2>&1) || ec=$? ;;
+    python) out=$(python3 "$work/test_traceparent.py" 2>&1) || ec=$? ;;
+    node) out=$(node --test "$work/traceparent.test.mjs" 2>&1) || ec=$? ;;
     rust)
       if rustc --test --edition 2021 -o "$work/kit-mutant-rust" "$work/traceparent.rs" \
         >"$work/build.log" 2>&1; then
-        out=$("$work/kit-mutant-rust" 2>&1)
-        ec=$?
+        out=$("$work/kit-mutant-rust" 2>&1) || ec=$?
       else
         # A mutant that does not compile proves NOTHING. The suite went red
         # without running, which is indistinguishable from a green suite to any

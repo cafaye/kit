@@ -20,16 +20,140 @@ build lands in kit once, and reaches the next service in a pull request.
 
 | Path | What it is | Who uses it |
 |------|-----------|-------------|
-| `workflows/ci.reusable.yml` | One reusable GitHub Actions workflow. Input `language` picks one of six jobs — install, lint, test, coverage gate. No job builds or pushes an image. | Every service, via a 6-line `.github/workflows/ci.yml` |
+| `workflows/ci.reusable.yml` | One reusable GitHub Actions workflow. Input `language` picks one of seven jobs — install, lint, test, coverage gate. Opt-in `telemetry` input adds the traceparent conformance job. No job builds or pushes an image. | Every service, via a 6-line `.github/workflows/ci.yml` |
 | `lint/yamllint.yml` | YAML style, with the three rules Actions forces us to retune. | Any repo that lints its own YAML; kit's gate uses it on itself |
 | `lint/golangci.yml` | golangci-lint v2, correctness linters on, `errcheck` excluded only for `Close`/`Flush`. | Go services |
 | `lint/rubocop.yml` | RuboCop, `NewCops: enable`, Metrics left on. | Ruby services |
-| `lint/eslint.config.mjs` | ESLint 9 flat config, type-checked rules on. | Node/TypeScript services |
-| `docker/Dockerfile.<lang>` | Six multi-stage templates. `go` and `rust` finish on distroless; `ruby`, `elixir`, `python`, and `node` finish on `*-slim`. All run non-root. | Every service |
+| `lint/eslint.config.mjs` | ESLint 9 flat config, type-checked rules on. | Node/TypeScript/Bun services |
+| `docker/Dockerfile.<lang>` | Seven multi-stage templates. `go` and `rust` finish on distroless; the rest finish on `*-slim`. All run non-root. | Every service |
 | `templates/bin-prime/<lang>.sh` | The worktree primer: one script per language, exit 0 only when the tree is genuinely ready. | Every service, as `bin/prime` |
+| `templates/bin/dev.sh` | The local developer loop: bring the stack up, wait for health, migrate, seed an admin, print the URLs. Idempotent, fails loudly. | Every service, as `bin/dev` |
+| `templates/compose/docker-compose.yml` | Postgres, NATS+JetStream, Redis and the OTel collector. Every port parameterized, every image pinned, every service healthchecked. | Every service, as `docker-compose.yml` |
+| `templates/compose/otel-collector.yml` | The collector: OTLP receiver, batch processor, and a `debug` exporter that writes to stdout. **Ships nothing.** | Every service, as `otel-collector.yml` |
+| `templates/compose/.env.example` | Every `${KIT_*}` the stack interpolates, each with a default. | Every service, as `.env.example` |
+| `templates/otel/<lang>/` | W3C traceparent: a stdlib codec, an executed conformance suite, an SDK snippet, and a README. | Every service, per language |
 | `templates/mise.toml` | Toolchain pins, one per language, commented. | Every service, as `mise.toml` |
 | `templates/AGENTS.md` | Skeleton repo-conventions file. | Every service, as `AGENTS.md` |
 | `tests/validate.sh` | kit's own suite — the gate. | kit |
+
+## The local stack — `templates/compose/`
+
+Postgres, NATS with JetStream, Redis, and an OpenTelemetry collector. One stack,
+one set of credentials, one command, for every service.
+
+```sh
+cp <kit>/templates/compose/docker-compose.yml ./docker-compose.yml
+cp <kit>/templates/compose/otel-collector.yml  ./otel-collector.yml
+cp <kit>/templates/compose/.env.example        ./.env
+cp <kit>/templates/bin/dev.sh                  ./bin/dev && chmod +x bin/dev
+
+bin/dev            # up, wait for health, migrate, seed, print URLs
+bin/dev status     # what is running
+bin/dev logs nats  # tail one service
+bin/dev down       # stop, keep the data
+bin/dev nuke       # stop and DELETE the data
+```
+
+It is a **template with placeholders**, not a fixed stack. Every published port
+is `${KIT_*:default}`, every image is pinned to an exact tag, and every service
+has a healthcheck so `up --wait` can mean something. A service joins by adding a
+`depends_on` and copying the connection URLs into its own `.env`.
+
+`bin/dev` is idempotent — run it twice and nothing changes — and it fails loudly
+rather than half-starting: if the stack does not become healthy it prints what is
+unhealthy and its logs, and stops *before* migrating, so a failed `up` cannot
+leave a half-migrated database behind.
+
+**The collector ships nothing.** Its only exporter is `debug`, which writes spans
+to the collector's own stdout on the machine already running it. It publishes no
+host port, so it is reachable by service name over the compose network and from
+nowhere else. To send spans to a backend you add an exporter block yourself and
+point it at a `${env:...}` endpoint; a literal endpoint fails kit's gate, so it
+cannot reach a repo by accident. This is a privacy boundary, not a preference:
+traces carry request paths, user identifiers, and occasionally a token in a span
+attribute.
+
+## Trace propagation — `templates/otel/`
+
+Every service speaks the same trace context, so a request crossing four cafaye
+services reads as one trace.
+
+Each language ships four files:
+
+| File | Use it when |
+|------|-------------|
+| `traceparent.*` | You need the header handling on its own: a queue consumer, a webhook signer, a background task, a test that asserts propagation without an SDK. Stdlib only. |
+| `test_traceparent.*` | Always. It is the contract. |
+| `*.snippet` | You serve HTTP. The upstream OTel SDK already does this and also gives you spans and metrics. Versions in [`templates/otel/pins.md`](templates/otel/pins.md); kit vendors nothing. |
+| `README.md` | When you are deciding. |
+
+The contract, identical in all six languages:
+
+- a valid inbound `traceparent` is **continued** — same trace-id, sampled flag
+  preserved, parent-id replaced with this hop's span id (§3.4);
+- a missing or malformed `traceparent` starts a **new** trace and never throws,
+  never 4xxs, never panics — a request is not an error because its trace header
+  was garbage (§3.2.2.3, §4.2);
+- `tracestate` travels with the trace, capped at 512 characters, truncated on
+  whole-entry boundaries only (§3.3.1.5);
+- a `traceparent` that fails to parse is **not** rescued by a `tracestate`
+  alongside it (§3.3).
+
+Reference: [W3C Trace Context, W3C Recommendation 23 November 2021](https://www.w3.org/TR/trace-context/).
+Start at [`templates/otel/README.md`](templates/otel/README.md) for the six-way
+comparison and the reason there are six implementations of one algorithm.
+
+### Worked example — `courier` adopting propagation
+
+A service that fans a delivery out to `parlor` and publishes to NATS. Three
+steps, in this order.
+
+**1. Copy the codec and its suite.** Keep both. The suite is what makes
+propagation a build failure instead of a claim in a README.
+
+```sh
+cp -R <kit>/templates/otel/elixir/. lib/courier/telemetry/
+cp <kit>/templates/otel/elixir/test_traceparent.exs test/
+```
+
+**2. Read the trace at the edge.** In a plug, before the controller:
+
+```elixir
+def read_trace(conn, _opts) do
+  hop = KitOtel.Traceparent.server_hop(conn.req_headers, KitOtel.Traceparent.new_span_id())
+  conn
+  |> assign(:trace_id, hop.trace_id)
+  |> assign(:outbound_trace, hop.outbound_headers())
+end
+```
+
+`server_hop/2` cannot fail. That is the design, not an omission — see
+[`templates/otel/elixir/README.md`](templates/otel/elixir/README.md).
+
+**3. Put it on the wire outbound.** On the `Req` call to `parlor`:
+
+```elixir
+Req.post!("#{parlor_url}/deliveries", json: payload, headers: outbound_trace)
+```
+
+`outbound_trace` is `{"traceparent" => "00-<trace-id>-<this hop's span id>-01"}`.
+The trace-id is the same one that came in, the parent-id is this hop's span, and
+`parlor` continues it. That is §3.4, and it is the whole mechanism.
+
+**4. Turn the suite into a build failure:**
+
+```yaml
+    with:
+      language: elixir
+      telemetry: 'true'
+```
+
+`bin/dev` then shows the trace locally, because the collector prints spans to
+stdout and the service points at it:
+
+```sh
+OTEL_EXPORTER_OTLP_ENDPOINT=http://otel-collector:4318 bin/dev
+```
 
 ## How a service repo adopts kit
 
@@ -48,11 +172,16 @@ jobs:
   ci:
     uses: cafaye/kit/workflows/ci.reusable.yml@master
     with:
-      language: go          # go | ruby | elixir | python | node | rust
+      language: go          # go | ruby | elixir | python | node | bun | rust
       working-dir: .        # the dir holding go.mod / Gemfile / pyproject.toml
 ```
 
 Two jobs for two languages? Call it twice with two different `language` values.
+
+`bun` is a first-class `language` value: frozen install from `bun.lock`,
+`typecheck`, `bun test`. It exists because `guard` was hand-rolling an entire
+workflow for want of one — a repo that has adopted `bun` here can delete that
+file and collapse it to the `uses:` above.
 
 **2. Copy the linter config** that matches your language into the repo root, so
 the config is part of the code review that changes the code:
@@ -60,21 +189,24 @@ the config is part of the code review that changes the code:
 ```sh
 cp <kit>/lint/golangci.yml  .golangci.yml     # go
 cp <kit>/lint/rubocop.yml    .rubocop.yml      # ruby
-cp <kit>/lint/eslint.config.mjs eslint.config.mjs   # node / typescript
+cp <kit>/lint/eslint.config.mjs eslint.config.mjs   # node / typescript / bun
 cp <kit>/lint/yamllint.yml   .yamllint.yml     # any repo with YAML
 ```
 
-**3. Copy the Dockerfile and the primer.** Rename the Dockerfile to
-`docker/Dockerfile` and the primer to `bin/prime`, then:
+**3. Copy the Dockerfile and the two scripts.** Rename the Dockerfile to
+`docker/Dockerfile`, the primer to `bin/prime`, and the dev loop to `bin/dev`:
 
 ```sh
 cp <kit>/docker/Dockerfile.go          docker/Dockerfile
 cp <kit>/templates/bin-prime/go.sh     bin/prime
-chmod +x bin/prime
+cp <kit>/templates/bin/dev.sh          bin/dev
+chmod +x bin/prime bin/dev
 ```
 
 Set `SERVICE_NAME` (Go, Rust) or the `:app` release name (Elixir) to your real
-binary or application name.
+binary or application name. `bin/dev` needs `docker-compose.yml`,
+`otel-collector.yml` and `.env` beside it — see
+[the local stack](#the-local-stack--templatescompose).
 
 **4. Copy `templates/mise.toml` to `mise.toml`** and raise every placeholder to
 the version you actually deploy. kit's values are placeholders, not an org-wide
@@ -103,6 +235,20 @@ Then raise `COVERAGE_FAIL_UNDER` in your CI caller:
       coverage-fail-under: '80'   # passed through as an env override
 ```
 
+**7b. Opt into trace propagation**, once you have copied
+`templates/otel/<lang>/`:
+
+```yaml
+    with:
+      language: go
+      telemetry: 'true'          # runs the W3C conformance suite on every push
+```
+
+It is opt-in and defaults to `'false'`, so adopting kit never turns a green repo
+red. It is a string rather than a boolean on purpose: GitHub coerces the bare
+word `false` to a boolean in some positions, and `if: inputs.telemetry` is a trap
+as a result.
+
 **7. Run kit's own gate before you open the PR that adopts it:**
 
 ```sh
@@ -116,9 +262,12 @@ bash <kit>/tests/validate.sh
 - [ ] Linter config copied to the repo root, unmodified
 - [ ] `docker/Dockerfile` copied, binary/application name set
 - [ ] `bin/prime` copied, `chmod +x`, green on a fresh clone
+- [ ] `bin/dev` copied, `chmod +x`, `bin/dev up` green on a fresh clone
+- [ ] `docker-compose.yml` + `otel-collector.yml` copied, ports parameterized
 - [ ] `mise.toml` copied, every placeholder raised to a shipped version
 - [ ] `AGENTS.md` copied and filled in
 - [ ] A coverage command exists and `COVERAGE_FAIL_UNDER` is above 0
+- [ ] If you propagate traces: `templates/otel/<lang>/` copied **with its suite**, `telemetry: 'true'`
 - [ ] `CHANGELOG.md` has an entry
 - [ ] The workflow is green on the adoption PR
 
@@ -147,19 +296,41 @@ python3 -m venv .venv && .venv/bin/pip install -r tests/requirements.txt
 bash tests/validate.sh
 ```
 
-`tests/validate.sh` walks every file in `workflows/`, `lint/`, `docker/`, and
-`templates/bin-prime/` and prints one line per file:
+`tests/validate.sh` runs in three phases and prints one line per check.
 
-- `.sh` → `bash -n`
-- `.yml` / `.yaml` → `python3` `yaml.safe_load`
-- `.mjs` → `node --check`, skipped when node is not installed
-- anything else (the `Dockerfile.*` templates) → `SKIP`, reported rather than
-  silently passed
+**static** — every artifact parses, and the strictness decisions are still what
+we wrote them down to be:
 
-Any `FAIL` exits 1, so the gate is red until every artifact parses. It is
-deliberately the whole suite: kit has no runtime code, so "it parses" is the
-strongest check a config repo can make. Semantic review — is the coverage gate
-real, is the final base image distroless — is what review and the six consuming
-repos' own CI are for.
+- `.sh` → `bash -n`, plus `shellcheck -S warning` when shellcheck is installed
+- `.yml` / `.yaml` → `python3` `yaml.safe_load`, plus `yamllint -c lint/yamllint.yml`
+- `.mjs` → `node --check`
+- handed-out scripts → must be executable
+- every language in the CI workflow must have a Dockerfile, a `bin/prime` and a
+  `[tools]` pin — "half a language is worse than none"
+- the collector must have no exporter but `debug`, no literal URL, and every
+  `${env:...}` it reads must actually be passed into the container
+- every published compose port must be a `${KIT_*:default}` substitution
+- the `telemetry` CI job must stay opt-in and the six original jobs must stay
+  gated on their language, or adopting kit breaks every consumer
 
-PyYAML is required (`tests/requirements.txt`); `node` is optional.
+**telemetry** — the W3C traceparent suites are **executed**, one per language:
+
+```sh
+bash tests/validate.sh --language=go     # one language
+bash tests/validate.sh --static-only     # no toolchains needed
+```
+
+Stdlib only and offline on purpose: no `go mod download`, no `bundle install`,
+no `npm ci`, no `cargo fetch`. If these ever need the network, a template has
+grown a dependency and kit has stopped being config-only.
+
+**self_test** — `tests/self_test.sh` breaks a throwaway copy of this tree
+eleven ways and asserts the gate goes red each time. Five breakages are for the
+static checks; one is a semantic mutation of each of the six language
+implementations, so **every suite is proven able to fail** rather than assumed
+to. A skip fails the run — a self_test that skips half its proofs and exits 0 is
+the "0 passed, 14 ignored" shape that verifies nothing.
+
+Any `FAIL` exits 1. A `SKIP` is always reported in the summary, never hidden.
+PyYAML and yamllint are required (`tests/requirements.txt`); the six language
+toolchains and `shellcheck` run when present.

@@ -134,12 +134,12 @@ services:
     # posture of the local stack. Services use
     # http://otel-collector:${KIT_OTEL_HTTP_PORT:-4318} instead.
     command: ["--config=/etc/otel/otel-collector.yml"]
-    # REQUIRED, and easy to miss. otel-collector.yml uses ${env:NAME}, which the
-    # collector resolves from ITS OWN process environment — not from the
-    # compose file's. Docker Compose reads .env to expand ${KIT_*:default} in the
-    # compose file itself; it does not inject those into containers. Without this
-    # block every ${env:...} resolves to an empty string and the collector exits
-    # with:
+    # REQUIRED, and easy to miss. otel-collector.yml interpolates its values from
+    # the collector's OWN process environment, not from the compose file's.
+    # Docker Compose reads .env to expand the placeholders in the compose file
+    # itself; it does not inject those into containers. Without this block every
+    # placeholder in the collector config resolves to an empty string and the
+    # collector exits with:
     #
     #   invalid configuration: processors::memory_limiter: 'limit_mib' or
     #   'limit_percentage' must be greater than zero
@@ -159,6 +159,10 @@ services:
       KIT_OTEL_DEBUG_VERBOSITY: ${KIT_OTEL_DEBUG_VERBOSITY:-normal}
       KIT_OTEL_HEALTH_ENDPOINT: ${KIT_OTEL_HEALTH_ENDPOINT:-0.0.0.0:13133}
       KIT_OTEL_LOG_LEVEL: ${KIT_OTEL_LOG_LEVEL:-info}
+      # Not a `ports:` entry and not a published port. The collector publishes
+      # nothing to the host; these three are the endpoints it BINDS inside the
+      # compose network, which is why the compose port check below ignores
+      # values in an `environment:` block.
     volumes:
       - ./otel-collector.yml:/etc/otel/otel-collector.yml:ro
     healthcheck:
