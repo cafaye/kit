@@ -163,8 +163,8 @@ MSG
 # 2.15.1's published `checksums.sha256` from the release itself, and the whole
 # block is one `HADOLINT_VERSION=` edit away from being updated.
 KIT_HADOLINT_VERSION='2.15.1'
-KIT_HADOLINT_SHA256S='darwin-arm64 5c09f3213f8e40406abe048233d985eebef336d4a6a20021be47fadb6cf480a2
-darwin-x86_64 ffe9bb18b23d5ed1eae50237aecdbb523d016e96da0bd4e7aa432040acfc3fde
+KIT_HADOLINT_SHA256S='macos-arm64 5c09f3213f8e40406abe048233d985eebef336d4a6a20021be47fadb6cf480a2
+macos-x86_64 ffe9bb18b23d5ed1eae50237aecdbb523d016e96da0bd4e7aa432040acfc3fde
 linux-arm64 f6198ef8090f404dbb771abfee086eb8c48ac177f30da7fd3510aca35b344b5d
 linux-x86_64 c7187db94eeeeca956519a6af171adc31453941a1e777961f6e680f697c8c507'
 
@@ -196,8 +196,11 @@ kit_bootstrap_binary() {
   fi
 
   local os arch asset want
+  # `uname -s` says Darwin; the release asset says macos. Getting this wrong is
+  # a 404, not a clear error, so the mapping is spelled out and the fallback is
+  # an explicit failure with a note rather than a silent skip.
   case "$(uname -s)" in
-    Darwin) os=darwin ;;
+    Darwin) os=macos ;;
     Linux) os=linux ;;
     *)
       printf 'note: no prebuilt %s for %s; install it and re-run\n' "$name" "$(uname -s)" >&2
