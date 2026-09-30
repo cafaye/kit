@@ -251,6 +251,128 @@ case "$out" in
 esac
 
 # ---------------------------------------------------------------------------
+# 1b. The EXACT-VALUE layer, on every call
+# ---------------------------------------------------------------------------
+printf -- '-- 1b. every printed line is filtered, not just the first\n'
+
+# THE BUG THIS EXISTS TO CATCH, and it is the most serious thing the audit
+# above could not see.
+#
+# `scrub` used to inherit one pipe on fd 3 for the life of the deploy. A pipe is
+# a STREAM with a single read, so the first `scrub` consumed it to EOF and every
+# later one got an EMPTY value list — and an empty value list means shape-only
+# redaction. The exact-value layer, the one that actually knows this deploy's
+# secrets, therefore applied to the first line printed and never again.
+#
+# Reproduced against the real functions with the real redactor:
+#
+#     call 1: a [redacted:secret] b
+#     call 2: c T=kit16CANARY… d     <- the secret, printed
+#     call 3: e T=kit16CANARY… f
+#
+# and the leak audit in section 7 could not catch it, because that audit only
+# fails when something ACTUALLY leaks. Nothing leaked on the runs that hid this.
+# A check that can only fail on a bad day is not a check; this one fails on the
+# structure instead.
+#
+# Driven by SOURCING the tool rather than by paraphrasing it: a copy of `scrub`
+# in this file would drift from the one that runs during a real deploy, and a
+# test of a copy tests nothing.
+# Sourcing `deploy` runs `main "$@"`, which would parse this suite's own
+# arguments and exit. Strip that one line, append the setter the probe needs,
+# and run it all inside a SUBSHELL so none of the tool's globals — `set -euo
+# pipefail`, `SERVICE`, `PROJECT`, the whole config block — leak into this
+# suite's shell. Sourcing in the current shell would replace the error handling
+# this test file depends on.
+cat >"$WORK/deploy-lib.sh" <<EOF
+$(sed -e 's|^main "\$@"$|# main "\$@"  (stripped: this is the library probe)|' "$DEPLOY")
+secret_values_set() {
+  SECRET_NAMES=(CANARY_KEY)
+  SECRET_VALUES=("\$1")
+  SECRET_PAIRS=("CANARY_KEY=\$1")
+}
+EOF
+
+LIB="$WORK/deploy-lib.sh"
+
+# Nine lines through THREE consecutive scrub calls, driven by the tool's own
+# `scrub` and the real redactor. The subshell keeps the tool's `set -euo
+# pipefail` and its config globals out of this suite's shell; REDACTOR is passed
+# in so the probe does not depend on the tool deriving SELF_DIR from `$0`, which
+# is THIS test file once it is sourced.
+CANARY3="kit16CanaryStream3f9a2c7e1b4d8065"
+out="$(LIB="$LIB" PROBE_REDACTOR="$REDACTOR" PROBE_CANARY="$CANARY3" bash -c '
+  set -euo pipefail
+  # shellcheck source=/dev/null
+  . "$LIB"
+  REDACTOR="$PROBE_REDACTOR"
+  DEFAULT_REDACTOR="$PROBE_REDACTOR"
+  setup_redaction
+  secret_values_set "$PROBE_CANARY"
+  for tag in one two three; do
+    {
+      printf "%s-a k=%s\n" "$tag" "$PROBE_CANARY"
+      printf "%s-b k=%s\n" "$tag" "$PROBE_CANARY"
+      printf "%s-c k=%s\n" "$tag" "$PROBE_CANARY"
+    } | scrub
+  done
+' 2>&1 || true)"
+
+# If the probe produced nothing, that is a BROKEN PROBE and not a pass. Counting
+# "no canary in the empty string" as success is how a redaction test reports
+# green having run nothing.
+probe_lines="$(printf '%s\n' "$out" | grep -c . || true)"
+if [ "$probe_lines" -eq 9 ]; then
+  pass "the probe produced 9 lines: the tool's scrub really ran three times"
+else
+  fail "the scrub probe produced $probe_lines lines, expected 9 — the probe itself is broken: $out"
+fi
+
+# Counted per BATCH, not per line: the bug is that whole batches come through
+# unredacted, so asserting "three consecutive calls" means "three batches of
+# three", and reporting which batch leaked localises a regression to a call.
+leaked_batches=""
+for tag in one two three; do
+  case "$out" in
+    *"$tag-a k=$CANARY3"* | *"$tag-b k=$CANARY3"* | *"$tag-c k=$CANARY3"*)
+      leaked_batches="$leaked_batches $tag"
+      ;;
+  esac
+done
+
+if [ -z "$leaked_batches" ]; then
+  pass "all three consecutive scrub calls filtered the exact value, not only the first"
+else
+  fail "scrub call(s)$leaked_batches printed the secret verbatim — the value list is being consumed"
+fi
+
+# And the SURVIVORS, because a filter that redacts everything is as useless as
+# one that redacts nothing.
+kept=0
+for tag in one two three; do
+  case "$out" in
+    *"$tag-a k=[redacted:"* | *"$tag-b k=[redacted:"* | *"$tag-c k=[redacted:"*)
+      kept=$((kept + 1))
+      ;;
+  esac
+done
+if [ "$kept" -eq 3 ]; then
+  pass "each of the three calls replaced the value in place and kept the line readable"
+else
+  fail "only $kept of 3 scrub calls left a readable redacted line"
+fi
+
+# ...and the shape layer must still be doing its job independently, because the
+# value list is not supposed to be the only thing standing between a secret and
+# a log.
+out="$(printf 'upstream said: %s\n' "$B64_CANARY" | "$PY" "$REDACTOR" --secrets-fd 3 3< /dev/null)"
+case "$out" in
+  *"$B64_CANARY"*) fail "the shape layer stopped working when the value list was empty" ;;
+  *redacted*) pass "the shape layer works with no value list at all" ;;
+  *) fail "shape-only redaction produced neither the key nor a marker: $out" ;;
+esac
+
+# ---------------------------------------------------------------------------
 # 2. The refusals. Each of these is a way to leak, and each must stop.
 # ---------------------------------------------------------------------------
 printf -- '-- 2. the tool refuses the inputs that would leak\n'

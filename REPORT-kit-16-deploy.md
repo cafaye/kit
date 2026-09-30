@@ -32,7 +32,7 @@ was not done.
 | Rollback demonstrated, not described | **Done.** Container image reference observed before, during and after. |
 | `REPORT-kit-16-deploy.md` | This file. |
 | `CHANGELOG.md` | Done. |
-| `tests/deploy_test.sh` | **Done.** 44 assertions, 0 failed, 0 skipped on a run with the image present. |
+| `tests/deploy_test.sh` | **Done.** 66 assertions across 9 sections, 0 failed, 0 skipped. |
 
 ### Files added — all new, nothing edited
 
@@ -255,7 +255,28 @@ re-used the previous artifact rather than quietly rebuilding something.
 - `deploy rollback` runs **the same deploy code path** with a different tag,
   including the same health gate. A rollback implemented as a second code path
   is a rollback never tested by the fact that deploys work.
-- `deploy up` **rolls itself back** when the health gate does not go green.
+- `deploy up` **rolls itself back** when the deploy cannot go green.
+
+**The automatic rollback is now executed, not asserted.** Section 6 proves
+`rollback` works when a human asks for it. Section 6b proves the third bullet —
+the sentence the tool's header and the `CHANGELOG` both lead with, which until
+this run was resting on reading the source. A deliberately broken artifact is
+deployed: a **one-layer derivative of the good image with
+`/app/bin/migrate` removed**. That construction is the point. Good and bad
+differ by exactly the thing under test and nothing else, so a rollback that
+appeared to work could not have worked by accident; and the failure mode is the
+most ordinary bad release there is — it boots, it serves, it **passes its health
+gate**, and it is still wrong, so only the migration step can catch it.
+
+Asserted, all five: `deploy up` exited non-zero; the deploy **said** it was
+rolling back; it did not report `ROLLBACK ALSO FAILED`; the container is serving
+the previous artifact's image **reference** again, unprompted; and the ledger
+never recorded the broken artifact as a successful deploy — because a bad
+release in the ledger is something the *next* incident would roll back to.
+
+The broken image is built at run time from a Dockerfile written into the suite's
+own temp directory. A deliberately broken image has no business in the
+repository, and the artifact exists for about ninety seconds.
 
 **How long it takes:** the tool prints it (`ROLLBACK: healthy on the previous
 artifact after Ns`) rather than this document asserting a number that would go
@@ -263,10 +284,11 @@ stale. In this packet's runs it was single-digit seconds, because the two
 artifacts are the same image under different tags — the health-gate wait
 dominates, and it is the same bounded wait every deploy uses.
 
-### Two rollback bugs this packet found in itself
+### Three rollback bugs this packet found in itself
 
-Both are recorded because both were invisible until the test asserted the right
-thing.
+All three are recorded because all three were invisible until the test asserted
+the right thing, and the third was invisible until something asserted the right
+thing *about the automatic path*, which nothing had done.
 
 1. **`rollback` did not read the credentials.** It re-runs the deploy path, the
    deploy path delivers secrets, and rollback had an empty secret list — so it
@@ -277,11 +299,36 @@ thing.
    append-ordered, so the newest entry is the *last* line; the original walked
    forwards, which made `rollback` redeploy the artifact that was **already
    running**, report success, and change nothing.
+3. **`deploy up`'s automatic rollback asked the ledger the wrong question**, and
+   this one is worth reading twice. Both callers used index `1`, but they want
+   different things. A rollback a **human asked for** runs while a good artifact
+   is current, so it must reach past the head — index `1`. A deploy that
+   **failed** never appended to the ledger (`do_deploy` appends only on
+   success), so the newest entry *is* the artifact that was serving a moment ago
+   — index `0`.
 
-The second is the dangerous one, and the reason the test asserts on the image
-**reference** and not the digest: the two tags under test point at the same
-image and therefore share a digest, so a digest assertion would have passed
-against a rollback that did nothing at all.
+   Both failure modes are silent, and the second is the dangerous one:
+
+   - with a ledger of `[A ok]` and a first-ever bad release, index `1` is out of
+     range, `ledger_last_ok` returns non-zero, and the rollback was **skipped
+     entirely** — leaving the stack on the broken artifact. That is the exact
+     outcome the feature exists to prevent, reached *by* the feature.
+   - with a ledger of `[A ok, B ok, A ok]` — a rollback having just happened,
+     which is the normal state after an incident — index `1` is `B`: the release
+     that had already been rolled back **away from**. The deploy reported a
+     successful rollback and moved the service to a version nobody had asked for.
+
+   `do_rollback_impl` now takes the index as a parameter, `cmd_up` passes `0`,
+   `cmd_rollback` passes `1`, and a failed first-ever deploy **says out loud**
+   that there is nothing to roll back to rather than skipping over it.
+
+The second is why the test asserts on the image **reference** and not the
+digest: the two tags under test point at the same image and therefore share a
+digest, so a digest assertion would have passed against a rollback that did
+nothing at all. The third is why §6b asserts on the image reference *and* on
+the ledger: a rollback to the wrong artifact reported success and served traffic
+perfectly happily, so every "it exited 0" assertion in this packet would have
+passed straight through it.
 
 ---
 
@@ -307,6 +354,19 @@ The same section asserts that `down` **removes the ledger**, which is the
 subtler half: a ledger that outlives its stack points the next `rollback` at an
 artifact whose database volume no longer exists, which is a rollback that cannot
 come back.
+
+And the scoping is **executed, not asserted by inspection**. The suite creates a
+container and a volume that belong to it and to nothing else, named so that they
+are deliberately *not* part of the compose project, and asserts that both
+**survive** `deploy down` **and** `deploy down --purge`. This goes red if
+`cmd_down` ever grows a prune or an unprefixed `docker rm` / `docker volume rm`
+— which is the whole point. An inspection ("there is no `docker system prune`
+anywhere in this file") is not a proof: the defect it would miss is a one-line
+edit to `cmd_down`, and a reader reviewing that diff sees nothing alarming.
+
+`down` and `down --purge` are also both exercised for what they *promise*: a
+plain `down` **keeps** the project's volume, `--purge` removes it, and both
+remove the ledger, so a later deploy knows it is the first one.
 
 Verified after the run:
 
@@ -444,12 +504,13 @@ a rule in the tool, because a rule would be wrong for at least four of the nine.
 
 `bash tests/deploy_test.sh`
 
-**44 passed, 0 failed, 0 skipped** on a run with the image present.
+**66 passed, 0 failed, 0 skipped** on a run with the image present, in nine
+sections.
 
-- **13 assertions run with no Docker at all** (the redactor, and the five
+- **13 assertions run with no Docker at all** (the redactor, and the six
   refusals) — and they are the ones that matter most, because they are the ones
   a machine without a daemon still gets.
-- **31 assertions are live** and need the daemon and an image. Without them the
+- **53 assertions are live** and need the daemon and an image. Without them the
   suite **SKIPs loudly with the build command printed**, never silently.
 - **No sleeps.** Every wait is a poll on a real signal — an HTTP status, a
   container health status, an image reference — against a deadline. `sleep`
@@ -478,12 +539,56 @@ a rule in the tool, because a rule would be wrong for at least four of the nine.
 ### Bugs the test found in the deliverables
 
 Every one of these was a real defect in the tool or the templates, not in the
-test: the newline-vs-space claim-check matching; `docker exec` not inheriting
-PID 1's environment (so migrations could not see the injected credentials);
-`POSTGRES_PASSWORD` and `POSTGRES_PASSWORD_FILE` being mutually exclusive in the
-official postgres image, which killed the database on boot; `PHX_SERVER` in the
-environment making `bin/migrate` fail to bind port 4000; the placeholder image
-variable leaking into rollback's deploy; and the two rollback bugs in §3.
+test. Listing them is the most useful thing this packet has to say about its own
+method, because each was found by a check written to be able to fail rather
+than by reading the code:
+
+1. the claim check matched names with a **space** on both sides while emitting
+   them one per line, so only the first label ever matched;
+2. **`docker exec` does not inherit PID 1's environment**, so an exec'd
+   migration never saw the injected credentials while the service was healthy;
+3. `POSTGRES_PASSWORD` and `POSTGRES_PASSWORD_FILE` are **mutually exclusive**
+   in the official postgres image, which killed the database on boot;
+4. `PHX_SERVER` in the environment made `bin/migrate` start the endpoint and
+   fail to bind port 4000, which the already-running server held;
+5. the placeholder image variable leaked into **rollback's** deploy, which
+   passes no `--image`, so compose tried to pull a repository named
+   `kit-deploy-no-artifact-required-for-this-command`;
+6. `ledger_last_ok` counted from the **start** of an append-ordered file, so
+   rollback redeployed the artifact that was already running (see §3);
+7. `do_rollback_impl` **ignored its index argument** and always reached one
+   entry too far back, so a failed deploy's self-rollback restored the artifact
+   that had already been rolled back away from;
+8. a later `compose up` can **recreate an earlier service** as a side effect —
+   observed when `postgres:17` was re-pulled and its digest no longer matched —
+   leaving it alive with an empty `/run/secrets` and taking the application
+   down through `depends_on: service_healthy`;
+9. `note()` was **not scrubbed**, on the reasoning that progress lines are
+   written by the tool and are therefore safe. That is the exact reasoning that
+   makes a leak feel safe right up until a secret is interpolated into one.
+
+### kit's own gate
+
+`bash tests/validate.sh` → **150 PASS, 0 FAIL, 2 SKIP**, and
+`PASS: every check passed.`
+
+Both skips are **pre-existing and not mine**:
+`templates/tier/{bun,node}/tier.test.ts` — stock `node --check` cannot read
+TypeScript. An earlier run of this packet had **three** skips, because
+`templates/bin/deploy` (no extension) got no syntax parser at all; renaming it
+to `deploy.sh` took the count back to the two that were already there.
+
+What the gate does to the new files, with no edit to `validate.sh`:
+
+```
+PASS  templates/bin/deploy.sh  (bash -n)
+PASS  templates/bin/deploy.sh  (executable)
+PASS  templates/bin/deploy.sh  (shellcheck -S warning)
+PASS  tests/deploy_test.sh  (bash -n)
+PASS  tests/deploy_test.sh  (shellcheck -S warning)
+PASS  templates/deploy/compose.deploy.yml  (yamllint -c lint/yamllint.yml)
+PASS  templates/deploy/reference/courier.deploy.yml  (yamllint -c lint/yamllint.yml)
+```
 
 ---
 

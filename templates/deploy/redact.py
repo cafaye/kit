@@ -29,6 +29,25 @@ HOW SECRETS REACH THIS PROCESS, AND WHY IT IS NOT argv OR THE ENVIRONMENT
     This process holds the values only in its own address space, and drops them
     when it exits.
 
+ONE CONTRACT WITH ITS CALLER, AND IT IS EASY TO GET WRONG
+    **fd 3 carries BARE VALUES, one per line, and nothing else.** Not
+    `NAME=value`, not quoted, not JSON, not with a trailing `=`.
+
+    A caller that sends `NAME=value` gets that entire string treated as the
+    value to scrub. The real value is then not in the list, so it is not
+    redacted — and the filter still exits 0, prints a plausible-looking
+    `[redacted:…]` marker for the *pair* if the pair ever appears, and reports
+    success. Nothing about that failure is visible from the outside.
+
+    This is not hypothetical. The deploy tool built its fd-3 stream from a list
+    of `name=value` pairs, so for a long time its exact-value layer scrubbed
+    the literal text `SECRET_KEY_BASE=hunter2` and printed the value `hunter2`
+    in the clear on every line after the first. Caught by
+    `tests/deploy_test.sh` §1b, which drives the tool's own `scrub` and asserts
+    the bare value is absent — a test that passes a *different* format than the
+    tool does would have gone green over it, which is exactly what happened for
+    as long as the redaction unit test used its own helper.
+
 TWO LAYERS, AND WHY THE SECOND ONE IS NOT OPTIONAL
     Layer 1 is the value list. It is exact and it is what protects the specific
     secrets this deploy was handed.

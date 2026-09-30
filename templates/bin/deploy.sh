@@ -80,13 +80,23 @@ SECRET_BYTE_LIMIT=32768
 # otherwise be masked everywhere and protect nothing.
 MIN_SECRET_LEN=8
 
+# BARE VALUES AND NOTHING ELSE. `redact.py` reads fd 3 as a list of literal
+# values to scrub, so this array must never hold `NAME=value` — a pair makes the
+# redactor match the whole `NAME=value` string and leave the value itself in the
+# clear. The NAMES live in SECRET_NAMES beside it and are only ever printed.
+#
 # Populated by read_secrets. Never printed, never exported to a child.
 SECRET_NAMES=()
 SECRET_VALUES=()
-SECRET_PAIRS=()
 
 fail() { printf '%s: %s\n' "$TOOL_NAME" "$1" >&2; exit "${2:-1}"; }
-note() { printf '%s: %s\n' "$TOOL_NAME" "$1"; }
+# note: an operator-facing progress line, AND it is scrubbed like everything
+# else. It was not, originally, on the reasoning that progress lines are
+# written by this file and therefore safe — which is exactly the reasoning
+# that makes a leak feel safe right up until a secret is interpolated into a
+# message. `note` and `say` are the same function with different prefixes, and
+# the prefix is the only reason they were ever two.
+note() { printf '%s: %s\n' "$TOOL_NAME" "$1" | scrub; }
 
 usage() {
   sed -n '2,50p' "$0" | sed 's/^# \{0,1\}//'
@@ -118,13 +128,53 @@ setup_redaction() {
   REDACT_CMD=("$py" "$REDACTOR" --secrets-fd 3)
 }
 
-# scrub: filter stdin through the redactor. fd 3 carries the secret values and
-# is inherited by the redactor only; it is never given to `docker`.
+# scrub: filter stdin through the redactor. The secret values reach the redactor
+# on fd 3 and on nothing else — not argv, not the environment, not a file.
+#
+# WHY A FRESH DESCRIPTOR EVERY TIME, which is not a style preference. An earlier
+# version opened ONE pipe on fd 3 at startup and every `scrub` inherited that
+# same descriptor:
+#
+#     exec 3< <(printf '%s\n' "${SECRET_PAIRS[@]}")
+#
+# The problem is that fd 3 is a PIPE and not a seekable file, so it is a STREAM
+# with one read. The first `scrub` consumed it to EOF and closed it. Every
+# `scrub` after that — and `scrub` sits behind every single thing this tool
+# prints, including `note` — inherited a descriptor already at EOF, so the
+# redactor received an EMPTY value list and fell back to shape matching alone.
+#
+# The consequence was quiet and severe: the exact-value layer, the one that
+# actually knows this deploy's secrets, applied to the FIRST line of output and
+# never again. From the second line onward a leaked secret was only caught if it
+# happened to match a credential SHAPE. An opaque value — a randomly generated
+# password, a base64 signing key — matches no shape, and would have been printed
+# in the clear.
+#
+# It also got worse as the tool grew. Every additional `note`/`say`/`run_scrubbed`
+# call was another opportunity to consume the pipe early, so the window in which
+# the real redaction was active shrank as the tool got chattier.
+#
+# Re-opening the pipe per call restores the invariant: every line this tool
+# prints is filtered against every secret it holds. The cost is one extra
+# subshell per call, which is nothing next to what a deploy does anyway.
 scrub() {
   if [ "${#SECRET_VALUES[@]}" -eq 0 ]; then
     cat
   else
-    "${REDACT_CMD[@]}" 3<&3
+    # BARE VALUES, and the second bug this function ever had. The stream used to
+    # be built from `SECRET_PAIRS`, which holds `NAME=value`. The redactor
+    # treats each fd-3 line as the literal value to scrub, so it was matching the
+    # text `SECRET_KEY_BASE=hunter2` and cheerfully printing `hunter2` on every
+    # line — running, exiting 0, and masking nothing.
+    #
+    # Nothing about that is visible from outside. The redactor is not supposed
+    # to be defensive about its input format because it cannot: a caller handing
+    # it the wrong shape is a caller bug, and the only place that can be caught
+    # is the tool that makes the call. Section 1b of `tests/deploy_test.sh`
+    # drives THIS function, which is the reason it is written against the tool
+    # rather than against the redactor — the redaction unit test used its own
+    # helper, passed the right shape, and went green over the whole thing.
+    "${REDACT_CMD[@]}" 3< <(printf '%s\n' "${SECRET_VALUES[@]}")
   fi
 }
 
@@ -171,7 +221,7 @@ read_secrets() {
     case "$line" in
       \#*) continue ;;
     esac
-    # First `=` splits, so a value may contain `=` (base64 padding, query
+    # FIRST `=` splits, so a value may contain `=` (base64 padding, query
     # strings, passwords). The name is validated, never the value.
     name="${line%%=*}"
     value="${line#*=}"
@@ -186,7 +236,6 @@ read_secrets() {
     total=$((total + ${#value}))
     SECRET_NAMES+=("$name")
     SECRET_VALUES+=("$value")
-    SECRET_PAIRS+=("$name=$value")
   done
 
   if [ "${#SECRET_VALUES[@]}" -eq 0 ]; then
@@ -201,12 +250,16 @@ read_secrets() {
     fail "secrets total $total bytes, over the $SECRET_BYTE_LIMIT byte redaction limit" 64
   fi
 
-  # Open the redaction stream ONCE, for the life of the deploy, so every
-  # `scrub` reads the same values from the same pipe. A process substitution
-  # is a pipe and not a temp file: `<<<` would put every secret in /tmp on
-  # shells that implement herestrings with one, which is the exact failure
-  # this whole design exists to prevent.
-  exec 3< <(printf '%s\n' "${SECRET_PAIRS[@]}")
+  # NO long-lived redaction stream is opened here, and that used to be the
+  # design. `scrub` now opens its own fresh pipe per call, because a pipe opened
+  # once is a stream with a single read: the first scrub drained it and every
+  # later one got an empty value list, which meant every line after the first
+  # was filtered by SHAPE alone and an opaque secret would have printed in the
+  # clear. The values already live in SECRET_VALUES in this shell's memory, so
+  # nothing is lost by re-deriving the pipe — and nothing is written to disk.
+  # `<<<` would put every secret in /tmp on shells that implement herestrings
+  # with a file, which is the failure this whole design exists to prevent, so the
+  # pipe is built with process substitution instead.
 
   # Never printed. Only the NAMES are ever shown, and only in aggregate.
   note "read ${#SECRET_VALUES[@]} secret(s): $(printf '%s ' "${SECRET_NAMES[@]}")"
@@ -626,14 +679,19 @@ do_deploy() {
     run_scrubbed docker build --tag "$tag" "$SERVICE_BUILD_CONTEXT" || fail "image build failed" 70
   fi
 
-  # 1. Record the artifact we are leaving, BEFORE starting anything. A ledger
-  #    written after the new deploy succeeds cannot tell you what to roll back
-  #    to when the new deploy succeeds and then misbehaves.
+  # 1. Name the artifact we are leaving, BEFORE starting anything. A ledger
+  #    written only after the new deploy succeeds cannot tell you what to roll
+  #    back to when the new deploy succeeds and then misbehaves.
+  #
+  #    Index 0, and the asymmetry with `do_rollback_impl`'s two indices is the
+  #    whole point: this deploy has NOT appended yet, so the newest `ok` entry
+  #    is the artifact that is serving right now. That is what `cmd_up` goes
+  #    back to if this deploy cannot go green.
   local previous_tag=""
-  if previous_tag="$(ledger_last_ok 1 | cut -f2)"; then
-    note "rollback target recorded: $previous_tag"
+  if previous_tag="$(ledger_last_ok 0 | cut -f2)"; then
+    note "the artifact running now, and the rollback target if this deploy fails: $previous_tag"
   else
-    note "no previous deployment on record; this is the first one"
+    note "no previous deployment on record; this is the first one, and a failure has nothing to roll back to"
   fi
 
   # 2. Each service in order. `SERVICE_ORDER` is the dependency order; every
@@ -762,9 +820,15 @@ cmd_up() {
   # quietly replaced by a broken one. Rolling back here is the difference
   # between a deploy and an outage with extra steps.
   local rb=0
-  if ledger_last_ok 1 >/dev/null 2>&1; then
-    note "rolling back to the previous artifact"
-    do_rollback_impl || rb=1
+  if ledger_last_ok 0 >/dev/null 2>&1; then
+    note "rolling back to the previous artifact (the one running before this deploy)"
+    do_rollback_impl 0 || rb=1
+  else
+    # Said out loud rather than skipped over. A first-ever deploy that fails
+    # leaves a broken stack with nothing to go back to, and an operator who is
+    # not told that will find out from their users.
+    say "no previous deployment on record, so there is nothing to roll back to"
+    say "the stack is on $tag and it is NOT healthy — this needs a human"
   fi
   if [ "$rb" -ne 0 ]; then
     say "ROLLBACK ALSO FAILED — this needs a human"
@@ -772,10 +836,26 @@ cmd_up() {
   return "$rc"
 }
 
+# do_rollback_impl <ledger-index>
+#
+# 0 = the artifact that was running a moment ago, 1 = the one before that.
+#
+# The two callers need different indices, and getting this wrong is invisible
+# until a deploy fails at 03:00. A deploy that FAILS never appends to the
+# ledger, so immediately after a failure the newest `ok` entry IS the artifact
+# that was serving before the failure — index 0. A `rollback` a human asked
+# for, on the other hand, runs while a perfectly good artifact is current, so
+# it must reach past it — index 1.
+#
+# Using 1 for both is wrong in a way the tests found: after a human rollback,
+# the ledger holds [A, B, A] — the rollback appends A as the new head — and a
+# later failed deploy then took index 1 and restored **B**, the artifact that
+# had already been rolled back away from. The stack was left on a version
+# nobody had asked for and nobody had rolled back to.
 do_rollback_impl() {
-  local line tag
-  line="$(ledger_last_ok 1)" || {
-    say "no previous deployment on record; there is nothing to roll back to"
+  local idx="${1:-1}" line tag
+  line="$(ledger_last_ok "$idx")" || {
+    say "no deployment on record ${idx} back; there is nothing to roll back to"
     return 1
   }
   tag="$(printf '%s' "$line" | cut -f2)"
@@ -792,7 +872,9 @@ cmd_rollback() {
   # deploy of a different artifact and needs the credentials that go with it.
   prepare_deploy
   start=$(date +%s)
-  if do_rollback_impl; then
+  # Index 1, explicitly: a human asked to go back from a GOOD artifact, so the
+  # one behind the head is the target. See do_rollback_impl.
+  if do_rollback_impl 1; then
     end=$(date +%s)
     note "ROLLBACK: healthy on the previous artifact after $((end - start))s"
     return 0

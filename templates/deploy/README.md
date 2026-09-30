@@ -155,9 +155,15 @@ Not a paragraph about how one might roll back.
   path** with a different tag, including the same health gate. A rollback
   implemented as a second code path is a rollback that was never tested by the
   fact that deploys work.
-- `deploy up` **rolls itself back** when the health gate does not go green, so
-  a failed deploy does not leave a broken version quietly replacing a working
-  one.
+- `deploy up` **rolls itself back** when the deploy cannot go green, so a failed
+  deploy does not leave a broken version quietly replacing a working one. This
+  is **executed, not asserted**: `tests/deploy_test.sh` §6b deploys a one-layer
+  derivative of the good image with `/app/bin/migrate` removed — good and bad
+  differ by exactly the thing under test, so a passing rollback could not pass
+  by accident — and asserts a non-zero exit, that the deploy *said* it was
+  rolling back, that it did not report a failed rollback, that the previous
+  artifact's image reference is serving again unprompted, and that the ledger
+  never recorded the broken artifact as a success.
 - Measured on the reference: the container is `running` again and `/readyz`
   answers 200 **within the same `wait_healthy` deadline the deploy itself
   used** — in this packet's runs, single-digit seconds, because both artifacts
@@ -305,6 +311,23 @@ wrong for at least four of the nine.
 - **A real scheduler.** `restart: unless-stopped` is Docker's, not an
   orchestrator's. One bad deploy takes out one container here; on a real
   target the blast radius is one replica.
+- **Secret re-delivery on restart.** Because `/run/secrets` is a tmpfs, it is
+  **empty again every time a container restarts**, so a restarted container
+  comes back **blocked at the credential gate** rather than serving with no
+  database URL. `deploy up` re-delivers on every invocation, which makes
+  re-running a deploy a repair rather than a no-op. On a real target the
+  orchestrator re-injects secrets on every start and none of this is manual —
+  and that is exactly why the secret store cannot simply be a file on disk,
+  where "it worked until it restarted" is the failure mode you would get.
+- **`docker exec` does not inherit PID 1's environment.** Anything run inside a
+  deployed container — a migration, a debug shell — has to load `/run/secrets`
+  itself or it will see no credentials while the service is perfectly healthy.
+  `deploy`'s `run_with_secrets` does this; anything else that execs in must too.
+- **`docker kill` does not trigger `restart: unless-stopped`** on Docker 29.4.0
+  / OrbStack (measured with a stock `alpine sleep 300`: `exited`,
+  `RestartCount 0`). A genuine crash does restart it (also measured). So to
+  exercise the policy, make the process exit on its own — kill PID 1 *from
+  inside* the container.
 - **TLS and a hostname.** `ports:` here is bound to `127.0.0.1`; a real target
   terminates TLS at a proxy and does not publish the port at all.
 - **Image provenance.** The tool deploys a tag. It does not build, sign or

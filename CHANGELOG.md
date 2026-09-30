@@ -64,17 +64,31 @@ semver contract — it is consumed by *calling*
     the new container starts, and `deploy rollback` runs the same deploy code
     path with a different tag and the same health gate.
 
-  - **`tests/deploy_test.sh` — every health gate proven red and green.** The
-    database is stopped underneath the running service and `/readyz` is
-    watched going 503, the container healthcheck is watched going unhealthy,
-    and `deploy verify` is watched exiting non-zero; then all three are watched
+  - **`tests/deploy_test.sh` — 66 assertions in nine sections, no sleeps.**
+    Every health gate is demonstrated red **and** green: the database is taken
+    away underneath the running service (`docker pause`, not `stop` — stopping
+    the container destroys its tmpfs, so restarting it brings the database back
+    *without its password* and tests the wrong thing), and `/readyz` is watched
+    going 503, the container healthcheck is watched going unhealthy, and
+    `deploy verify` is watched exiting non-zero; then all three are watched
     coming back. `/healthz` is asserted to stay 200 throughout, because a
     liveness probe that fails on a dependency turns a database blip into a
     crash-restart loop. The leak audit runs last, against the accumulated
     deploy log, the rendered compose config and `docker inspect`, and asserts
     the secret is present in the container's tmpfs so the negatives are real
-    negatives. **13 static proofs run without Docker; the live proofs SKIP
-    loudly when the daemon or the image is absent, never silently.**
+    negatives.
+
+    Two further sections close claims that would otherwise rest on reading the
+    source. One deploys a **deliberately broken artifact** — the good image minus
+    `/app/bin/migrate`, so the two differ by exactly the thing under test — and
+    requires the deploy to report failure, to say it is rolling back, and to
+    leave the previous artifact serving. The other creates a **decoy container
+    and volume outside the compose project** and requires both to survive `down`
+    *and* `down --purge`, so "never touch state you do not own" is executed
+    rather than grepped for; it goes red if `cmd_down` ever grows a prune.
+
+    **13 static proofs run without Docker; the 53 live ones SKIP loudly when the
+    daemon or the image is absent, never silently.**
 
   - **The polyglot table, and why it is a table.** `docker/Dockerfile.go` and
     `docker/Dockerfile.rust` are `gcr.io/distroless/static` — **no shell, no
