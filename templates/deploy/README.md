@@ -53,7 +53,7 @@ a good candidate.
 | `redact.py` | The log redactor. Every line the tool prints goes through it. |
 | `reference/courier.deploy.yml` | The worked example, and the thing this packet actually ran. |
 
-The tool is `templates/bin/deploy`, next to `dev.sh` — the other script kit
+The tool is `templates/bin/deploy.sh`, next to `dev.sh` — the other script kit
 hands out.
 
 ```
@@ -70,7 +70,7 @@ every other input, including a path:
 ```sh
 SERVICE_NAME=courier KIT_DEPLOY_IMAGE=cafaye-kit16/courier:35c6a27 \
   3< <(vault read -format=json ... | jq -r 'to_entries[]|"\(.key)=\(.value)"') \
-  templates/bin/deploy up --service courier \
+  templates/bin/deploy.sh up --service courier \
     --file templates/deploy/reference/courier.deploy.yml --secrets-fd 3
 ```
 
@@ -174,21 +174,37 @@ no unprefixed `docker rm` anywhere in the tool or its tests.** A machine with
 other people's `searxng-*`, a `p07-*` stack, a `kit-stack-*` stack and the kamal
 buildkit in it is the normal case here, not an edge case.
 
+That is asserted **by execution rather than by reading the source**, which is the
+only kind of assertion this project trusts. `tests/deploy_test.sh` §9 creates a
+container and a volume that belong to nothing else, names them outside the
+compose project, and asserts both **survive `down` and `down --purge`**. It goes
+red if `cmd_down` grows a prune or an unprefixed `docker rm`. The same section
+asserts that a plain `down` keeps the volume, that `--purge` removes it, and
+that **`down` removes the ledger** — a ledger that outlives its stack points the
+next rollback at an artifact whose database volume no longer exists.
+
 ## 5. Polyglot: where the nine languages genuinely differ
 
 **This is the part a single template cannot do, so it is a table and not a
 template.** Seven Dockerfiles ship in `docker/`; the facts below are read from
 those files, and the two marked *verified* were measured by running the image.
 
-| | Runtime image | App user | Shell in the image? | `curl`/`wget`? | Health probe from inside | Start command | Migrations |
+| | Runtime image | App user | Shell in the image? | `curl`? | Health probe from inside | Start command | Migrations |
 |---|---|---|---|---|---|---|---|
-| **go** | `gcr.io/distroless/static-debian12:nonroot` | `nonroot:nonroot` (numeric) | **no** | no | exec-form only — see below | `/app/service` | none by default |
-| **rust** | `gcr.io/distroless/static-debian12:nonroot` | `nonroot:nonroot` (numeric) | **no** | no | exec-form only — see below | `/app/service` | none by default |
-| **ruby** | `ruby:<v>-slim` | `app` | yes | no (*verified on debian slim*) | `ruby -rnet/http -e` | `bin/rails server -b 0.0.0.0` | `bin/rails db:migrate` |
-| **python** | `python:<v>-slim` | `app` | yes | no (*verified on debian slim*) | `python -c 'import urllib.request…'` | `/app/.venv/bin/python -m app` | framework / Alembic |
-| **node** | `node:<v>-slim` | `node` | yes | no (*verified on debian slim*) | `node -e 'fetch(…)'` | `node dist/main.js` | varies (Prisma, Knex, TypeORM) |
-| **bun** | `oven/bun:<v>-slim` | `bun` | yes | no (*verified on debian slim*) | `bun -e 'await fetch(…)'` | `bun run src/index.ts` | varies |
-| **elixir** | `elixir:<v>-otp-<otp>-slim` | `app` | yes | **not in kit's Dockerfile** | `curl` — courier's own Dockerfile installs it | `/app/bin/app start` | `/app/bin/migrate` |
+| **go** | `gcr.io/distroless/static-debian12:nonroot` | `nonroot:nonroot` (numeric) | **no** *(measured)* | no | exec-form only — see below | `/app/service` | none by default |
+| **rust** | `gcr.io/distroless/static-debian12:nonroot` | `nonroot:nonroot` (numeric) | **no** *(measured)* | no | exec-form only — see below | `/app/service` | none by default |
+| **ruby** | `ruby:<v>-slim` | `app` | yes | no *(measured — see (b))* | `ruby -rnet/http -e` | `bin/rails server -b 0.0.0.0` | `bin/rails db:migrate` |
+| **python** | `python:<v>-slim` | `app` | yes | no *(measured on `python:3.13-slim`)* | `python -c 'import urllib.request…'` | `/app/.venv/bin/python -m app` | framework / Alembic |
+| **node** | `node:<v>-slim` | `node` | yes | no *(measured — see (b))* | `node -e 'fetch(…)'` | `node dist/main.js` | varies (Prisma, Knex, TypeORM) |
+| **bun** | `oven/bun:<v>-slim` | `bun` | yes | no *(measured — see (b))* | `bun -e 'await fetch(…)'` | `bun run src/index.ts` | varies |
+| **elixir** | `elixir:<v>-otp-<otp>-slim` | `app` | yes | **not in kit's Dockerfile** | `curl` — courier's own Dockerfile installs it *(measured)* | `/app/bin/app start` | `/app/bin/migrate` |
+
+"*(measured)*" means run against the real image on this machine, not read from a
+tag name. One image was pulled and probed per distinct base — `gcr.io/distroless/
+static-debian12:nonroot`, `python:3.13-slim` (the pin in `docker/Dockerfile.python`),
+`postgres:17-alpine`, and courier's own release image. The other `-slim` rows
+share `debian:<trixie>-slim` and are marked as inheriting that measurement rather
+than as individually verified. Anything not measured is not claimed here.
 
 ### The three differences that actually bite
 
@@ -200,17 +216,44 @@ container** rather than the operator: `container_has_shell` tries one `docker
 exec`, and when there is no shell it switches transport to a tar streamed over
 `docker cp`, which moves bytes over the Docker API instead of exec'ing
 anything. The `.loaded` barrier becomes an extra tar member, so a distroless
-service gets the identical guarantee. *This path was built and run; the
-`docker cp` transport was verified against a live container before being
-written into the tool.*
+service gets the identical guarantee.
+
+*Measured, and the measurement is the interesting part.* A stock distroless
+image contains no **process** at all — `docker run` on it fails with `no command
+specified`, so a running container cannot even be made to test against without
+adding a binary to it. A real go or rust service image is distroless *plus* a
+static binary, so the probe image was `FROM
+gcr.io/distroless/static-debian12:nonroot` with busybox copied in as a bare
+`/busybox` — deliberately **not** as `/bin/sh`. That gives a running container
+with a process, a tmpfs and no shell, which is the only combination that
+exercises this path. Against it, using the tool's own functions verbatim:
+`container_has_shell` correctly answered *no shell*; `tar_stream` produced a
+one-member tar with mode `0444`; `docker cp -` delivered it into the tmpfs; the
+`.loaded` member landed; `docker cp` back out read the value; and `/bin/sh` was
+genuinely absent from the image rather than merely unwritable. The container's
+`Config.Env` held no credential throughout. The probe image was removed
+afterwards.
 
 **(b) A `CMD-SHELL` compose healthcheck needs a shell, and a `curl` healthcheck
-needs `curl`.** Neither is present in the slim runtimes — *verified: a
-`postgres:17` container, which is Debian-slim-based, has neither `curl` nor
-`wget`.* So the healthcheck in `compose.deploy.yml` is written with `curl`
-**because courier's own Dockerfile installs it deliberately**, and the other
-eight must each use their own runtime's HTTP client or add the probe tool to
-their image. For `go` and `rust` the healthcheck must be exec-form:
+needs `curl`.** These are two different requirements and only one of them is
+satisfied by the slim runtimes:
+
+- **a shell: present.** *Measured on `python:3.13-slim` — `/bin/sh -> dash`.* The
+  other three slim tags are the same `debian:<trixie>-slim` base, so
+  `CMD-SHELL` works for ruby, python, node and bun.
+- **`curl`: absent.** *Measured on `python:3.13-slim` — neither `curl` nor
+  `wget` is installed.* So the healthcheck in `compose.deploy.yml` is written
+  with `curl` **because courier's own Dockerfile installs it deliberately**
+  *(measured: `/usr/bin/curl`, no `wget`, and `/bin/sh -> dash`)*, and the other
+  eight must each use their own runtime's HTTP client or add the probe tool to
+  their image.
+
+The database is the worked example of getting this right by accident rather than
+by design. `postgres:17-alpine` ships busybox, so it has `wget` — and no `curl`
+*(both measured)* — which means an HTTP-shaped probe would be the wrong tool
+there anyway: what a database has to answer is "do I accept connections", and
+`pg_isready` is the one binary in that image that says so. For `go` and `rust`
+there is no shell either, so the healthcheck must be exec-form:
 
 ```yaml
 healthcheck:

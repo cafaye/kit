@@ -4,7 +4,7 @@
 #   SERVICE_NAME=courier \
 #   KIT_DEPLOY_IMAGE=cafaye-kit16/courier:35c6a27 \
 #   KIT_DEPLOY_PORT=16800 \
-#     templates/bin/deploy up --service courier --file <this file> --secrets-fd 3
+#     templates/bin/deploy.sh up --service courier --file <this file> --secrets-fd 3
 #
 # WHY courier IS THE REFERENCE, SAID UP FRONT
 #
@@ -49,7 +49,12 @@ name: kit-deploy-${SERVICE_NAME:-courier}
 
 services:
   db:
-    image: postgres:17
+    # postgres:17-alpine, the fleet's standard pin and the same tag
+    # templates/compose/docker-compose.yml uses. Measured against this image
+    # rather than assumed: /bin/sh (busybox), pg_isready, uid 0, and
+    # docker-entrypoint.sh on PATH — and no curl, which is why the health probe
+    # below is pg_isready rather than an HTTP fetch.
+    image: postgres:17-alpine
     restart: unless-stopped
 
     entrypoint: ["/bin/sh", "/kit/entrypoint.sh"]

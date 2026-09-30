@@ -313,23 +313,33 @@ ledger_append() {
     >>"$(ledger_path)"
 }
 
-# The most recent entry with a given status, optionally skipping back n of
-# them. `ledger_last_ok 0` is what is running now; `1` is the rollback target.
+# The Nth most recent successful deploy, counting back from the newest.
+# `ledger_last_ok 0` is what is running now; `1` is the rollback target.
+#
+# COUNTING FROM THE END, and that is the whole point of the function. The
+# ledger is append-ordered, so the newest entry is the LAST line, and the first
+# version of this walked the file forwards and compared a running index against
+# `$skip`. That returns the OLDEST successful deploy for `0` and the second
+# oldest for `1` — so `rollback`, which asks for `1`, cheerfully redeployed the
+# artifact that was already running, reported success, and changed nothing.
+#
+# The symptom was the most dangerous kind: a rollback that reports it worked.
+# `tests/deploy_test.sh` caught it by asserting on the container's image
+# REFERENCE rather than its digest, because the two tags under test share an
+# image and therefore share a digest — a digest assertion would have passed
+# against a rollback that did nothing at all.
 ledger_last_ok() {
-  local skip="${1:-0}" i=0 line
+  local skip="${1:-0}" line idx
+  local -a hits=()
   [ -r "$(ledger_path)" ] || return 1
   while IFS= read -r line; do
     case "$line" in
-      *"	ok") ;;
-      *) continue ;;
+      *"	ok") hits+=("$line") ;;
     esac
-    if [ "$i" -ge "$skip" ]; then
-      printf '%s\n' "$line"
-      return 0
-    fi
-    i=$((i + 1))
   done <"$(ledger_path)"
-  return 1
+  [ "$skip" -lt "${#hits[@]}" ] || return 1
+  idx=$(( ${#hits[@]} - 1 - skip ))
+  printf '%s\n' "${hits[$idx]}"
 }
 
 # ---------------------------------------------------------------------------
@@ -523,6 +533,33 @@ start_with_secrets() {
   return 0
 }
 
+# redeliver_secrets <service>
+#
+# Re-send the credentials a service claims, to whatever container currently
+# bears that service name. Used after the whole set has been started, because
+# `compose up` on one service can recreate another — see the comment at its
+# call site.
+#
+# It resolves the container fresh rather than reusing a captured id, because
+# the whole point is that the id may have changed. A service that claims
+# nothing is skipped, which is what makes this safe to run over a stack whose
+# services are not all credentialed.
+redeliver_secrets() {
+  local svc="$1" cid claimed
+  cid="$(service_container "$svc")"
+  if [ -z "$cid" ]; then
+    say "service '$svc' has no container to re-deliver credentials to"
+    return 1
+  fi
+  claimed="$(container_label "$cid" 'kit.deploy/secrets')"
+  if [ -z "$claimed" ]; then
+    return 0
+  fi
+  # shellcheck disable=SC2086  # a deliberately word-split list of names.
+  inject_secrets "$cid" $claimed || return 1
+  return 0
+}
+
 # run_with_secrets <container> <command> [args...]
 #
 # Run a command inside a deployed container WITH ITS CREDENTIALS.
@@ -575,6 +612,15 @@ run_with_secrets() {
 do_deploy() {
   local tag="$1" cid rc=0
 
+  # Every compose call made while deploying THIS artifact must name THIS
+  # artifact. `main` exports a placeholder so that `down` and `status` can
+  # render the file at all, and without this line that placeholder wins for
+  # rollback — which passes no `--image` — and compose tries to pull a
+  # repository literally named `kit-deploy-no-artifact-required-for-this-command`.
+  # The bug is only reachable through `rollback`, which is the worst possible
+  # time for a deploy tool to be unable to name its own artifact.
+  export KIT_DEPLOY_IMAGE="$tag"
+
   if [ "$BUILD" -eq 1 ]; then
     note "building $tag"
     run_scrubbed docker build --tag "$tag" "$SERVICE_BUILD_CONTEXT" || fail "image build failed" 70
@@ -602,6 +648,29 @@ do_deploy() {
       say "service '$svc' did not reach green; the deploy is not going out"
       return 1
     }
+  done
+
+  # RE-DELIVER TO EVERYTHING, once the whole set exists.
+  #
+  # A later `compose up` can RECREATE an earlier service as a side effect —
+  # observed, not theorised: after a daemon restart, `compose up -d app`
+  # printed `db-1 Recreate / db-1 Recreated` because `postgres:17-alpine` had
+  # been re-pulled and its digest no longer matched the one the container was
+  # created from. A recreated container comes back with an EMPTY /run/secrets,
+  # so it blocks at the credential gate, its healthcheck fails, and
+  # `depends_on: service_healthy` takes the application down with it.
+  #
+  # This is the restart problem one layer down: a tmpfs credential store is
+  # only correct for as long as the container holding it. Injecting at each
+  # service's own start and then trusting that nothing later touches it is a
+  # deploy that is correct until an image is re-pulled — which on a machine with
+  # a shared image cache is a Tuesday.
+  #
+  # Re-delivering is idempotent and cheap — the same values, over the same
+  # pipe — and it closes the window where a service is alive but has no
+  # credentials.
+  for svc in $SERVICE_ORDER; do
+    redeliver_secrets "$svc" || return 1
   done
 
   cid="$(service_container app)"

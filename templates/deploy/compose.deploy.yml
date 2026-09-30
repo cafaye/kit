@@ -44,7 +44,16 @@ services:
   db:
     # Pinned, never `latest` and never a floating major: the artifact this
     # deployment is tested against has to be the artifact that gets deployed.
-    image: postgres:17
+    # `postgres:17-alpine` is the fleet's standard pin — the same tag
+    # `templates/compose/docker-compose.yml` uses for the developer stack, so a
+    # deploy and a `bin/dev up` are running the same database.
+    #
+    # `-alpine` is measured, not assumed. Verified against this image: /bin/sh
+    # present (busybox), `pg_isready` present, runs as uid 0 so the gate can
+    # write the tmpfs, and `docker-entrypoint.sh` on PATH — but NO `curl`.
+    # `pg_isready` is the health probe for exactly that reason: it is the one
+    # thing this image ships that means "the server ACCEPTS CONNECTIONS".
+    image: postgres:17-alpine
     restart: unless-stopped
 
     # The database goes through the SAME secret gate as the application. This

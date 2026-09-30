@@ -27,7 +27,7 @@ semver contract — it is consumed by *calling*
     on every service, a healthcheck on every service, and **no credential
     anywhere in the file** — which is the property that shapes everything else.
 
-  - **`templates/bin/deploy` — the tool**, beside `dev.sh`, the other script
+  - **`templates/bin/deploy.sh` — the tool**, beside `dev.sh`, the other script
     kit hands out. `up` / `verify` / `rollback` / `status` / `down`. A deploy
     does not report success until the container's own healthcheck says
     `healthy`; a deploy that cannot reach green **rolls itself back** rather
@@ -82,14 +82,24 @@ semver contract — it is consumed by *calling*
     all. The tool asks the container rather than the operator and switches to
     a tar streamed over `docker cp` when there is no shell, with the `.loaded`
     barrier as an extra tar member so a distroless service gets the identical
-    guarantee. Separately, a `CMD-SHELL` healthcheck needs a shell and a
-    `curl` healthcheck needs `curl`, and a Debian-slim base has **neither** —
-    verified by running one. So each service writes its healthcheck in its own
-    runtime's HTTP client, or, for distroless, in exec-form against a
-    `healthcheck` subcommand the service itself provides. Migrations are a
-    per-service label rather than a rule, because `bin/rails db:migrate`,
-    `manage.py migrate` and `/app/bin/migrate` have no common form and Go and
-    Rust have no schema at all.
+    guarantee; measured end to end against a distroless image carrying one bare
+    binary and deliberately no `/bin/sh`. Separately, a `curl` healthcheck needs
+    `curl`, and **the `-slim` runtimes ship neither `curl` nor `wget`** — a
+    shell they do have, measured on `python:3.13-slim`. So each service writes
+    its healthcheck in its own runtime's HTTP client, or, for distroless, in
+    exec-form against a `healthcheck` subcommand the service itself provides.
+    Migrations are a per-service label rather than a rule, because
+    `bin/rails db:migrate`, `manage.py migrate` and `/app/bin/migrate` have no
+    common form and Go and Rust have no schema at all.
+
+  - **The database is pinned `postgres:17-alpine`**, the fleet's standard tag and
+    the one `templates/compose/docker-compose.yml` already uses, so a deploy and
+    a `bin/dev up` run the same server. Measured rather than assumed: `/bin/sh`
+    (busybox), `pg_isready`, uid 0 and `docker-entrypoint.sh` on `PATH` — and no
+    `curl`, with `wget` present, which is why the database's health probe is
+    `pg_isready` and not an HTTP fetch. It runs behind the same secret gate as
+    the application, because a `POSTGRES_PASSWORD` in `environment:` is a
+    password `docker inspect` prints.
 
 - **kit-07 — the declared tier, and the allowlist that is supposed to shrink.**
   A tier is a class of test that needs a real dependency. The failure this
