@@ -36,6 +36,23 @@
 #     and is git-ignored by every adopting repo.
 #   - Connection URLs are printed, never written anywhere else. A developer
 #     pasting one into a ticket is the developer's choice, not this script's.
+#   - The observability profile comes UP, and this is the load-bearing decision
+#     for the dev loop's speed. Observability is on by default (PLAN.md §7b), so
+#     `bin/dev` without arguments brings up the collector AND Tempo, Loki, Mimir
+#     and Grafana — five more containers than kit-02 shipped, and the difference
+#     between "a developer sees real traces" and "read the docs about installing
+#     a tracing backend".
+#   - It is still ONE command and still not slow, because the profile is opt-OUT
+#     via `KIT_DEV_PROFILES`, and the expensive stores are memory-bounded in the
+#     compose file. `bin/dev` prints the wall-clock it took, so "the dev loop is
+#     slow" is a number rather than a feeling.
+#   - NOTHING HERE WAITS ON TELEMETRY. Not `up --wait` (which gates on the
+#     collector's own health, and the collector's health does not depend on
+#     Tempo, Loki or Mimir), not migrate, not seed. A dev machine that cannot
+#     start because an observability store is unhealthy is a dev machine that
+#     teaches people to switch telemetry off, which is the opposite of the
+#     intent. `tests/no_telemetry_in_readiness.sh` in kit proves the underlying
+#     property against a real collector.
 
 set -euo pipefail
 
@@ -51,7 +68,25 @@ cd "$(dirname "$SELF")/.."
 # How long to wait for the stack to be healthy, in seconds. A deadline, not a
 # sleep: `up --wait` polls health itself, and this is the point at which we stop
 # believing it and say so.
-STACK_TIMEOUT="${KIT_DEV_TIMEOUT:-120}"
+#
+# 180 rather than kit-02's 120, and the extra 60 is for the observability
+# profile: five more containers, four of them with a real initialisation
+# (Tempo's WAL, Loki's schema, Mimir's ingester, Grafana's migrations). The
+# deadline has to cover the default path, and a deadline that fires on a cold
+# start is a deadline that trains people to re-run.
+STACK_TIMEOUT="${KIT_DEV_TIMEOUT:-180}"
+
+# The compose profiles to bring up. The observability profile IS the default,
+# because observability is on by default and a stack that requires a flag to
+# show you its own errors is opt-in with extra steps.
+#
+# The escape hatch is one variable, and it is the same shape as
+# `<SERVICE>_OTEL_ENDPOINT`: a self-hoster on a constrained machine, or CI,
+# sets `KIT_DEV_PROFILES=` (empty) and gets postgres/nats/redis/collector alone.
+# The collector is NOT behind the profile — it is the default value of the
+# endpoint variable, so a service with nothing switched on needs somewhere to
+# send, and a dead endpoint with no retry costs spans rather than availability.
+KIT_DEV_PROFILES="${KIT_DEV_PROFILES-observability}"
 
 step() { printf '\n\033[1m== %s\033[0m\n' "$1"; }
 info() { printf '   %s\n' "$1"; }
@@ -71,12 +106,39 @@ compose() {
   # tool with different flags. Probe for the plugin and fail with a message that
   # says which one is missing, because "unknown command" from docker is the
   # single least helpful error in this script.
-  if docker compose version >/dev/null 2>&1; then
-    docker compose "$@"
-  elif command -v docker-compose >/dev/null 2>&1; then
-    docker-compose "$@"
+  #
+  # `--profile` is applied here, on every invocation, so no call site can forget
+  # it. `up` is the one that matters for the default path; `ps` and `logs` need
+  # it too, or `bin/dev status` reports a healthy stack as half-absent and
+  # `bin/dev logs tempo` says "no such service".
+  #
+  # THE EMPTY-ARRAY EXPANSION IS THE TRAP, and it is a trap because `set -u` is
+  # on. macOS ships bash 3.2, where an empty array expanded as "${a[@]}" under
+  # `set -u` is an "unbound variable" ERROR rather than nothing — so the escape
+  # hatch (`KIT_DEV_PROFILES= bin/dev up`, the documented way to run without the
+  # observability stack) died on the first line of the script with
+  #
+  #   bin/dev: line 120: profile_args[@]: unbound variable
+  #
+  # which is a spectacularly bad way to find out that a documented flag does not
+  # work. The conditional expansion below is the portable form: on bash 4.4+ it
+  # is identical to "${a[@]}" and on 3.2 it yields nothing.
+  if [ -n "$KIT_DEV_PROFILES" ]; then
+    if docker compose version >/dev/null 2>&1; then
+      docker compose --profile "$KIT_DEV_PROFILES" "$@"
+    elif command -v docker-compose >/dev/null 2>&1; then
+      docker-compose --profile "$KIT_DEV_PROFILES" "$@"
+    else
+      die "neither 'docker compose' (v2) nor 'docker-compose' is installed" 127
+    fi
   else
-    die "neither 'docker compose' (v2) nor 'docker-compose' is installed" 127
+    if docker compose version >/dev/null 2>&1; then
+      docker compose "$@"
+    elif command -v docker-compose >/dev/null 2>&1; then
+      docker-compose "$@"
+    else
+      die "neither 'docker compose' (v2) nor 'docker-compose' is installed" 127
+    fi
   fi
 }
 
@@ -91,6 +153,10 @@ require_files() {
     printf '\nFrom a fresh kit checkout:\n' >&2
     printf '  cp <kit>/templates/compose/docker-compose.yml ./docker-compose.yml\n' >&2
     printf '  cp <kit>/templates/compose/otel-collector.yml  ./otel-collector.yml\n' >&2
+    printf '  cp -R <kit>/templates/compose/grafana ./grafana\n' >&2
+    printf '  cp -R <kit>/templates/compose/tempo  ./tempo\n' >&2
+    printf '  cp -R <kit>/templates/compose/loki   ./loki\n' >&2
+    printf '  cp -R <kit>/templates/compose/mimir  ./mimir\n' >&2
     printf '  cp <kit>/templates/compose/.env.example        ./.env\n' >&2
     exit 1
   fi
@@ -117,6 +183,14 @@ ensure_env() {
 
 up() {
   step "starting the stack (deadline: ${STACK_TIMEOUT}s)"
+  # The wall-clock is measured here and printed at the end, because "the dev
+  # loop is slow" is a claim everyone makes and nobody measures, and the whole
+  # point of shipping five more containers is that it is not slow. A number in
+  # the output is the only thing that settles the argument, and it is also what
+  # makes a regression visible in a commit message.
+  local started elapsed
+  started=$(date +%s)
+
   # --wait blocks on health, not on "the container exists". A postgres that is
   # running but has not finished initdb answers nothing, and the migration step
   # below would fail against it.
@@ -138,6 +212,15 @@ up() {
   seed
 
   print_urls
+
+  elapsed=$(( $(date +%s) - started ))
+  step "up in ${elapsed}s"
+  if [ -n "$KIT_DEV_PROFILES" ]; then
+    info "observability is ON (compose profile: $KIT_DEV_PROFILES)"
+    info "to run the data services only: KIT_DEV_PROFILES= bin/dev up"
+  else
+    info "observability is OFF (KIT_DEV_PROFILES is empty) — nothing is exporting anywhere"
+  fi
 }
 
 migrate() {
@@ -182,9 +265,14 @@ print_urls() {
   # shellcheck disable=SC1091
   set -a && . ./.env && set +a
 
-  local pg_port="${KIT_POSTGRES_PORT:-5432}"
-  local nats_port="${KIT_NATS_CLIENT_PORT:-4222}"
-  local redis_port="${KIT_REDIS_PORT:-6379}"
+  # Every port read from .env, never hardcoded — including the observability
+  # ones. A printed URL that does not resolve is worse than none, and the whole
+  # point of kit's claimed port block is that these are NOT the well-known
+  # numbers, so hardcoding them here would print the one address that is wrong.
+  local pg_port="${KIT_POSTGRES_PORT:-15500}"
+  local nats_port="${KIT_NATS_CLIENT_PORT:-15600}"
+  local redis_port="${KIT_REDIS_PORT:-15800}"
+  local grafana_port="${KIT_GRAFANA_PORT:-15000}"
   local pg_user="${KIT_POSTGRES_USER:-cafaye}"
   local pg_pass="${KIT_POSTGRES_PASSWORD:-cafaye}"
   local pg_db="${KIT_POSTGRES_DB:-cafaye_platform}"
@@ -194,13 +282,21 @@ print_urls() {
    postgres     postgresql://$pg_user:$pg_pass@localhost:$pg_port/$pg_db
    nats         nats://localhost:$nats_port
    redis        redis://localhost:$redis_port
+
+   grafana      http://localhost:$grafana_port        (traces, metrics, errors)
+   tempo        http://localhost:${KIT_TEMPO_PORT:-15900}
+   loki         http://localhost:${KIT_LOKI_PORT:-15901}
+   mimir        http://localhost:${KIT_MIMIR_PORT:-15902}
+
    otel (otlp)  http://otel-collector:${KIT_OTEL_HTTP_PORT:-4318}   (compose network only)
 
    service      ${KIT_DEV_SERVICE_URL:-http://localhost:3000}
 
-   The collector exports nothing off this machine. Point a service at it by
-   setting OTEL_EXPORTER_OTLP_ENDPOINT in your own .env; the compose template
-   publishes no collector port, so it is reachable by service name only.
+   Nothing leaves this machine unless you point it somewhere. To use your own
+   backend instead of the four above, set <SERVICE>_OTEL_ENDPOINT in your own
+   .env — that is the only contract, and the shipped collector is just its
+   default value. Unset the variable and the exporter is a genuine no-op: no
+   queue, no retry loop, no warning per request, no dial at boot.
 URLS
 }
 
@@ -235,7 +331,15 @@ nuke() {
 
 main() {
   case "${1:-up}" in
-    up) require_files docker-compose.yml; ensure_env; up ;;
+    up)
+      # The vendor config trees are required alongside the compose file. They
+      # are mounted read-only and they are the reason the four stores start, so
+      # a missing `tempo/` is a `bin/dev up` that dies four containers later
+      # with a bind-mount error naming a path the developer has never heard of.
+      require_files docker-compose.yml otel-collector.yml grafana tempo loki mimir
+      ensure_env
+      up
+      ;;
     down) down ;;
     nuke) nuke ;;
     status) status ;;

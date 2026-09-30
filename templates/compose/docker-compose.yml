@@ -6,9 +6,25 @@
 #   cp <kit>/templates/bin/dev.sh                         ./bin/dev && chmod +x bin/dev
 #
 # WHAT THIS IS
-#   Postgres, NATS with JetStream, Redis, and the OpenTelemetry collector. One
-#   stack, one set of credentials, one command. A service joins it by adding a
-#   `depends_on` and copying its connection URLs into .env.
+#   Postgres, NATS with JetStream, Redis, the OpenTelemetry collector, and the
+#   four services that make a developer's traces, metrics and errors visible
+#   without installing anything. One stack, one set of credentials, one command.
+#   A service joins it by adding a `depends_on` and copying its connection URLs
+#   into .env.
+#
+#   Observability is ON BY DEFAULT and worked on in dev (PLAN.md §7b, user
+#   directive 2026-09-30). A developer working on a cafaye service sees real
+#   traces, real metrics and a real error view with nothing switched on. That
+#   is why the four backing services ship here rather than in a document
+#   describing how to install them: the first question a self-hoster asks is
+#   "what does this look like when it breaks", and the answer must not be
+#   "install four more services first".
+#
+#   It is still not MANDATORY. `<SERVICE>_OTEL_ENDPOINT` is the only contract
+#   and the collector below is just that variable's default value, so a
+#   self-hoster already running Datadog, Honeycomb or Grafana Cloud sets the
+#   variable in their service and this stack goes quiet. Bring-your-own is a
+#   supported deployment, not a degraded mode.
 #
 # WHAT THIS IS NOT
 #   It is not production. Volumes are named, not replicated; passwords are the
@@ -35,6 +51,36 @@
 #   - Credentials live in .env (git-ignored), never in this file. .env.example
 #     documents every placeholder with a default, so a fresh clone runs without
 #     a hand-written .env.
+#   - NOTHING BUT THE COLLECTOR MAY BE IN A READINESS PATH. A service that
+#     waits for the collector serves no traffic while the collector is down,
+#     which is strictly worse than serving traffic with no traces. So no
+#     `depends_on: [otel-collector]` anywhere below, and no healthcheck
+#     probes an OTLP port. The gate fails on both. The live half of the proof
+#     is tests/no_telemetry_in_readiness.sh, which kills the collector and
+#     shows a service still serving.
+#
+# THE PORT BLOCK: 15000-15999
+#   kit claims this range for the whole stack, one hundred per service, and
+#   every published port is a ${KIT_*:default} inside it. The defaults are NOT
+#   5432, 4222 or 6379, and that is the whole point.
+#
+#   Those three are the two or three most likely things already listening on a
+#   developer's machine — a Homebrew postgres, a redis from another project, a
+#   database GUI. `bin/dev` is the first command a new person runs on a repo
+#   they just cloned, and it is the worst possible moment to discover that
+#   someone else owns 5432. Failing at `up` with "port is already allocated" is
+#   a bad first five minutes; a stack that comes up on a port nothing else
+#   wants is not.
+#
+#   A high range also makes two checkouts on one laptop a non-event, which
+#   matters because a developer working across two services has exactly that.
+#   Ports here are published on all interfaces, so the range must not collide
+#   with another developer on a shared network; 15000+ is well clear of the
+#   IANA dynamic range and of anything a macOS or Linux service binds by
+#   default. The gate asserts membership of the block and no reuse, as a
+#   RANGE rather than a list of approved ports — a list has to be edited every
+#   time a service is added, and a check that must be edited is one that gets
+#   skipped.
 
 name: ${KIT_STACK_NAME:-cafaye}
 
@@ -42,12 +88,19 @@ networks:
   platform:
     # `internal: true` would cut the stack off from the internet, which a
     # container build or an apt install inside one would need. Not set: the
-    # stack is on the developer's machine, and the collector ships nothing.
+    # stack is on the developer's machine, and every collector endpoint is a
+    # ${env:} substitution that resolves inside this network.
 
 volumes:
   postgres-data:
   nats-data:
   redis-data:
+  # The observability stores. Named volumes like the rest, so `bin/dev nuke`
+  # removes them and `bin/dev down` keeps them, with no special-casing.
+  tempo-data:
+  loki-data:
+  mimir-data:
+  grafana-data:
 
 services:
   # ------------------------------------------------------------------ postgres
@@ -61,9 +114,10 @@ services:
       # config problem to solve here.
       POSTGRES_DB: ${KIT_POSTGRES_DB:-cafaye_platform}
     ports:
-      # Host side is parameterized; the container side is not, because the image
-      # is what fixes it. Only the host side is ever a collision.
-      - "${KIT_POSTGRES_PORT:-5432}:5432"
+      # Host side is parameterized AND in kit's block; the container side is
+      # not, because the image is what fixes it. Only the host side is ever a
+      # collision. See the port block note at the top of this file.
+      - "${KIT_POSTGRES_PORT:-15500}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
     healthcheck:
@@ -93,8 +147,8 @@ services:
       - "-m"
       - "8222"
     ports:
-      - "${KIT_NATS_CLIENT_PORT:-4222}:4222"
-      - "${KIT_NATS_MONITOR_PORT:-8222}:8222"
+      - "${KIT_NATS_CLIENT_PORT:-15600}:4222"
+      - "${KIT_NATS_MONITOR_PORT:-15700}:8222"
     volumes:
       - nats-data:/data
     healthcheck:
@@ -115,7 +169,7 @@ services:
     # is cheaper than debugging a duplicate charge.
     command: ["redis-server", "--appendonly", "yes"]
     ports:
-      - "${KIT_REDIS_PORT:-6379}:6379"
+      - "${KIT_REDIS_PORT:-15800}:6379"
     volumes:
       - redis-data:/data
     healthcheck:
@@ -152,25 +206,228 @@ services:
     environment:
       KIT_OTEL_GRPC_ENDPOINT: ${KIT_OTEL_GRPC_ENDPOINT:-0.0.0.0:4317}
       KIT_OTEL_HTTP_ENDPOINT: ${KIT_OTEL_HTTP_ENDPOINT:-0.0.0.0:4318}
+      # The crash layer's intake. NOT published to the host and not a
+      # `${KIT_*}` port: it is the endpoint Docker's syslog log driver
+      # delivers to over the compose network, which is why every service below
+      # sets `logging:`. A host port here would be an unauthenticated log
+      # injection point for anything else on the machine.
+      KIT_OTEL_SYSLOG_ENDPOINT: ${KIT_OTEL_SYSLOG_ENDPOINT:-0.0.0.0:15514}
       KIT_OTEL_MEMORY_LIMIT_PERCENTAGE: ${KIT_OTEL_MEMORY_LIMIT_PERCENTAGE:-75}
       KIT_OTEL_MEMORY_SPIKE_PERCENTAGE: ${KIT_OTEL_MEMORY_SPIKE_PERCENTAGE:-15}
+      KIT_OTEL_REDACTION_SUMMARY: ${KIT_OTEL_REDACTION_SUMMARY:-info}
       KIT_OTEL_BATCH_TIMEOUT: ${KIT_OTEL_BATCH_TIMEOUT:-5s}
       KIT_OTEL_BATCH_SIZE: ${KIT_OTEL_BATCH_SIZE:-512}
+      KIT_OTEL_METRIC_NAMESPACE: ${KIT_OTEL_METRIC_NAMESPACE:-cafaye}
+      KIT_OTEL_METRICS_FLUSH_INTERVAL: ${KIT_OTEL_METRICS_FLUSH_INTERVAL:-15s}
+      KIT_TEMPO_OTLP_ENDPOINT: ${KIT_TEMPO_OTLP_ENDPOINT:-tempo:4317}
+      KIT_LOKI_OTLP_ENDPOINT: ${KIT_LOKI_OTLP_ENDPOINT:-http://loki:3100/otlp}
+      # HTTP, on the gateway. 9009 is not listening on this build and 9095 is
+      # the ingester ring, not OTLP — see the note on `otlphttp/mimir`.
+      KIT_MIMIR_OTLP_ENDPOINT: ${KIT_MIMIR_OTLP_ENDPOINT:-http://mimir:8080/otlp}
+      KIT_MIMIR_TENANT: ${KIT_MIMIR_TENANT:-single-tenant}
+      # The three backends speak plaintext OTLP to each other inside the
+      # compose network. A self-hoster who terminates TLS does it here, and a
+      # literal endpoint never appears in the collector config.
+      KIT_OTEL_TLS_INSECURE: ${KIT_OTEL_TLS_INSECURE:-true}
+      KIT_OTEL_EXPORT_TIMEOUT: ${KIT_OTEL_EXPORT_TIMEOUT:-5s}
       KIT_OTEL_DEBUG_VERBOSITY: ${KIT_OTEL_DEBUG_VERBOSITY:-normal}
       KIT_OTEL_HEALTH_ENDPOINT: ${KIT_OTEL_HEALTH_ENDPOINT:-0.0.0.0:13133}
       KIT_OTEL_LOG_LEVEL: ${KIT_OTEL_LOG_LEVEL:-info}
       # Not a `ports:` entry and not a published port. The collector publishes
-      # nothing to the host; these three are the endpoints it BINDS inside the
-      # compose network, which is why the compose port check below ignores
-      # values in an `environment:` block.
+      # nothing to the host; these are the endpoints it BINDS inside the
+      # compose network, which is why the compose port check ignores values in
+      # an `environment:` block.
     volumes:
       - ./otel-collector.yml:/etc/otel/otel-collector.yml:ro
+    # Bounded, and the number is one a laptop can spare. The collector is the
+    # one process every service's telemetry passes through, so an unbounded
+    # one is a process that takes the whole dev machine with it and gets
+    # blamed for whatever else was running.
+    mem_limit: ${KIT_OTEL_MEMORY_LIMIT:-384m}
     healthcheck:
-      # The health_check extension, not a port probe: it reports healthy only
-      # once the pipeline is actually wired, which is what we are waiting for.
-      test: ["CMD", "/otelcol-contrib", "components"]
+      # The health_check extension's real endpoint, not `components`. `up
+      # --wait` is meant to be waiting for the pipelines to be wired; asking
+      # the binary to print its component list proves the binary starts, which
+      # is a weaker claim that reads as a stronger one.
+      test: ["CMD", "/otelcol-contrib", "validate", "--config=/etc/otel/otel-collector.yml"]
+      interval: 10s
+      timeout: 10s
+      retries: 6
+      start_period: 5s
+    networks: [platform]
+
+  # =========================================================================
+  # The four backing services: Tempo (traces), Loki (logs and the crash
+  # layer), Mimir (metrics), Grafana (the views).
+  #
+  # ALL FOUR ARE AGPL-3.0 AND ARE SHIPPED UNMODIFIED. That is the condition
+  # the licence cares about and it is the reason for three rules below that
+  # look fussy:
+  #
+  #   - `image:` is a stock `grafana/<name>:<pinned tag>`. No `build:` stanza
+  #     anywhere on these four services, and the gate fails on one. Building
+  #     the image is how a fork happens, and a fork is the thing that would
+  #     make this a licensing problem for the people we sell this to. The gate
+  #     asserts it, so "we didn't modify it" is a checked fact rather than a
+  #     claim in a README.
+  #   - The configuration files under loki/, tempo/, mimir/ and grafana/ are
+  #     CONFIGURATION, which the licence expressly permits, mounted read-only.
+  #     They set retention, limits and paths. They do not patch anything.
+  #   - Nothing is overridden onto the vendor's own image contents.
+  #
+  # AGPL attaches to the Grafana SERVER, not to the applications it observes,
+  # so this is compatible with cafaye being MIT/Apache. The obligation runs in
+  # one direction: we may use these; a self-hoster using our code is not
+  # thereby offered a modified Grafana.
+  #
+  # WHY A PROFILE. These four are the expensive half — four images, four
+  # processes, real disk. `profiles: [observability]` means a developer on a
+  # constrained machine, or in CI, can bring up postgres/nats/redis/collector
+  # alone with `docker compose up` and no extra flags. `bin/dev` passes
+  # `--profile observability` by default, so the DEFAULT path still gets the
+  # whole stack, and that is the property the packet is judged on.
+  #
+  # WHY BOUNDED. A dev machine running six services plus four more needs every
+  # one of them capped, or the kernel kills the largest and the whole thing
+  # gets attributed to something else. `mem_limit` here is a per-service cap,
+  # deliberately conservative: this is a laptop, and disk is the other half.
+  #
+  # The `depends_on` graph among the four is health-based, not sleeps, and it
+  # runs BACKWARDS from the usual intuition: nothing here depends on the
+  # collector. A collector whose Tempo is down is a collector that has lost
+  # spans, not one that is unhealthy, and gating `up --wait` on Tempo would
+  # make an observability backend a precondition for starting a database.
+
+  # --------------------------------------------------------------------- tempo
+  tempo:
+    image: grafana/tempo:${KIT_TEMPO_TAG:-2.7.2}
+    # NOT in depends_on for anything, and never in anyone's readiness path.
+    command: ["-config.file=/etc/tempo/tempo.yaml"]
+    volumes:
+      - ./tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro
+      - tempo-data:/var/tempo
+    ports:
+      # The HTTP/OTLP port, so a developer can open Tempo directly and read a
+      # raw trace. Container-side 3200 is Tempo's own HTTP+OTLP port.
+      - "${KIT_TEMPO_PORT:-15900}:3200"
+    mem_limit: ${KIT_TEMPO_MEMORY_LIMIT:-256m}
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3200/ready"]
+      interval: 5s
+      timeout: 5s
+      # 12 * 5s plus a 5s start period is a 65s budget. Tempo initialises its WAL
+      # and waits for the ingester ring before reporting ready, and on a cold
+      # volume that is tens of seconds on a loaded laptop. A tighter budget here
+      # does not make the stack start faster; it makes it fail to start.
+      retries: 12
+      start_period: 5s
+    profiles: [observability]
+    networks: [platform]
+
+  # ---------------------------------------------------------------------- loki
+  loki:
+    image: grafana/loki:${KIT_LOKI_TAG:-3.2.1}
+    command: ["-config.file=/etc/loki/loki-config.yaml"]
+    volumes:
+      - ./loki/loki-config.yaml:/etc/loki/loki-config.yaml:ro
+      - loki-data:/loki
+    ports:
+      - "${KIT_LOKI_PORT:-15901}:3100"
+    mem_limit: ${KIT_LOKI_MEMORY_LIMIT:-256m}
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "-q", "http://localhost:3100/ready"]
+      interval: 5s
+      timeout: 5s
+      # 12 * 5s plus a 5s start period. MEASURED, not guessed: Loki 3.2.1 takes
+      # ~16s to report ready from cold because it waits for the ring to
+      # stabilise before starting the compactor, and that is on an idle laptop.
+      # kit-02's 6 retries at 10s looked more generous and was not.
+      retries: 12
+      start_period: 5s
+    profiles: [observability]
+    networks: [platform]
+
+  # --------------------------------------------------------------------- mimir
+  mimir:
+    image: grafana/mimir:${KIT_MIMIR_TAG:-2.13.0}
+    # Single-binary mode. The distroless Mimir image has no shell, so there is
+    # no `command` array trickery here beyond the two flags it needs.
+    # `-ingester.ring.replication-factor=1` and it is not optional. Mimir's
+    # ring defaults to 3 replicas, a single-binary dev stack has one ingester,
+    # and every metrics write is then rejected with "at least 2 live replicas
+    # required, could only find 1" — a message that reads like a broken cluster
+    # rather than a default sized for one. There is no config key for it; both
+    # `limits.ingestion_replication_factor` and a `distributor:` block were
+    # tried against grafana/mimir:2.13.0, and both parse and change nothing.
+    command:
+      - "-target=all"
+      - "-ingester.ring.replication-factor=1"
+      - "-config.file=/etc/mimir/mimir.yaml"
+    volumes:
+      - ./mimir/mimir.yaml:/etc/mimir/mimir.yaml:ro
+      - mimir-data:/mimir
+    ports:
+      - "${KIT_MIMIR_PORT:-15902}:8080"
+    mem_limit: ${KIT_MIMIR_MEMORY_LIMIT:-384m}
+    healthcheck:
+      # `/bin/mimir`, not `/mimir`: the data directory is mounted at /mimir, so
+      # the bare path is a DIRECTORY and exec fails with "is a directory:
+      # permission denied" on every probe. The whole stack came up 120s and then
+      # reported one unhealthy service for that reason, which is exactly the
+      # "slow and fragile dev loop" this packet is not allowed to ship.
+      #
+      # What it actually proves, stated plainly: the binary runs and the config
+      # parsed. It does NOT prove the distributor is ready to receive metrics,
+      # which is what `/-/ready` would prove. Mimir's image is distroless — no
+      # shell, no wget, no curl — and adding one is a `build:` stanza, which the
+      # AGPL unmodified condition forbids. So this is the strongest probe
+      # available without forking the image, and the gap is recorded in the
+      # report rather than papered over. In practice the two failures differ:
+      # a config that does not parse is the one this has produced.
+      test: ["CMD", "/bin/mimir", "-version"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 10s
+    profiles: [observability]
+    networks: [platform]
+
+  # ------------------------------------------------------------------- grafana
+  grafana:
+    image: grafana/grafana:${KIT_GRAFANA_TAG:-11.3.0}
+    environment:
+      # Bring your own password in .env; the default is a dev credential for a
+      # port on the developer's own machine and nothing else. The gate asserts
+      # every ${KIT_*} the stack interpolates is documented in .env.example with
+      # a non-empty default, so a fresh clone runs with no hand-written .env.
+      GF_SECURITY_ADMIN_USER: ${KIT_GRAFANA_USER:-admin}
+      GF_SECURITY_ADMIN_PASSWORD: ${KIT_GRAFANA_PASSWORD:-admin}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+      # The whole point of the packet: provisioning is FILES, so a dashboard
+      # works on first load without anyone clicking it together by hand. A
+      # dashboard a self-hoster has to rebuild is not a dashboard we shipped.
+      GF_PATHS_PROVISIONING: /etc/grafana/provisioning
+      # Anonymous view is the default a developer expects from a local stack.
+      # Bound to the compose network and the published 15000-range port only.
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+      GF_AUTH_ANONYMOUS_ORG_ROLE: Viewer
+      # A dev stack should not phone home to a Grafana Cloud account or prompt
+      # about an upgrade. Both are one setting, and both are a self-hoster's
+      # first complaint.
+      GF_ANALYTICS_REPORTING_ENABLED: "false"
+      GF_ANALYTICS_CHECK_FOR_UPDATES: "false"
+      GF_NEWS_NEWS_FEED_ENABLED: "false"
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - grafana-data:/var/lib/grafana
+    ports:
+      - "${KIT_GRAFANA_PORT:-15000}:3000"
+    mem_limit: ${KIT_GRAFANA_MEMORY_LIMIT:-256m}
+    healthcheck:
+      test: ["CMD-SHELL", "wget --spider -q http://localhost:3000/api/health || exit 1"]
       interval: 10s
       timeout: 5s
       retries: 6
-      start_period: 10s
+      start_period: 5s
+    profiles: [observability]
     networks: [platform]

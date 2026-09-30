@@ -1,0 +1,122 @@
+---
+# kit template — Mimir CONFIGURATION for the local cafaye stack.
+#
+# CONFIGURATION, which AGPL-3.0 expressly permits. Mounted read-only over a
+# stock `grafana/mimir` image, which is distroless: there is no shell in it and
+# no way to patch one in without a `build:` stanza, which the gate forbids.
+# Nothing here patches, forks or rebrands a vendor binary.
+#
+# WHAT THIS IS
+#   Mimir is the METRICS store, and it holds exactly one family of series: what
+#   the collector's `spanmetrics` connector derived from already-redacted spans.
+#   That is a deliberate choice over having each service ship its own meter.
+#   One implementation of one histogram is what makes "one place to see all
+#   errors for the whole system" a single query instead of six dashboards to
+#   compare by eye.
+#
+#   It also means this file has almost no custom metrics vocabulary to define,
+#   which is the point. The series names come from core's metrics schema.
+#
+# SINGLE-BINARY MODE. `-target=all` runs the ingester, distributor,
+# store-gateway and querier in one process. Every backend is local, so a laptop
+# does not need three containers and a bucket to answer "what did that request
+# cost".
+#
+# VERIFIED AGAINST THE PINNED IMAGE, NOT REASONED ABOUT
+#   Mimir's config is strict in a way that costs a whole `bin/dev up` to learn:
+#   an unknown key is a startup failure naming a Go type, not a config key. The
+#   first version of this file carried `compactor_block_retention`,
+#   `retention_enforced`, a top-level `storage:` block and a `path_prefix`,
+#   and the container exited in eight seconds. Those were all correct for an
+#   older Mimir; the image is pinned, so the config has to match IT.
+#
+#   Mimir 2.13's shape, which is the whole of the difference:
+#     * blocks live under `blocks_storage:`, not a top-level `storage:`
+#     * retention is `limits.compactor_blocks_retention_period`, a duration
+#     * `limits` is a flat map of per-tenant limit NAMES with a `default`
+#       value inline, not a nested structure
+#     * there is no `common:` block and no `path_prefix`; the working directory
+#       is the image's
+#   Every key below was loaded into grafana/mimir:2.13.0 and the container
+#   watched to reach "Application started".
+#
+# REPLICATION FACTOR 1 IS A FLAG, NOT A CONFIG KEY.
+#   Mimir's ingester ring defaults to `-ingester.ring.replication-factor 3`, and
+#   a single-binary dev stack has exactly ONE ingester. A metrics write is then
+#   rejected with
+#
+#     send data to ingesters: at least 2 live replicas required, could only find 1
+#
+#   which reads like a broken cluster rather than a default sized for one. There
+#   is no `limits.ingestion_replication_factor` and no `distributor` block that
+#   sets it — both were tried against the pinned image and both parse and change
+#   nothing. The flag in docker-compose.yml is the only lever, which is why that
+#   file carries a `-ingester.ring.replication-factor=1` and this one does not.
+
+# Filesystem, not object storage. A dev stack with MinIO in front of Mimir is
+# five containers to read four panels.
+blocks_storage:
+  backend: filesystem
+  filesystem:
+    dir: /mimir/data
+
+memberlist:
+  # Bound, and deliberately so. Memberlist is gossip, and unbounded gossip on a
+  # laptop shows up as mysteriously high CPU attributed to nothing in
+  # particular.
+  bind_port: 7946
+
+limits:
+  # THE RETENTION ANSWER. Blocks are deleted by the compactor, and only if a
+  # compactor runs — the same shape as Tempo's and Loki's, and the same trap: a
+  # retention setting with no compactor deletes nothing.
+  #
+  # 24h of metrics. Long enough to see yesterday's regression, short enough that
+  # a week of local load testing does not leave a 40GB volume behind.
+  compactor_blocks_retention_period: 24h
+
+  # THE CARDINALITY RULE, ENFORCED WHERE IT CAN BE ENFORCED. OpenTelemetry
+  # folds a metric stream into one `otel.metric.overflow=true` point at 2000
+  # attribute combinations and DROPS every measurement attribute: totals stay
+  # right while every breakdown silently undercounts. That is the worst shape a
+  # bug can have — the dashboard renders, the total looks right, and the
+  # breakdown is wrong, with no error anywhere.
+  #
+  # The real control is upstream: core's metrics schema prohibits
+  # `tenant_id`/`user_id`/`request_id` on a measurement, and the collector's
+  # `redaction/cafaye_metrics` allowlist keeps them off. These limits are the
+  # backstop for a service that brings its own backend, and they REJECT rather
+  # than fold: a rejected series is a visible error, which is strictly better
+  # than a dashboard that renders and is wrong.
+  #
+  # A dev fleet is six services. 5k series per metric is generous for that and
+  # small enough that a runaway loop hits the ceiling inside a minute instead of
+  # filling a disk over a weekend.
+  max_global_series_per_user: 50000
+  max_global_series_per_metric: 5000
+
+compactor:
+  # The windows the compactor rolls up through. 2h and 24h are what the
+  # retention above actually needs; 168h is a week of history for a regression
+  # hunt, and it is a list of DURATIONS in Mimir 2.13 — the `{from: …, trim: …}`
+  # mapping form from older Mimir is a hard startup failure on this image.
+  block_ranges:
+    - 2h
+    - 24h
+    - 168h
+  compaction_interval: 10m
+  # A laptop. Four parallel compactions is four things competing with six
+  # services for the same cores.
+  compaction_concurrency: 2
+
+# NOT HERE, DELIBERATELY: `ingester.chunk_idle_period`,
+# `ingester.max_block_duration`, `ha_tracker`, `querier.frontend_splitting_enabled`
+# and `runtime_config`. Mimir 2.13 rejects the first two outright, and the rest
+# are production-distribution settings whose dev defaults are already the small
+# ones a laptop wants. A config that restates a default is a line that can
+# disagree with the default in the next release without anybody noticing.
+#
+# Self-hoster note: per-tenant OTLP resolution and per-tenant limits go under
+# `limits:` above and in the runtime config. They are absent here because a
+# single-binary dev stack has one tenant, and a limits table with invented
+# per-tenant rows is a config that reads as if it did something.

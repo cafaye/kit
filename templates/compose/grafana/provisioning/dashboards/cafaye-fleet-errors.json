@@ -1,0 +1,484 @@
+{
+  "uid": "cafaye-fleet-errors",
+  "title": "cafaye — every error in the fleet",
+  "description": "The answer to 'one place to see all errors for the whole system' (PLAN.md §7b). Read the header below before editing a query: the predicate is span STATUS, and error.type is a drill-down inside a service. A fleet-wide breakdown grouped by error.type is the documented mistake.",
+  "tags": [
+    "cafaye",
+    "errors",
+    "fleet"
+  ],
+  "timezone": "utc",
+  "schemaVersion": 39,
+  "version": 1,
+  "editable": false,
+  "graphTooltip": 1,
+  "refresh": "30s",
+  "time": {
+    "from": "now-1h",
+    "to": "now"
+  },
+  "timepicker": {},
+  "templating": {
+    "list": [
+      {
+        "name": "service",
+        "label": "Service",
+        "type": "query",
+        "datasource": {
+          "type": "mimir",
+          "uid": "mimir"
+        },
+        "query": "label_values(cafaye_calls_total, service_name)",
+        "refresh": 1,
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      },
+      {
+        "name": "error_class",
+        "label": "Error class",
+        "type": "query",
+        "datasource": {
+          "type": "mimir",
+          "uid": "mimir"
+        },
+        "query": {
+          "query": "label_values(cafaye_calls_total{error_type=~\"$service\"}, error_type)",
+          "refId": "A"
+        },
+        "refresh": 1,
+        "includeAll": true,
+        "multi": true,
+        "current": {
+          "text": "All",
+          "value": "$__all"
+        }
+      }
+    ]
+  },
+  "panels": [
+    {
+      "id": 1,
+      "type": "row",
+      "title": "Is the system healthy right now",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 0
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 2,
+      "type": "stat",
+      "title": "Error ratio (fleet, last 5m)",
+      "description": "THE PREDICATE IS SPAN STATUS. otel.status_code=\"ERROR\" over all calls, per service. Not grouped by error_type: the semconv expects high cardinality in error.type when no filter is applied, and a global breakdown by it is invalid however good it looks.",
+      "datasource": {
+        "type": "mimir",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 0,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(cafaye_calls_total{service_name=~\"$service\", otel_status_code=\"STATUS_CODE_ERROR\"}[5m])) / clamp_min(sum(rate(cafaye_calls_total{service_name=~\"$service\"}[5m])), 0.0001)",
+          "legendFormat": "fleet",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          }
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "background",
+        "graphMode": "area",
+        "thresholds": {
+          "mode": "absolute",
+          "steps": [
+            {
+              "color": "green",
+              "value": null
+            },
+            {
+              "color": "orange",
+              "value": 0.01
+            },
+            {
+              "color": "red",
+              "value": 0.05
+            }
+          ]
+        }
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "percentunit",
+          "decimals": 2
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 3,
+      "type": "stat",
+      "title": "Requests / s (all services)",
+      "datasource": {
+        "type": "mimir",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 6,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum(rate(cafaye_calls_total{service_name=~\"$service\"}[5m]))",
+          "legendFormat": "rps",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          }
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "decimals": 2
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 4,
+      "type": "stat",
+      "title": "p95 request duration",
+      "description": "From the spanmetrics duration histogram. Core's metrics schema allows http.route and the status CLASS as dimensions, never the raw 500-valued status code, and never a tenant or user id — those are on the resource, which is exempt from the 2000-combination cap.",
+      "datasource": {
+        "type": "mimir",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 12,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "histogram_quantile(0.95, sum by (le) (rate(cafaye_duration_bucket{service_name=~\"$service\"}[5m])))",
+          "legendFormat": "p95",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          }
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "area"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "s",
+          "decimals": 3
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 5,
+      "type": "stat",
+      "title": "Services reporting",
+      "description": "A fully-down service has an error ratio of nothing, because it is not serving. Silence is its own signal — see the 'A service has exported no spans' alert rule.",
+      "datasource": {
+        "type": "mimir",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 5,
+        "w": 6,
+        "x": 18,
+        "y": 1
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "count(count by (service_name) (rate(cafaye_calls_total[5m])))",
+          "legendFormat": "services",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          }
+        }
+      ],
+      "options": {
+        "reduceOptions": {
+          "calcs": [
+            "lastNotNull"
+          ],
+          "fields": "",
+          "values": false
+        },
+        "colorMode": "none",
+        "graphMode": "none"
+      },
+      "fieldConfig": {
+        "defaults": {
+          "unit": "short",
+          "decimals": 0
+        },
+        "overrides": []
+      }
+    },
+    {
+      "id": 6,
+      "type": "row",
+      "title": "Errors, by service (the predicate is span status)",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 6
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 7,
+      "type": "timeseries",
+      "title": "Error rate by service",
+      "description": "Partitioned by service.name, filtered on status_code = STATUS_CODE_ERROR. §7b's answer, in one query: which service is failing, over time.",
+      "datasource": {
+        "type": "mimir",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 16,
+        "x": 0,
+        "y": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "sum by (service_name) (rate(cafaye_calls_total{service_name=~\"$service\", otel_status_code=\"STATUS_CODE_ERROR\"}[5m]))",
+          "legendFormat": "{{service_name}}",
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "decimals": 3,
+          "custom": {
+            "drawStyle": "line",
+            "fillOpacity": 12,
+            "lineWidth": 2,
+            "showPoints": "never"
+          }
+        },
+        "overrides": []
+      },
+      "options": {
+        "legend": {
+          "displayMode": "table",
+          "placement": "right",
+          "calcs": [
+            "sum",
+            "max"
+          ]
+        }
+      }
+    },
+    {
+      "id": 8,
+      "type": "table",
+      "title": "Error class, inside one service",
+      "description": "THE DRILL-DOWN, AND ONLY UNDER A SERVICE FILTER. error_type is a bounded snake_case class from core's vocabulary; §7b and the semconv both say consumers expect HIGH CARDINALITY in it when no filter is applied, so it is never a fleet-wide grouping key. The service filter is the ${service} template variable, which is what makes this panel legal.",
+      "datasource": {
+        "type": "mimir",
+        "uid": "mimir"
+      },
+      "gridPos": {
+        "h": 8,
+        "w": 8,
+        "x": 16,
+        "y": 7
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "topk(15, sum by (error_type) (rate(cafaye_calls_total{service_name=~\"$service\", otel_status_code=\"STATUS_CODE_ERROR\", error_type=~\"$error_class\"}[5m])))",
+          "legendFormat": "{{error_type}}",
+          "format": "table",
+          "instant": true,
+          "datasource": {
+            "type": "prometheus",
+            "uid": "mimir"
+          }
+        }
+      ],
+      "transformations": [
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "Time": true
+            },
+            "renameByName": {
+              "error_type": "Class",
+              "Value": "Errors / s"
+            }
+          }
+        }
+      ],
+      "fieldConfig": {
+        "defaults": {
+          "unit": "reqps",
+          "decimals": 4
+        },
+        "overrides": []
+      },
+      "options": {
+        "showHeader": true
+      }
+    },
+    {
+      "id": 9,
+      "type": "row",
+      "title": "The errors themselves",
+      "gridPos": {
+        "h": 1,
+        "w": 24,
+        "x": 0,
+        "y": 15
+      },
+      "collapsed": false,
+      "panels": []
+    },
+    {
+      "id": 10,
+      "type": "logs",
+      "title": "Error log records (the crash layer)",
+      "description": "Every container's stderr, with no per-language SDK: §7b's second error layer, obtained for free because all six languages already write fatal errors to stderr. The collector drops exception.message and exception.stacktrace — the attributes that would carry a stack trace, and on muse a path straight to a prompt — so a record here is a class, not a transcript.",
+      "datasource": {
+        "type": "loki",
+        "uid": "loki"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 14,
+        "x": 0,
+        "y": 16
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{service_name=~\"$service\"} |= `log.severity` |~ \"(?i)error|fatal\"",
+          "queryType": "range",
+          "datasource": {
+            "type": "loki",
+            "uid": "loki"
+          }
+        }
+      ],
+      "options": {
+        "showTime": true,
+        "wrapLogMessage": true,
+        "sortOrder": "Descending",
+        "enableLogDetails": true
+      }
+    },
+    {
+      "id": 11,
+      "type": "traces",
+      "title": "Error spans, straight from Tempo",
+      "description": "Tempo's own documented error workflow: {status=error} and only then break it down. A span that reached Error with no error.type is still an error and still shows up here, which is precisely why status is the predicate and error.type is not.",
+      "datasource": {
+        "type": "tempo",
+        "uid": "tempo"
+      },
+      "gridPos": {
+        "h": 9,
+        "w": 10,
+        "x": 14,
+        "y": 16
+      },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "nativeSearch",
+          "serviceMapQuery": "",
+          "query": "{status=error}",
+          "datasource": {
+            "type": "tempo",
+            "uid": "tempo"
+          }
+        }
+      ],
+      "options": {
+        "spanBar": 4,
+        "showLabels": false,
+        "showTraceID": true
+      }
+    },
+    {
+      "id": 12,
+      "type": "text",
+      "title": "How to read this dashboard",
+      "description": "",
+      "gridPos": {
+        "h": 7,
+        "w": 24,
+        "x": 0,
+        "y": 25
+      },
+      "options": {
+        "mode": "markdown",
+        "content": "**The predicate for \"this is an error\" is span status `Error`, not `error.type`.**\n\n`error.type` is a *classification beneath* that predicate. Tempo's own documented error workflow filters `{status=error}` and only then breaks the result down, and the OpenTelemetry semantic conventions say consumers should expect *high* cardinality in `error.type` when no filter is applied. So:\n\n- **partition by `resource.service.name`** — that is `by (service_name)` on every panel above;\n- **filter on status = error** — `otel.status_code=\"ERROR\"` here, `{status=error}` in Tempo;\n- **use `error.type` only as a drill-down inside a service** — the table above is scoped to the `${service}` variable, and that scoping is what makes it legal rather than wrong.\n\nA span that ended in Error but carried no `error.type` still appears on the traces panel and still counts in the error rate. A dashboard that groups fleet-wide by `error.type` would show a different, less useful total, which is the specific failure PLAN.md §7b calls out by name.\n\n`tests/validate.sh` asserts all three properties on this file's JSON: that no panel groups by an error class without a service filter, that at least one panel filters on status, and that at least one partitions by service. A \"fix\" that makes that check go red is a dashboard that answers the wrong question."
+      }
+    }
+  ]
+}

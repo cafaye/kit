@@ -54,6 +54,47 @@ Run these; do not improvise equivalents.
   the identifier needed to find the failing row, not just a message.
 - Money is integer minor units. Time is UTC. IDs are opaque strings.
 
+## Observability
+
+On by default. Not opt-in, and not something a developer turns on to see traces
+(PLAN.md §7b, user directive 2026-09-30).
+
+- **`<SERVICE>_OTEL_ENDPOINT` is the only contract** — `MUSE_OTEL_ENDPOINT`,
+  `CAF_OTEL_ENDPOINT`, `DARKSROOM_OTEL_ENDPOINT`, whatever this service is
+  called, uppercase, no `OTEL_EXPORTER_` prefix and no `_EXPORTER_` infix. Its
+  DEFAULT is the collector that ships with `bin/dev`, which is why a developer
+  sees real traces with nothing configured.
+- **A self-hoster who already runs Datadog, Honeycomb or Grafana Cloud sets that
+  variable** and the shipped stack goes quiet for this service. Bring-your-own
+  is a supported deployment, documented as carefully as the default, not a
+  degraded mode.
+- **Turning telemetry off is one variable.** Unset it and the exporter is a
+  genuine no-op: no queue, no retry loop against a dead endpoint, no warning per
+  request, no dial at boot. Implement that with `OTEL_SDK_DISABLED` — the
+  OpenTelemetry spec's own switch — rather than a cafaye reimplementation, and
+  check `OTEL_TRACES_EXPORTER`, `OTEL_METRICS_EXPORTER` and
+  `OTEL_LOGS_EXPORTER` too. A no-op that only covers traces still phones home
+  for metrics, and that is the failure a customer's invoice finds first.
+- **Telemetry is NEVER in a readiness path.** Not in `/healthz`, not in
+  `/readyz`, not in a `depends_on`, not in a compose healthcheck. A service that
+  waits for the collector serves no traffic while the collector is down, which
+  is strictly worse than serving traffic with no traces. `kit`'s
+  `tests/no_telemetry_in_readiness.sh` proves this against a real collector;
+  a service that breaks it will not be caught there, so it is written down here.
+- **`error.type` is a bounded class, never a message.** snake_case, 64
+  characters, from the fleet vocabulary. `error.message` and
+  `error.stacktrace` are prohibited by name: a provider's content-policy
+  rejection quotes the offending content back at you, so the message is a
+  prompt by another route. The predicate for "this is an error" is span STATUS,
+  not `error.type`.
+- **Exceptions are LOG RECORDS.** The `exception` span event is deprecated; an
+  exception log record with a severity chosen by expected impact replaces it.
+- **The collector enforces the redaction allowlist** (core's
+  `redaction.schema.json`, `enforcedAt: collector`). The per-service SDK
+  allowlist is defence in depth, not the only line — and a service pointing
+  `*_OTEL_ENDPOINT` at a vendor backend is exactly the case where the collector
+  is the only line.
+
 ## Testing
 
 - Tests are written **first**, and shown failing before the implementation.

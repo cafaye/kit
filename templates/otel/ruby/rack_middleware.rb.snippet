@@ -19,6 +19,13 @@
 # header, and §4.2 says a tracestate on its own is invalid and must be
 # discarded. There is no exception to rescue here because there is no raise.
 #
+# OBSERVABILITY IS ON BY DEFAULT (PLAN.md §7b)
+#   `BILLING_OTEL_ENDPOINT` DEFAULTS to the collector that ships with the stack,
+#   so a developer working on this service sees real traces with nothing
+#   switched on. Unsetting the variable is a genuine no-op; pointing it at
+#   somebody else's OTLP endpoint is a supported deployment, not a degraded
+#   mode. The variable is the ONLY contract — see `Kit::Telemetry.endpoint`.
+#
 # SPEC: W3C Trace Context, W3C Recommendation 23 November 2021
 #       https://www.w3.org/TR/trace-context/
 #
@@ -26,6 +33,9 @@
 # bundle add opentelemetry-sdk
 # bundle add opentelemetry-exporter-otlp
 # bundle add opentelemetry-instrumentation-rails
+# bundle add opentelemetry-instrumentation-rack
+# bundle add opentelemetry-instrumentation-active_record
+# bundle add opentelemetry-instrumentation-faraday
 # ---------------------------------------------------------------------------
 
 # config/initializers/otel.rb
@@ -41,18 +51,103 @@ module Kit
     SERVICE_NAME = ENV.fetch("OTEL_SERVICE_NAME", "billing").freeze
     SERVICE_VERSION = ENV.fetch("OTEL_SERVICE_VERSION", "0.0.0").freeze
 
-    # NO EXPORTER BY DEFAULT, and this is the load-bearing part.
-    # OTEL_EXPORTER_OTLP_ENDPOINT is opt-in. Unset means spans stay in this
-    # process: a developer who clones this service and runs it locally must not
-    # have their spans leave the machine. The same privacy boundary
-    # templates/compose/otel-collector.yml enforces, applied in code because a
-    # Rails process can boot without compose.
-    def self.install!
-      return unless ENV["OTEL_EXPORTER_OTLP_ENDPOINT"]
+    # The collector that ships with the local stack. A DEFAULT VALUE, not a
+    # constant: that is the whole of "observability is on by default". A
+    # developer with no configuration exports into a collector on their own
+    # machine; a self-hoster who already runs a backend sets the variable and
+    # this address goes quiet.
+    DEFAULT_ENDPOINT = "http://otel-collector:4318".freeze
+
+    # SIGNALS, in the order they are checked. `OTEL_SDK_DISABLED` is the
+    # OpenTelemetry spec's OWN kill switch and it is what core's
+    # otel-endpoint schema pins the no-op to — not a cafaye reimplementation.
+    # Re-implementing "disabled" in six languages is how six services acquire
+    # six different definitions of it, and the difference between them is
+    # somebody's production incident.
+    PER_SIGNAL = %w[OTEL_TRACES_EXPORTER OTEL_METRICS_EXPORTER OTEL_LOGS_EXPORTER].freeze
+
+    module_function
+
+    # The OTLP endpoint, or nil for a genuine no-op.
+    #
+    # This is the WHOLE of the contract (core D16), which is why it is this
+    # short. `BILLING_OTEL_ENDPOINT` set — export there; the shipped collector,
+    # Datadog, Honeycomb, Grafana Cloud, anything speaking OTLP, and
+    # bring-your-own is a *supported deployment*, not a degraded mode. Unset —
+    # go nowhere at all, not "go nowhere and try". `OTEL_EXPORTER_OTLP_ENDPOINT`
+    # is honoured as a fallback so the service also works with generic OTel
+    # tooling, and the cafaye name wins when both are set: the precedence is
+    # written down here rather than discovered later, because a contract with an
+    # undocumented precedence order is a bug report.
+    def endpoint
+      value = ENV["BILLING_OTEL_ENDPOINT"]
+      value = ENV["OTEL_EXPORTER_OTLP_ENDPOINT"] if value.nil? || value.empty?
+      return value unless value.nil? || value.empty?
+
+      DEFAULT_ENDPOINT
+    end
+
+    # Whether there is anywhere to export to, for ANY signal. All three
+    # per-signal switches are checked, not just the first: a no-op that only
+    # covers traces is a service that still phones home for metrics, which is
+    # the failure discovered by a customer's invoice rather than by a test.
+    def enabled?
+      return false if ENV["OTEL_SDK_DISABLED"].to_s.casecmp("true").zero?
+
+      PER_SIGNAL.none? { |name| ENV[name].to_s.casecmp("none").zero? }
+    end
+
+    # One line for the startup log, and only ever on the DISABLED path. Silence
+    # is the contract there: a warning per export attempt fills the service's
+    # own log store with the fact that telemetry is off, which is how a
+    # self-hoster discovers that turning it off is not supported — the opposite
+    # of the intent. One line at startup is not spam, and it is the difference
+    # between "telemetry is off" and "telemetry is broken", which look
+    # identical from outside.
+    def no_op_reason
+      return "OTEL_SDK_DISABLED=true" if ENV["OTEL_SDK_DISABLED"].to_s.casecmp("true").zero?
+
+      off = PER_SIGNAL.select { |name| ENV[name].to_s.casecmp("none").zero? }
+      off.empty? ? "" : "#{off.join(',')}=none"
+    end
+
+    # Process identity, attached once per process rather than once per span.
+    # It is the correct home for `tenant_id` and it is EXEMPT from
+    # OpenTelemetry's 2000-attribute-combination metric cap. Put a tenant on a
+    # MEASUREMENT instead and the moment that stream overflows every per-tenant
+    # breakdown silently undercounts while the total stays right — the worst
+    # shape a bug can have, because the dashboard still renders and looks fine.
+    def resource_attributes
+      attributes = {
+        "service.name" => SERVICE_NAME,
+        "service.version" => SERVICE_VERSION
+      }
+      environment = ENV["DEPLOYMENT_ENVIRONMENT"]
+      attributes["deployment.environment"] = environment if environment && !environment.empty?
+      tenant = ENV["BILLING_TENANT_ID"]
+      attributes["tenant_id"] = tenant if tenant && !tenant.empty?
+      attributes
+    end
+
+    def install!
+      unless enabled?
+        # NO EXPORTER IS BUILT AT ALL. Not an exporter pointed at nothing and
+        # left to retry, not a processor with a queue behind it. A queue that
+        # accepts spans and holds them is a memory leak with a
+        # telemetry-shaped trigger; a retry loop against an endpoint that is
+        # not there is a thread waking on a timer for the life of the process,
+        # invisible in every dashboard because nothing is being recorded. A
+        # "disabled" path that still dials out is worse than no telemetry
+        # support at all (PLAN.md §7b), so the no-op is the ABSENCE of the
+        # machinery rather than the machinery aimed at nothing.
+        Rails.logger.info("telemetry off (#{no_op_reason}); spans stay in-process")
+        return false
+      end
 
       OpenTelemetry::SDK.configure do |c|
         c.service_name = SERVICE_NAME
         c.service_version = SERVICE_VERSION
+        c.resource = OpenTelemetry::SDK::Resources::Resource.create(resource_attributes)
         # `use_all!` installs instrumentation for every gem on the load path:
         # Rails, ActiveRecord, Faraday, Net::HTTP. It is a bang method for a
         # reason — it raises if a gem is half-present, which at boot is the
@@ -64,11 +159,87 @@ module Kit
           )
         )
       end
+      true
     end
   end
 end
 
 Kit::Telemetry.install!
+
+# ---------------------------------------------------------------------------
+# Recording a failure. Two things, and the second is the point.
+# ---------------------------------------------------------------------------
+
+module Kit
+  # Span names, error classes, and exception log records.
+  #
+  # All three live in one place because they are one contract: the fleet's span
+  # names, its bounded `error.type` vocabulary, and the current form of the
+  # exception convention. A service that spreads them across a codebase gets
+  # six of them and compares none.
+  module Errors
+    # A span is an error when its STATUS says so. This is the predicate the
+    # whole fleet dashboard filters on, and it is not `error.type`: a span whose
+    # status is unset is invisible to a `{status=error}` filter however many
+    # error attributes it carries.
+    #
+    # The OTel HTTP convention would name a span `GET /v1/invoices/{id}`, which
+    # puts the route in the NAME. A name is the grouping key in every trace UI,
+    # so an attribute in the name is an attribute that cannot be filtered out,
+    # and a route with an id in it is a cardinality explosion with a GET
+    # attached. core's span-naming schema caps every segment at fifteen
+    # characters, which is what makes an interpolated id impossible to spell
+    # even by accident.
+    def self.span_name(operation, target = nil, qualifier = nil)
+      [Kit::Telemetry::SERVICE_NAME, operation, target, qualifier].compact.join(".")
+    end
+
+    # `error.type` is the CLASS, never the message — snake_case, at most 64
+    # characters, drawn from a vocabulary the whole fleet shares, so a Go and an
+    # Elixir service reporting `provider_auth` mean the same thing and "one
+    # place to see all errors" is one place rather than six.
+    #
+    # `span.record_exception` is deliberately NOT called. The OTel Ruby SDK
+    # records `exception.message` and `exception.stacktrace`, and a message is
+    # unbounded, is a cardinality bomb on the metrics side, and is a prompt by
+    # another route on an LLM gateway: a provider's content-policy rejection
+    # quotes the offending content back at you. core's redaction schema
+    # prohibits those attributes by name for exactly that reason, and the
+    # collector drops them even if something here adds them.
+    #
+    # A handled-and-retried error is not recorded at all. A retry that succeeded
+    # is not an error, and recording it makes the error rate a lie.
+    def self.record_failure(span, error_type, description)
+      span.status = OpenTelemetry::Trace::Status.error(description)
+      span.set_attribute("error.type", error_type.to_s)
+      span
+    end
+
+    # An EXCEPTION LOG RECORD, which is the current convention. The `exception`
+    # SPAN EVENT is Deprecated in favour of exactly this: a log record with an
+    # event name ending `.exception` and a severity chosen by EXPECTED IMPACT.
+    # The span event form is a compatibility shim, and a service still writing
+    # it has not migrated (PLAN.md §7b).
+    #
+    # The class goes on the record and the detail does not: the collector drops
+    # `exception.message` and `exception.stacktrace` because they are on
+    # nobody's allowlist, and a stack trace is unbounded text. The class is what
+    # survives a searchable, retained store; `detail` is for the caller's own
+    # application log.
+    def self.log_exception(error_type, detail, impact: "error")
+      severity = { "warning" => :warn, "fatal" => :fatal }.fetch(impact, :error)
+      # `log.error`, not `span.add_event("exception", ...)`. The span-event
+      # form is the deprecated one; the record has to reach the log pipeline
+      # for the collector to route it to the crash layer at all.
+      Rails.logger.public_send(
+        severity,
+        detail,
+        error_type: error_type.to_s,
+        event: "exception"
+      )
+    end
+  end
+end
 
 # ---------------------------------------------------------------------------
 # config/initializers/trace_context.rb
@@ -162,9 +333,6 @@ Rails.application.config.log_tags = [
 # `faraday-otel` is the supported wiring; the hand-rolled version is below
 # because it is short enough to read and shows exactly what is on the wire.
 # ---------------------------------------------------------------------------
-class TracingClient < Faraday::Connection
-  # ...
-end
 
 Faraday.new(url: "https://courier.internal") do |f|
   f.request :trace_context # from faraday-otel; injects traceparent + tracestate

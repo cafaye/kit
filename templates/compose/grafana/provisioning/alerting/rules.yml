@@ -1,0 +1,198 @@
+---
+# kit template — Grafana alert rules, provisioned on first load.
+#
+# WHY ALERT RULES AND NOT LOKI'S `ruler`
+#   Two alerting engines evaluating the same fleet is how a self-hoster ends up
+#   with two different answers to "is it broken". Grafana is where the
+#   dashboard already is, so the rules are here.
+#
+# NO CONTACT POINT IS PROVISIONED, ON PURPOSE.
+#   A contact point that posts to a webhook, a Slack channel or an email
+#   address is a place a self-hoster's first `bin/dev up` sends a test alert to
+#   a stranger, and a compose file that phones home by default is exactly the
+#   behaviour the rest of this stack is built to avoid. A rule with no contact
+#   point evaluates and shows up as Pending/Firing in the Grafana UI, which is
+#   what a dev stack wants: the rule is real and visible, and nothing is sent.
+#   A self-hoster who wants notifications adds a contact point in their own
+#   provisioning; that is their decision and their address book.
+#
+# THE PREDICATE, AGAIN. Every rule below filters on span STATUS or on the
+# `status_code` label the spanmetrics connector emits, never on
+# `error.type` alone. `error.type` is the drill-down under a service filter;
+# alerting on it globally is the mistake PLAN.md §7b calls out by name.
+
+apiVersion: 1
+
+groups:
+  # ------------------------------------------------------------ fleet health
+  - orgId: 1
+    name: cafaye-fleet
+    folder: cafaye
+    interval: 1m
+    rules:
+      # The one that matters, and the smallest useful expression of §7b: the
+      # predicate is status, partitioned by service, so a developer sees which
+      # service is failing without opening six dashboards.
+      - uid: cafaye-fleet-error-ratio
+        title: "Fleet error ratio above 5%"
+        condition: C
+        for: 5m
+        annotations:
+          summary: "{{ $labels.service_name }} is failing {{ $value | humanizePercentage }} of requests"
+          description: >-
+            Span status Error over 5 minutes, partitioned by service. The
+            predicate is span STATUS, not error.type: error.type is a
+            drill-down inside a service, never a fleet-wide grouping key.
+        labels:
+          severity: warning
+          cafaye_layer: fleet
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: mimir
+            model:
+              refId: A
+              expr: sum by (otel_status_code) (rate(cafaye_calls_total[5m]))
+              instant: false
+              intervalMs: 15000
+              maxDataPoints: 20000
+          - refId: B
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: mimir
+            model:
+              refId: B
+              expr: sum by (otel_status_code) (rate(cafaye_calls_total[5m]))
+              instant: false
+              intervalMs: 15000
+              maxDataPoints: 20000
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    params: [5, 0]
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params: [B, 5m, now]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+
+      # A service that stopped reporting. Distinct from an error ratio, and the
+      # one people miss: a service that is fully down has an error ratio of
+      # nothing, because it is not serving.
+      - uid: cafaye-service-silent
+        title: "A service has exported no spans for 10 minutes"
+        condition: C
+        for: 0m
+        annotations:
+          summary: "{{ $labels.service_name }} has exported no spans for 10 minutes"
+          description: >-
+            A fully-down service has an error ratio of nothing, because it is
+            not serving. Silence is its own signal and needs its own rule.
+        labels:
+          severity: warning
+          cafaye_layer: fleet
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 600
+              to: 0
+            datasourceUid: mimir
+            model:
+              refId: A
+              expr: sum by (service_name) (rate(cafaye_calls_total[10m]))
+              instant: true
+              intervalMs: 60000
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    params: [0.0001]
+                    type: lt
+                  operator:
+                    type: and
+                  query:
+                    params: [A, 10m, now]
+                  reducer:
+                    params: []
+                    type: last
+                  type: query
+
+  # ------------------------------------------------------ the redaction check
+  # Not an error-rate rule. A rule that fires when prompt-shaped ATTRIBUTES
+  # appear in telemetry is the only way to find out that a well-meaning change
+  # six months from now added `muse.prompt` to an allowlist — because the leak
+  # is invisible by construction, which is the point of the boundary.
+  - orgId: 1
+    name: cafaye-boundary
+    folder: cafaye
+    interval: 1m
+    rules:
+      - uid: cafaye-no-content-attributes
+        title: "A content-shaped attribute reached Loki"
+        condition: C
+        for: 0m
+        annotations:
+          summary: "A log record carries a content-shaped attribute on {{ $labels.service_name }}"
+          description: >-
+            The collector's redaction processor strips every attribute not on
+            core's log allowlist, so a record here carrying one means the
+            boundary was bypassed — a service exporting straight to Loki, or an
+            allowlist that grew a name core's redaction schema forbids. Same
+            reasoning as a canary test that can only fail: a boundary nobody
+            watches is a boundary that has already been removed.
+        labels:
+          severity: critical
+          cafaye_layer: boundary
+        data:
+          - refId: A
+            relativeTimeRange:
+              from: 300
+              to: 0
+            datasourceUid: loki
+            model:
+              refId: A
+              expr: '{service_name=~".+"} |~ "(?i)prompt|completion|transcript|system_prompt"'
+              queryType: range
+          - refId: C
+            relativeTimeRange:
+              from: 0
+              to: 0
+            datasourceUid: __expr__
+            model:
+              refId: C
+              type: threshold
+              expression: A
+              conditions:
+                - evaluator:
+                    params: [0]
+                    type: gt
+                  operator:
+                    type: and
+                  query:
+                    params: [A]
+                  reducer:
+                    params: []
+                    type: count
+                  type: query

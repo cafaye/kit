@@ -19,6 +19,13 @@
 # tracestate alone is invalid and must be discarded. Phoenix's telemetry events
 # are emitted unconditionally, so there is no rescue needed and none offered.
 #
+# OBSERVABILITY IS ON BY DEFAULT (PLAN.md §7b)
+#   `COURIER_OTEL_ENDPOINT` DEFAULTS to the collector that ships with the stack,
+#   so a developer working on this service sees real traces with nothing
+#   switched on. Unsetting the variable is a genuine no-op; pointing it at
+#   somebody else's OTLP endpoint is a supported deployment, not a degraded
+#   mode. The variable is the ONLY contract — see `endpoint/0`.
+#
 # SPEC: W3C Trace Context, W3C Recommendation 23 November 2021
 #       https://www.w3.org/TR/trace-context/
 #
@@ -38,26 +45,119 @@ defmodule Courier.Telemetry do
   OpenTelemetry setup for a Phoenix service.
 
   The config is built in code rather than in config/runtime.exs so that the
-  no-exporter-by-default rule is in one readable place with a comment on it,
-  instead of spread across environment-variable interpolation that nobody reads
-  at 2am.
+  endpoint contract and the no-op path are in one readable place with a comment
+  on each, instead of spread across environment-variable interpolation that
+  nobody reads at 2am.
   """
 
   require Logger
 
   @service_name "courier"
-  @service_version Mix.Project.config()[:version] || "0.0.0"
+
+  # `Mix.Project.config()[:version] || "0.0.0"` is the usual form, and it is
+  # evaluated at COMPILE time — which means this module cannot be loaded by
+  # plain `elixir`, only by `mix`. kit's gate checks this snippet by loading it,
+  # so a compile-time Mix call would make the check unrunnable and the snippet
+  # unverifiable. Read the version at runtime instead, with a fallback: a
+  # snippet nobody can load is a snippet nobody can check.
+  defp service_version, do: System.get_env("OTEL_SERVICE_VERSION") || "0.0.0"
+
+  @doc """
+  The emitting service's own name.
+
+  The mandatory prefix on every span name and the label every fleet query
+  partitions by. Change the literal above; everything else reads it from here.
+  """
+  def service_name, do: @service_name
+
+  # The collector that ships with the local stack. A DEFAULT VALUE, not a
+  # constant: that is the whole of "observability is on by default". A developer
+  # with no configuration exports into a collector on their own machine; a
+  # self-hoster who already runs a backend sets the variable and this address
+  # goes quiet.
+  @default_endpoint "http://otel-collector:4318"
+
+  # SIGNALS. `OTEL_SDK_DISABLED` is the OpenTelemetry spec's OWN kill switch and
+  # it is what core's otel-endpoint schema pins the no-op to — not a cafaye
+  # reimplementation. Re-implementing "disabled" in six languages is how six
+  # services acquire six different definitions of it, and the difference between
+  # them is somebody's production incident.
+  @per_signal ~w(OTEL_TRACES_EXPORTER OTEL_METRICS_EXPORTER OTEL_LOGS_EXPORTER)
+
+  @doc """
+  The OTLP endpoint.
+
+  This is the WHOLE of the contract (core D16), which is why it is this short.
+  `COURIER_OTEL_ENDPOINT` set — export there; the shipped collector, Datadog,
+  Honeycomb, Grafana Cloud, anything speaking OTLP, and bring-your-own is a
+  *supported deployment*, not a degraded mode. Unset — go nowhere at all, not
+  "go nowhere and try".
+
+  `OTEL_EXPORTER_OTLP_ENDPOINT` is honoured as a fallback so the release also
+  works with generic OTel tooling, and the cafaye name wins when both are set:
+  the precedence is written down here rather than discovered later, because a
+  contract with an undocumented precedence order is a bug report.
+  """
+  def endpoint do
+    System.get_env("COURIER_OTEL_ENDPOINT")
+    |> presence(System.get_env("OTEL_EXPORTER_OTLP_ENDPOINT"))
+    |> presence(@default_endpoint)
+  end
+
+  @doc """
+  Whether there is anywhere to export to, for ANY signal.
+
+  All three per-signal switches are checked, not just the first: a no-op that
+  only covers traces is a service that still phones home for metrics, which is
+  the failure discovered by a customer's invoice rather than by a test.
+  """
+  def enabled? do
+    disabled_by_sdk?() or Enum.any?(@per_signal, &exporter_off?/1)
+  end
+
+  @doc """
+  One line for the startup log, and only ever on the DISABLED path.
+
+  Silence is the contract there: a warning per export attempt fills the
+  service's own log store with the fact that telemetry is off, which is how a
+  self-hoster discovers that turning it off is not supported — the opposite of
+  the intent. One line at startup is not spam, and it is the difference between
+  "telemetry is off" and "telemetry is broken", which look identical from
+  outside.
+  """
+  def no_op_reason do
+    cond do
+      disabled_by_sdk?() -> "OTEL_SDK_DISABLED=true"
+      off = Enum.filter(@per_signal, &exporter_off?/1) -> Enum.join(off, ",") <> "=none"
+      true -> ""
+    end
+  end
+
+  defp disabled_by_sdk?, do: System.get_env("OTEL_SDK_DISABLED", "") |> String.downcase() |> String.trim() == "true"
+  defp exporter_off?(name), do: System.get_env(name, "") |> String.downcase() |> String.trim() == "none"
+  defp presence(value, _fallback) when is_binary(value) and value != "", do: value
+  defp presence(_value, fallback), do: fallback
 
   @doc """
   Configure and start the SDK.
 
-  NO EXPORTER BY DEFAULT, and this is the load-bearing part. The exporter is
-  started only when `OTEL_EXPORTER_OTLP_ENDPOINT` is set: unset means spans stay
-  in this BEAM node, and we never fall back to a vendor's default endpoint. A
-  developer who clones this service and runs it locally must not have their
-  spans leave their machine — the same privacy boundary
-  `templates/compose/otel-collector.yml` enforces, applied in code because a
-  Phoenix release can boot without compose.
+  THE DISABLED PATH IS FREE, and that is asserted rather than promised: when
+  telemetry is off this function starts `:otel_simple_processor` and does NOT
+  start the exporter at all. Not an exporter pointed at nothing and left to
+  retry, not a batch processor with a queue behind it.
+
+  A queue that accepts spans and holds them is a memory leak with a
+  telemetry-shaped trigger — a request that succeeds with unbounded retained
+  spans in the BEAM heap. A retry loop against an endpoint that is not there is
+  a process waking on a timer for the life of the release, invisible in every
+  dashboard because nothing is being recorded. A "disabled" path that still
+  dials out is worse than no telemetry support at all (PLAN.md §7b), so the
+  no-op is the ABSENCE of the exporter rather than the exporter aimed at
+  nothing.
+
+  `:otel_simple_processor` is still registered, and that is deliberate: it keeps
+  every `[:telemetry, :span]` call in the codebase valid, so no call site needs
+  an `if telemetry_enabled?` around it. It holds no queue and exports nowhere.
   """
   def start_link(opts \\ []) do
     :ok =
@@ -68,53 +168,67 @@ defmodule Courier.Telemetry do
         Logger.log(level, message)
       end)
 
-    resource = [
-      service: {service.name, @service_name},
-      service: {service.version, @service_version}
-    ]
+    if enabled?() do
+      resource = resource()
+      target = endpoint()
 
-    config = [
-      # A sampler that respects the caller's decision rather than re-deciding per
-      # hop. `parent_based` is the part that matters: a service that samples
-      # independently produces traces with holes, which are worse to debug than
-      # no traces at all.
-      span_processor: batch_span_processor(resource),
-      sampler: {:parent_based, %{root: {:always_on, []}}},
-      resource: resource
-    ]
+      config = [
+        # A sampler that respects the CALLER's decision rather than re-deciding
+        # per hop. `parent_based` is the part that matters: a service that
+        # samples independently produces traces with holes, which are worse to
+        # debug than no traces at all.
+        span_processor:
+          {:otel_batch_processor, %{resource: resource, endpoint: target, exporter_options: [num_connections: 2]}},
+        sampler: {:parent_based, %{root: {:always_on, []}}},
+        resource: resource
+      ]
 
-    :ok = :opentelemetry.start(:otel_exporter, config)
+      :ok = :opentelemetry.start(:otel_exporter, config)
+      Logger.info("telemetry started: service=#{@service_name} endpoint=#{redact_endpoint(target)}")
+    else
+      # One line, on the disabled path only, and never a per-span warning.
+      :ok = :opentelemetry.start(:otel_exporter, span_processor: :otel_simple_processor)
+      Logger.info("telemetry off (#{no_op_reason()}); spans stay in this node")
+    end
 
-    Logger.info("telemetry started: service=#{@service_name} version=#{@service_version}")
     :ok
   end
 
-  defp batch_span_processor(resource) do
-    opts = [
-      # A queue that drops rather than blocks. Under load a telemetry pipeline
-      # that backpressures the request path takes the service down with it, and
-      # losing spans is strictly better.
-      schedules: [
-        export_interval: 5_000,
-        max_queue_size: 2_048,
-        exporting_timeout: 30_000
-      ]
-    ]
+  @doc """
+  Process identity, attached once per process rather than once per span.
 
-    case System.get_env("OTEL_EXPORTER_OTLP_ENDPOINT") do
-      nil ->
-        # Nothing to export to. Registering a no-op span processor keeps every
-        # `[:telemetry]` call in the codebase valid, so no call site needs a
-        # `if telemetry_enabled?` around it.
-        :otel_simple_processor
+  It is the correct home for `tenant_id` and it is EXEMPT from OpenTelemetry's
+  2000-attribute-combination metric cap. Put a tenant on a MEASUREMENT instead
+  and the moment that stream overflows every per-tenant breakdown silently
+  undercounts while the total stays right — the worst shape a bug can have,
+  because the dashboard still renders and looks fine.
+  """
+  def resource do
+    %{
+      service: %{
+        name: @service_name,
+        version: service_version()
+      }
+    }
+    |> maybe_put(:deployment, System.get_env("DEPLOYMENT_ENVIRONMENT"))
+    |> maybe_put(:"tenant.id", System.get_env("COURIER_TENANT_ID"))
+  end
 
-      endpoint ->
-        :otel_batch_processor
-        |> then(fn processor ->
-          {:otel_exporter, processor, %{resource: resource, endpoint: endpoint}}
-        end)
-        |> :otel_span_processor()
-    end
+  # The keys are OpenTelemetry's, not ours: `deployment.environment` and
+  # `tenant_id` are the two identity attributes core's resource schema names
+  # besides service identity, and the OTel resource builder takes them dotted.
+  defp maybe_put(attributes, _key, nil), do: attributes
+  defp maybe_put(attributes, _key, ""), do: attributes
+  defp maybe_put(attributes, key, value), do: Map.put(attributes, key, value)
+
+  # An endpoint in a log line is a hostname and a port, or — for a bring-your-own
+  # backend — an API KEY in the path or the query string. Redact the query and
+  # the fragment and print the rest, so a self-hoster can confirm which backend
+  # their service is pointed at without their key landing in a log store.
+  defp redact_endpoint(target) do
+    target
+    |> String.split(["?", "#"], parts: 2)
+    |> hd()
   end
 end
 
@@ -127,6 +241,118 @@ end
 #     {Bandit, plug: CourierWeb.Endpoint, scheme: :http}
 #   ]
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Span names, error classes, and exception log records.
+#
+# All three in one module because they are one contract: the fleet's span-name
+# form, its bounded `error.type` vocabulary, and the current form of the
+# exception convention. Spread across a codebase, a service acquires three
+# spellings of each and compares none of them.
+# ---------------------------------------------------------------------------
+defmodule Courier.Observability do
+  @moduledoc """
+  The three things a span must get right, in one place.
+
+  `record_failure/4` is the one to read. Two decisions are in it and the second
+  is the one people get wrong.
+  """
+
+  @doc """
+  The fleet's span name: `<service>.<operation>[.<target>[.<qualifier>]]`.
+
+  NOT the OTel HTTP convention's `GET /v1/deliveries/{id}`. A name is the
+  grouping key in every trace UI, so an attribute in the name is an attribute
+  that cannot be filtered out, and a route with an id in it is a cardinality
+  explosion with a GET attached. core's span-naming schema caps every segment
+  at fifteen characters, which is what makes an interpolated id impossible to
+  spell even by accident — the grammar says nothing about cafaye id formats, it
+  just says no segment is longer than fifteen characters.
+  """
+  def span_name(operation, target \\ nil, qualifier \\ nil) do
+    [Courier.Telemetry.service_name(), operation, target, qualifier]
+    |> Enum.reject(&is_nil/1)
+    |> Enum.join(".")
+  end
+
+  @doc """
+  The emitting service's own name, which is the mandatory span-name prefix.
+
+  A name that does not say who produced it says what happened and not who did
+  it, so a query has to guess which of six services to attribute a span to.
+  """
+  def service_name, do: Courier.Telemetry.service_name()
+
+  @doc """
+  Mark a span ERRORED and attach the bounded error CLASS.
+
+  Two decisions:
+
+  1. The PREDICATE for "this is an error" is span status, not `error.type`. The
+     fleet dashboard partitions by `service.name`, filters on `status = error`,
+     and uses `error.type` only as a drill-down inside a service — because the
+     OpenTelemetry semantic conventions expect HIGH cardinality in `error.type`
+     when no filter is applied, and a fleet-wide breakdown grouped by it is
+     invalid however good it looks. A span whose status is unset is invisible
+     to that filter however many error attributes it carries.
+
+  2. `error.type` is the CLASS, never the message. `otel_span.record_error/3`
+     is deliberately NOT called here: the Erlang SDK records
+     `exception.message` and `exception.stacktrace`, and a message is unbounded,
+     is a cardinality bomb on the metrics side, and on an LLM gateway is a
+     prompt by another route — a provider's content-policy rejection quotes the
+     offending content back at you. core's redaction schema prohibits those
+     attributes by name, and the collector drops them even if something here
+     adds them.
+
+  A handled-and-retried error is not recorded at all. A retry that succeeded is
+  not an error, and recording it makes the error rate a lie.
+  """
+  def record_failure(span, status, error_type, description) do
+    :otel_span.set_status(span, status)
+    :otel_span.set_attribute(span, :"error.type", to_string(error_type))
+    :otel_span.set_attribute(span, :"otel.status_code", if(status == :error, do: "ERROR", else: "OK"))
+    _ = description
+    span
+  end
+
+  @doc """
+  An EXCEPTION LOG RECORD, which is the current convention.
+
+  The `exception` SPAN EVENT is Deprecated in favour of exactly this: a log
+  record with an event name ending `.exception` and a severity chosen by
+  EXPECTED IMPACT. The span-event form is a compatibility shim, and a service
+  still writing it has not migrated (PLAN.md §7b).
+
+  The class goes on the record and the detail does not: the collector drops
+  `exception.message` and `exception.stacktrace` because they are on nobody's
+  allowlist, and a stack trace is unbounded text. The class is what survives a
+  searchable, retained store; `detail` is for the caller's own application log,
+  which is not one.
+  """
+  def log_exception(error_type, detail, impact \\ :error) do
+    level = case impact do
+      :warning -> :warning
+      :fatal -> :error
+      _ -> :error
+    end
+
+    require Logger
+
+    # All `=>` string keys, not a mix of `key:` and `"key" =>`. Elixir's map and
+    # keyword syntax forbids the mix outright — `message: …, "error.type" => …`
+    # is a hard SyntaxError — and `error.type` is not a valid atom key anyway,
+    # so a keyword list is the wrong data structure for the same reason the
+    # attribute is named the way it is.
+    Logger.log(
+      level,
+      detail,
+      event: "exception",
+      error_type: to_string(error_type),
+      log_severity: to_string(level)
+    )
+  end
+end
 
 # ---------------------------------------------------------------------------
 # Reading the trace id, for a log line or a response header.

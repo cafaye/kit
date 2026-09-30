@@ -13,13 +13,20 @@
 //   - Reads an inbound `traceparent` and continues it, starting a new trace when
 //     it is absent or malformed.
 //   - Injects `traceparent` and `tracestate` on every outbound reqwest request.
-//   - Records the error status OTel backends expect, so a failed request and a
-//     successful one are distinguishable in a trace view.
+//   - Records the error status OTel backends expect, so a failed request and
+//     a successful one are distinguishable in a trace view.
 //
 // NEVER ERRORS OVER A MALFORMED HEADER. §3.2.2.3 says to ignore it, and §4.2
 // says a missing traceparent is not an error. `TraceContextExtractor::extract`
 // returns the input context unchanged for a header it cannot read, so the
 // `unwrap_or_else` below is a fallback, not an error path.
+//
+// OBSERVABILITY IS ON BY DEFAULT (PLAN.md §7b)
+//   `DARKROOM_OTEL_ENDPOINT` DEFAULTS to the collector that ships with the
+//   stack, so a developer working on this service sees real traces with nothing
+//   switched on. Unsetting the variable is a genuine no-op; pointing it at
+//   somebody else's OTLP endpoint is a supported deployment, not a degraded
+//   mode. The variable is the ONLY contract — see `endpoint()`.
 //
 // SPEC: W3C Trace Context, W3C Recommendation 23 November 2021
 //       https://www.w3.org/TR/trace-context/
@@ -31,72 +38,230 @@
 // cargo   add opentelemetry-semantic-conventions@0.27
 // cargo add opentelemetry-http@0.27
 // cargo add reqwest@0.12 --features trace
+// cargo add tracing@0.1
+// cargo add tracing-opentelemetry@0.28
+// cargo add tracing-subscriber@0.3 --features env-filter
+// cargo add opentelemetry-appender-tracing@0.27
 // ---------------------------------------------------------------------------
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use opentelemetry::global;
 use opentelemetry::propagation::TextMapPropagator;
 use opentelemetry::trace::{Span, Status, Tracer, TracerProvider};
-use opentelemetry_otlp::WithExportConfig;
+use opentelemetry_otlp::{WithExportConfig, WithExportTransform};
 use opentelemetry_sdk::propagation::TraceContextPropagator;
 use opentelemetry_sdk::trace::{self as sdktrace, Sampler, TracerProvider as _};
 use opentelemetry_sdk::Resource;
+use tracing_subscriber::layer::SubscriberExt;
+use tracing_subscriber::util::SubscriberInitExt;
+use tracing_subscriber::EnvFilter;
 
-/// NO EXPORTER BY DEFAULT, and this is the load-bearing part.
+/// The emitting service. The mandatory prefix on every span name: a name that
+/// does not say who produced it says what happened and not who did it, so a
+/// query has to guess which of six services to attribute a span to.
+pub const SERVICE_NAME: &str = "darkroom";
+
+/// The collector that ships with the local stack.
 ///
-/// `OTEL_EXPORTER_OTLP_ENDPOINT` is opt-in: `None` means the provider installs
-/// no exporter at all, and we never fall back to a vendor's default endpoint. A
-/// developer who clones this service and runs it locally must not have their
-/// spans leave their machine — the same privacy boundary
-/// `templates/compose/otel-collector.yml` enforces, applied in code because a
-/// Rust service can start without compose.
-pub fn init_tracing(service_name: &'static str, version: &'static str) -> Option<sdktrace::TracerProvider> {
-    let resource = Resource::builder()
-        .with_service_name(service_name)
-        .with_attribute(opentelemetry::KeyValue::new("service.version", version))
-        .build();
+/// A DEFAULT VALUE, not a constant, and that is the whole of "observability is
+/// on by default" (PLAN.md §7b). A developer with no configuration exports into
+/// a collector on their own machine; a self-hoster who already runs Datadog,
+/// Honeycomb or Grafana Cloud sets the variable and this address goes quiet.
+/// Bring-your-own is a supported deployment, not a degraded mode.
+const DEFAULT_ENDPOINT: &str = "http://otel-collector:4318";
 
-    let provider = sdktrace::SdkTracerProvider::builder()
-        .with_resource(resource)
-        // A sampler that respects the caller's decision rather than re-deciding
-        // per hop. `ParentBased` is the part that matters: a service that samples
-        // independently produces traces with holes, which are worse to debug
-        // than no traces at all.
-        .with_sampler(Sampler::ParentBased(Box::new(Sampler::AlwaysOn)))
-        .build();
+/// The OpenTelemetry spec's OWN kill switch, and the mechanism core's
+/// otel-endpoint schema pins the no-op to.
+///
+/// Not a cafaye reimplementation: re-implementing "disabled" in six languages
+/// is how six services acquire six different definitions of it, and the
+/// difference between them is somebody's production incident.
+const SDK_DISABLED: &str = "OTEL_SDK_DISABLED";
 
-    match std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT") {
-        Ok(endpoint) => {
-            // Batch, not simple: one export per span makes the collector the
-            // bottleneck and drops spans on a slow network.
-            let exporter = opentelemetry_otlp::SpanExporter::builder()
-                .with_tonic()
-                .with_endpoint(endpoint)
-                .build()
-                .expect("OTLP exporter config");
-            let provider = provider.with_batch_exporter(exporter);
-            let _ = provider.force_flush();
-            global::set_tracer_provider(provider.clone());
-            Some(provider)
-        }
-        Err(_) => {
-            // No exporter. Spans are still created and still propagate; they
-            // just go nowhere, which is exactly what a developer on a laptop
-            // wants and exactly what production must not have.
-            global::set_tracer_provider(provider.clone());
-            Some(provider)
+/// The finer-grained half. ALL THREE are checked, not just traces: a no-op that
+/// only covers traces is a service that still phones home for metrics, which is
+/// the failure discovered by a customer's invoice rather than by a test.
+const PER_SIGNAL: [&str; 3] = [
+    "OTEL_TRACES_EXPORTER",
+    "OTEL_METRICS_EXPORTER",
+    "OTEL_LOGS_EXPORTER",
+];
+
+/// The OTLP endpoint, and the WHOLE of the contract (core D16).
+///
+/// `DARKROOM_OTEL_ENDPOINT` wins, then the standard
+/// `OTEL_EXPORTER_OTLP_ENDPOINT` so the binary also works with generic OTel
+/// tooling, then the shipped collector. The precedence is written down rather
+/// than discovered later: a contract with an undocumented precedence order is a
+/// bug report.
+pub fn endpoint() -> String {
+    std::env::var("DARKROOM_OTEL_ENDPOINT")
+        .ok()
+        .filter(|value| !value.is_empty())
+        .or_else(|| {
+            std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT")
+                .ok()
+                .filter(|value| !value.is_empty())
+        })
+        .unwrap_or_else(|| DEFAULT_ENDPOINT.to_owned())
+}
+
+/// Whether there is anywhere to export to, for any signal.
+pub fn enabled() -> bool {
+    !disabled_by_sdk() && !PER_SIGNAL.iter().any(|name| exporter_off(name))
+}
+
+/// One line for the startup log, and only ever on the DISABLED path.
+///
+/// Silence is the contract there: a warning per export attempt fills the
+/// service's own log store with the fact that telemetry is off, which is how a
+/// self-hoster discovers that turning it off is not supported — the opposite of
+/// the intent. One line at startup is not spam, and it is the difference
+/// between "telemetry is off" and "telemetry is broken", which look identical
+/// from outside.
+pub fn no_op_reason() -> &'static str {
+    if disabled_by_sdk() {
+        "OTEL_SDK_DISABLED=true"
+    } else {
+        ""
+    }
+}
+
+fn disabled_by_sdk() -> bool {
+    std::env::var(SDK_DISABLED)
+        .map(|value| value.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
+fn exporter_off(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| value.eq_ignore_ascii_case("none"))
+        .unwrap_or(false)
+}
+
+/// Process identity, attached once per process rather than once per span.
+///
+/// It is the correct home for `tenant_id` and it is EXEMPT from
+/// OpenTelemetry's 2000-attribute-combination metric cap. Put a tenant on a
+/// MEASUREMENT instead and the moment that stream overflows every per-tenant
+/// breakdown silently undercounts while the total stays right — the worst shape
+/// a bug can have, because the dashboard still renders and nobody reports an
+/// error anywhere.
+pub fn resource(version: &'static str) -> Resource {
+    let mut builder = Resource::builder()
+        .with_service_name(SERVICE_NAME)
+        .with_attribute(opentelemetry::KeyValue::new("service.version", version));
+
+    if let Ok(environment) = std::env::var("DEPLOYMENT_ENVIRONMENT") {
+        builder = builder.with_attribute(opentelemetry::KeyValue::new(
+            "deployment.environment",
+            environment,
+        ));
+    }
+    if let Ok(tenant) = std::env::var("DARKROOM_TENANT_ID") {
+        builder = builder.with_attribute(opentelemetry::KeyValue::new("tenant_id", tenant));
+    }
+    builder.build()
+}
+
+/// What `init` returns. `None` means telemetry is off, and it is NOT an error
+/// and NOT a degraded mode.
+pub struct Telemetry {
+    /// `None` when telemetry is off. Holding no provider is what makes the
+    /// no-op free: there is no batch processor, no queue, no exporter and
+    /// therefore no timer, no allocation per span and no dial at boot.
+    tracer_provider: Option<sdktrace::SdkTracerProvider>,
+}
+
+impl Telemetry {
+    /// Flush before the process exits, or the last batch is lost — which is
+    /// usually the batch containing the error you were restarting to look at.
+    ///
+    /// Bounded on purpose. A telemetry flush must not hold up a shutdown: a
+    /// service that takes thirty seconds to stop because a collector is
+    /// unreachable is a deploy that times out for a reason nobody can see.
+    pub fn shutdown(&mut self) {
+        if let Some(provider) = self.tracer_provider.take() {
+            let _ = provider.shutdown();
         }
     }
 }
 
-/// Install the W3C propagator globally.
+/// Install the propagator, the tracer provider and the logging bridge.
 ///
-/// Named explicitly. The default global propagator IS W3C today, but any
-/// library that calls `set_global_textmap` can replace it, and a service that
-/// depends on a default it never wrote down breaks silently when one does.
-pub fn init_propagation() {
+/// THE DISABLED PATH IS FREE, and that is asserted rather than promised: when
+/// telemetry is off this function builds no exporter, no batch processor and
+/// no queue. Not an exporter pointed at nothing and left to retry.
+///
+/// A queue that accepts spans and holds them is a memory leak with a
+/// telemetry-shaped trigger — a request that succeeds with unbounded retained
+/// spans in the heap. A retry loop against an endpoint that is not there is a
+/// task waking on a timer for the life of the process, invisible in every
+/// dashboard because nothing is being recorded. A "disabled" path that still
+/// dials out is worse than no telemetry support at all (PLAN.md §7b), so the
+/// no-op is the ABSENCE of the machinery rather than the machinery aimed at
+/// nothing.
+pub fn init(version: &'static str) -> Result<Telemetry, Box<dyn std::error::Error>> {
+    // W3CTraceContext named explicitly rather than left to the default. The
+    // default IS W3C today, but any library that calls `set_text_map_propagator`
+    // can replace it, and a service that depends on a default it never wrote
+    // down breaks silently when one of them does.
     global::set_text_map_propagator(TraceContextPropagator::new());
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    if !enabled() {
+        // tracing's own console layer and NOTHING else. The OpenTelemetry
+        // appender is not installed, so there is no exporter and no queue
+        // behind it.
+        tracing_subscriber::registry().with(filter).init();
+        return Ok(Telemetry {
+            tracer_provider: None,
+        });
+    }
+
+    let target = endpoint();
+
+    let exporter = opentelemetry_otlp::SpanExporter::builder()
+        .with_tonic()
+        .with_endpoint(&target)
+        // Bounded, because a slow export is a latency bug caused by an
+        // observability tool, which is the worst possible source of one.
+        .with_timeout(Duration::from_secs(5))
+        .build()?;
+
+    let provider = sdktrace::SdkTracerProvider::builder()
+        .with_resource(resource(version))
+        // A sampler that respects the CALLER's decision rather than re-deciding
+        // per hop. `ParentBased` is the part that matters: a service that
+        // samples independently produces traces with holes, which are worse to
+        // debug than no traces at all.
+        .with_sampler(Sampler::ParentBased(Box::new(Sampler::AlwaysOn)))
+        // Batch, not simple: one export per span makes the collector the
+        // bottleneck and drops spans on a slow network.
+        .with_batch_exporter(exporter)
+        .build();
+
+    global::set_tracer_provider(provider.clone());
+
+    // `tracing` -> the logs pipeline. The `exception` SPAN EVENT is Deprecated
+    // in favour of an exception LOG RECORD, and this appender is how a
+    // `tracing::error!` becomes one: severity by EXPECTED IMPACT, the event
+    // name on the record, and the class as an attribute.
+    use tracing_subscriber::layer::SubscriberExt as _;
+    let logs = tracing_opentelemetry::layer()
+        .with_tracer(tracing_opentelemetry::OpenTelemetryTracingBridge::new());
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(tracing_subscriber::fmt::layer())
+        .with(logs)
+        .init();
+
+    Ok(Telemetry {
+        tracer_provider: Some(provider),
+    })
 }
 
 /// A `reqwest` client that injects the current trace into every request.
@@ -104,11 +269,23 @@ pub fn init_propagation() {
 /// Use this instead of a bare `reqwest::Client` for service-to-service calls. A
 /// bare client breaks the trace at that hop, silently and permanently, with no
 /// error anywhere to grep for.
-pub fn traced_client() -> reqwest::Client {
+pub fn traced_client() -> Result<reqwest::Client, reqwest::Error> {
     reqwest::Client::builder()
         .trace(true) // reqwest's `trace` feature wires the propagator in
         .build()
-        .expect("reqwest client")
+}
+
+/// The fleet's span name: `<service>.<operation>[.<target>]`.
+///
+/// NOT the OTel HTTP convention's `GET /v1/objects/{id}`. A name is the
+/// grouping key in every trace UI, so an attribute in the name is an attribute
+/// that cannot be filtered out, and a route with an id in it is a cardinality
+/// explosion with a GET attached. core's span-naming schema caps every segment
+/// at fifteen characters, which is what makes an interpolated id impossible to
+/// spell even by accident — the grammar says nothing about cafaye id formats,
+/// it just says no segment is longer than fifteen characters.
+pub fn span_name(operation: &str) -> String {
+    format!("{SERVICE_NAME}.{operation}")
 }
 
 /// Continue the caller's trace for an inbound request, or start a new one.
@@ -118,38 +295,81 @@ pub fn traced_client() -> reqwest::Client {
 /// response, which is why this function has no error return.
 pub fn start_server_span(
     tracer: &dyn Tracer,
-    name: &'static str,
+    operation: &str,
     headers: &HashMap<String, String>,
 ) -> opentelemetry::Context {
-    // The carrier is the header map the framework already built; extracting from
-    // it is the whole integration. Nothing is fetched and nothing is parsed here
-    // — that is the propagator's job, which is why this function cannot fail.
-    let parent_cx = global::get_text_map_propagator(|prop| {
-        prop.extract(&HashMapCarrier(headers.clone()))
-    });
+    // The carrier is the header map the framework already built; extracting
+    // from it is the whole integration. Nothing is fetched and nothing is parsed
+    // here — that is the propagator's job, which is why this function cannot
+    // fail.
+    let parent_cx =
+        global::get_text_map_propagator(|prop| prop.extract(&HashMapCarrier(headers.clone())));
 
     // A parent-based start is what makes this a continuation rather than a new
     // trace: with no valid parent the SDK starts a root span, which is correct.
+    let name = span_name(operation);
     tracer.start_with_context(name, parent_cx)
 }
 
-/// Record an error on a span.
+/// Mark a span ERRORED and attach the bounded error CLASS.
 ///
-/// OTel's error status is a convention every backend understands. Without it a
-/// failed request and a successful one look identical in a trace view.
-pub fn record_error(span: &mut dyn Span, err: &anyhow::Error) {
-    span.record_error(err.to_string());
-    span.set_status(Status::error(err.to_string()));
+/// Two decisions, and the second is the point:
+///
+/// 1. `Status::error` is what makes the span an error AT ALL. The predicate for
+///    "this is an error" is span status, not `error.type` — the fleet dashboard
+///    partitions by `service.name`, filters on `status = error`, and uses
+///    `error.type` only as a drill-down inside a service, because the
+///    OpenTelemetry semantic conventions expect HIGH cardinality in `error.type`
+///    when no filter is applied. A span whose status is unset is invisible to
+///    that filter however many error attributes it carries.
+///
+/// 2. `error.type` is the CLASS, never the message. `span.record_error` is
+///    deliberately NOT called: the Rust SDK records `exception.message` and
+///    `exception.stacktrace`, and a message is unbounded, is a cardinality bomb
+///    on the metrics side, and on an LLM gateway is a prompt by another route —
+///    a provider's content-policy rejection quotes the offending content back
+///    at you. core's redaction schema prohibits those attributes by name, and
+///    the collector drops them even if something here adds them.
+///
+/// `description` is a short STATIC string for a human. `span.set_status` does
+/// not read it as a label, so this is safe, but it still ends up in a
+/// searchable store — keep it a category ("storage unavailable"), never an
+/// error message.
+///
+/// A handled-and-retried error is not recorded at all. A retry that succeeded
+/// is not an error, and recording it makes the error rate a lie.
+pub fn record_failure(span: &mut dyn Span, error_type: &str, description: &str) {
+    span.set_status(Status::error(description.to_owned()));
+    span.set_attribute(opentelemetry::KeyValue::new("error.type", error_type.to_owned()));
 }
 
-/// Flush before the process exits, or the last spans are lost.
+/// An EXCEPTION LOG RECORD, which is the current convention.
 ///
-/// Dropping a provider does flush in recent versions, but an explicit shutdown
-/// in `main` is unambiguous and costs one line.
-pub fn shutdown(provider: Option<sdktrace::TracerProvider>) {
-    if let Some(provider) = provider {
-        let _ = provider.shutdown();
+/// The `exception` SPAN EVENT is Deprecated in favour of exactly this: a log
+/// record with an event name ending `.exception` and a severity chosen by
+/// EXPECTED IMPACT. The span-event form is a compatibility shim, and a service
+/// still writing it has not migrated (PLAN.md §7b).
+///
+/// `class` goes on the record and `detail` does not: the collector drops
+/// `exception.message` and `exception.stacktrace` because they are on nobody's
+/// allowlist, and a stack trace is unbounded text. The class is what survives a
+/// searchable, retained store; `detail` is for the caller's own application log.
+pub fn log_exception(class: &str, detail: &str, impact: Impact) {
+    match impact {
+        Impact::Warning => tracing::warn!(error.type = class, event = "exception", "{detail}"),
+        Impact::Error => tracing::error!(error.type = class, event = "exception", "{detail}"),
+        Impact::Fatal => tracing::error!(error.type = class, event = "exception", "{detail}"),
     }
+}
+
+/// Severity by EXPECTED IMPACT, not by what the code found convenient: a
+/// single failed request for one caller is a warning, a request the service
+/// cannot serve is an error, and something that corrupts state or ends the
+/// process is fatal.
+pub enum Impact {
+    Warning,
+    Error,
+    Fatal,
 }
 
 /// A `HashMap` as an OTel `Extractor` / `Injector`.

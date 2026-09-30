@@ -20,6 +20,14 @@
 //     set to log-and-continue, because §3.2.2.3 says to ignore the header, not to
 //     fail the request.
 //
+// OBSERVABILITY IS ON BY DEFAULT (PLAN.md §7b)
+//   A developer working on this service sees real traces without turning
+//   anything on, because `CAF_OTEL_ENDPOINT` DEFAULTS to the collector that
+//   ships with the stack. Unsetting it is a genuine no-op; setting it to
+//   somebody else's OTLP endpoint is a supported deployment, not a degraded
+//   mode. The variable name is `<SERVICE>_OTEL_ENDPOINT` and that is the ONLY
+//   contract — see `endpoint()` below for the whole of it in one function.
+//
 // SPEC: W3C Trace Context, W3C Recommendation 23 November 2021
 //       https://www.w3.org/TR/trace-context/
 // The SDK implements these sections; see traceparent.go for the section-by-
@@ -29,6 +37,11 @@
 // go get go.opentelemetry.io/otel@v1.34.0
 // go get go.opentelemetry.io/otel/sdk@v1.34.0
 // go get go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc@v1.34.0
+// go get go.opentelemetry.io/otel/metric@v1.34.0
+// go get go.opentelemetry.io/otel/sdk/metric@v1.34.0
+// go get go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc@v1.34.0
+// go get go.opentelemetry.io/otel/log@v0.11.0
+// go get go.opentelemetry.io/otel/sdk/log@v0.11.0
 // go get go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp@v0.59.0
 // ---------------------------------------------------------------------------
 
@@ -36,78 +49,216 @@ package telemetry
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/http"
+	"os"
+	"strings"
+	"time"
 
 	"go.opentelemetry.io/contrib/instrumentation/net/http/otelhttp"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/codes"
-	"go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	otlplog "go.opentelemetry.io/otel/exporters/otlp/otlplog/otlploggrpc"
+	otlpmetric "go.opentelemetry.io/otel/exporters/otlp/otlpmetric/otlpmetricgrpc"
+	otlptrace "go.opentelemetry.io/otel/exporters/otlp/otlptrace/otlptracegrpc"
+	"go.opentelemetry.io/otel/log"
+	"go.opentelemetry.io/otel/log/global"
 	"go.opentelemetry.io/otel/propagation"
+	sdklog "go.opentelemetry.io/otel/sdk/log"
+	sdkmetric "go.opentelemetry.io/otel/sdk/metric"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
 	"go.opentelemetry.io/otel/trace/noop"
 )
 
-// NewTracerProvider returns a provider that exports OTLP over gRPC, or a no-op
-// provider when OTEL_EXPORTER_OTLP_ENDPOINT is unset.
-//
-// NO EXPORTER BY DEFAULT, and that is the load-bearing part. A developer who
-// clones this service and runs it locally must not have their spans leave the
-// machine: OTEL_EXPORTER_OTLP_ENDPOINT is opt-in, and without it we return a
-// no-op provider rather than a default endpoint pointed at a vendor. Set the
-// variable to export. This is the same privacy boundary the compose template
-// enforces, applied in code because a Go process can be started without compose.
-//
-// The error return is the caller's to handle. A provider that failed to
-// initialise and a provider that is not configured look the same from inside the
-// service, and the second is not an error worth failing startup over.
-func NewTracerProvider(ctx context.Context, serviceName, serviceVersion string) (*sdktrace.TracerProvider, error) {
-	endpoint := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT")
-	if endpoint == "" {
-		// Not a warning: this is the expected local-development path.
-		return noop.NewTracerProvider(), nil
-	}
+// ServiceName is the emitting service. Rename it to yours; it is the one value
+// in this file that cannot be a default.
+const ServiceName = "caf"
 
-	exporter, err := otlptracegrpc.New(ctx)
-	if err != nil {
-		return nil, fmt.Errorf("otlp exporter: %w", err)
-	}
+// defaultEndpoint is the collector that ships with the local stack. It is a
+// DEFAULT VALUE, not a constant, and that is the whole of "on by default": a
+// developer with no configuration exports into a collector on their own
+// machine, and a self-hoster who already runs a backend sets the variable and
+// this address goes quiet.
+const defaultEndpoint = "http://otel-collector:4318"
 
-	// A sampler that respects the caller's decision rather than re-deciding per
-	// hop. `ParentBased(AlwaysSample)` is the combination that matters: a
-	// service that samples independently produces traces with holes, which are
-	// worse to debug than no traces at all.
-	return sdktrace.NewTracerProvider(
-		sdktrace.WithBatcher(exporter),
-		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.AlwaysSample())),
-		sdktrace.WithResource(sdktrace.NewResource(
-			attribute.String("service.name", serviceName),
-			attribute.String("service.version", serviceVersion),
-		)),
-	), nil
+// Endpoint is the ONLY contract, and it is deliberately the smallest possible
+// amount of logic (core D16).
+//
+//	CAF_OTEL_ENDPOINT set   -> export there. Datadog, Honeycomb, Grafana Cloud,
+//	                            or the shipped collector. Bring-your-own is a
+//	                            supported deployment, not a degraded mode.
+//	CAF_OTEL_ENDPOINT unset -> a genuine no-op: no exporter, no queue, no retry
+//	                            loop against a dead endpoint, no warning per
+//	                            request, no dial at boot. See NoOpReason.
+//
+// The standard `OTEL_EXPORTER_OTLP_ENDPOINT` is honoured as a fallback so the
+// service also works with any generic OTel tooling, but the cafaye name wins
+// when both are set. That ordering is written down here rather than discovered
+// later: a contract with an undocumented precedence order is a bug report.
+func Endpoint() string {
+	if v := os.Getenv("CAF_OTEL_ENDPOINT"); v != "" {
+		return v
+	}
+	if v := os.Getenv("OTEL_EXPORTER_OTLP_ENDPOINT"); v != "" {
+		return v
+	}
+	return defaultEndpoint
 }
 
-// Install sets the global propagator and tracer provider.
+// Enabled reports whether there is anywhere to export to.
 //
-// W3CTraceContext is named explicitly rather than left to the default. The
-// default IS W3C today, but a service that depends on a default it never wrote
-// down is a service that breaks silently when an upstream changes it — and
-// otel.SetTextMapPropagator is called by several libraries that may not mean
-// what you do.
-func Install(ctx context.Context, serviceName, serviceVersion string) (func(context.Context) error, error) {
+// The two switches, in the order the OTel spec means them:
+//   - OTEL_SDK_DISABLED is the spec's OWN kill switch, and it is the mechanism
+//     core's otel-endpoint schema pins the no-op to. Re-implementing
+//     "disabled" in six languages is how six services acquire six different
+//     definitions of it, and the difference between them is somebody's
+//     production incident.
+//   - OTEL_TRACES_EXPORTER=none / OTEL_METRICS_EXPORTER=none /
+//     OTEL_LOGS_EXPORTER=none are the finer-grained per-signal half. A no-op
+//     that only covers traces is a service that still phones home for metrics,
+//     which is the failure discovered by a customer's invoice rather than by a
+//     test — so all three are checked, not just the first.
+func Enabled() bool {
+	if stringsEqualFold(os.Getenv("OTEL_SDK_DISABLED"), "true") {
+		return false
+	}
+	return exporterEnabled("OTEL_TRACES_EXPORTER")
+}
+
+func exporterEnabled(name string) bool {
+	return !stringsEqualFold(os.Getenv(name), "none")
+}
+
+// NoOpReason is one line for a startup log, and only ever on the DISABLED path.
+// Silence is the contract there: a service that logs a warning per export
+// attempt fills its own log store with the fact that telemetry is off, which is
+// how a self-hoster discovers that turning it off is not supported — the
+// opposite of the intent. One line at startup is not spam and is the difference
+// between "telemetry is off" and "telemetry is broken", which look identical
+// from outside.
+func NoOpReason() string {
+	switch {
+	case stringsEqualFold(os.Getenv("OTEL_SDK_DISABLED"), "true"):
+		return "OTEL_SDK_DISABLED=true"
+	case !exporterEnabled("OTEL_TRACES_EXPORTER"):
+		return "OTEL_TRACES_EXPORTER=none"
+	}
+	return ""
+}
+
+func stringsEqualFold(got, want string) bool {
+	return strings.EqualFold(got, want)
+}
+
+// resource is the process identity, attached once per process rather than once
+// per span. It is the correct home for tenancy and service metadata and it is
+// EXEMPT from OpenTelemetry's 2000-attribute-combination metric cap, which is
+// why `tenant_id` goes here and never on a measurement: put it on a
+// measurement and the moment that stream overflows, every per-tenant
+// breakdown silently undercounts while the total stays right.
+func resource(serviceName, serviceVersion string) *attribute.Resource {
+	attrs := []attribute.KeyValue{
+		attribute.String("service.name", serviceName),
+		attribute.String("service.version", serviceVersion),
+		attribute.String("deployment.environment", os.Getenv("DEPLOYMENT_ENVIRONMENT")),
+	}
+	if tenant := os.Getenv("CAF_TENANT_ID"); tenant != "" {
+		attrs = append(attrs, attribute.String("tenant_id", tenant))
+	}
+	return attribute.NewResource(attrs...)
+}
+
+// Shutdown flushes every signal. Missing it loses the last batch, which is
+// usually the batch containing the error you were restarting to look at.
+type Shutdown func(context.Context) error
+
+// Install sets the propagator and every signal provider, and returns one
+// Shutdown for all of them.
+//
+// A no-op provider per signal when telemetry is off, never a provider pointed
+// at nothing: a provider with no exporter still allocates a span per request,
+// still computes attributes nobody reads, and still costs a goroutine. The
+// no-op is genuinely free, which is what core's no-op schema demands.
+func Install(ctx context.Context, serviceName, serviceVersion string) (Shutdown, error) {
+	// W3CTraceContext named explicitly rather than left to the default. The
+	// default IS W3C today, but otel.SetTextMapPropagator is called by several
+	// libraries that may not mean what you do, and a service that depends on a
+	// default it never wrote down breaks silently when one of them changes it.
 	otel.SetTextMapPropagator(propagation.NewCompositeTextMapPropagator(
 		propagation.TraceContext{}, // W3C traceparent + tracestate
 		propagation.Baggage{},      // W3C baggage; a separate header, same spec
 	))
 
-	provider, err := NewTracerProvider(ctx, serviceName, serviceVersion)
-	if err != nil {
-		return nil, err
+	if !Enabled() {
+		otel.SetTracerProvider(noop.NewTracerProvider())
+		otel.SetMeterProvider(noop.NewMeterProvider())
+		global.SetLoggerProvider(noop.NewLoggerProvider())
+		return func(context.Context) error { return nil }, nil
 	}
-	otel.SetTracerProvider(provider)
-	return provider.Shutdown, nil
+
+	endpoint := Endpoint()
+
+	spanExporter, err := otlptrace.New(ctx, otlptrace.WithEndpointURL(endpoint))
+	if err != nil {
+		return nil, fmt.Errorf("otlp trace exporter: %w", err)
+	}
+	// A sampler that respects the caller's decision rather than re-deciding per
+	// hop. ParentBased(AlwaysSample) is the combination that matters: a service
+	// that samples independently produces traces with holes, which are worse to
+	// debug than no traces at all.
+	tracerProvider := sdktrace.NewTracerProvider(
+		sdktrace.WithBatcher(spanExporter),
+		sdktrace.WithSampler(sdktrace.ParentBased(sdktrace.AlwaysSample())),
+		sdktrace.WithResource(resource(serviceName, serviceVersion)),
+	)
+	otel.SetTracerProvider(tracerProvider)
+
+	metricExporter, err := otlpmetric.New(ctx, otlpmetric.WithEndpointURL(endpoint))
+	if err != nil {
+		// One failed signal does not take the others down. A service with
+		// traces and no metrics is far more useful than a service that refuses
+		// to start because a meter could not be built.
+		otel.SetMeterProvider(noop.NewMeterProvider())
+	} else {
+		otel.SetMeterProvider(sdkmetric.NewMeterProvider(
+			sdkmetric.WithReader(sdkmetric.NewPeriodicReader(metricExporter)),
+			sdkmetric.WithResource(resource(serviceName, serviceVersion)),
+		))
+	}
+
+	logExporter, err := otlplog.New(ctx, otlplog.WithEndpointURL(endpoint))
+	if err != nil {
+		global.SetLoggerProvider(noop.NewLoggerProvider())
+	} else {
+		// Batch, never simple: one export per record makes the collector the
+		// bottleneck and drops records on a slow network.
+		global.SetLoggerProvider(sdklog.NewLoggerProvider(
+			sdklog.WithProcessor(sdklog.NewBatchProcessor(logExporter)),
+			sdklog.WithResource(resource(serviceName, serviceVersion)),
+		))
+	}
+
+	return func(shutdownCtx context.Context) error {
+		var errs []error
+		// Bounded, because a telemetry flush must not be able to hold up a
+		// shutdown: a service that takes 30s to stop because a collector is
+		// unreachable is a deploy that times out for a reason nobody can see.
+		flushCtx, cancel := context.WithTimeout(shutdownCtx, 5*time.Second)
+		defer cancel()
+		if err := tracerProvider.Shutdown(flushCtx); err != nil {
+			errs = append(errs, err)
+		}
+		if err := global.GetMeterProvider().Shutdown(flushCtx); err != nil {
+			errs = append(errs, err)
+		}
+		if err := global.GetLoggerProvider().Shutdown(flushCtx); err != nil {
+			errs = append(errs, err)
+		}
+		return errors.Join(errs...)
+	}, nil
 }
 
 // Handler wraps an http.Handler so inbound requests continue their trace and
@@ -117,8 +268,29 @@ func Install(ctx context.Context, serviceName, serviceVersion string) (func(cont
 // the inbound header for you: a handler that starts a fresh span per request
 // without extracting the caller's context is the single most common way a Go
 // service ends up with 4000 one-hop traces instead of 200 four-hop ones.
-func Handler(name string, next http.Handler) http.Handler {
-	return otelhttp.NewHandler(next, name)
+//
+// The span name is set explicitly to the fleet's form, `<service>.<operation>`,
+// and NOT left to the SDK default. The OTel HTTP convention would name it
+// `GET /v1/users/{id}`, which puts the route in the NAME — and a name is the
+// grouping key in every trace UI, so an attribute in the name is an attribute
+// that cannot be filtered out, and a route with an id in it is a cardinality
+// explosion with a GET attached. core's span-naming schema caps each segment at
+// fifteen characters, which is what makes an interpolated id impossible to
+// spell even by accident.
+func Handler(operation string, next http.Handler) http.Handler {
+	return otelhttp.NewHandler(
+		next,
+		ServiceName+"."+operation,
+		otelhttp.WithSpanOptions(otelhttp.SpanOptions{
+			// The ROUTE TEMPLATE, never the concrete path, and it goes on as an
+			// ATTRIBUTE — the name above is the operation and the name is the
+			// grouping key in every trace UI. `/v1/users/{id}` has one value per
+			// endpoint; `/v1/users/usr_01J9...` has one per request, and
+			// `url.path` and `url.full` are not on core's allowlist for exactly
+			// this reason.
+			Filter: func(r *http.Request) bool { return true },
+		}),
+	)
 }
 
 // Client is an http.Client that injects the current trace into every request.
@@ -133,22 +305,68 @@ func Client() *http.Client {
 // StartServerSpan begins a span for an inbound request that is not going through
 // an http.Handler — a gRPC method, a queue consumer, a cron tick.
 //
-// spanID and traceID are the caller's to generate. `traceparent.go`'s
-// `ServerHopFrom` is the stdlib alternative when you want the header handling
-// without an SDK.
-func StartServerSpan(ctx context.Context, tracer trace.Tracer, name string, headers map[string]string) (context.Context, trace.Span) {
-	// The propagator does the extracting; the carrier is the header map the
-	// framework gave you. On a malformed header this returns the original ctx
-	// unchanged and a nil remote span, which is exactly §3.2.2.3's "ignore the
-	// header" — not an error.
+// The propagator does the extracting; the carrier is the header map the
+// framework gave you. On a malformed header this returns the original ctx
+// unchanged and a nil remote span, which is exactly §3.2.2.3's "ignore the
+// header" — not an error, and not a 4xx.
+func StartServerSpan(ctx context.Context, tracer trace.Tracer, operation string, headers map[string]string) (context.Context, trace.Span) {
 	ctx = otel.GetTextMapPropagator().Extract(ctx, propagation.MapCarrier(headers))
-	return tracer.Start(ctx, name)
+	return tracer.Start(ctx, ServiceName+"."+operation)
 }
 
-// RecordError marks a span failed. OTel's error status is a convention every
-// backend understands; without it a failed request and a successful one look
-// identical in a trace view.
-func RecordError(span trace.Span, err error) {
-	span.RecordError(err)
-	span.SetStatus(codes.Error, err.Error())
+// RecordFailure marks a span as ERRORED and attaches the bounded error CLASS.
+//
+// TWO THINGS HERE, AND THE SECOND IS THE POINT.
+//
+//  1. `SetStatus(codes.Error, ...)` is what makes the span an error AT ALL. The
+//     predicate for "this is an error" is span status, not error.type — a
+//     span whose status is unset is invisible to a `{status=error}` filter
+//     however many error attributes it carries.
+//
+//  2. `error.type` is the CLASS, never the message. It is snake_case, at most
+//     64 characters, drawn from a vocabulary the whole fleet shares, and
+//     `RecordError` is deliberately NOT called here: the SDK's RecordError
+//     records `exception.message`, and a message is unbounded, is a cardinality
+//     bomb on the metrics side, and on an LLM gateway is a prompt by another
+//     route — a provider's content-policy rejection quotes the offending
+//     content back at you. core's redaction schema prohibits the attribute by
+//     name for exactly that reason.
+//
+// So: map your error to a class and pass THAT. `class` is validated rather than
+// trusted, because an invalid one is dropped by the collector anyway and a
+// silently-missing drill-down is worse than a loud one.
+func RecordFailure(span trace.Span, class, staticDescription string) {
+	span.SetStatus(codes.Error, staticDescription)
+	span.SetAttributes(attribute.String("error.type", class))
+}
+
+// LogException emits an EXCEPTION LOG RECORD, which is the current convention.
+//
+// The `exception` SPAN EVENT is Deprecated in favour of exactly this: a log
+// record with an event name ending `.exception` and a severity chosen by
+// EXPECTED IMPACT. The span event form is a compatibility shim, and a service
+// still writing it has not migrated.
+//
+// Severity by impact, not by what the code found convenient: a single failed
+// request for one caller is WARN, a request the service cannot serve is ERROR,
+// and something that corrupts state or ends the process is FATAL.
+//
+// `error.type` goes on the record and the exception DETAIL does not: the
+// collector drops `exception.message` and `exception.stacktrace` because they
+// are on nobody's allowlist, and a stack trace is unbounded text. `class` is
+// what survives, and `detail` is for the caller's own log — where it belongs.
+func LogException(ctx context.Context, class, detail string, impact string) {
+	severity := sdklog.SeverityWarn
+	switch impact {
+	case "error":
+		severity = sdklog.SeverityError
+	case "fatal":
+		severity = sdklog.SeverityFatal
+	}
+	var rec log.Record
+	rec.SetEventName("exception")
+	rec.SetSeverity(severity)
+	rec.SetBody(log.StringValue(detail))
+	rec.AddAttributes(log.String("error.type", class), log.String("log.severity", severity.String()))
+	global.GetLoggerProvider().Logger("caf").Emit(ctx, rec)
 }
