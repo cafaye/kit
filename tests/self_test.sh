@@ -42,8 +42,19 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 
-PY="${KIT_PYTHON:-$ROOT/.venv/bin/python}"
-[ -x "$PY" ] || PY=python3
+# Standalone runs bootstrap too, and `validate.sh` exports KIT_PYTHON so the
+# nested copies use the same interpreter. Self-bootstrapping here is not
+# redundancy: `bash tests/self_test.sh` is a documented command, and a
+# documented command that only works after a different documented command has
+# been run is two commands wearing one name.
+if [ ! -r "$ROOT/tests/bootstrap.sh" ]; then
+  echo "self_test.sh: tests/bootstrap.sh is missing — cannot resolve a python" >&2
+  exit 1
+fi
+# shellcheck source=tests/bootstrap.sh
+. "$ROOT/tests/bootstrap.sh"
+kit_bootstrap_python "$ROOT"
+export KIT_PYTHON="$PY"
 
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/kit-self-test.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT

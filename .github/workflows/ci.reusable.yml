@@ -146,7 +146,9 @@ jobs:
         run: |
           set -euo pipefail
           if [ ! -f tests/validate.sh ]; then
-            echo "::error::language 'none' runs this repository's own gate, and tests/validate.sh does not exist. Either ship the gate, or pass a real language." >&2
+            echo "::error::language 'none' runs this repository's own gate, and"
+            echo "::error::tests/validate.sh does not exist. Either ship the gate,"
+            echo "::error::or pass a real language."
             exit 1
           fi
           bash tests/validate.sh

@@ -49,13 +49,9 @@ WORKFLOW='.github/workflows/ci.reusable.yml'
 # for it, so the four-artifacts rule deliberately does not apply.
 CONFIG_ONLY='none'
 
-PY="${KIT_PYTHON:-$ROOT/.venv/bin/python}"
-[ -x "$PY" ] || PY=python3
-"$PY" -c 'import yaml' 2>/dev/null || {
-  echo "no python with PyYAML: pip install -r tests/requirements.txt" >&2
-  exit 1
-}
-
+# Arguments are parsed BEFORE anything is installed, so `--help` answers on a
+# machine with no python and no network. A `--help` that bootstraps a virtualenv
+# is a help message with a side effect.
 RUN_STATIC=1
 RUN_TELEMETRY=1
 RUN_SELF_TEST=1
@@ -82,6 +78,31 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+# The gate installs its own dependencies. Not `shellcheck` and not `node` —
+# those stay optional and reported as SKIPs when absent — but PyYAML, without
+# which not one check in this file can run, and yamllint, which kit's own
+# configs are linted with.
+#
+# This is the second time this has been a problem. It was a two-line manual
+# step in AGENTS.md that every fresh clone and every CI runner missed, and the
+# gate exited 1 with `no python with PyYAML` before checking anything. A
+# prerequisite that is documented and not automated is a prerequisite that will
+# be skipped by exactly the machine you most wanted to hear from.
+#
+# The resolved interpreter is exported so `tests/self_test.sh`, and every
+# throwaway copy of the gate it spawns, uses the same one instead of each
+# re-deriving it. That is not only speed: sixteen copies bootstrapping sixteen
+# virtualenvs is sixteen chances to fail for a reason that has nothing to do
+# with the breakage under test.
+if [ ! -r "$ROOT/tests/bootstrap.sh" ]; then
+  echo "validate.sh: tests/bootstrap.sh is missing — the gate cannot install its own dependencies" >&2
+  exit 1
+fi
+# shellcheck source=tests/bootstrap.sh
+. "$ROOT/tests/bootstrap.sh"
+kit_bootstrap_python "$ROOT"
+export KIT_PYTHON="$PY"
 
 # ---------------------------------------------------------------------------
 # static helpers
@@ -725,18 +746,46 @@ PY
   }
   check 'templates/compose/.env.example  (every placeholder documented)' env_example_check
 
-  # Dogfood lint/yamllint.yml on the two YAML templates kit writes. Optional:
-  # yamllint ships in tests/requirements.txt, and a machine without it gets a
-  # reported SKIP rather than a silent pass.
+  # Dogfood lint/yamllint.yml on every YAML in the tree, not just the two
+  # compose templates. kit ships the config and a repo that copies it lints its
+  # own CI against it on day one, so a YAML that breaks the config is a YAML
+  # that greets the first adopting repo with a failure nobody authored.
+  #
+  # Required, not optional: it is in tests/requirements.txt and the bootstrap
+  # above has already installed it, so a machine that reaches this line has
+  # yamllint. A SKIP here would hide a broken config behind a missing tool on
+  # exactly the machine that has not run the gate before.
+  #
+  # The check that used to skip when it was absent is now a FAIL, and says so —
+  # the absence is a defect in the environment, not a neutral fact, and it is
+  # the difference between "this YAML is bad" and "I did not look".
+  section 'static: every YAML in the tree is yamllint clean'
   YAMLLINT="${KIT_YAMLLINT:-$ROOT/.venv/bin/yamllint}"
-  if [ -x "$YAMLLINT" ]; then
-    section 'static: compose templates are yamllint clean'
-    for f in otel-collector.yml docker-compose.yml; do
-      check "templates/compose/$f  (yamllint -c lint/yamllint.yml)" \
-        "$YAMLLINT" -c "$ROOT/lint/yamllint.yml" "$ROOT/templates/compose/$f"
-    done
+  if [ ! -x "$YAMLLINT" ]; then
+    report FAIL 'yamllint (required, not installed: pip install -r tests/requirements.txt)'
   else
-    report SKIP 'yamllint (not installed: pip install -r tests/requirements.txt)'
+    # Lint the tree, not a hand-kept list. `git ls-files` rather than `find` so
+    # the gate lints exactly what a caller clones, and so a .venv full of
+    # somebody else's YAML never enters the report. Falls back to `find` in a
+    # throwaway copy from self_test, which is not a git repository.
+    # `while read` rather than `mapfile` into an array: mapfile is a bash 4
+    # builtin, and kit's gate is also run by the `sh` that ships in a slim
+    # container. A loop over a pipeline needs no array and no `set -u`-safe
+    # empty expansion.
+    yamls_of_the_tree() {
+      if [ -d "$ROOT/.git" ] || [ -f "$ROOT/.git" ]; then
+        git -C "$ROOT" ls-files '*.yml' '*.yaml' 2>/dev/null
+      else
+        (cd "$ROOT" && find . -name .venv -prune -o -type f \( -name '*.yml' -o -name '*.yaml' \) -print |
+          sed 's|^\./||' | sort)
+      fi
+    }
+    while IFS= read -r rel; do
+      [ -n "$rel" ] || continue
+      [ -f "$ROOT/$rel" ] || continue
+      check "$rel  (yamllint -c lint/yamllint.yml)" \
+        "$YAMLLINT" -c "$ROOT/lint/yamllint.yml" "$ROOT/$rel"
+    done < <(yamls_of_the_tree)
   fi
 
   # The CI workflow gains a job; assert the job exists, is opt-in, and that the
