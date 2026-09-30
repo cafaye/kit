@@ -655,6 +655,211 @@ edit "$twentytwo/tests/staleness.py" '    return UNDECLARED' '    return CURRENT
 expect_red_script 'breakage 22: the staleness reporter calls an undeclared pin current' \
   "$twentytwo" tests/staleness_test.sh
 
+# 23-27. THE LINT GATE. Five ways the "lint runs from kit" mechanism can stop
+#       being a gate while every other check in this repository stays green,
+#       and the advisory one is the most likely of the five by a wide margin.
+#
+#       All five name the check that must catch them, because "the gate went red"
+#       is a weak claim when a dozen checks could have gone red: a lint step
+#       that lost its `--config` would also be caught by, at most, one other
+#       thing, and a check that has stopped being load-bearing should fail HERE
+#       rather than being discovered months later by the policy it stopped
+#       policing.
+LINTWIRE='lint/ + the workflow  (every lint step is a gate on kit config)'
+
+# 23. THE LINT STEP DELETED. The crudest form: `ci.reusable.yml` still declares
+#     a language, still has a job for it, still runs a build and a test — and
+#     nothing in it lints. Everything else about the job is untouched, so this is
+#     what "someone removed a step in a hurry" looks like.
+#
+#     The deletion is done with a parser rather than a text edit, for the same
+#     reason breakage 9 was: an `edit` recipe whose anchor no longer matches
+#     must FAIL LOUDLY, and one that silently matches the wrong occurrence is
+#     worse than no recipe at all. Here the whole step is removed by identity.
+twentythree="$(fresh_copy lint-step-deleted)"
+"$PY" - "$twentythree/.github/workflows/ci.reusable.yml" <<'PY'
+import sys
+
+import yaml
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    doc = yaml.safe_load(fh)
+# The go job's lint step, by name. Exactly one must go, or the recipe is stale.
+hits = 0
+for job in (doc.get("jobs") or {}).values():
+    steps = (job or {}).get("steps") or []
+    kept = [s for s in steps if not (isinstance(s, dict) and s.get("name") == "lint")]
+    hits += len(steps) - len(kept)
+    if isinstance(job, dict):
+        job["steps"] = kept
+if hits < 1:
+    sys.exit("self_test: no `lint` step existed to delete — the recipe is stale")
+with open(path, "w", encoding="utf-8") as fh:
+    yaml.safe_dump(doc, fh, sort_keys=False, default_flow_style=False)
+PY
+expect_red_check 'breakage 23: a language job no longer lints at all' \
+  "$twentythree" "$LINTWIRE" --static-only
+
+# 24. THE ADVISORY ONE, and the breakage that matters most. `continue-on-error:
+#     true` leaves the step running, leaves it printing every finding it found,
+#     and turns the job green. Nothing in the YAML is malformed; the build
+#     passes; the lint results are on the page where nobody reads them. A linter
+#     that only warns is a report, and this is how a report is born without
+#     anybody deciding to write one.
+#
+#     It is asserted on the PARSED step, so it also catches the same defect
+#     written the other two ways it can be written: `|| true` at the end of the
+#     run body, which is continue-on-error in shell and reads to nobody as
+#     anything but a deliberate choice. That one is exercised here too, because
+#     the check claims to catch it and a claim nobody has tried to break is a
+#     claim nobody has tested.
+twentyfour="$(fresh_copy lint-made-advisory)"
+edit "$twentyfour/.github/workflows/ci.reusable.yml" \
+  '        uses: golangci/golangci-lint-action@v9
+        with:' \
+  '        uses: golangci/golangci-lint-action@v9
+        continue-on-error: true
+        with:'
+expect_red_check 'breakage 24: the lint step is advisory (continue-on-error) — a report, not a gate' \
+  "$twentyfour" "$LINTWIRE" --static-only
+
+twentyfour_b="$(fresh_copy lint-advisory-in-shell)"
+edit "$twentyfour_b/.github/workflows/ci.reusable.yml" \
+  'run: bundle exec rubocop --parallel --config "$KIT_LINT_DIR/lint/rubocop.yml" ${{ env.KIT_LINT_ARGS }}' \
+  'run: bundle exec rubocop --parallel --config "$KIT_LINT_DIR/lint/rubocop.yml" ${{ env.KIT_LINT_ARGS }} || true'
+expect_red_check 'breakage 24b: the lint step swallows its exit status with `|| true`' \
+  "$twentyfour_b" "$LINTWIRE" --static-only
+
+# 25. THE CONFIG NO LONGER FOUND. The checkout deleted, or the path changed. The
+#     step is untouched, it still says `--config`, it still names a file — and
+#     the file is not there, so the linter falls back to its defaults: five
+#     linters for golangci-lint, MethodLength 10 for rubocop, no rules for
+#     eslint. All green, all much weaker. This is the breakage that the
+#     `--config` flag's existence is defending against and it is invisible from
+#     the YAML alone.
+twentyfive="$(fresh_copy kit-not-checked-out)"
+"$PY" - "$twentyfive/.github/workflows/ci.reusable.yml" <<'PY'
+import sys
+
+import yaml
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    doc = yaml.safe_load(fh)
+removed = 0
+for job in (doc.get("jobs") or {}).values():
+    if not isinstance(job, dict):
+        continue
+    steps = job.get("steps") or []
+    kept = [
+        s
+        for s in steps
+        if not (
+            isinstance(s, dict)
+            and str(s.get("uses", "")).startswith("actions/checkout")
+            and (s.get("with") or {}).get("repository") == "cafaye/kit"
+        )
+    ]
+    removed += len(steps) - len(kept)
+    job["steps"] = kept
+if removed < 1:
+    sys.exit("self_test: no kit checkout existed to delete — the recipe is stale")
+with open(path, "w", encoding="utf-8") as fh:
+    yaml.safe_dump(doc, fh, sort_keys=False, default_flow_style=False)
+PY
+expect_red_check 'breakage 25: the kit checkout is gone, so `--config` names nothing' \
+  "$twentyfive" "$LINTWIRE" --static-only
+
+# 26. THE CONFIG WEAKENED. The sharpest of the five, because every check above
+#     can be green while it happens. The workflow still points `--config` at
+#     `.kit/lint/golangci.yml` on every run, the file still parses, the lint
+#     step still exits nonzero on an error — and the policy is now golangci-
+#     lint's five defaults, which nobody in the fleet chose.
+#
+#     A step that lost its flag is a defect a reader can see in a diff. A config
+#     that lost three linters is a two-line deletion that looks like tidying,
+#     and the build stays green throughout. So the linter list is asserted BY
+#     VALUE, parsed as YAML, which also means the three names cannot be
+#     satisfied by the comment block that explains why they are enabled.
+twentysix="$(fresh_copy config-weakened)"
+"$PY" - "$twentysix/lint/golangci.yml" <<'PY'
+import sys
+
+import yaml
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    doc = yaml.safe_load(fh)
+enable = ((doc.get("linters") or {}).get("enable")) or []
+before = len(enable)
+# Drop the correctness linters one at a time. Each removal is a plausible
+# "this is noisy" edit, which is exactly why none of them can be left to review.
+doc["linters"]["enable"] = [x for x in enable if x not in ("bodyclose", "noctx", "errorlint")]
+if len(doc["linters"]["enable"]) == before:
+    sys.exit("self_test: none of the weakened linters was present — the recipe is stale")
+with open(path, "w", encoding="utf-8") as fh:
+    yaml.safe_dump(doc, fh, sort_keys=False, default_flow_style=False)
+PY
+expect_red_check 'breakage 26: kit config silently drops correctness linters the policy names' \
+  "$twentysix" "$LINTWIRE" --static-only
+
+# 27. A SERVICE DRIFTS BACK TO A COPY. The failure this whole packet exists to
+#     end, at the layer where it actually lands: a repo that used to lint with
+#     kit's config goes back to running its own, and kit has no way to see it
+#     from inside its own repository.
+#
+#     The shape checked here is the one kit CAN see without reading the fleet:
+#     a service's own lint config, sitting in a place the reusable workflow's
+#     steps never read. A file that nothing points at is not a deviation, it is
+#     a copy that has stopped being one — and golangci-lint will still
+#     DISCOVER it, because `.golangci.yml` in the repository root beats
+#     everything. So a service carrying one is being linted by a policy that
+#     kit's CI does not run, and the mismatch is invisible from both sides.
+#
+#     This is the check the brief asked for in the form it asked for: it reads
+#     BOTH files and reports the DIFFERENCE, rather than demanding the file be
+#     absent. A repo with no `.golangci.yml` passes; a repo whose file agrees
+#     with kit's passes; a repo whose file disagrees is told exactly which
+#     linters differ.
+LINTDRIFT='lint drift  (a service config is compared to kit, not merely forbidden)'
+
+twentyseven="$(fresh_copy service-drifted-back-to-a-copy)"
+# A realistic drift: the service keeps kit's linters but drops the linter that
+# was complaining about its generated client, and disables errcheck outright
+# rather than excluding one path. Both are real, both are what a team does under
+# pressure, and neither is visible in kit's own tree.
+cat >"$twentyseven/.golangci.yml" <<'EOF'
+---
+# A service that went back to owning its lint config.
+version: '2'
+linters:
+  enable:
+    - bodyclose
+    - copyloopvar
+    - errorlint
+    - exhaustive
+    - misspell
+    - noctx
+    - revive
+    - unconvert
+    - wastedassign
+  disable:
+    - errcheck
+EOF
+expect_red_check 'breakage 27: a service carries a lint config INCONSISTENT with kit, not merely present' \
+  "$twentyseven" "$LINTDRIFT" --static-only
+
+# 27b. The other half of the same claim, and the reason the check reads both
+#      files: a config that AGREES with kit's must PASS. A check that fails on
+#      the mere presence of a `.golangci.yml` would be satisfied by this packet
+#      and would train every service to delete a file it is allowed to keep —
+#      which is a worse outcome than the drift, because it is a silent one.
+twentyseven_b="$(fresh_copy service-config-agrees-with-kit)"
+cp "$twentyseven_b/lint/golangci.yml" "$twentyseven_b/.golangci.yml"
+expect_green 'breakage 27b: a service config that MATCHES kit is not a failure' \
+  "$twentyseven_b" --static-only
+
 printf '\n'
 if [ "$failures" -ne 0 ]; then
   echo "FAIL: self_test — $failures breakage(s) the gate did not catch."

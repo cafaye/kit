@@ -1,6 +1,19 @@
 ---
-# golangci-lint v2 config — copy to .golangci.yml in a Go service repo.
-#   golangci-lint run ./...
+# golangci-lint v2 config — kit's own, used FROM kit at run time. Not copied
+# into a service repo:
+#   golangci-lint run --config=<repo>/.kit/lint/golangci.yml ./...
+# See README.md, "Where the lint configs run".
+#
+# WHY THE FLAG IS NOT OPTIONAL — measured, and this is the load-bearing line in
+# the file:
+#   With no config present anywhere, golangci-lint v2 does not fail and does
+#   not run nothing. It falls back to its own five-linter default set
+#   (errcheck govet ineffassign staticcheck unused) and exits 0 on a file this
+#   config rejects — a misspelling in a comment is green without `--config` and
+#   red with it. So a Go service whose lint step lost its `--config` still runs,
+#   still passes, and is now on a policy nobody chose and nobody can see.
+#   `GOLANGCI_LINT_CONFIG` is NOT an alternative: measured on v2.6.2, setting it
+#   changes nothing and the run proceeds on that same default set.
 #
 # STRICTNESS NOTES
 #   - version: "2" is the config schema version, not the tool version; CI runs
@@ -15,6 +28,10 @@
 #   - We disable errcheck on Close/Flush only: those return errors nobody can
 #     act on, and forcing a `//nolint` per call site is how people learn to
 #     ignore errcheck. No other exclusion is pre-approved.
+#   - There is no `extends`. Measured: the v2 JSON Schema sets
+#     `additionalProperties: false` and `extends` is not a key, so a config that
+#     tries to inherit one is rejected or ignored. Deviation is therefore a
+#     documented workflow input, not a file — see the `lint-extra-args` input.
 version: '2'
 run:
   go: '1.24'
