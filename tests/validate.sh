@@ -2585,6 +2585,29 @@ STUB
   # code that knows what a repository is, and it answers with a machine-readable
   # marker. `check` cannot express three outcomes, which is why this is written
   # out rather than delegated: a SKIP is not a PASS that happened quietly.
+  #
+  # THE ADOPTION CEILING, and it is the fourth outcome this block has to express.
+  # `fleet_check.py` answers three questions and this file must not collapse
+  # them: is there a fleet (SKIP), is any ADOPTING repository defective (FAIL),
+  # and is any UNADOPTED repository carrying debt (PASS, with the debt printed).
+  # The three outcomes are read off the exit code plus the `CEILING fleet:` line
+  # the check always prints, rather than from a fourth flag, because a fourth
+  # flag is a fourth thing to keep in step with the check that emits it.
+  #
+  # WHY A PASS CAN CARRY FINDINGS, and why this is not the softening the packet
+  # refuses. The strictness has not moved anywhere weaker; it has moved to WHERE
+  # ADOPTION EXISTS. The same four predicates, the same messages, the same
+  # severity — and the moment a repository commits `git -C ../kit rev-parse HEAD
+  # > kit.ref`, every finding inside it becomes a FAIL with no discretion and no
+  # re-review. A gate that stays red for thirteen findings no repository has
+  # agreed to fix is a gate whose red stops being read, and a gate nobody reads
+  # catches nothing. This is core-16's shape for a missing OpenAPI document, and
+  # it is a WAVE, not a discount: each repository's adoption converts its own
+  # named debt into a failure.
+  #
+  # The count is printed because a ceiling with no number on it cannot be
+  # argued about: "PASS" and "PASS with 13 named warnings across 6 repositories"
+  # are different statements, and only the second is true.
   section 'static: the fleet adopts the stack rather than copying it'
   fleet_out='' fleet_ec=0
   fleet_out="$("$PY" "$ROOT/tests/fleet_check.py" --kit "$ROOT" \
@@ -2595,7 +2618,12 @@ STUB
       ;;
     *)
       if [ "$fleet_ec" -eq 0 ]; then
-        report PASS 'fleet  (no stale copy, no weakened boundary, no dead config, every ref pinned)'
+        if printf '%s\n' "$fleet_out" | grep -q '^WARN fleet: '; then
+          fleet_debt=$(printf '%s\n' "$fleet_out" | sed -n 's/^WARN fleet: //p')
+          report PASS "fleet  (adopting repositories clean; $fleet_debt — adoption debt, non-fatal until each repository writes kit.ref)"
+        else
+          report PASS 'fleet  (no stale copy, no weakened boundary, no dead config, every ref pinned)'
+        fi
         printf '%s\n' "$fleet_out" | sed 's/^/       /'
       else
         report FAIL 'fleet  (no stale copy, no weakened boundary, no dead config, every ref pinned)'
@@ -4202,7 +4230,20 @@ if [ "$RUN_SELF_TEST" -eq 1 ]; then
   # a hardcoded number is exactly the kind of thing that goes stale quietly when
   # the next packet adds a check. The wording follows from the count so the two
   # cannot disagree.
-  _st_breakages=$(grep -cE '^expect_red(_check|_lang|_script)? ' "$ROOT/tests/self_test.sh" || true)
+  # Two counts, because the helpers no longer agree on what they expect.
+  # `expect_green_check` (breakage 30) asserts the gate stays GREEN while
+  # naming the finding — the adoption ceiling's other side. Conflating it with
+  # the red-expecting helpers would either claim thirty-one reds when there are
+  # thirty, or drop the green-expecting proof from the label entirely, and a
+  # proof the summary does not count is a proof nobody runs.
+  #
+  # The `_green` suffix on the first pattern and its absence on the second is
+  # the load-bearing asymmetry: `breakages` is every recipe, `reds` is only the
+  # ones that must fail. Both read the same file, so neither can go stale.
+  _st_breakages=$(grep -cE '^expect_(red(_check|_lang|_script)?|green_check) ' \
+    "$ROOT/tests/self_test.sh" || true)
+  _st_reds=$(grep -cE '^expect_red(_check|_lang|_script)? ' \
+    "$ROOT/tests/self_test.sh" || true)
 
   # The header is a promise about what the file proves, and a promise nobody
   # reads is decoration. Compare the breakage numbers the header NAMES against
@@ -4259,12 +4300,21 @@ carried = set(
         # and breakage 4's single; matching one of them would have reported a
         # disagreement that does not exist, and the fix belongs in the pattern
         # rather than in rewriting a working recipe to suit a new check.
-        # All FOUR helpers, or the check reports a header/recipe disagreement
+        # All FIVE helpers, or the check reports a header/recipe disagreement
         # that does not exist: breakages 21 and 22 are `expect_red_script`, and
         # a pattern missing `_script` calls them undocumented. Same omission as
         # the `_st_breakages` count above — one bug, two symptoms, because the
         # helper list was written down twice.
-        r"""^expect_red(?:_check|_lang|_script)? ['"]breakage\s+(\d+[a-z]?):""",
+        #
+        # `expect_green_check` is in it for breakage 30, the adoption ceiling's
+        # unadopted side. That recipe asserts the gate stays GREEN, so leaving
+        # it out of `_st_breakages` (above) is correct and leaving it out of THIS
+        # pattern would not be: the question here is whether the header documents
+        # what the file proves, and breakage 30 is a proof the file carries.
+        # `expect_(?:red(?:_check|_lang|_script)?|green_check)` — one regex
+        # rather than an alternation of two, so a sixth helper has to be added
+        # in one place to be counted here at all.
+        r"""^expect_(?:red(?:_check|_lang|_script)?|green_check) ['"]breakage\s+(\d+[a-z]?):""",
         src,
         re.M,
     )
@@ -4288,7 +4338,12 @@ PY
   check 'tests/self_test.sh  (every documented breakage has a recipe, and vice versa)' \
     self_test_claims
 
-  if check "tests/self_test.sh  ($_st_breakages breakages, $_st_breakages reds)" \
+  # The label carries both numbers and, deliberately, does not sum them into
+  # "N breakages, N reds" the way it did while every recipe was red-expecting.
+  # Thirty-one breakages of which thirty must go red and one must stay green is a
+  # *stronger* suite than thirty-one that must all go red, and a label that
+  # flattened the two would hide the only fact that distinguishes them.
+  if check "tests/self_test.sh  ($_st_breakages breakages: $_st_reds red, $((_st_breakages - _st_reds)) green-expecting — the ceiling has both sides proved)" \
     bash "$ROOT/tests/self_test.sh"; then
     :
   fi

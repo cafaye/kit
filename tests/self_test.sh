@@ -79,6 +79,21 @@
 #               authoritative, every edit to it changes nothing, and a
 #               developer has no way to find out.
 #           26. a `kit.ref` holding `master` -> the pin check goes red.
+#   30-31. THE ADOPTION CEILING, both sides of it, because a ceiling that only has
+#         one side proved is not a ceiling — it is a deleted check.
+#           30. the SAME stale copy in a repository with NO `kit.ref` -> the gate
+#               stays GREEN and the finding is printed as a WARN naming the
+#               adoption path. This is the half that could have been quietly
+#               wrong: if the unadopted side went red, the ceiling would not
+#               exist and this breakage would have caught it.
+#           31. that repository's `kit.ref` written -> the gate goes RED on the
+#               same defect, same message, same severity. This is the half that
+#               proves nothing was weakened: it is the fixture of breakage 23
+#               plus one committed line.
+#           The pair is also the ratchet proof. 30 and 31 run over the SAME
+#           fixture, so a change that softened the adopted side fails 31 and a
+#           change that hardened the unadopted side fails 30, and there is no
+#           third state in which both pass and the checks are weaker.
 #   27-29. the override rules, each against the named check.
 #           27. a vendor config mount that stopped resolving from the fetched
 #               tree. Found by RUNNING the stack; `docker compose config`
@@ -209,6 +224,48 @@ expect_red_check() {
     printf 'FAIL self_test: %s — the gate went red, but NOT via `%s`\n' "$label" "$want"
     printf '%s\n' "$out" | grep '^FAIL' | sed 's/^/       /'
     failures=$((failures + 1))
+  fi
+}
+
+# expect_green_check <label> <dir> <check-label> <needle> <validate.sh args...>
+#
+# The mirror of `expect_red_check`, and it exists for exactly one case: a
+# finding the gate is supposed to report WITHOUT failing on. "The gate stayed
+# green" is necessary but far too weak — the gate is green on a tree where the
+# fleet check crashed, or exited 2 and had its SKIP swallowed, or printed
+# nothing at all. So this asserts BOTH halves:
+#
+#   1. the named check reported PASS, and
+#   2. `needle` — a literal string from the finding — is in the output.
+#
+# (1) alone is the "silently skipped" failure this repository keeps warning
+# about, and (2) alone would be satisfied by a check that printed the word
+# somewhere. Together they are the claim: *this* check passed, and it passed
+# while telling you about this specific thing.
+expect_green_check() {
+  local label="$1" dir="$2" want="$3" needle="$4"
+  shift 4
+  local out ec=0
+  out=$(cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" 2>&1) || ec=$?
+  if [ "$ec" -ne 0 ]; then
+    printf 'FAIL self_test: %s — the gate went RED (exit %s), so the ceiling is not in force\n' \
+      "$label" "$ec"
+    printf '%s\n' "$out" | grep -E '^(FAIL|  -|       )' | tail -20 | sed 's/^/       /'
+    failures=$((failures + 1))
+  elif ! printf '%s\n' "$out" | grep -qF "PASS $want"; then
+    printf 'FAIL self_test: %s — the gate stayed GREEN but `%s` did not report PASS\n' \
+      "$label" "$want"
+    printf '%s\n' "$out" | grep -E '^(FAIL|SKIP)' | tail -20 | sed 's/^/       /'
+    failures=$((failures + 1))
+  elif ! printf '%s\n' "$out" | grep -qF "$needle"; then
+    # The dangerous one. A green run that said nothing is a check that ran
+    # nothing, and it is exactly what a deleted ceiling looks like from here.
+    printf 'FAIL self_test: %s — GREEN, but the finding was never named (no %q)\n' \
+      "$label" "$needle"
+    printf '%s\n' "$out" | sed -n '/fleet/,+4p' | sed 's/^/       /'
+    failures=$((failures + 1))
+  else
+    printf 'PASS self_test: %s — stayed green and named the debt\n' "$label"
   fi
 }
 
@@ -427,6 +484,51 @@ services:
 YAML
   done
   printf '%s' "$root"
+}
+
+# break_stale_copy <fixture> — give `alpha` a `postgres` of its own.
+#
+# FACTORED OUT of breakage 23 because breakage 31 needs the identical mutation,
+# and the two halves of the adoption-ceiling proof are only a proof if they are
+# the SAME defect in the SAME shape. Two hand-written copies of a nine-line
+# YAML mutation would drift, and the drift would show up as "31 went green
+# because it was mutating something else" — which is indistinguishable from
+# "31 proved the ceiling is airtight".
+#
+# The mutation is the real shape rather than a toy: a service that names its
+# database `db` and pins `postgres:17`. The service name is `db` and not
+# `postgres` on purpose, because that is what five of the six repositories in
+# scope actually do, and the check keys on the IMAGE.
+break_stale_copy() {
+  "$PY" - "$1/alpha/docker-compose.yml" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+body = open(path, encoding="utf-8").read()
+old = "  alpha:\n    image: cafaye/alpha:dev"
+new = (
+    "  db:\n    image: postgres:17\n    environment:\n      POSTGRES_USER: alpha\n"
+    "      POSTGRES_DB: alpha\n    ports:\n      - \"15500:5432\"\n"
+    "    volumes:\n      - alpha-pg:/var/lib/postgresql/data\n    healthcheck:\n"
+    "      test: [\"CMD\", \"pg_isready\", \"-U\", \"alpha\"]\n"
+    "      interval: 10s\n      timeout: 5s\n      retries: 5\n"
+    "  alpha:\n    image: cafaye/alpha:dev"
+)
+if old not in body:
+    sys.exit(f"self_test: break_stale_copy: {old!r} not in {path}")
+open(path, "w", encoding="utf-8").write("volumes:\n  alpha-pg:\n" + body.replace(old, new, 1))
+PYEOF
+}
+
+# unadopt <fixture> — remove every `kit.ref` in a fixture fleet.
+#
+# Every repository, not just `alpha`. The ceiling is per-repository, and a
+# fixture where `beta` still adopted would be testing two things at once: that
+# an unadopted repository warns, and that a clean adopting repository passes.
+# Both are worth proving, but not in one recipe, and not when a failure of the
+# first cannot be told from a failure of the second.
+unadopt() {
+  find "$1" -name kit.ref -type f -delete
 }
 
 printf -- '-- self_test: a gate that cannot fail is not a gate\n'
@@ -790,24 +892,7 @@ FLEETCHECK='fleet  (no stale copy, no weakened boundary, no dead config, every r
 #     six repositories in scope call their database `db`, so a check that matched
 #     on the NAME found nothing in any of them.
 twentythree_fixture="$(fixture_fleet stale-copy)"
-"$PY" - "$twentythree_fixture/alpha/docker-compose.yml" <<'PYEOF'
-import sys
-
-path = sys.argv[1]
-body = open(path, encoding="utf-8").read()
-body = body.replace(
-    "  alpha:\n    image: cafaye/alpha:dev",
-    "  db:\n    image: postgres:17\n    environment:\n      POSTGRES_USER: alpha\n"
-    "      POSTGRES_DB: alpha\n    ports:\n      - \"15500:5432\"\n"
-    "    volumes:\n      - alpha-pg:/var/lib/postgresql/data\n    healthcheck:\n"
-    "      test: [\"CMD\", \"pg_isready\", \"-U\", \"alpha\"]\n"
-    "      interval: 10s\n      timeout: 5s\n      retries: 5\n"
-    "  alpha:\n    image: cafaye/alpha:dev",
-    1,
-)
-body = "volumes:\n  alpha-pg:\n" + body
-open(path, "w", encoding="utf-8").write(body)
-PYEOF
+break_stale_copy "$twentythree_fixture"
 export KIT_FLEET="$twentythree_fixture"
 expect_red_check 'breakage 23: a service carries its own copy of the shared stack' \
   "$base" "$FLEETCHECK" --static-only
@@ -959,6 +1044,51 @@ export KIT_FLEET="$twentynine_fixture"
 expect_red_check 'breakage 29: a service publishes a port on a service kit already ships' \
   "$base" "$FLEETCHECK" --static-only
 
+# 30-31. THE ADOPTION CEILING, both sides of it, and the pair is the proof.
+#
+# The fleet gate was red on master for six repositories that have adopted
+# nothing, which is the same shape as a build that has been red for a quarter:
+# the red is true, and it has stopped being information. The ceiling is the
+# response core-16 applied to a missing OpenAPI document — absence is a named
+# warning with the adoption path attached, and it becomes a failure the moment
+# the repository adopts.
+#
+# A ceiling needs BOTH halves proved, and that is why these are two recipes over
+# ONE mutation rather than one recipe over two mutations:
+#
+#   30  the stale copy, with no kit.ref anywhere in the fleet. The gate stays
+#       GREEN, and the finding is PRINTED, with the adoption path. If this one
+#       goes red the ceiling does not exist — the gate is failing unadopted
+#       repositories, which is the state the packet was dispatched to fix.
+#   31  the identical stale copy, with kit.ref committed. The gate goes RED on
+#       the identical finding. If this one stays green then the ceiling is not
+#       a ceiling but a deletion: the checks no longer decide anything at all.
+#
+# 31 is breakage 23 plus one committed line, and that is the entire argument in
+# one diff. Nothing about the predicate, the message or the severity changed
+# between them; what changed is whether the repository has accepted the standard
+# it is being measured against.
+#
+# The needle in 30 is a literal substring of the finding rather than the word
+# `WARN`. A check that printed "WARN" and nothing else would satisfy the weaker
+# assertion, and a check that deleted the finding entirely and left the string
+# in a comment would satisfy it too — which is the shape this repository has
+# already been bitten by once, with a policy stated in both the Python and a
+# rule.
+CEILINGCHECK='fleet  (adopting repositories clean;'
+thirty_fixture="$(fixture_fleet ceiling-unadopted)"
+break_stale_copy "$thirty_fixture"
+unadopt "$thirty_fixture"
+export KIT_FLEET="$thirty_fixture"
+expect_green_check 'breakage 30: an UNADOPTED service copies the stack — green, and named' \
+  "$base" "$CEILINGCHECK" "which is the image kit's stack already ships" --static-only
+
+thirtyone_fixture="$(fixture_fleet ceiling-adopted)"
+break_stale_copy "$thirtyone_fixture"
+export KIT_FLEET="$thirtyone_fixture"
+expect_red_check 'breakage 31: the same copy in an ADOPTING service is a hard FAIL' \
+  "$base" "$FLEETCHECK" --static-only
+
 # Cleared, because `export` is not scoped to a command the way `VAR=v cmd` is, and
 # the final recipe above would otherwise leave the fixture in the environment for
 # whatever runs next. The alternative — a `VAR=v` prefix per call — puts
@@ -984,4 +1114,5 @@ fi
 # against it by `tests/validate.sh`, so a breakage added without a header entry
 # (or a header entry with no recipe) is a red gate rather than a doc that lies.
 counted=$(grep -cE '^expect_red(_check|_lang|_script)? ' "$0" || true)
-echo "PASS: self_test — all $counted breakages went red, and the unbroken tree is green."
+green=$(grep -cE '^expect_green_check ' "$0" || true)
+echo "PASS: self_test — $counted breakages went red, $green stayed green while naming its finding, and the unbroken tree is green."

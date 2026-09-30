@@ -140,10 +140,16 @@ Three phases, and all three must pass:
   without.
 - **fleet** — `tests/fleet_check.py` reads the **other** repositories: a stale
   copy of the stack, a weakened redaction boundary, a collector config nothing
-  ever starts, an unpinned `kit.ref`. It is deliberately **red on this fleet**
-  and must not be softened to make it green: five of the six repositories that
-  declare local infrastructure carry their own `postgres` today, and a gate that
-  went quiet about that is the gate that let the state exist. It SKIPs loudly
+  ever starts, an unpinned `kit.ref`. It carries an **adoption ceiling**: a
+  finding inside a repository that **has** a `kit.ref` is a hard `FAIL`; a
+  finding inside a repository that has adopted nothing is a non-fatal `WARN`
+  naming the adoption path. Five of the six repositories that declare local
+  infrastructure carry their own `postgres` today and **none of them has a
+  `kit.ref`**, so under the ceiling all five are warnings — and that is the
+  point, not a softening: the strictness has moved to where adoption exists,
+  and a gate that has been red for thirteen findings nobody agreed to fix stops
+  being read within one release. **A warning is a debt with a name; the adoption
+  wave turns them into failures one repository at a time.** It SKIPs loudly
   when there is no fleet, because "no fleet was found" is not "the fleet is
   clean" — the same `unknown` vs `current` confusion `staleness.py` avoids.
 - **self_test** — twenty-nine breakages of a throwaway copy, asserting the gate
@@ -278,12 +284,20 @@ that is usually true:
   current" into "one command, whatever this checkout last fetched".
 - **`tests/fleet_check.py` reads the CALLERS, not this repository.** A defect in
   the standard is invisible to a gate that only reads the standard, which is the
-  same argument as D4. It is **red against the current fleet on purpose**. As
-  measured: six repositories declare local infrastructure, **four** carry their
-  own copy of the shared stack (a fifth, `muse`, cannot be read to tell — its
-  compose file does not parse), **all six** have no pin, and **two** publish a
-  port on a service kit already ships. Do not soften any of it to make this
-  repository green; report it and name the repositories.
+  same argument as D4. As measured: six repositories declare local
+  infrastructure, **five** carry their own copy of the shared stack (billing,
+  courier, darkroom, identity, muse), **all six** have no `kit.ref`, and **two**
+  publish a port on a service kit already ships — 13 findings, and the gate names
+  every one of them. **All six are currently WARNINGS and none is a FAIL**, because
+  the ceiling keys on adoption and not one of them has adopted. That is the state
+  to beat, and it is a state the gate is now *about to be able to leave*: the
+  first repository to commit `kit.ref` finds its own two or three findings are
+  failures, with no change to this repository.
+
+  Do not soften the checks to make this repository green. Do not raise the
+  ceiling either — a repository that HAS adopted is judged strictly, and
+  `breakage 31` in `self_test.sh` is the recipe that would go red if that ever
+  stopped being true. Report the findings; name the repositories.
 
 `README.md` carries the override rules, and one of them is a trap worth knowing
 before you write a service compose file: **a second file's `ports:` list is

@@ -67,10 +67,39 @@ WHY IT SKIPS AND DOES NOT PASS WHEN THERE IS NO FLEET
     `unknown` vs `current` confusion `tests/staleness.py` exists to avoid. It
     exits 0 with `--no-fleet` and the caller SKIPs loudly.
 
+THE ADOPTION CEILING, and why it is not a weakening
+    A finding inside a repository that has NOT adopted is a WARNING that names
+    the adoption path. A finding inside a repository that HAS a `kit.ref` is a
+    FAIL, every time, with no discretion.
+
+    The judgement is about WHO OWNS THE DEBT, not about how bad it is. All four
+    findings are equally true of an unadopted repository; what differs is whether
+    that repository has already accepted the standard and is therefore already
+    accountable to it. `identity` has adopted and still runs its own
+    `postgres:17-alpine` — that is a defect in an adopting repository and it
+    fails. `billing` has adopted nothing and runs the same image — that is the
+    cost of a fleet that has not taken up the standard, and it is reported by
+    name so the adoption wave can retire it.
+
+    The strictness MOVES rather than disappearing. Nothing about the four checks
+    changes: the same predicate, the same message, the same severity the moment
+    a `kit.ref` exists. What the ceiling buys is that the gate is red for
+    something a repository can act on *today* — commit one line and re-run —
+    instead of being red for thirteen findings nobody has agreed to fix, which is
+    the state a permanently-red gate decays into within one release.
+
+    The ceiling is stated in this file's output, in `tests/validate.sh`, and in
+    REPORT-kit-13.md, because a ceiling that only exists in the exit code is a
+    ceiling nobody knows is there:
+
+        A WARNING IS A DEBT WITH A NAME. The adoption wave turns them into
+        failures one repository at a time.
+
 EXIT STATUS
-    0  the fleet adopts the stack, or there is no fleet to check
-    1  at least one service is carrying a copy, weakening the boundary, or
-       pinning something that moves
+    0  no finding inside an ADOPTING repository, and no fleet to check. Warnings
+       about unadopted repositories do not change this.
+    1  at least one adopting repository is carrying a copy, weakening the
+       boundary, pinning something that moves, or failing to parse
     2  bad invocation, or a service named on the command line is unreadable
 """
 
@@ -597,7 +626,13 @@ def main(argv: list) -> int:
         )
 
     problems: list = []
+    warnings: list = []
+    # The repositories each warning is about, so the ceiling's own output can say
+    # "across 6 repository(ies)" about the debt and not about the whole fleet.
+    warned_repos: set = set()
     checked = 0
+    adopted = 0
+    failing: set = set()
     out_of_scope = 0
     for name in names:
         repo = os.path.join(repos_dir, name)
@@ -619,11 +654,20 @@ def main(argv: list) -> int:
         # repository that ships no infrastructure at all.
         compose_path = find_compose_file(repo)
         compose_docs = []
+        # Every finding for this repository lands here first, and the CEILING
+        # decides where they go at the end. Collecting first and routing once is
+        # what keeps the ceiling honest: a check that appended straight to
+        # `problems` would be choosing its own severity, and a check that
+        # short-circuited on an unreadable file would be exempt from the ceiling
+        # in precisely the case where the file is most wrong.
+        found: list = []
         if compose_path:
             try:
                 doc = load_yaml(compose_path)
             except Exception as exc:
-                problems.append(f"{name}/{os.path.basename(compose_path)}: not valid YAML: {exc}")
+                found.append(
+                    f"{name}/{os.path.basename(compose_path)}: not valid YAML: {exc}"
+                )
                 doc = None
             if doc is not None:
                 # `__path__` is where a relative bind-mount source is resolved
@@ -632,11 +676,39 @@ def main(argv: list) -> int:
                 # against cwd would call every service's mount wrong.
                 doc["__path__"] = compose_path
                 compose_docs.append(doc)
-        check_pin(repo, name, problems)
-        check_dead_collector_config(repo, name, compose_docs, problems)
+        check_pin(repo, name, found)
+        check_dead_collector_config(repo, name, compose_docs, found)
         for doc in compose_docs:
-            check_stale_copy(repo, name, doc, problems)
-            check_override_surface(repo, name, doc, problems)
+            check_stale_copy(repo, name, doc, found)
+            check_override_surface(repo, name, doc, found)
+
+        # THE CEILING, and the one place it is applied. Read once, from the same
+        # `read_kit_ref` every other check's wording already assumes, so there
+        # is no second definition of "adopted" to keep in step — the failure mode
+        # this file already documents once (`reportUnusedDisableDirectives`-shaped
+        # drift) does not get a second chance here.
+        #
+        # `source == "absent"` is the ONLY value that means "has not adopted".
+        # An unreadable, empty or multi-valued `kit.ref` is a repository that has
+        # adopted and written the pin wrong, and `check_pin` already says which
+        # of those it is. Reading adoption from "the file is there" instead would
+        # have been simpler and wrong: it would have made a broken pin a warning
+        # in exactly the case where somebody tried to fix the last warning.
+        if read_kit_ref(repo)[1] == "absent":
+            if found:
+                warnings.extend(found)
+                warned_repos.add(name)
+        else:
+            adopted += 1
+            if found:
+                # Counted per DEFECTIVE repository, not per adopting repository.
+                # `FAIL fleet: 1 problem(s) across 2 adopting repository(ies)` is a
+                # sentence about two repositories when one of them is clean, and a
+                # summary line that overstates the blast radius is the first thing
+                # a reader stops trusting — which costs the gate the credibility it
+                # needs to hold the line when adoption does arrive.
+                failing.add(name)
+            problems.extend(found)
         checked += 1
 
     print(
@@ -644,14 +716,88 @@ def main(argv: list) -> int:
         + (f"; {out_of_scope} have none and are out of scope" if out_of_scope else ""),
         file=sys.stderr if problems else sys.stdout,
     )
+    # The ceiling is printed even when there is nothing to report, and it is
+    # printed BY THIS PROGRAM rather than by the caller: a caller that decides
+    # whether to print the rule is a caller that can be pointed at a fixture
+    # fleet where it does not, and the rule stops being a property of the check.
+    # When there are no warnings the line still appears, because the reader who
+    # sees "PASS fleet" needs to know what PASS was measured against.
+    #
+    # It goes ABOVE the findings, not below them. A rule stated after the thing
+    # it governs reads as an epilogue, and an epilogue is what a reader skips
+    # when they are scanning for what went wrong.
+    print(
+        "CEILING fleet: a finding inside a repository that has a kit.ref is a FAIL; "
+        "inside one that has not adopted, it is the WARN below. The four checks are "
+        "identical either way — the strictness MOVES to where adoption exists, it "
+        "does not disappear. A warning is a debt with a name, and the adoption wave "
+        "turns them into failures one repository at a time.",
+        file=sys.stderr if (problems or warnings) else sys.stdout,
+    )
+    if warnings:
+        for w in warnings:
+            print(f"  WARN {w}", file=sys.stderr)
+        print(
+            f"WARN fleet: {len(warnings)} finding(s) across {len(warned_repos)} "
+            f"repository(ies) that have not adopted kit's stack "
+            f"({', '.join(sorted(warned_repos))}).",
+            file=sys.stderr,
+        )
+        # The path ONCE, not once per repository. Six identical four-line blocks
+        # is a wall, and a wall is read as boilerplate — which is how the one
+        # line in it that a service owner has to type gets skipped. The
+        # repositories are already named on the WARN line above, so nothing is
+        # lost by printing it once for all of them.
+        print("  the adoption path, for every repository named above:", file=sys.stderr)
+        print(
+            "    1. git -C ../kit rev-parse HEAD > kit.ref      # ONE committed line, and "
+            "the only thing that decides which bytes of kit your machine runs",
+            file=sys.stderr,
+        )
+        print(
+            "    2. your docker-compose.yml becomes an OVERRIDE beside the fetched "
+            "stack, not a copy of it: delete your own postgres service and point at "
+            "kit's by overriding its environment (POSTGRES_DB / POSTGRES_USER). "
+            "The collector config is never yours to own.",
+            file=sys.stderr,
+        )
+        print(
+            "    3. move a published port with its VARIABLE (KIT_POSTGRES_PORT=…), "
+            "because a second compose file's `ports:` list is APPENDED rather than "
+            "substituted, so a `ports:` block buys you both ports",
+            file=sys.stderr,
+        )
     if problems:
         for p in problems:
             print(f"  - {p}", file=sys.stderr)
         print(
-            f"FAIL fleet: {len(problems)} problem(s) across {checked} repository(ies).",
+            f"FAIL fleet: {len(problems)} problem(s) across {len(failing)} of the "
+            f"{adopted} adopting repository(ies) checked "
+            f"({', '.join(sorted(failing))}). Every one of these is a repository "
+            f"that HAS a kit.ref, so each is a defect against a standard it has "
+            f"already adopted.",
             file=sys.stderr,
         )
         return 1
+    if warnings:
+        # The adopting count is stated even at zero, and `no repository has
+        # adopted yet` rather than `0 repository(ies) are clean`. The second
+        # phrasing reads as a boast, and this gate's whole subject is the
+        # distance between the fleet and the standard — a summary that flatters
+        # the current state is exactly the thing a reader stops trusting.
+        clean = (
+            f"{adopted} adopting repository(ies) are clean"
+            if adopted
+            else "no repository has adopted yet, so nothing is judged strictly"
+        )
+        print(
+            f"PASS fleet: {clean} — no copy of the stack, no weakened boundary, no "
+            f"dead collector config, every ref a pin. {len(warned_repos)} unadopted "
+            f"repository(ies) carry {len(warnings)} named warning(s) above; that is "
+            f"adoption debt, not a pass, and committing kit.ref is what converts it "
+            f"into the failure it already is."
+        )
+        return 0
     print(
         f"PASS fleet: no service carries a copy of kit's stack, none weakens the "
         f"redaction boundary, no collector config is dead, and every kit.ref is a pin."

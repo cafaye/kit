@@ -36,7 +36,7 @@ build lands in kit once, and reaches the next service in a pull request.
 | `templates/compose/.env.example` | Every `${KIT_*}` the stack interpolates, each with a default. **Fetched, not copied** — `bin/dev` writes it into `.env` on first run. | `bin/dev`, on first run |
 | `tests/fetch_test.sh` | Executes the fetch against a local bare remote: a pin resolves and the bytes are identical, a branch is refused **before any network call**, and offline mode is real in all four of its states. | kit |
 | `tests/stack_live_test.sh` | Brings the **fetched** stack up, sends real OTLP, and reads a trace out of Tempo, a metric out of Mimir, and no canary into either. | kit |
-| `tests/fleet_check.py` | Reads the **other** repositories: a stale copy of the stack, a weakened redaction boundary, a collector config nothing starts, a published port on a service kit already ships, an unpinned ref. **Red on this fleet today.** | kit, over the sibling checkouts |
+| `tests/fleet_check.py` | Reads the **other** repositories: a stale copy of the stack, a weakened redaction boundary, a collector config nothing starts, a published port on a service kit already ships, an unpinned ref. Under the **adoption ceiling**: a `FAIL` inside a repository that has a `kit.ref`, a named `WARN` inside one that has not. | kit, over the sibling checkouts |
 | `tests/canary_test.sh` | Plants a canary in ten leak shapes against a real collector and asserts it reaches no exporter. | kit |
 | `tests/no_telemetry_in_readiness.sh` | Kills the collector and proves a service still starts, still serves and still reports healthy. | kit |
 | `templates/otel/<lang>/` | W3C traceparent: a stdlib codec, an executed conformance suite, an SDK snippet, and a README. | Every service, per language |
@@ -236,7 +236,7 @@ mean something. A service joins by writing an **override** file — its own imag
 its own port, its own database name — which `bin/dev` merges with the fetched
 stack.
 
-### The gate on adoption, and why it is red
+### The gate on adoption, and the adoption ceiling
 
 `tests/fleet_check.py` reads the **sibling repositories**, not kit's own files,
 because the failure this packet exists to catch is in the callers and not in the
@@ -249,11 +249,39 @@ callee. Four claims, one check each:
 | no dead config | an `otel-collector.yml` that nothing mounts, so editing it changes nothing |
 | every ref pinned | a `kit.ref` holding a branch |
 
-**It is red against the current fleet, and that is the deliverable rather than a
-defect in the gate.** Five repositories carry their own copy of the shared stack
-and six have no pin at all. This is the same shape as D4: three repositories not
-spelling their gate the same way is invisible to any check that reads only one of
-them, so kit's gate reads all of them.
+**Measured against the current fleet: six repositories declare local
+infrastructure, 13 findings.** Five carry their own copy of the shared stack
+(billing, courier, darkroom, identity, muse), six have no `kit.ref` at all, and
+two publish a port on a service kit already ships. This is the same shape as D4:
+three repositories not spelling their gate the same way is invisible to any check
+that reads only one of them, so kit's gate reads all of them.
+
+#### The ceiling, and why it is not a softening
+
+| | a repository **with** a `kit.ref` | a repository **without** one |
+|---|---|---|
+| stale copy · weakened boundary · dead config · published port · bad pin | **FAIL** | **WARN**, naming the adoption path |
+
+Same four checks, same predicates, same messages. **The strictness moves to
+where adoption exists; it does not disappear.** The judgement is about **who owns
+the debt**, not about how bad it is — `identity` has adopted and still runs its
+own `postgres:17-alpine`, which is a defect in an adopting repository and fails;
+`billing` has adopted nothing and runs the same image, which is the cost of a
+fleet that has not taken up the standard.
+
+All six repositories in scope are currently **warnings and no failures**, because
+not one of them has adopted. That is a deliberate, temporary, named state and it
+is a *wave*, not a discount: commit the one line and your own findings become
+failures, with no change to this repository and no re-review.
+
+```sh
+git -C ../kit rev-parse HEAD > kit.ref    # the only thing that decides which kit you run
+```
+
+**A warning is a debt with a name.** A gate that has been red for thirteen
+findings no repository has agreed to fix stops being read within one release, and
+a gate nobody reads catches nothing — which is how the state this packet exists to
+remove survived a full round of CI the first time.
 
 The check is keyed on the **image**, not the service name, and reads the set of
 images out of kit's own compose file rather than a hand-kept list. Five of the six

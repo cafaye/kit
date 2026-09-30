@@ -69,15 +69,41 @@ semver contract — it is consumed by *calling*
 
 ### Added
 
-- **`tests/fleet_check.py` — the gate on the FLEET, and it is RED on master.**
-  It reads the *other* repositories, because nothing else in kit does: a stale
-  copy of the stack, a weakened redaction boundary, a collector config nothing
-  ever starts, an unpinned ref, and a published port on a service kit already
-  ships. Against this fleet: **6 repositories in scope, 13 findings** — the
-  stale-copy rule catches **billing, courier, darkroom, identity, muse**, the pin
-  rule catches **all six**, and the port rule catches **darkroom, identity**. It
-  is not softened to make master green: a gate that goes quiet about five copies
-  is the gate that let them exist.
+- **`tests/fleet_check.py` — the gate on the FLEET, and it names the fleet's
+  adoption debt.** It reads the *other* repositories, because nothing else in kit
+  does: a stale copy of the stack, a weakened redaction boundary, a collector
+  config nothing ever starts, an unpinned ref, and a published port on a service
+  kit already ships. Against this fleet: **6 repositories in scope, 13
+  findings** — the stale-copy rule catches **billing, courier, darkroom,
+  identity, muse**, the pin rule catches **all six**, and the port rule catches
+  **darkroom, identity**.
+
+  **The adoption ceiling.** A finding inside a repository that HAS a `kit.ref`
+  is a **FAIL**, every time, with no discretion. A finding inside a repository
+  that has adopted nothing is a **WARN** naming the adoption path — the exact
+  `git -C ../kit rev-parse HEAD > kit.ref`, the override-not-copy rule, and the
+  port-variable rule — and it does not turn the build red. Same four predicates,
+  same messages, same severity: **the strictness MOVES to where adoption
+  exists, it does not disappear.** A repository that adopts converts its own
+  named debt into a failure with no re-review, which is what makes this a wave
+  rather than a discount.
+
+  The judgement is about **who owns the debt**, not about how bad it is:
+  `identity` has adopted and still runs its own `postgres:17-alpine` — a defect
+  in an adopting repository, and a failure. `billing` has adopted nothing and
+  runs the same image, which is the cost of a fleet that has not taken up the
+  standard. A gate that stays red for thirteen findings no repository has agreed
+  to fix is a gate whose red stops being read within one release, and a gate
+  nobody reads catches nothing. The ceiling is printed by the check, carried in
+  the gate's own summary line, and argued in `REPORT-kit-13.md`; a ceiling that
+  exists only in an exit code is a ceiling nobody knows is there.
+
+  Adoption is read from `read_kit_ref` — the same function every finding message
+  already assumes — and only `absent` counts as unadopted. An empty,
+  multi-valued or unreadable `kit.ref` is a repository that **adopted and wrote
+  the pin wrong**, and it fails; reading adoption from "the file exists" would
+  have made a broken pin a warning in exactly the case where somebody was
+  fixing the previous warning.
 
   It also found something no check in kit could have: **`muse/docker-compose.yml`
   did not parse.** Line 65 put a `: ` inside an unquoted YAML scalar and
@@ -117,12 +143,31 @@ semver contract — it is consumed by *calling*
   reads the same file — three files, one fact, and their disagreeing is invisible
   from any one of them.
 
+- **Two new self-test breakages (30–31), and they are the adoption ceiling
+  proved from BOTH sides.** 30 is the same stale copy as 23 in a fleet with no
+  `kit.ref` anywhere: the gate **stays green** and the finding is still printed,
+  asserted with a literal substring of the finding rather than the word `WARN`,
+  so a gate that printed `WARN` and nothing else cannot satisfy it. 31 is that
+  identical mutation with `kit.ref` committed: the gate goes **red** on the
+  identical finding. Now **31 breakages in all — 30 red, 1 green-expecting**,
+  15 of them name-specific — and the summary line counts the two separately
+  rather than summing them, because "31 breakages, 31 reds" would hide the only
+  fact that distinguishes them.
+
+  One mutation, factored into `break_stale_copy`, shared by all three recipes:
+  two hand-written copies of a nine-line YAML mutation would drift, and the drift
+  would read as "31 proved the ceiling is airtight" when 31 had stopped testing
+  the same thing 23 tests. `unadopt` removes `kit.ref` from **every** repository
+  in the fixture, because the ceiling is per-repository and a half-adopted
+  fixture cannot tell a failure of the unadopted side from a failure of the
+  clean-adopting side.
+
 - **Seven new self-test breakages (23–29), each asserting the NAMED check.**
   The four failure modes against **fixture** fleets (the real fleet is red by
   design, so "the gate went red" there is satisfied by two clean repositories),
   plus the mount regression, the pin moved back into `.env.example`, and the
   `ports:` append rule the compose file's own comment promised and the gate did
-  not implement — now 30 breakages in all, 15 of them name-specific.
+  not implement.
 
   Breakage 28's shape is the one that reads like an improvement: shipping
   `KIT_STACK_REF=<sha>` in the template means a fresh clone looks configured and
