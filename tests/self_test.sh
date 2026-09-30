@@ -61,17 +61,46 @@
 #   22. report an undeclared core pin as `current` -> staleness_test.sh goes red.
 #         Two real repositories are in that state today, which is what makes the
 #         difference between `undeclared` and `current` load-bearing.
+#   23. a parity-allowlist entry naming an artefact kit does not ship -> the
+#         dead-entry check goes red. The ESLint direction, and the mutation is
+#         well-formed in every other respect, so a shape-only check passes it.
+#   24. a parity-allowlist entry naming a repository that does not exist, at the
+#         gate, where the fleet is not on disk -> the same check goes red. The
+#         OTHER direction of the same rule, and the one that is easy to get
+#         wrong: an entry for a repo that is merely out of scope is NOT dead.
+#   25. `tests/artifacts.json` naming a `{lang}` source kit does not ship for
+#         every language -> the artefact-table check goes red. Half a language is
+#         worse than none, and the table is what says so.
+#   26. report an ABSENT artefact as `current` -> staleness_test.sh goes red.
+#         This is the breakage the packet is for: the reporter treating the
+#         commonest state in the fleet as the one that means everything is fine.
+#   27. grade a copy by RESEMBLANCE rather than by equality -> staleness_test.sh
+#         goes red. The failure mode the packet names: a file that looks like
+#         kit's is not evidence it is kit's.
+#   28. give one of the two programs a third-party import -> the carve-out check
+#         goes red. "Standard library only" was a sentence in AGENTS.md for the
+#         whole life of the rule and nothing checked it; a boundary nobody can
+#         cross is not a boundary.
 #
 #   These are numbered 20-22 rather than 19-21 because 19 is the allowlist
 #   breakage above, from the tier work. Both packets numbered their first entry
 #   independently and the collision is only visible in the union — which is what
 #   the header/recipe check in validate.sh is for.
 #
-#   Eight of them (7-10, 11, 12, 19, 20) additionally assert WHICH check went
-#         red. Every other breakage only proves the gate can fail; those prove
-#         the check written for that defect is still load-bearing, which is a
-#         different claim and the one that decays silently. 21 and 22 assert the
-#         same thing about the two scripts that are themselves proofs.
+#   23-27 continue that numbering from the same two packets: 23-25 are the
+#   parity-allowlist, artefact-table and carve-out checks (kit-14), 26-27 break
+#   the staleness reporter's templates half, and 28 is the third-party import.
+#   The reason the copy-is-gone case gets TWO breakages and not one is that
+#   "report absent as current" and "grade by resemblance" are opposite mistakes
+#   that a single mutation cannot both produce: one removes a finding, the
+#   other invents one, and a gate that can only do one of them is half a gate.
+#
+#   Eleven of them (7-10, 11, 12, 19, 20, 23-25, 28) additionally assert WHICH
+#         check went red. Every other breakage only proves the gate can fail;
+#         those prove the check written for that defect is still load-bearing,
+#         which is a different claim and the one that decays silently. 21, 22,
+#         26 and 27 assert the same thing about the two scripts that are
+#         themselves proofs.
 #
 #   The counts here were wrong twice and both times a check caught it rather
 #   than a reader: the header said "seven" over a four-wide range, and it
@@ -124,6 +153,10 @@ fresh_copy() {
   # `core` is here for the same reason `.github` is: the breakages below mutate
   # files in it, and a copy without it would fail on a missing path rather than
   # on the defect under test — which is a self_test that proves nothing.
+  # `templates` is here for the parity-allowlist breakages below, and the copy
+  # is useless without it: a copy missing the file the mutation edits would fail
+  # on a missing path rather than on the defect, which is the failure mode
+  # `edit` exists to prevent and the reason the failure is silent.
   for entry in .github AGENTS.md README.md CHANGELOG.md core docker lint templates tests; do
     [ -e "$ROOT/$entry" ] && cp -R "$ROOT/$entry" "$dst/"
   done
@@ -654,6 +687,133 @@ twentytwo="$(fresh_copy undeclared-reads-current)"
 edit "$twentytwo/tests/staleness.py" '    return UNDECLARED' '    return CURRENT'
 expect_red_script 'breakage 22: the staleness reporter calls an undeclared pin current' \
   "$twentytwo" tests/staleness_test.sh
+
+# 23-25. The parity allowlist and the artefact table.
+#
+#     23 and 24 are the two directions of ONE rule — an entry that matches
+#     nothing is a failure — and they are separate breakages because they fail
+#     for different reasons and a check that catches only one is half a rule.
+#     23 is the ESLint shape (the artefact is gone); 24 is the one that is easy
+#     to over-reach on (the repository is merely not on disk at gate time, which
+#     is NOT the same as gone, and treating it as gone is how a scoped run
+#     becomes a false alarm on a fleet-wide ledger).
+#
+#     Both entries are well-formed in every other respect. That is the point: a
+#     shape-only check passes both, and a hygiene rule in a data file is exactly
+#     the shape of a check nobody has ever seen fail.
+PARITY='templates/parity-allowlist  (reason, owner, since, until; dead entries fail)'
+ARTTABLE='tests/artifacts.json  (every declared source exists, for every language)'
+
+# 23. An entry for an artefact kit does not ship. The realistic version is a
+#     rename: `lint/eslint.config.mjs` becomes `lint/eslint.config.ts`, the
+#     entry keeps the old id, and it is now exempting nothing.
+twentythree="$(fresh_copy dead-parity-entry)"
+cat >>"$twentythree/templates/parity-allowlist" <<'ENTRY'
+diverged billing lint/eslint.config.mjs reason="this artefact was renamed in artifacts.json, so this entry exempts nothing" owner=kit since=2026-09-30 until=2026-12-31
+ENTRY
+expect_red_check 'breakage 23: a parity entry naming an artefact kit does not ship' \
+  "$twentythree" "$PARITY" --static-only
+
+# 24. An entry naming a repository that is not on disk. The gate has no fleet —
+#     kit's CI has no sibling checkouts — so the check that catches this is a
+#     check about the LEDGER's own consistency, and it has to be able to tell
+#     "this repo is not here" from "this repo is not in scope". A gate that
+#     cannot tell those two is a gate that reports eighty dead entries on a
+#     clean tree, which is a report nobody reads.
+twentyfour="$(fresh_copy parity-names-a-ghost)"
+cat >>"$twentyfour/templates/parity-allowlist" <<'ENTRY'
+diverged a-repository-that-was-never-here mise.toml reason="a repository that does not exist, so this entry cannot be checked against anything" owner=kit since=2026-09-30 until=2026-12-31
+ENTRY
+expect_red_check 'breakage 24: a parity entry naming a repository that does not exist' \
+  "$twentyfour" "$PARITY" --static-only
+
+# 25. A `{lang}` source kit does not ship for one language. `bun` is the one
+#     that matters: it was added late and for a service that had been
+#     hand-rolling a whole workflow for want of it, so it is the language most
+#     likely to be half-adopted again.
+#
+#     The mutation DELETES the source rather than corrupting it, because that is
+#     the defect: not a broken primer, a missing one, which is the one shape
+#     every existing check would sail past.
+twentyfive="$(fresh_copy half-a-language)"
+rm -f "$twentyfive/templates/bin-prime/bun.sh"
+expect_red_check 'breakage 25: kit offers `language: bun` but ships no primer for it' \
+  "$twentyfive" "$ARTTABLE" --static-only
+
+# 26. AN ABSENCE REPORTED AS `current`.
+#
+#     This is the breakage the packet exists for. The templates half's commonest
+#     state in the real fleet is `absent` — 0 of 9 services hold the collector,
+#     1 of 9 holds `bin/dev` — and the one-line way to make all of that
+#     disappear is to grade a path that is not there as fine.
+#
+#     The mutation is in the state table, not in the comparison, because the
+#     comparison is not what is wrong: reading a missing file as "no
+#     difference" is a one-word change in the classification and it turns the
+#     most alarming column of the report into a green one.
+twentysix="$(fresh_copy absent-reads-current)"
+edit "$twentysix/tests/staleness.py" \
+  '    if missing:
+        cell["state"] = TPL_ABSENT' \
+  '    if missing:
+        cell["state"] = TPL_CURRENT'
+expect_red_script 'breakage 26: the staleness reporter calls an ABSENT artefact current' \
+  "$twentysix" tests/staleness_test.sh
+
+# 27. GRADE BY RESEMBLANCE.
+#
+#     The packet's third requirement: never infer a pin from content. The
+#     realistic bug is a well-intentioned threshold — a future reader decides
+#     99.9% identical is close enough, because the alternative (a flag on every
+#     re-copy) is annoying.
+#
+#     `difflib.SequenceMatcher(...).quick_ratio()` is exactly that threshold,
+#     already imported, and it is the shape a helpful patch would take. The
+#     assertion it has to break is the one asserting a ONE-BYTE difference is
+#     `diverged`, which is the property in its smallest form.
+twentyseven="$(fresh_copy grade-by-resemblance)"
+edit "$twentyseven/tests/staleness.py" \
+  '        if pair_kit == repo_bytes:' \
+  '        if pair_kit == repo_bytes or matcher_ratio(pair_kit, repo_bytes) > 0.99:'
+cat >>"$twentyseven/tests/staleness.py" <<'PY'
+
+
+def matcher_ratio(a: bytes, b: bytes) -> float:
+    """The resemblance threshold the packet forbids. Added by self_test 27."""
+    import difflib
+
+    return difflib.SequenceMatcher(None, a, b, autojunk=False).quick_ratio()
+PY
+expect_red_script 'breakage 27: the reporter grades a copy by resemblance, not equality' \
+  "$twentyseven" tests/staleness_test.sh
+
+# 28. THE CARVE-OUT BOUNDARY.
+#
+#     `core/` ships two programs and AGENTS.md says they are "standard library
+#     only, no import outside json/os/re/sys/argparse/subprocess". Nothing
+#     checked that sentence for the whole life of the rule, which made it a
+#     promise — and a promise nobody can break is decoration. kit is a
+#     configuration repository; a `pip install` in one of these files is a
+#     dependency, and the whole argument for the carve-out is that there are
+#     none.
+#
+#     The mutation is a function-local import, because a function-local import is
+#     what a contributor actually writes when they are being careful about
+#     looking tidy, and it is the shape a grep-based check would miss. The check
+#     walks the AST, so there is nowhere to put one that it cannot see.
+twentyeight="$(fresh_copy a-third-party-import)"
+"$PY" - "$twentyeight/tests/staleness.py" <<'PY'
+import sys
+
+path = sys.argv[1]
+body = open(path, encoding="utf-8").read()
+# Appended at the end, at module scope, so the file still parses and still runs:
+# a mutation that broke the program would prove only that Python exists.
+with open(path, "a", encoding="utf-8") as fh:
+    fh.write("\n\ndef _third_party():\n    import requests  # self_test breakage 28\n")
+PY
+expect_red_check 'breakage 28: one of the two programs gains a third-party import' \
+  "$twentyeight" 'tests/classify.py + tests/staleness.py' --static-only
 
 printf '\n'
 if [ "$failures" -ne 0 ]; then

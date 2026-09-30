@@ -39,12 +39,14 @@ kit/
 │   ├── tier/<lang>/                      # the DECLARED tier, per language
 │   ├── tier/skip-allowlist               # one file for the fleet; four hygiene rules
 │   ├── tier/README.md                    # the format, the rules, and the limits
+│   ├── parity-allowlist                  # WHY each service's copy is not kit's bytes
 │   ├── mise.toml                         # toolchain pin template
 │   └── AGENTS.md                         # skeleton for a service repo
 └── tests/
     ├── validate.sh                       # THE gate
     ├── classify.py  rules.json           # the change classifier, failing closed
-    └── staleness.py                      # the fleet staleness reporter
+    ├── staleness.py  artifacts.json      # the staleness reporter, and WHAT it measures
+    └── self_test.sh                      # every check, broken once, asserted red
 ```
 
 Flat on purpose. `grep -r` finds everything; there is no plugin system to
@@ -133,14 +135,15 @@ Three phases, and all three must pass:
   guard: a check that only parsed those two files would pass on a classifier
   that waves every change through. They stay runnable when static analysis is
   skipped, because a gate that skips is not green.
-- **self_test** — twenty-three breakages of a throwaway copy, asserting the gate
+- **self_test** — twenty-nine breakages of a throwaway copy, asserting the gate
   goes red each time. Six of them are a semantic mutation of one language each,
-  so **every suite is proven able to fail** rather than assumed to. Eight assert
+  so **every suite is proven able to fail** rather than assumed to. Twelve assert
   that one *named* check reported `FAIL`, so a check written for a specific
-  defect is proven still load-bearing. Two assert that a *proof* goes red: one
-  inverts the classifier's fail-closed property, and one makes the staleness
-  reporter call an undeclared pin `current`. A property nobody has tried to
-  break is a property nobody has tested.
+  defect is proven still load-bearing. Four assert that a *proof* goes red: the
+  classifier's fail-closed property inverted, an undeclared core pin reported
+  `current`, an **absent** template reported `current`, and a copy graded by
+  **resemblance** rather than equality. A property nobody has tried to break is
+  a property nobody has tested.
 - Tests are written **first** and watched fail before the artifacts exist. A
   config written from documentation instead of from the pinned image is a config
   that breaks on the first `bin/dev up`: Tempo, Loki and Mimir all reject keys
@@ -210,6 +213,56 @@ So:
   those two keywords as sets. Each had to argue for itself. Widening the list is
   a deliberate, diffable act in one file.
 
+## The reporter fails closed too, and so does a copy that is missing
+
+`tests/staleness.py` has two scopes. `--scope core` measures a **pin**; the one
+kit already had. `--scope templates` measures a **file**, and a file has a state
+a pin does not have: it is not there. `templates/` has drifted furthest and the
+commonest state in the fleet is `absent` — 0 of 9 services hold the collector,
+1 of 9 holds `bin/dev` — so the reporter needed a word for it before anything
+else could be said.
+
+Five states, and the vocabulary is the whole design:
+
+| state | meaning | needs a pin? |
+| --- | --- | --- |
+| `current` | byte-identical to what kit ships, at the declared path | no |
+| `diverged` | present, and not byte-identical | **yes** |
+| `absent` | kit ships one and the service holds nothing there | **yes** |
+| `unknown` | it could not be measured | **yes** |
+| `n/a` | kit ships no variant of this artefact for this service's language | no |
+
+`unknown` inherits the rule above rather than copying it. A service that
+declares no `language`, a symlink where a copy should be, an unreadable file, an
+artefact kit has stopped shipping — each is a finding, because the cheap answer
+in every one of those cases is a guess, and a guess reported as a measurement is
+the fail-open direction. `n/a` exists so that `unknown` can stay honest: a Go
+service has no `.rubocop.yml` because it is not a Ruby service, and calling that
+unmeasured would put three permanent, unfixable findings on every service in the
+fleet.
+
+**Never infer a copy from its content.** There is no similarity threshold, no
+percentage, no "closest match", and no search for a file that hashes to kit's
+artefact. A copy is `current` when the bytes at the declared path are equal and
+the path is a real file in the service's own tree, and at no other time. One
+appended byte makes it `diverged`, and `diverged` needs a pin. This is
+self_test breakage 27, written as the well-intentioned patch it would be — a
+`quick_ratio() > 0.99` — because that is the shape a helpful contributor
+reaches for, and the only way to know the rule holds is to try to break it.
+
+**`templates/parity-allowlist` is the same dialect as
+`templates/tier/skip-allowlist`: the same four rules, in the same words, one
+entry per line.** Two dialects of "record why" is how one of them goes stale. It
+adds one rule the tier file does not need — **an unpinned divergence or absence
+is a failure** — because its entries name copies in repositories the gate cannot
+read, so the file is a *record of the fleet*, and a record that silently omits a
+cell is worse than no record: it reads as "handled".
+
+The count is printed on PASS and it is a measurement, not a ledger to shrink.
+It is currently **80**, which is a bad number, and the way to move it is to
+re-copy an artefact and delete the entry — never to delete an entry, which the
+dead-entry rule turns red.
+
 ## Adding a language
 
 1. Add `<lang>` to the `language` input's `options` in
@@ -250,13 +303,24 @@ an `option` with no `job` is a green build that ran nothing.
     programs rather than configuration. They are here because a standard
     without a thing that enforces it is a standard enforced by whoever reads
     it. They stay inside the boundary deliberately: **standard library only,
-    no import outside `json`/`os`/`re`/`sys`/`argparse`/`subprocess`**, no
-    installable dependency, and **nothing imports them** — the real test of this
-    rule is that nothing here is a library, and a classifier is not. The
+    no import outside `json`/`os`/`re`/`sys`/`argparse`/`subprocess`/`difflib`/`glob`/`urllib`/`__future__`**,
+    no installable dependency, and **nothing imports them** — the real test of
+    this rule is that nothing here is a library, and a classifier is not. The
     reporter prints a table for a scheduled job and **never commits its
     output**, because a committed report is the "generated output" this rule
     forbids and the kind of file that rots. If a third program is proposed, the
     default answer is no.
+  - **The allowed-import list is ENFORCED, not aspirational.**
+    `difflib` and `glob` arrived with the templates half of the staleness
+    reporter — the first counts the lines two copies differ by, the second
+    resolves a `{lang}` source — and `urllib` was already there and already
+    unnamed, so the sentence was out of date before anybody checked it.
+    `tests/validate.sh`'s `carve-out boundary` check walks the **AST** of both
+    programs, not their text, so a function-local import is read the same as a
+    top-level one, and it asserts that every module it finds is named in **this
+    paragraph**. Widening the list is a deliberate, diffable act in this file
+    *and* a red gate until the check agrees with it. A list that grows by a later
+    commit is not a control — the same argument `advisoryOps` rests on.
 - **Callers override, they never fork.** Anything that differs per service —
   versions, thresholds, names — is an input or a build arg, never a copy of a
   file. Six repos each holding their own workflow is the drift this repo

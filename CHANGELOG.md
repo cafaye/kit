@@ -13,6 +13,97 @@ semver contract — it is consumed by *calling*
 
 ### Added
 
+- **kit-14 — the staleness reporter, pointed at `templates/`, and the word
+  `absent`.**
+  kit already had a change classifier and a staleness reporter for `core/`, and
+  both work. Both also **only watched `core/`**, while `templates/` — the
+  directory that has drifted furthest — was watched by nothing.
+
+  This is not "detect drift in `templates/`". Drift detection assumes a copy
+  exists, and in the fleet the copies are gone: of the twelve files in
+  `templates/compose/`, the nine services hold `docker-compose.yml` in seven of
+  them and **none of the collector, Tempo, Loki, Mimir or Grafana provisioning
+  in any of them**. A reporter that only knew `current` and `stale` would have
+  nothing to say about the commonest state in the fleet.
+
+  - **`tests/artifacts.json` — the one place kit says what it ships and where a
+    service puts it.** Twelve artefacts, the language each applies to, and the
+    `compose` bundle's twelve members. Read by the reporter *and* by the gate,
+    because a table written down twice is a table that is right in one of the
+    two places. `destAlternatives` records the six Dockerfiles that live at the
+    repository root rather than at kit's documented `docker/Dockerfile`: a
+    documented, working placement is not an absence, and a reporter that cries
+    wolf over it is a reporter that gets muted.
+  - **`tests/staleness.py --scope templates` — five states.**
+    `current`, `diverged`, **`absent`**, `unknown`, and `n/a`. `absent` is the
+    new word and the whole reason the packet existed. `unknown` inherits the
+    classifier's fail-closed rule rather than copying it: no declared language,
+    a symlink where a copy should be, an unreadable file, an artefact kit has
+    stopped shipping — each is a finding, because the cheap answer in every one
+    of those cases is a guess. `n/a` exists so `unknown` can stay honest; a Go
+    service has no `.rubocop.yml` because it is not a Ruby service, and calling
+    that unmeasured would put three permanent, unfixable findings on every
+    service in the fleet.
+  - **A copy is never inferred from its content.** No similarity threshold, no
+    percentage, no search for a file that hashes to kit's. A copy is `current`
+    when the bytes at the declared path are equal and the path is a real file
+    in the service's own tree, and at no other time. Proved by
+    `tests/self_test.sh` breakage 27, written as the `quick_ratio() > 0.99`
+    patch somebody would write to relax it.
+  - **`templates/parity-allowlist` — why a copy is not kit's bytes.** The tier
+    skip-allowlist's four hygiene rules in the same words and the same one-line
+    dialect, because kit does not have two dialects of "record why". It adds the
+    rule the tier file does not need: **an unpinned divergence or absence is a
+    failure**, since its entries name copies in repositories the gate cannot
+    read, and a record that silently omits a cell reads as "handled". **80
+    entries**, and the count is printed on every green run because 80 is a bad
+    number and everybody should be able to see that it is one.
+  - **Four new self-test breakages (23–27) and a boundary that finally has a
+    check behind it (28).** 23 and 24 are the two directions of one rule: a
+    dead entry, and an entry naming a repository that does not exist (which is
+    *not* the same as a repository out of scope, and the first version could not
+    tell them apart and reported all eighty as dead on a scoped run). 25 is a
+    `{lang}` source kit offers but does not ship — half a language is worse than
+    none. 26 reports an `absent` artefact as `current`, and 27 grades by
+    resemblance; they are separate because they are opposite mistakes, one
+    removing a finding and the other inventing one, and a gate that can only do
+    one of them is half a gate.
+  - **`carve-out boundary` — a check, and the sentence it found out of date.**
+    `AGENTS.md` has said "standard library only" since the carve-out was made
+    and nothing verified it. The new check walks the **AST** of both programs —
+    so a function-local import is read the same as a top-level one — and asserts
+    that every module it finds is named in the sentence as well as on the list.
+    It failed on its first run: `glob` arrived with this packet and `urllib` had
+    been imported all along without ever being written down.
+
+- **`tests/staleness.py --scope templates` measured the fleet, and the brief's
+  numbers did not survive it.** `README.md` opens
+  [what the fleet actually adopted](#what-the-fleet-actually-adopted) with the
+  result. The corrections worth stating here: `mise.toml` and `AGENTS.md` are
+  9/9 diverged and both divergences are **adoption working** (README steps 4
+  and 5), with 8–19 code lines between them once comments are stripped; and
+  `lint/*` is **3 diverged, 3 absent**, not 0/9, because `billing`, `parlor` and
+  `identity` each hold a linter config that is their own — none carrying kit's
+  STRICTNESS NOTES block. The honest sentence is "nobody lints with kit's
+  rules", not "nobody lints".
+
+- **One of my own sentences was wrong, which is why it is here.** The first draft
+  of `REPORT-kit-14.md` and of eight ledger entries said a partially-adopted
+  compose stack "cannot start". Checked with `docker compose config`: it does
+  not. None of the seven services' compose files mounts any of kit's eleven,
+  each declares one or two services of its own, and five of six pass validation
+  — they are **replacements that kept a filename**, not broken copies. The
+  reporter now says what it measured ("partially adopted: N of 12 members
+  held") and stops there, because comparing bytes cannot tell a replacement from
+  a broken copy.
+
+- **A defect the byte-comparison cannot see, found while checking the sentence
+  above.** `muse/docker-compose.yml` **does not parse**: an unquoted
+  `${MUSE_VAULT_KEY:?…, or run: …}` whose error message contains a colon, and
+  YAML reads the value as the start of a mapping. `docker compose config` fails
+  with `yaml: line 65, column 67`. The reporter calls that cell `diverged`,
+  which is true and is not the interesting thing about it; the ledger entry for
+  `muse` now says so.
 - **kit-07 — the declared tier, and the allowlist that is supposed to shrink.**
   A tier is a class of test that needs a real dependency. The failure this
   exists to prevent has already happened in this fleet: a green run in which the

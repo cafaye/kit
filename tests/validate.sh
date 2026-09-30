@@ -3202,6 +3202,397 @@ PY
   check 'templates/tier/skip-allowlist  (reason, owner, since, until; unused entries fail)' \
     skip_allowlist_check
 
+  # (3b) The PARITY allowlist, and the artefact table it is checked against.
+  #
+  #     Same four hygiene rules as the tier skip allowlist above, in the same
+  #     words, because kit does not have two dialects of "record why". What is
+  #     NEW here is the other direction, and it is the one that matters most:
+  #
+  #     AN UNPINNED DIVERGENCE OR ABSENCE IS A FAILURE.
+  #
+  #     The tier allowlist does not need that rule because its entries name
+  #     tests that are either present or absent for reasons the file's own
+  #     comments explain. This one names copies in repositories kit cannot see
+  #     at gate time, so the file is a RECORD OF THE FLEET, and a record that
+  #     silently omits a cell is worse than no record: it reads as "handled".
+  #
+  #     Which is why the count is printed on PASS, in the sentence a green run
+  #     shows, and why the header says the number is a measurement and not a
+  #     ledger to shrink. Deleting an entry to make the count go down is a
+  #     failure of its own, and the reporter catches it against the fleet.
+  #
+  #     The two checks the gate can run WITHOUT the fleet are the ones it runs:
+  #     an entry that names an `artefact-id` kit does not ship, and an entry
+  #     whose verb is not a verb the reporter can report. The rest — an unpinned
+  #     cell, a dead entry, a verb that disagrees with the measurement — needs
+  #     the fleet, and is proven by `tests/staleness_test.sh` against a fixture
+  #     fleet rather than asserted here. Saying so is the point: a check that
+  #     claims to have compared 80 entries against nine repositories it has
+  #     never read is the kind of claim this repository exists to distrust.
+  parity_allowlist_check() {
+    "$PY" - "$ROOT" <<'PY'
+import datetime
+import json
+import os
+import re
+import sys
+
+root = sys.argv[1]
+ledger = os.path.join(root, "templates", "parity-allowlist")
+table_path = os.path.join(root, "tests", "artifacts.json")
+
+if not os.path.isfile(ledger):
+    sys.exit(
+        "templates/parity-allowlist is missing: kit ships twelve artefacts that "
+        "services copy, and a divergence with no recorded reason is unproven "
+        "rather than fine"
+    )
+if not os.path.isfile(table_path):
+    sys.exit("tests/artifacts.json is missing: there is no declaration of what kit ships")
+
+# The inventory is the artefact table — the SAME file the reporter reads, which
+# is the point of having one. An inventory derived independently here would be a
+# second, unchecked copy of the truth, which is the defect AGENTS.md's
+# header/recipe check exists to prevent and which kit has already had once.
+try:
+    with open(table_path, encoding="utf-8") as fh:
+        table = json.load(fh)
+except (OSError, json.JSONDecodeError) as exc:
+    sys.exit(f"tests/artifacts.json is unreadable: {exc}. A table this gate cannot "
+             f"read is a table it would approve anything against")
+
+ids = {a.get("id") for a in table.get("artefacts", []) if a.get("id")}
+if not ids:
+    sys.exit(
+        "tests/artifacts.json declares no artefact ids, so the unused-entry rule "
+        "would check nothing: an allowlist validated against an empty inventory "
+        "is an allowlist that accepts everything"
+    )
+
+#   diverged  present at the declared path, not byte-identical
+#   absent    not present where kit ships one
+#   unknown   the comparison could not be made (no declared language)
+#
+# Three verbs, and the third is why this is not a two-verb format: an
+# unmeasurable cell is a finding, and a two-verb ledger would have to state
+# something false about it to record something true.
+LINE = re.compile(
+    r'^(?P<verb>diverged|absent|unknown)\s+(?P<repo>\S+)\s+(?P<artefact>\S+)'
+    r'(?P<fields>(?:\s+[a-z]+=(?:"[^"]*"|\S+))*)\s*$'
+)
+FIELD = re.compile(r'([a-z]+)=("[^"]*"|\S+)')
+WHY = {
+    "reason": 'without one, "it is fine" becomes the reason for everything',
+    "owner": "a divergence nobody owns is a divergence nobody will bring back into line",
+    "since": "the ratchet needs the date the decision was taken",
+    "until": "an entry that cannot expire has stopped being a decision",
+}
+
+today = datetime.date.today()
+problems = []
+seen = {}
+entries = 0
+
+for lineno, raw in enumerate(open(ledger, encoding="utf-8").read().splitlines(), 1):
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    entries += 1
+
+    m = LINE.match(line)
+    if not m:
+        problems.append(
+            f"line {lineno}: malformed entry. Expected 'diverged|absent|unknown <repo> "
+            f"<artefact-id> reason=\"...\" owner=… since=YYYY-MM-DD "
+            f"until=YYYY-MM-DD' on ONE line — a wrapped reason is two entries, one "
+            f"of which is a parse error"
+        )
+        continue
+
+    fields = {k: v.strip('"') for k, v in FIELD.findall(m.group("fields"))}
+    key = (m.group("repo"), m.group("artefact"))
+
+    for name in ("reason", "owner", "since", "until"):
+        if not fields.get(name):
+            problems.append(f"line {lineno}: entry names no {name} — {WHY[name]}")
+
+    # The unused-entry rule, against the artefact table. This is ESLint's
+    # `reportUnusedDisableDirectives` shape: an entry for something that no
+    # longer exists excuses nothing, and the entry is how you find out first.
+    # Resolved against the TABLE and not against a directory listing, so a
+    # renamed artefact fails loudly instead of quietly matching whatever now
+    # sits at that path.
+    if m.group("artefact") not in ids:
+        problems.append(
+            f"line {lineno}: entry matches NOTHING — tests/artifacts.json declares "
+            f"no artefact {m.group('artefact')!r}. The artefact was renamed or "
+            f"removed, or the entry was written for a typo. Either way it is dead "
+            f"weight, and a ledger that cannot notice its own dead entries is a "
+            f"ledger that eventually contains the whole fleet"
+        )
+
+    if key in seen:
+        problems.append(
+            f"line {lineno}: duplicate entry for {key[0]}/{key[1]}, already listed "
+            f"on line {seen[key]}. Two records for one cell means one of them is "
+            f"not being read"
+        )
+    seen[key] = lineno
+
+    for name in ("since", "until"):
+        value = fields.get(name)
+        if not value:
+            continue
+        try:
+            parsed = datetime.date.fromisoformat(value)
+        except ValueError:
+            problems.append(f"line {lineno}: {name}={value!r} is not an ISO date (YYYY-MM-DD)")
+            continue
+        if name == "until" and parsed < today:
+            problems.append(
+                f"line {lineno}: EXPIRED on {value} (today is {today.isoformat()}). "
+                f"Re-copy the artefact and delete the entry, or move the date and "
+                f"write a NEW reason — a date that rolls forward by itself is not "
+                f"a ratchet"
+            )
+
+if problems:
+    for p in problems:
+        print("  -", p)
+    sys.exit(1)
+
+# THE TOTAL, PRINTED ON PASS. `check` indents a passing check's stdout under its
+# label, so this is visible in a GREEN run — the only place a growing list is
+# least likely to be noticed, and the whole reason the tier allowlist prints its
+# count too. 80 entries is a bad number, and it is printed so that everybody
+# can see it is a bad number.
+print(
+    f"parity allowlist: {entries} entr{'y' if entries == 1 else 'ies'} across "
+    f"{len({k[0] for k in seen})} repositor{'y' if len({k[0] for k in seen}) == 1 else 'ies'}, "
+    f"every artefact id in artifacts.json, none expired, none dead. THE TOTAL IS "
+    f"THE MEASUREMENT: 80 entries is 80 copies of kit's templates that the fleet "
+    f"has not adopted or has changed, and the way to shrink it is to re-copy, not "
+    f"to delete an entry. Compare against `tests/staleness.py --scope templates "
+    f"--repos-dir …` for the per-cell state."
+)
+PY
+  }
+  check 'templates/parity-allowlist  (reason, owner, since, until; dead entries fail)' \
+    parity_allowlist_check
+
+  # (3c) The artefact table must describe files that EXIST.
+  #
+  #     A table naming a file kit does not ship makes the reporter call every
+  #     service `absent` for it, forever. That output is indistinguishable from
+  #     a migration backlog, which is the dangerous direction: it would put a
+  #     permanent, unactionable finding in front of a reader and be believed.
+  #     So the table is checked against the tree, and the reporter refuses to
+  #     run at all on a table that fails — proved by staleness_test.sh case 28.
+  #
+  #     This is the same check the reporter makes, called directly rather than
+  #     reimplemented, because two implementations of "is this a real path" is
+  #     one implementation too many.
+  artifact_table_check() {
+    "$PY" - "$ROOT" <<'PY'
+import importlib.util
+import os
+import sys
+
+root = sys.argv[1]
+spec = importlib.util.spec_from_file_location(
+    "staleness", os.path.join(root, "tests", "staleness.py")
+)
+if spec is None or spec.loader is None:
+    sys.exit("tests/staleness.py could not be loaded, so the artefact table cannot "
+             "be checked against the tree it describes")
+staleness = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(staleness)
+
+table = staleness.load_table(os.path.join(root, "tests", "artifacts.json"))
+problems = staleness.validate_table_against_kit(table, root)
+
+# A `{lang}` source must resolve for EVERY language the workflow offers. The
+# glob above proves the shape exists, which catches a rename; this catches a
+# template that exists for five of the seven languages, which is a half-adopted
+# language and the exact defect kit's own "half a language is worse than none"
+# rule is about.
+# The languages, read the way the rest of this file reads them: as YAML, from
+# the workflow's real `options`. `validate.sh` already requires PyYAML and
+# already loads this workflow several times, so parsing it here is not a new
+# dependency — it is the difference between asking the question and grepping
+# for it. The first version of this used a regex over the raw text, matched
+# nothing because `description:` sits between the key and `options:`, and
+# reported a FAILURE — which was the check being right about its own blindness
+# and wrong about the tree. A check that could not parse the thing it is
+# checking must say so, and here it did.
+#
+# `none` is excluded: it is not a language, it is the option for a repository
+# with no service manifest, and `templates/bin-prime/none.sh` does not exist and
+# should not.
+import yaml
+
+workflow = os.path.join(root, ".github", "workflows", "ci.reusable.yml")
+languages = set()
+try:
+    with open(workflow, encoding="utf-8") as fh:
+        doc = yaml.safe_load(fh) or {}
+    triggers = doc.get("on") or doc.get(True) or {}
+    declared = ((triggers.get("workflow_call") or {}).get("inputs") or {})
+    options = ((declared.get("language") or {}).get("options")) or []
+    languages = {o for o in options if o and o != "none"}
+except (OSError, yaml.YAMLError) as exc:
+    problems.append(f"the reusable workflow could not be parsed: {exc}")
+if not languages:
+    problems.append(
+        "the reusable workflow declares no `language` options, so the "
+        "{lang}-interpolated artefacts cannot be checked for every language. A "
+        "check that could not ask its question must not report a pass"
+    )
+
+for artefact in table["artefacts"]:
+    if not artefact.get("needsLanguage"):
+        continue
+    for lang in sorted(languages):
+        source = os.path.join(root, artefact["source"].replace("{lang}", lang))
+        if not os.path.isfile(source):
+            problems.append(
+                f"{artefact['id']}: kit offers `language: {lang}` but ships no "
+                f"{artefact['source'].replace('{lang}', lang)}. Half a language is "
+                f"worse than none: a service that adopts it gets a broken primer"
+            )
+
+if problems:
+    for p in problems:
+        print("  -", p)
+    sys.exit(1)
+print(
+    f"artefact table: {len(table['artefacts'])} artefact(s), every source present "
+    f"in this tree, and every {{lang}} source resolving for all "
+    f"{len(languages)} languages the workflow offers"
+)
+PY
+  }
+  check 'tests/artifacts.json  (every declared source exists, for every language)' \
+    artifact_table_check
+
+  # (3d) The carve-out boundary: the two programs import NOTHING from outside the
+  #      standard library, and only from the seven modules AGENTS.md names.
+  #
+  #      AGENTS.md's rules section says "standard library only, no import outside
+  #      json/os/re/sys/argparse/subprocess" and calls that a carve-out rather
+  #      than a precedent. Until now nothing checked it, which made the sentence
+  #      a promise — and a promise nobody can break is decoration. This parses
+  #      every `import` in both programs rather than grepping, so a
+  #      `from x import y`, a function-local import and a module named inside a
+  #      docstring's example are all read the same way.
+  #
+  #      `difflib` is on the list because the templates half of the staleness
+  #      reporter counts the lines two copies differ by, and a list that grows
+  #      by a later commit is not a control — so growing it is a red gate, and
+  #      the only way past is to change this file and this check in the same
+  #      commit.
+  carveout_boundary_check() {
+    "$PY" - "$ROOT" <<'PY'
+import ast
+import os
+import sys
+
+root = sys.argv[1]
+
+# The list is written HERE and in AGENTS.md, and the two are compared against
+# each other by the check below — so the sentence in AGENTS.md cannot quietly
+# stop matching the rule the gate enforces, which is the property that made
+# kit-05's fail-closed headline worth restating.
+ALLOWED = {"__future__", "argparse", "difflib", "glob", "json", "os", "re",
+           "subprocess", "sys", "urllib"}
+
+programs = ["tests/classify.py", "tests/staleness.py"]
+problems = []
+seen_modules = set()
+
+for rel in programs:
+    path = os.path.join(root, rel)
+    if not os.path.isfile(path):
+        problems.append(f"{rel} is missing: the carve-out is a boundary around two programs")
+        continue
+    with open(path, encoding="utf-8") as fh:
+        try:
+            tree = ast.parse(fh.read(), filename=rel)
+        except SyntaxError as exc:
+            problems.append(f"{rel} does not parse: {exc}")
+            continue
+    # ast.walk, not the module body: a function-local import is still an
+    # import, and the whole value of this check is that there is nowhere to put
+    # one that it cannot see.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            # `level > 0` is a relative import, which cannot happen in a program
+            # nothing imports — and is checked rather than assumed.
+            if node.level:
+                problems.append(
+                    f"{rel}:{node.lineno} is a RELATIVE import. Nothing here is a "
+                    f"package, and a relative import is the first sign of one"
+                )
+                continue
+            names = [node.module or ""]
+        else:
+            continue
+        for name in names:
+            top = name.split(".")[0]
+            seen_modules.add(top)
+            if top not in ALLOWED:
+                problems.append(
+                    f"{rel}:{getattr(node, 'lineno', '?')} imports {top!r}, which is "
+                    f"not standard library or not on AGENTS.md's list. The two "
+                    f"programs are the ONE carve-out from 'config only', and the "
+                    f"carve-out is what keeps kit a repository with no "
+                    f"dependencies — so a new import is a decision about this "
+                    f"repo's identity, not a convenience"
+                )
+
+# A check that proved nothing because it parsed nothing is a check that ran
+# nothing. Both programs must be present AND the walk must have seen something.
+if not seen_modules:
+    problems.append(
+        "no imports were found in either program, so the carve-out check would "
+        "approve anything: the programs have changed shape and the check has not"
+    )
+
+# AGENTS.md and this list must agree. The list is the enforcement; the sentence
+# in AGENTS.md is what a reader believes, and a reader who believes something
+# else from the one that is enforced is worse off than either.
+#
+# `urllib` and its submodules are the reason this half exists as a separate
+# assertion: the reporter imports `urllib.request` and `urllib.error` for the
+# GitHub-org discovery route, and AGENTS.md's original list did not name them —
+# so the sentence was already out of date before this check, and the only way
+# anyone would ever have found out is if they went looking.
+agents = open(os.path.join(root, "AGENTS.md"), encoding="utf-8").read()
+missing = sorted(m for m in seen_modules if f"`{m}`" not in agents)
+if missing:
+    problems.append(
+        f"AGENTS.md's carve-out sentence does not name {', '.join(missing)}, which "
+        f"the programs import. The sentence a reader trusts and the list the gate "
+        f"enforces are not allowed to be different lists"
+    )
+
+if problems:
+    for p in problems:
+        print("  -", p)
+    sys.exit(1)
+print(
+    f"carve-out boundary: {len(programs)} programs, {len(seen_modules)} distinct "
+    f"imports ({', '.join(sorted(seen_modules))}), all standard library, all named "
+    f"in AGENTS.md. kit has no dependency and cannot grow one without this gate "
+    f"going red."
+)
+PY
+  }
+  check 'tests/classify.py + tests/staleness.py  (stdlib only; the carve-out, enforced)' \
+    carveout_boundary_check
+
   # (4) Never cache a test report.
   #
   #     `actions/cache` `restore-keys` restores STALE caches by PREFIX MATCH, and
@@ -3318,6 +3709,14 @@ for path in (
     "templates/compose/mimir",
     "tests/canary_test.sh",
     "tests/no_telemetry_in_readiness.sh",
+    # The two files the staleness templates half is made of. Both are the kind
+    # of thing a reader would never know to look for: the reporter is
+    # self-explanatory, and the ledger is a list. A reader who does not know
+    # they exist concludes the reporter invents its own inventory, which it
+    # does not — and that a divergence with no recorded reason is fine, which
+    # it is not.
+    "tests/artifacts.json",
+    "templates/parity-allowlist",
 ):
     if path not in readme:
         problems.append(f"README.md never mentions {path}")
@@ -3870,8 +4269,36 @@ check 'tests/classify_test.sh  (19 cases, incl. the fail-closed property)' \
   bash "$ROOT/tests/classify_test.sh"
 
 section 'staleness: the fleet reporter tells the states apart'
-check 'tests/staleness_test.sh  (12 cases, incl. the red proof)' \
-  bash "$ROOT/tests/staleness_test.sh"
+# The case count is READ OUT OF THE RUN rather than counted in the source, and
+# that is not pedantry. Counting `printf 'PASS …'` sites in the file gives 27
+# while the suite runs 26, because case 9b has two mutually exclusive branches
+# (a worktree that could be created, and the direct `is_worktree()` assertion
+# for when it could not). A number derived from the source and a number the
+# reader sees in the output then disagree on a green run, which is exactly how a
+# count stops meaning anything — the same reason `self_test`'s count is counted
+# from recipes and the header/recipe check exists at all.
+#
+# So the script runs, its own summary line is read, and the label carries what
+# the run said. If the two ever drift, this block fails rather than printing a
+# number nobody checked.
+_stale_out=""
+_stale_ec=0
+_stale_out=$(bash "$ROOT/tests/staleness_test.sh" 2>&1) || _stale_ec=$?
+_stale_cases=$(printf '%s\n' "$_stale_out" | sed -nE 's/^PASS: staleness_test — ([0-9]+) case.*/\1/p')
+if [ "$_stale_ec" -ne 0 ] || [ -z "$_stale_cases" ]; then
+  report FAIL "tests/staleness_test.sh  (the templates half could not report its own case count)"
+  printf '%s\n' "$_stale_out" | sed 's/^/       /'
+elif [ "$_stale_cases" -lt 20 ]; then
+  # A floor, and it exists because this suite's job is to be able to fail: a
+  # run that quietly stopped proving the absent case would still exit 0. The
+  # number is not the claim — the self-test breakages are — but a suite that
+  # lost half its cases is a suite nobody is running any more.
+  report FAIL "tests/staleness_test.sh  ($_stale_cases cases; the templates half is no longer covered)"
+  printf '%s\n' "$_stale_out" | sed 's/^/       /'
+else
+  report PASS "tests/staleness_test.sh  ($_stale_cases cases, incl. the red proof and the absent case)"
+  printf '%s\n' "$_stale_out" | sed 's/^/       /'
+fi
 
 # ===========================================================================
 # phase: self_test — prove the gate can go red
