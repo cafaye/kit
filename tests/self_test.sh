@@ -157,14 +157,25 @@ expect_red_lang() {
         out=$("$work/kit-mutant-rust" 2>&1)
         ec=$?
       else
-        out=$(cat "$work/build.log")
-        ec=99
+        # A mutant that does not compile proves NOTHING. The suite went red
+        # without running, which is indistinguishable from a green suite to any
+        # harness that only reads the exit code — and a mutation that breaks the
+        # build instead of the behaviour means the spec rule under test was
+        # never reached. This is its own verdict, not a pass.
+        printf 'FAIL self_test: %s — the mutant did not compile, so the suite never ran\n' "$label"
+        sed 's/^/       /' "$work/build.log"
+        failures=$((failures + 1))
+        return
       fi
       ;;
   esac
 
   if [ "$ec" -eq 0 ]; then
     printf 'FAIL self_test: %s — the suite stayed GREEN on a broken codec\n' "$label"
+    # Printed here and nowhere else, because this is the one branch where the
+    # output is the diagnosis: a green run tells you the rule is unasserted, and
+    # the run tells you which test file claims to assert it.
+    printf '%s\n' "$out" | tail -20 | sed 's/^/       /'
     failures=$((failures + 1))
   else
     printf 'PASS self_test: %s\n' "$label"

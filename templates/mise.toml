@@ -58,6 +58,14 @@
 "node" = "22"
 "pnpm" = "9.15.4" # only if the repo ships pnpm-lock.yaml; delete otherwise
 
+# ------------------------------------------------------------- bun (guard/parlor)
+# An EXACT pin, not a series, and the reason is a lockfile: bun.lock is a text
+# format whose resolver output is tied to the bun that wrote it, and a worktree
+# on a different patch resolves differently for the same manifest. Keep the
+# number in step with docker/Dockerfile.bun (BUN_VERSION) and `engines.bun` in
+# package.json — three places, one value.
+"bun" = "1.3.12"
+
 # --------------------------------------------------------- rust (darkroom)
 # Keep the toolchain triple in sync with docker/Dockerfile.rust: a worktree on
 # a newer rustc than the image builds on produces a binary CI never produced.

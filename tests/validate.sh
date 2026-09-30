@@ -226,6 +226,83 @@ OTEL
   fi
 
   # -------------------------------------------------------------------------
+  # AGENTS.md: "Half a language is worse than none." The whole point of kit is
+  # that six repos get the same thing, so a language that has a CI job but no
+  # primer is worse than a language kit does not claim to support: the first is
+  # a service that adopts kit and finds a step missing, silently.
+  #
+  # One list, checked four ways, so adding a language is one edit that fails
+  # until the other three artifacts exist.
+  section 'static: every language ships all four artifacts'
+  kit_languages() {
+    # Kept in step with ci_check's `languages` list below. Both read the CI
+    # workflow's `language` options, so there is exactly one place to add a
+    # language and the workflow cannot claim one the tree does not have.
+    "$PY" - "$ROOT" <<'PY'
+import sys
+
+import yaml
+
+with open(f"{sys.argv[1]}/workflows/ci.reusable.yml", encoding="utf-8") as fh:
+    doc = yaml.safe_load(fh)
+triggers = doc.get("on") or doc.get(True) or {}
+call = (triggers.get("workflow_call") or {}).get("inputs") or {}
+for lang in ((call.get("language") or {}).get("options") or []):
+    print(lang)
+PY
+  }
+
+  while IFS= read -r lang; do
+    [ -n "$lang" ] || continue
+    if otel_required "docker/Dockerfile.$lang" "templates/bin-prime/$lang.sh"; then
+      report PASS "$lang  (Dockerfile + bin/prime present)"
+    else
+      report FAIL "$lang  (Dockerfile + bin/prime present)"
+    fi
+  done < <(kit_languages)
+
+  # mise.toml pins every language too. Checked by parsing the TOML rather than
+  # grepping, so a key that appears in a comment does not count as a pin — a
+  # check that can be satisfied by a comment is not a check.
+  mise_check() {
+    "$PY" - "$ROOT" <<'PY'
+import re
+import sys
+
+root = sys.argv[1]
+with open(f"{root}/workflows/ci.reusable.yml", encoding="utf-8") as fh:
+    import yaml
+
+    doc = yaml.safe_load(fh)
+triggers = doc.get("on") or doc.get(True) or {}
+call = (triggers.get("workflow_call") or {}).get("inputs") or {}
+langs = (call.get("language") or {}).get("options") or []
+
+source = open(f"{root}/templates/mise.toml", encoding="utf-8").read()
+# Only the [tools] table, and only its own lines: a version mentioned in a
+# comment above the table is documentation, not a pin.
+table = re.split(r"^\[", source, flags=re.M)
+tools = ""
+for chunk in table:
+    if chunk.startswith("tools]"):
+        tools = chunk
+        break
+
+problems = []
+if not tools:
+    problems.append("templates/mise.toml has no [tools] table")
+else:
+    for lang in langs:
+        if not re.search(rf'^\s*"?{re.escape(lang)}"?\s*=\s*\S', tools, flags=re.M):
+            problems.append(f"templates/mise.toml pins no version for {lang}")
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check 'templates/mise.toml  (a [tools] pin per language)' mise_check
+
+  # -------------------------------------------------------------------------
   section 'static: compose — nothing hardcoded, nothing shipped'
   # Privacy boundary, enforced. The collector template a developer clones onto
   # a laptop must not be able to send a span anywhere on its own. Asserted on
@@ -391,6 +468,7 @@ PY
   # breaks every consumer's CI is a kit change that does not ship.
   ci_check() {
     "$PY" - "$ROOT" <<'PY'
+import re
 import sys
 
 import yaml
@@ -417,7 +495,13 @@ else:
 
 jobs = doc.get("jobs") or {}
 
-for lang in ("go", "ruby", "elixir", "python", "node", "rust"):
+# One entry per language kit ships a Dockerfile, a bin/prime and a mise pin for.
+# The list lives here and nowhere else, so "add a language" is one line that
+# fails immediately until the other three artifacts exist — rather than a
+# language with a CI job and no primer.
+languages = ["go", "ruby", "elixir", "python", "node", "bun", "rust"]
+
+for lang in languages:
     job = jobs.get(lang)
     if not isinstance(job, dict):
         problems.append(f"job {lang} disappeared")
@@ -425,6 +509,15 @@ for lang in ("go", "ruby", "elixir", "python", "node", "rust"):
     cond = job.get("if")
     if cond is None or f"inputs.language == '{lang}'" not in cond:
         problems.append(f"job {lang} is no longer gated on its language input")
+
+# A caller can only pass what `options` allows, so an option with no job is a
+# green build that ran nothing, and a job with no option is a job no repo can
+# reach. The two lists are the same list.
+options = ((call.get("language") or {}).get("options")) or []
+if sorted(options) != sorted(languages):
+    problems.append(
+        f"`language` options {sorted(options)} do not match the job set {sorted(languages)}"
+    )
 
 tjob = jobs.get("telemetry")
 if not isinstance(tjob, dict):
@@ -438,6 +531,35 @@ else:
         problems.append("telemetry job has no language matrix: it must execute every language")
     elif sorted(matrix) != sorted(["go", "ruby", "elixir", "python", "node", "rust"]):
         problems.append(f"telemetry matrix does not cover the six languages: {matrix}")
+
+# A workflow that parses is not a workflow that runs. `if:` conditions and
+# `${{ }}` are opaque to yaml.safe_load, so the two ways this file has actually
+# broken in review — an expression that never resolves, and a `${{` that opens a
+# block it never closes — are caught by reading the source as text. A file
+# needing this check is a file that needed it.
+source = open(f"{root}/workflows/ci.reusable.yml", encoding="utf-8").read()
+for match in re.finditer(r"\$\{\{", source):
+    lineno = source[: match.start()].count("\n") + 1
+    tail = source[match.start() :]
+    line_end = tail.find("\n")
+    line = tail if line_end == -1 else tail[:line_end]
+    if "}}" not in line:
+        problems.append(f"line {lineno}: unclosed ${{{{ in an expression")
+        break
+
+# Every `uses:` is owner/repo[/path]@ref. A step with no ref resolves to
+# whatever that action's default branch says today, which is not a pin.
+for lineno, line in enumerate(source.splitlines(), 1):
+    stripped = line.strip()
+    if not stripped.startswith("uses:"):
+        continue
+    ref = stripped.split("uses:", 1)[1].strip().strip("'\"")
+    if ref.startswith("./") or ref.startswith("docker://"):
+        continue
+    if "@" not in ref:
+        problems.append(f"line {lineno}: `uses: {ref}` has no ref")
+    elif ref.endswith(("@master", "@main")):
+        problems.append(f"line {lineno}: `uses: {ref}` points at a branch, not a release")
 
 if problems:
     sys.exit("; ".join(problems))
