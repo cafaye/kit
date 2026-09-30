@@ -329,7 +329,6 @@ PY
   # `ruby -c foo.snippet` fails on the extension alone and `node --check` throws
   # ERR_UNKNOWN_FILE_EXTENSION.
   section 'static: every otel snippet parses in its own language'
-
   snippet_dir="$TMP/snippets"
   rm -rf "$snippet_dir"
   mkdir -p "$snippet_dir"
@@ -645,12 +644,12 @@ for signal, pipe in pipelines.items():
             f"{signal} pipeline redacts after batching, which is after the data "
             f"has already left the process"
         )
-    # SPAN EVENTS ARE OUT OF REACH. The redaction processor is specified over
-    # span/log/datapoint ATTRIBUTES; a span event carries its own attribute map
-    # at a different depth which it does not visit. So a service still writing
-    # the DEPRECATED `exception` span event ships `exception.message` and
-    # `exception.stacktrace` straight through a boundary with neither on its
-    # allowlist. Found by the canary test failing, not by reading the docs.
+    # 3. SPAN EVENTS ARE OUT OF REACH. The redaction processor is specified over
+    #    span/log/datapoint ATTRIBUTES; a span event carries its own attribute map
+    #    at a different depth which it does not visit. So a service still writing
+    #    the DEPRECATED `exception` span event ships `exception.message` and
+    #    `exception.stacktrace` straight through a boundary with neither on its
+    #    allowlist. Found by the canary test failing, not by reading the docs.
     if signal == "traces" and not any("span_event" in p for p in raw):
         problems.append(
             "the traces pipeline has no span-event transform, so exception.message "
@@ -1963,6 +1962,71 @@ if problems:
 PY
   }
   check 'templates/compose/.env.example  (every placeholder documented)' env_example_check
+
+  # bin/dev's escape hatch must actually WORK, and "must work" is a claim only
+  # running it settles.
+  #
+  # `set -u` plus an empty array is a portable-shell trap: macOS ships bash 3.2,
+  # where `"${a[@]}"` on an empty array is an "unbound variable" ERROR rather
+  # than nothing. kit-03 shipped `local profile_args=()` and expanded it
+  # unconditionally, so `KIT_DEV_PROFILES= bin/dev up` — the DOCUMENTED way to
+  # run the stack without the observability backends — died on line one with
+  #
+  #   bin/dev: line 120: profile_args[@]: unbound variable
+  #
+  # The failure is spectacular precisely because the default path works, so
+  # nothing else in the suite noticed. Here the script is actually executed with
+  # the variable empty and is only required to get past argument parsing, which
+  # is where the trap bites; a stub `docker` on PATH keeps the test hermetic and
+  # fast, because what is under test is the shell, not compose.
+  dev_escape_hatch_check() {
+    local stub sandbox out ec=0
+    stub="$TMP/dev-hatch-stub"
+    sandbox="$TMP/dev-hatch"
+    rm -rf "$stub" "$sandbox"
+    mkdir -p "$stub" "$sandbox/bin" "$sandbox/grafana" "$sandbox/tempo" \
+      "$sandbox/loki" "$sandbox/mimir"
+    cat >"$stub/docker" <<'STUB'
+#!/usr/bin/env bash
+# Reports readiness so `bin/dev up` believes the stack came up, and does
+# nothing else. What is under test is the SHELL, not compose.
+case "$*" in
+  *" version"*) echo "Docker Compose version v2.0.0"; exit 0 ;;
+esac
+case "$1" in
+  --profile) shift 2 ;;
+esac
+exit 0
+STUB
+    chmod +x "$stub/docker"
+    # A compose file and the vendor config trees, so `require_files` passes and
+    # the run reaches `up`, which is where the trap fires. They are empty files
+    # on purpose: nothing here parses them.
+    : >"$sandbox/docker-compose.yml"
+    : >"$sandbox/otel-collector.yml"
+    : >"$sandbox/.env.example"
+    cp "$ROOT/templates/bin/dev.sh" "$sandbox/bin/dev"
+
+    # `KIT_DEV_PROFILES=''` and not `KIT_DEV_PROFILES=`: shellcheck reads the
+    # latter as a typo, and it is right to.
+    out="$(cd "$sandbox" && KIT_DEV_PROFILES='' PATH="$stub:$PATH" \
+      bash ./bin/dev up 2>&1)" || ec=$?
+    case "$out" in
+      *"unbound variable"*)
+        echo "the documented escape hatch KIT_DEV_PROFILES= is broken:"
+        printf '%s\n' "$out" | head -3
+        return 1
+        ;;
+      *"no migration command found"*) return 0 ;;
+      *)
+        echo "bin/dev with KIT_DEV_PROFILES= exited $ec without reaching the"
+        echo "migration step; expected the clean 'no migration command' exit."
+        printf '%s\n' "$out" | head -6
+        return 1
+        ;;
+    esac
+  }
+  check 'templates/bin/dev.sh  (KIT_DEV_PROFILES= escape hatch actually runs)' dev_escape_hatch_check
 
   # Dogfood lint/yamllint.yml on the two YAML templates kit writes. Optional:
   # yamllint ships in tests/requirements.txt, and a machine without it gets a

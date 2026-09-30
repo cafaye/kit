@@ -540,7 +540,27 @@ processors:
           # first version passed `":"` and produced a metric called
           # `cafaye_calls:_total`, which is worse than no suffix at all because
           # it looks deliberate.
-          - 'set(name, Concat([name, "_total"], "")) where IsMatch(name, "\\.calls$")'
+          #
+          # AND THE ESCAPING IS THE WHOLE STORY. The pattern used to read
+          # `IsMatch(name, "\\.calls$")` — inside a YAML SINGLE-QUOTED scalar,
+          # where a backslash is not an escape character, so OTTL received a
+          # regex of `\\.calls$`: a literal BACKSLASH followed by any character
+          # followed by `calls`. The connector emits `cafaye.calls`, which that
+          # does not match, so the rename never fired on any metric, ever.
+          #
+          # This processor was wired into the metrics pipeline and documented at
+          # length, and every dashboard panel queries `cafaye_calls_total` (Mimir
+          # mangles the dot to an underscore on OTLP ingestion), so every panel
+          # on both dashboards rendered "No data" against a stack that was
+          # working perfectly. Found by asking Mimir what series it actually
+          # held rather than by reading this file.
+          #
+          # The fix avoids escapes entirely rather than correcting them, because
+          # a single-quoted YAML scalar is the wrong place to carry one: the
+          # character class matches a leading dot or underscore, so the rule
+          # survives whichever separator the connector or the store uses, and
+          # there is no layer where the escaping could be counted wrong.
+          - 'set(name, Concat([name, "_total"], "")) where IsMatch(name, "(^|[._])calls$")'
       - context: datapoint
         statements:
           - 'delete_key(attributes, "redaction.redacted.count")'

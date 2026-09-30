@@ -111,17 +111,34 @@ compose() {
   # it. `up` is the one that matters for the default path; `ps` and `logs` need
   # it too, or `bin/dev status` reports a healthy stack as half-absent and
   # `bin/dev logs tempo` says "no such service".
-  local profile_args=()
+  #
+  # THE EMPTY-ARRAY EXPANSION IS THE TRAP, and it is a trap because `set -u` is
+  # on. macOS ships bash 3.2, where an empty array expanded as "${a[@]}" under
+  # `set -u` is an "unbound variable" ERROR rather than nothing — so the escape
+  # hatch (`KIT_DEV_PROFILES= bin/dev up`, the documented way to run without the
+  # observability stack) died on the first line of the script with
+  #
+  #   bin/dev: line 120: profile_args[@]: unbound variable
+  #
+  # which is a spectacularly bad way to find out that a documented flag does not
+  # work. The conditional expansion below is the portable form: on bash 4.4+ it
+  # is identical to "${a[@]}" and on 3.2 it yields nothing.
   if [ -n "$KIT_DEV_PROFILES" ]; then
-    profile_args=(--profile "$KIT_DEV_PROFILES")
-  fi
-
-  if docker compose version >/dev/null 2>&1; then
-    docker compose "${profile_args[@]}" "$@"
-  elif command -v docker-compose >/dev/null 2>&1; then
-    docker-compose "${profile_args[@]}" "$@"
+    if docker compose version >/dev/null 2>&1; then
+      docker compose --profile "$KIT_DEV_PROFILES" "$@"
+    elif command -v docker-compose >/dev/null 2>&1; then
+      docker-compose --profile "$KIT_DEV_PROFILES" "$@"
+    else
+      die "neither 'docker compose' (v2) nor 'docker-compose' is installed" 127
+    fi
   else
-    die "neither 'docker compose' (v2) nor 'docker-compose' is installed" 127
+    if docker compose version >/dev/null 2>&1; then
+      docker compose "$@"
+    elif command -v docker-compose >/dev/null 2>&1; then
+      docker-compose "$@"
+    else
+      die "neither 'docker compose' (v2) nor 'docker-compose' is installed" 127
+    fi
   fi
 }
 
