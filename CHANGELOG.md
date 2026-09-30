@@ -1,13 +1,96 @@
 # Changelog
 
 All notable changes to `kit` are recorded here. kit has no releases yet and no
-semver contract — it is consumed by *calling* `workflows/ci.reusable.yml@master`
-and by *copying* files out of `lint/`, `docker/`, and `templates/`.
+semver contract — it is consumed by *calling*
+`.github/workflows/ci.reusable.yml@master` and by *copying* files out of
+`lint/`, `docker/`, and `templates/`.
+
+> Entries under **Earlier**, and the three `workflows/ci.reusable.yml` bullets
+> below, record the path the file had *at the time*. It was
+> `workflows/ci.reusable.yml` until the move recorded in Unreleased/Changed.
 
 ## Unreleased
 
 ### Added
 
+- A **`callable path` check** in `tests/validate.sh`: the reusable workflow
+  exists at the path callers are documented to use, it declares
+  `on: workflow_call`, every real `uses:` that names kit — in `README.md`,
+  `AGENTS.md` and this repo's own workflow files — is exactly that path,
+  `kit`'s own CI calls it with the local `./` form, and there is exactly one
+  copy of it in the tree. The failure it exists for: for six months the file
+  sat at `workflows/ci.reusable.yml`, the README told every reader to call
+  `cafaye/kit/workflows/ci.reusable.yml@master`, GitHub resolved that to
+  nothing, and **every check in the suite was green throughout**. A layout bug
+  and a documentation bug that agree with each other are invisible to any check
+  that reads only one of them.
+- `tests/bootstrap.sh` — the gate now installs its own dependencies.
+  `bash tests/validate.sh` is the **whole procedure on a clean clone**: it
+  resolves an interpreter, builds `.venv` and pip installs
+  `tests/requirements.txt` on first run, printing a `note:` line. `AGENTS.md`
+  and the README no longer instruct anyone to run a two-line step first.
+
+  This was the second time the gate failed on arrival. It exited 1 with
+  `no python with PyYAML: pip install -r tests/requirements.txt` on every fresh
+  clone and every CI runner, because it preferred the gitignored `.venv` and
+  fell back to a `python3` that has no PyYAML. The prerequisite was documented,
+  which is exactly why it got skipped: by every runner, and by anyone who
+  cloned without reading the file first.
+- `yamllint` now lints **every** YAML in the tree, enumerated by `git ls-files`
+  rather than a hand-kept list of the two compose templates, and a missing
+  yamllint is a `FAIL` instead of a `SKIP`. kit ships the config and a repo
+  that copies it lints its own CI against it on day one, so a YAML that breaks
+  the config greets the first adopting repo with a failure nobody authored. A
+  skip here would hide a broken config behind a missing tool on precisely the
+  machine that had not run the gate before.
+- **`lint/hadolint.yaml`, and real lint on all seven Dockerfiles.** They were
+  the only artifact in the tree with no parser at all — seven `SKIP ... (no
+  parser for this file type)` lines, honest and completely uncovered, on a file
+  every adopting service inherits. They now get three layers: hadolint
+  (required, pinned to 2.15.1, verified against hadolint's published
+  `checksums.sha256`); a non-root / no-`:latest` / no-`ADD` check for the two
+  properties hadolint cannot see; and a check that each template's own
+  STRICTNESS NOTES state the non-root guarantee to the reader deciding whether
+  to adopt the file.
+
+  **hadolint found a real defect on its first run.** `docker/Dockerfile.python`
+  ran `pip install uv` with no version, so the resolver's own version decided
+  what every build resolved to — an unpinned build input in the one image whose
+  whole point is a frozen resolution. Now `ARG UV_VERSION=0.5.11`, in step with
+  the `uv` pin in `templates/mise.toml`.
+
+  **The third check found a documentation bug in the same run.**
+  `Dockerfile.bun`'s STRICTNESS NOTES said *"The official image has no
+  unprivileged user, so we create one."* `oven/bun:1.3.12-slim` ships `bun` at
+  uid 1000 (verified against the running container) and the `useradd` that note
+  described was never in the file — the note described a different Dockerfile
+  than the one being read. Three of the seven said nothing about non-root at
+  all; all seven say so now.
+- The one ignored hadolint rule is DL3008 ("pin apt versions"), argued in
+  `lint/hadolint.yaml` rather than assumed: a hardcoded `build-essential=12.9`
+  in a template thirteen repos copy is a version thirteen people must remember
+  to bump, and the day Debian drops that build every one of them fails at once —
+  a correlated outage caused by a security patch landing. A service that wants
+  reproducible apt resolution pins in its own repo, which is the
+  "callers override, they never fork" rule.
+- `expect_red_check` in `tests/self_test.sh`, which asserts that one *named*
+  check reported `FAIL` rather than merely that the gate went red. Breakages
+  7-10 use it, so the check written for each layout/documentation drift is
+  proven load-bearing instead of being one of forty checks that could have
+  gone red for an unrelated reason.
+- `.github/workflows/ci.yml` — kit calling its own reusable workflow with
+  `uses: ./.github/workflows/ci.reusable.yml`. The repository that defines the
+  standard is now the first repository held to it, and if the callable path ever
+  breaks again it is red on kit's own commit rather than discovered by the
+  first service that adopts it.
+- A `none` value for the `language` input, and a `none` job that runs the
+  calling repository's own `tests/validate.sh`. **This is a bug fix, not a
+  feature.** The workflow was uncallable by any repository without a service
+  manifest — which includes `kit`. `language` is `required: true` and every
+  value in `options` named a toolchain, so `uses: ./.github/workflows/ci.reusable.yml`
+  had no input that could make it resolve. The job fails when `tests/validate.sh`
+  is absent, because a config gate with no gate in it is the same defect as a
+  coverage threshold left at `0`.
 - `workflows/ci.reusable.yml` — a `bun` job: `bun install --frozen-lockfile` →
   `bun run typecheck` → `bun test`, with an opt-in coverage step. Exists because
   `guard` was hand-rolling a whole workflow for want of one; a repo that adopts
@@ -55,8 +138,14 @@ and by *copying* files out of `lint/`, `docker/`, and `templates/`.
 
 ### Changed
 
-- `self_test.sh` grew from 5 breakages to 11. Six are new: one semantic
-  mutation per language implementation, each against a different W3C section, so
+- **The reusable workflow moved to `.github/workflows/ci.reusable.yml`.** It was
+  at `workflows/ci.reusable.yml`, and GitHub documents that subdirectories of
+  the workflows directory are not supported — so the `uses: cafaye/kit/workflows/
+  ci.reusable.yml@master` line in the README resolved to nothing. No repository
+  in the fleet was calling it. It is now a **move, not a mirror**: one file, at
+  the only path GitHub will resolve, so there is no second copy to diverge.
+- `self_test.sh` grew from 5 breakages to 18. Six are per-language semantic
+  mutations, each against a different W3C section, so
   **every** suite is proven able to fail rather than assumed to. A mutant that
   fails to compile is its own verdict rather than a pass, a missing toolchain is
   a skip that fails the run, and an unmatched mutation is a hard failure so the

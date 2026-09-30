@@ -17,16 +17,19 @@
 #   telemetry  the W3C traceparent templates are EXECUTED, one suite per
 #              language. This is the phase that is easy to fake and so is the
 #              one that runs the code rather than greps it.
-#   self_test  breaks a throwaway copy of this tree four ways and asserts the
+#   self_test  breaks a throwaway copy of this tree once per kind of check and asserts the
 #              gate goes red each time. A gate that cannot fail is not a gate.
 #
 # One line per check: PASS, FAIL, or SKIP. Any FAIL exits 1. A SKIP is always
 # reported in the summary — never hidden.
 #
-# Needs a python with PyYAML (tests/requirements.txt). node, shellcheck,
-# yamllint and the six language toolchains run when present and skip when not;
-# the artifact-presence and static checks always run, so a deleted template is
-# a failure on a machine with no toolchains at all.
+# Dependencies: PyYAML and yamllint (tests/requirements.txt) and hadolint, all
+# three REQUIRED and all three bootstrapped by tests/bootstrap.sh on first run,
+# so this one command is the whole procedure on a clean clone.
+#
+# node, the shellcheck binary, and the six language toolchains run when present
+# and skip when they are not; the artifact-presence and static checks always
+# run, so a deleted template is a failure on a machine with no toolchains at all.
 
 set -euo pipefail
 
@@ -34,13 +37,24 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/kit-validate.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
 
-PY="${KIT_PYTHON:-$ROOT/.venv/bin/python}"
-[ -x "$PY" ] || PY=python3
-"$PY" -c 'import yaml' 2>/dev/null || {
-  echo "no python with PyYAML: pip install -r tests/requirements.txt" >&2
-  exit 1
-}
+# The one path the whole repo agrees on, read by every check that looks at the
+# reusable workflow. It is a variable rather than a literal repeated in a dozen
+# heredocs because the path being wrong is exactly the defect this packet
+# exists to fix — see the `callable path` check below.
+WORKFLOW='.github/workflows/ci.reusable.yml'
 
+# The one `language` option that is not a language. `none` means "this
+# repository has no service manifest": no go.mod, no Gemfile, no
+# pyproject.toml. It exists because the repository that defines the workflow
+# is itself such a repository, and without it kit cannot call its own
+# standard — the file was uncallable by the only repo that had any business
+# calling it. A real Dockerfile, a `bin/prime` and a mise pin are meaningless
+# for it, so the four-artifacts rule deliberately does not apply.
+CONFIG_ONLY='none'
+
+# Arguments are parsed BEFORE anything is installed, so `--help` answers on a
+# machine with no python and no network. A `--help` that bootstraps a virtualenv
+# is a help message with a side effect.
 RUN_STATIC=1
 RUN_TELEMETRY=1
 RUN_SELF_TEST=1
@@ -67,6 +81,31 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+# The gate installs its own dependencies. Not `shellcheck` and not `node` —
+# those stay optional and reported as SKIPs when absent — but PyYAML, without
+# which not one check in this file can run, and yamllint, which kit's own
+# configs are linted with.
+#
+# This is the second time this has been a problem. It was a two-line manual
+# step in AGENTS.md that every fresh clone and every CI runner missed, and the
+# gate exited 1 with `no python with PyYAML` before checking anything. A
+# prerequisite that is documented and not automated is a prerequisite that will
+# be skipped by exactly the machine you most wanted to hear from.
+#
+# The resolved interpreter is exported so `tests/self_test.sh`, and every
+# throwaway copy of the gate it spawns, uses the same one instead of each
+# re-deriving it. That is not only speed: eighteen copies each bootstrapping
+# their own virtualenv is eighteen chances to fail for a reason that has nothing
+# to do with the breakage under test.
+if [ ! -r "$ROOT/tests/bootstrap.sh" ]; then
+  echo "validate.sh: tests/bootstrap.sh is missing — the gate cannot install its own dependencies" >&2
+  exit 1
+fi
+# shellcheck source=tests/bootstrap.sh
+. "$ROOT/tests/bootstrap.sh"
+kit_bootstrap_python "$ROOT"
+export KIT_PYTHON="$PY"
 
 # ---------------------------------------------------------------------------
 # static helpers
@@ -118,9 +157,135 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # ===========================================================================
 
 if [ "$RUN_STATIC" -eq 1 ]; then
+  # Dockerfile rules hadolint does not cover. Defined here rather than inline so
+  # the section above reads as a list of assertions.
+  docker_rules() {
+    "$PY" - "$ROOT" <<'PY'
+import os
+import re
+import sys
+
+root = sys.argv[1]
+docker_dir = os.path.join(root, "docker")
+
+problems = []
+for name in sorted(os.listdir(docker_dir)):
+    if not name.startswith("Dockerfile."):
+        continue
+    rel = f"docker/{name}"
+    body = open(os.path.join(docker_dir, name), encoding="utf-8").read()
+    lines = body.splitlines()
+
+    # `USER` after the LAST `FROM` is the runtime user. Everything before it is
+    # build-time and runs as root by design — that is what a builder stage is.
+    last_from = max(
+        (i for i, ln in enumerate(lines) if re.match(r"^\s*FROM\s", ln, re.I)),
+        default=None,
+    )
+    if last_from is None:
+        problems.append(f"{rel}: no FROM — nothing to run")
+        continue
+
+    final_stage = lines[last_from:]
+    users = [
+        ln.strip()[len("USER "):].strip()
+        for ln in final_stage
+        if re.match(r"^\s*USER\s+\S", ln, re.I)
+    ]
+    if not users:
+        problems.append(
+            f"{rel}: the final stage sets no USER, so it runs as root — "
+            f"a container running as root is a container where a bug is a host "
+            f"compromise"
+        )
+    elif any(u.split(":")[0] in ("root", "0", "0:0") for u in users):
+        problems.append(f"{rel}: the final stage's USER is root ({users[-1]})")
+
+    # Every FROM carries an explicit tag, and never `latest`.
+    for i, ln in enumerate(lines, 1):
+        m = re.match(r"^\s*FROM\s+(\S+)(.*)$", ln, re.I)
+        if not m:
+            continue
+        image, rest = m.group(1), m.group(2)
+        # An ARG-interpolated tag still has to end in a real tag, so the last
+        # colon-separated component is what carries it: `python:${V}-slim` ends
+        # in `-slim`, `golang:${V}` ends in `${V}`. Neither is `latest`.
+        tail = re.split(r"[ \t]", rest.strip())[0] if rest.strip() else ""
+        if not tail and ":" not in image:
+            problems.append(f"{rel}:{i}: FROM {image} has no tag; an untagged base is a moving target")
+        if tail in ("latest",) or image.rsplit(":", 1)[-1] == "latest":
+            problems.append(f"{rel}:{i}: FROM {image} is :latest")
+
+    # ADD pulls a URL as easily as a file, so it is a way to put unverified
+    # content in an image without a hash. COPY cannot do that. The four kit
+    # artifacts a service inherits should not hand a reader that option.
+    for i, ln in enumerate(lines, 1):
+        if re.match(r"^\s*ADD\s", ln, re.I):
+            problems.append(f"{rel}:{i}: ADD — use COPY, which cannot fetch a URL")
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+
+  # Every template's STRICTNESS NOTES must state the non-root guarantee, in the
+  # final stage, in the file itself. Parsed as the leading comment block rather
+  # than grepped for a keyword: all seven files mention "root" somewhere in
+  # prose, so a grep was satisfied by a line about root-owned directories while
+  # the actual guarantee went unstated.
+  docker_notes() {
+    "$PY" - "$ROOT" <<'PY'
+import os
+import re
+import sys
+
+root = sys.argv[1]
+docker_dir = os.path.join(root, "docker")
+
+problems = []
+for name in sorted(os.listdir(docker_dir)):
+    if not name.startswith("Dockerfile."):
+        continue
+    rel = f"docker/{name}"
+    lines = open(os.path.join(docker_dir, name), encoding="utf-8").read().splitlines()
+
+    # The leading comment block, stopping at the first instruction.
+    head = []
+    for ln in lines:
+        if not ln.lstrip().startswith("#"):
+            break
+        head.append(ln)
+
+    if not head:
+        problems.append(f"{rel}: no STRICTNESS NOTES header comment")
+        continue
+
+    body = "\n".join(head).lower()
+    # `non-root`, `nonroot`, or `uid 1000`-style: the claim is that the process
+    # is not uid 0, however the file happens to word it. What it must NOT accept
+    # is a note that only talks about root-owned files.
+    claims_non_root = re.search(r"non-?root", body) is not None
+    if not claims_non_root:
+        problems.append(
+            f"{rel}: its STRICTNESS NOTES do not state that the final stage runs "
+            f"non-root. Every one of these templates does run non-root (the check "
+            f"above proves it), but a reader deciding whether to adopt the file "
+            f"reads the notes, not the gate"
+        )
+    if "strictness" not in body:
+        problems.append(
+            f"{rel}: the header comment has no STRICTNESS NOTES block, so a future "
+            f"contributor has nothing saying what is enforced and why"
+        )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+
   section 'static: every artifact parses'
 
-  for f in "$ROOT"/workflows/* "$ROOT"/lint/* "$ROOT"/docker/* \
+  for f in "$ROOT"/.github/workflows/* "$ROOT"/lint/* "$ROOT"/docker/* \
     "$ROOT"/templates/bin-prime/* "$ROOT"/templates/compose/* \
     "$ROOT"/templates/bin/* "$ROOT"/tests/*.sh; do
     [ -f "$f" ] || continue
@@ -135,7 +300,20 @@ if [ "$RUN_STATIC" -eq 1 ]; then
           report SKIP "$path  (node not installed)"
         fi
         ;;
-      *) report SKIP "$path  (no parser for this file type)" ;;
+      "$ROOT"/docker/Dockerfile.*)
+        # Linted by hadolint in the section below, and by `docker_rules` for the
+        # two properties hadolint does not cover. Deliberately not reported
+        # here: "no parser for this file type" was the seven-line SKIP this
+        # packet exists to remove, and printing it next to a real hadolint
+        # result would say both "unchecked" and "checked" in the same run.
+        ;;
+      *)
+        # A new file type with no parser is a gap, so it is loud rather than
+        # quiet. It is still a SKIP, because the honest report matters more
+        # than a red gate on an unknown extension — but a SKIP is counted and
+        # printed in the summary, which is how the seven Dockerfiles were found.
+        report SKIP "$path  (no parser for this file type)"
+        ;;
     esac
   done
 
@@ -394,6 +572,75 @@ SNIPPETS
   fi
 
   # -------------------------------------------------------------------------
+  # The seven Dockerfiles.
+  #
+  # These are one of the four artifacts every adopting service inherits, and
+  # until now they received NO lint at all: the artifact-presence loop above
+  # reached the `*)` branch and printed
+  #
+  #     SKIP docker/Dockerfile.go  (no parser for this file type)
+  #
+  # seven times. A skip is honest, which is how it was found, and honest is not
+  # the same as covered: a Dockerfile that does not build ships unverified, and
+  # a service that adopts one finds out on its own first deploy.
+  #
+  # hadolint is the real parser and it is required, not optional. It is a
+  # single static binary, so `kit_bootstrap_binary` fetches a pinned release and
+  # verifies its published sha256 rather than trusting whatever is on PATH —
+  # a linter that is silently absent, or silently different, is the same
+  # SKIP wearing a PASS.
+  section 'static: every Dockerfile is hadolint clean'
+  if kit_bootstrap_binary hadolint \
+    "https://github.com/hadolint/hadolint/releases/download/v${KIT_HADOLINT_VERSION}" \
+    "$KIT_HADOLINT_SHA256S" "$ROOT"; then
+    for f in "$ROOT"/docker/Dockerfile.*; do
+      [ -f "$f" ] || continue
+      rel="${f#"$ROOT"/}"
+      # `--no-color`: the gate's output is read by humans and by CI log
+      # scrapers, and an ANSI escape in a FAIL block is noise in both.
+      if out=$("$BIN" -c "$ROOT/lint/hadolint.yaml" --no-color "$f" 2>&1); then
+        report PASS "$rel  (hadolint)"
+      else
+        report FAIL "$rel  (hadolint)"
+        printf '%s\n' "$out" | sed 's/^/       /'
+      fi
+    done
+  else
+    # Not a SKIP. hadolint is the only thing standing between a template and a
+    # broken build, and a gate that reports "I could not check" and exits 0 is
+    # the exact shape PLAN.md §1 calls a gate that is not green. It is also the
+    # shape that let seven Dockerfiles go unlinted in the first place.
+    report FAIL 'hadolint (required: could not be installed — see the note above)'
+  fi
+
+  # hadolint is a syntax-and-practice linter. It will happily pass a Dockerfile
+  # whose final stage runs as root, and root in a container is a container where
+  # a bug is a host compromise. So the two properties kit's own STRICTNESS NOTES
+  # claim for all seven — a non-root final stage, and a pinned (never `:latest`)
+  # base image — are asserted here rather than assumed from the prose.
+  #
+  # Read from the file as text, not from a Dockerfile parser: these templates
+  # use `ARG` interpolation, so a base image is `python:${PYTHON_VERSION}-slim`
+  # and the claim to check is that the tag exists and is not `latest`, not that
+  # it is a literal. hadolint is the parser for everything it can parse; this is
+  # the two claims that outlive it.
+  section 'static: every Dockerfile runs non-root on a pinned base'
+  check 'docker/Dockerfile.*  (non-root final stage, no :latest, no ADD)' docker_rules
+
+  # A Dockerfile with no USER in its final stage is a real defect, and the check
+  # above proves that claim can fail. So the claim is written down where the
+  # reader is: in each template's own STRICTNESS NOTES, the block a person
+  # deciding whether to adopt this file actually reads.
+  #
+  # The note is required to be about the non-root final stage specifically, not
+  # merely to contain the word "root" — every one of the seven already mentions
+  # running non-root SOMEWHERE in passing, in prose no check read. A check that
+  # the claim is documented where the reader looks, and the check that the claim
+  # is true, are different checks; this is the first.
+  section 'static: each Dockerfile documents its own non-root guarantee'
+  check 'docker/Dockerfile.*  (STRICTNESS NOTES state the non-root stage)' docker_notes
+
+  # -------------------------------------------------------------------------
   # AGENTS.md: "Half a language is worse than none." The whole point of kit is
   # that six repos get the same thing, so a language that has a CI job but no
   # primer is worse than a language kit does not claim to support: the first is
@@ -406,17 +653,26 @@ SNIPPETS
     # Kept in step with ci_check's `languages` list below. Both read the CI
     # workflow's `language` options, so there is exactly one place to add a
     # language and the workflow cannot claim one the tree does not have.
-    "$PY" - "$ROOT" <<'PY'
+    #
+    # `$2` is the option that means "no language" and so ships no artifacts.
+    # It is skipped here rather than being special-cased out of the workflow,
+    # because a hardcoded name in two places is exactly how the two drift.
+    #
+    # The path arrives as argv[3] rather than being written out again here: a
+    # second copy of this string is a second thing to forget to move.
+    "$PY" - "$ROOT" "$CONFIG_ONLY" "$WORKFLOW" <<'PY'
 import sys
 
 import yaml
 
-with open(f"{sys.argv[1]}/workflows/ci.reusable.yml", encoding="utf-8") as fh:
+skip = sys.argv[2]
+with open(sys.argv[3], encoding="utf-8") as fh:
     doc = yaml.safe_load(fh)
 triggers = doc.get("on") or doc.get(True) or {}
 call = (triggers.get("workflow_call") or {}).get("inputs") or {}
 for lang in ((call.get("language") or {}).get("options") or []):
-    print(lang)
+    if lang != skip:
+        print(lang)
 PY
   }
 
@@ -433,18 +689,20 @@ PY
   # grepping, so a key that appears in a comment does not count as a pin — a
   # check that can be satisfied by a comment is not a check.
   mise_check() {
-    "$PY" - "$ROOT" <<'PY'
+    "$PY" - "$ROOT" "$CONFIG_ONLY" "$WORKFLOW" <<'PY'
 import re
 import sys
 
 root = sys.argv[1]
-with open(f"{root}/workflows/ci.reusable.yml", encoding="utf-8") as fh:
+config_only = sys.argv[2]
+with open(sys.argv[3], encoding="utf-8") as fh:
     import yaml
 
     doc = yaml.safe_load(fh)
 triggers = doc.get("on") or doc.get(True) or {}
 call = (triggers.get("workflow_call") or {}).get("inputs") or {}
-langs = (call.get("language") or {}).get("options") or []
+# `none` is the absence of a toolchain; there is no mise tool to pin for it.
+langs = [x for x in ((call.get("language") or {}).get("options") or []) if x != config_only]
 
 source = open(f"{root}/templates/mise.toml", encoding="utf-8").read()
 # Only the [tools] table, and only its own lines: a version mentioned in a
@@ -699,32 +957,68 @@ PY
   }
   check 'templates/compose/.env.example  (every placeholder documented)' env_example_check
 
-  # Dogfood lint/yamllint.yml on the two YAML templates kit writes. Optional:
-  # yamllint ships in tests/requirements.txt, and a machine without it gets a
-  # reported SKIP rather than a silent pass.
-  YAMLLINT="${KIT_YAMLLINT:-$ROOT/.venv/bin/yamllint}"
-  if [ -x "$YAMLLINT" ]; then
-    section 'static: compose templates are yamllint clean'
-    for f in otel-collector.yml docker-compose.yml; do
-      check "templates/compose/$f  (yamllint -c lint/yamllint.yml)" \
-        "$YAMLLINT" -c "$ROOT/lint/yamllint.yml" "$ROOT/templates/compose/$f"
-    done
+  # Dogfood lint/yamllint.yml on every YAML in the tree, not just the two
+  # compose templates. kit ships the config and a repo that copies it lints its
+  # own CI against it on day one, so a YAML that breaks the config is a YAML
+  # that greets the first adopting repo with a failure nobody authored.
+  #
+  # Required, not optional: it is in tests/requirements.txt and the bootstrap
+  # above has already installed it, so a machine that reaches this line has
+  # yamllint. A SKIP here would hide a broken config behind a missing tool on
+  # exactly the machine that has not run the gate before.
+  #
+  # The check that used to skip when it was absent is now a FAIL, and says so —
+  # the absence is a defect in the environment, not a neutral fact, and it is
+  # the difference between "this YAML is bad" and "I did not look".
+  section 'static: every YAML in the tree is yamllint clean'
+  if [ -z "${KIT_YAMLLINT:-}" ]; then
+    if ! kit_bootstrap_console_script yamllint yamllint "$ROOT"; then
+      exit 1
+    fi
+    YAMLLINT="$CONSOLE"
   else
-    report SKIP 'yamllint (not installed: pip install -r tests/requirements.txt)'
+    YAMLLINT="$KIT_YAMLLINT"
+  fi
+  if [ ! -x "$YAMLLINT" ]; then
+    report FAIL "yamllint (KIT_YAMLLINT=$YAMLLINT is not executable)"
+  else
+    # Lint the tree, not a hand-kept list. `git ls-files` rather than `find` so
+    # the gate lints exactly what a caller clones, and so a .venv full of
+    # somebody else's YAML never enters the report. Falls back to `find` in a
+    # throwaway copy from self_test, which is not a git repository.
+    #
+    # `while read` rather than `mapfile` into an array: mapfile is a bash 4
+    # builtin and kit's gate is also run by whatever `bash` a slim container
+    # ships. A loop over a pipeline needs no array, and no `set -u`-safe empty
+    # expansion.
+    yamls_of_the_tree() {
+      if [ -d "$ROOT/.git" ] || [ -f "$ROOT/.git" ]; then
+        git -C "$ROOT" ls-files '*.yml' '*.yaml' 2>/dev/null
+      else
+        (cd "$ROOT" && find . -name .venv -prune -o -type f \( -name '*.yml' -o -name '*.yaml' \) -print |
+          sed 's|^\./||' | sort)
+      fi
+    }
+    while IFS= read -r rel; do
+      [ -n "$rel" ] || continue
+      [ -f "$ROOT/$rel" ] || continue
+      check "$rel  (yamllint -c lint/yamllint.yml)" \
+        "$YAMLLINT" -c "$ROOT/lint/yamllint.yml" "$ROOT/$rel"
+    done < <(yamls_of_the_tree)
   fi
 
   # The CI workflow gains a job; assert the job exists, is opt-in, and that the
   # default call still runs exactly the six original jobs. A kit change that
   # breaks every consumer's CI is a kit change that does not ship.
   ci_check() {
-    "$PY" - "$ROOT" <<'PY'
+    "$PY" - "$ROOT" "$CONFIG_ONLY" "$WORKFLOW" <<'PY'
 import re
 import sys
 
 import yaml
 
-root = sys.argv[1]
-with open(f"{root}/workflows/ci.reusable.yml", encoding="utf-8") as fh:
+config_only = sys.argv[2]
+with open(sys.argv[3], encoding="utf-8") as fh:
     doc = yaml.safe_load(fh)
 
 problems = []
@@ -762,12 +1056,29 @@ for lang in languages:
 
 # A caller can only pass what `options` allows, so an option with no job is a
 # green build that ran nothing, and a job with no option is a job no repo can
-# reach. The two lists are the same list.
+# reach. The two lists are the same list — plus the one option that names the
+# absence of a language, which has a job of its own.
 options = ((call.get("language") or {}).get("options")) or []
-if sorted(options) != sorted(languages):
+if sorted(options) != sorted(languages + [config_only]):
     problems.append(
-        f"`language` options {sorted(options)} do not match the job set {sorted(languages)}"
+        f"`language` options {sorted(options)} do not match the job set "
+        f"{sorted(languages + [config_only])}"
     )
+
+# `none` is what lets a repository with no service manifest adopt this
+# workflow at all, and kit is such a repository. It gets the same treatment as
+# every other option: a job, and a guard on the input. An option whose job has
+# no `if` would run in all thirteen consumer repos on day one.
+cjob = jobs.get(config_only)
+if not isinstance(cjob, dict):
+    problems.append(
+        f"job {config_only} disappeared: without it a repository with no service "
+        f"manifest cannot call this workflow, which is why kit never called its own"
+    )
+else:
+    cond = cjob.get("if")
+    if cond is None or f"inputs.language == '{config_only}'" not in cond:
+        problems.append(f"job {config_only} is not gated on its language input")
 
 tjob = jobs.get("telemetry")
 if not isinstance(tjob, dict):
@@ -787,7 +1098,7 @@ else:
 # broken in review — an expression that never resolves, and a `${{` that opens a
 # block it never closes — are caught by reading the source as text. A file
 # needing this check is a file that needed it.
-source = open(f"{root}/workflows/ci.reusable.yml", encoding="utf-8").read()
+source = open(sys.argv[3], encoding="utf-8").read()
 for match in re.finditer(r"\$\{\{", source):
     lineno = source[: match.start()].count("\n") + 1
     tail = source[match.start() :]
@@ -815,7 +1126,7 @@ if problems:
     sys.exit("; ".join(problems))
 PY
   }
-  check 'workflows/ci.reusable.yml  (opt-in telemetry job, defaults intact)' ci_check
+  check "$WORKFLOW  (opt-in telemetry job, defaults intact)" ci_check
 
   # Every README section a reader is told to copy must exist. A doc that points
   # at a path that was renamed is worse than no doc.
@@ -846,13 +1157,13 @@ PY
 
   # The README's own examples must call the workflow the README says it does.
   #
-  # Every yaml block in the README that contains `uses: cafaye/kit/workflows/`
-  # is a caller. A caller passing an input the workflow does not declare fails at
+  # Every yaml block in the README that contains `uses: cafaye/kit/` is a
+  # caller. A caller passing an input the workflow does not declare fails at
   # run time on the adopting repo's first push — thirteen repos, one stale
   # sentence in this file. So the examples are parsed and checked against the
   # workflow's real inputs, and a doc that lies fails the gate.
   caller_check() {
-    "$PY" - "$ROOT" <<'PY2'
+    "$PY" - "$ROOT" "$WORKFLOW" <<'PY2'
 import re
 import sys
 
@@ -863,11 +1174,11 @@ readme = open(f"{root}/README.md", encoding="utf-8").read()
 
 # Fenced yaml blocks only, and only the ones that are actually calling kit.
 blocks = re.findall(r"```yaml\n(.*?)```", readme, re.S)
-callers = [b for b in blocks if "uses: cafaye/kit/workflows/" in b]
+callers = [b for b in blocks if "uses: cafaye/kit/" in b]
 if not callers:
     sys.exit("no documented caller of the reusable workflow found in README.md")
 
-with open(f"{root}/workflows/ci.reusable.yml", encoding="utf-8") as fh:
+with open(sys.argv[2], encoding="utf-8") as fh:
     doc = yaml.safe_load(fh)
 triggers = doc.get("on") or doc.get(True) or {}
 declared = ((triggers.get("workflow_call") or {}).get("inputs")) or {}
@@ -916,7 +1227,7 @@ for n, block in enumerate(callers, 1):
         problems.append(f"documented caller #{n} is not valid YAML: {exc}")
         continue
     for job_name, job in (doc_n.get("jobs") or {}).items():
-        if not isinstance(job, dict) or "cafaye/kit/workflows/" not in str(job.get("uses", "")):
+        if not isinstance(job, dict) or "cafaye/kit/" not in str(job.get("uses", "")):
             continue
         passed = set(job.get("with") or {})
         unknown = sorted(passed - set(declared))
@@ -982,6 +1293,246 @@ if problems:
 PY2
   }
   check 'README.md  (its documented callers match the workflow inputs)' caller_check
+
+  # -------------------------------------------------------------------------
+  # The check this packet exists for.
+  #
+  # kit-02 shipped a reusable workflow at `workflows/ci.reusable.yml`, a README
+  # telling every reader to write
+  #
+  #     uses: cafaye/kit/workflows/ci.reusable.yml@master
+  #
+  # and GitHub, which does not support subdirectories of the workflows
+  # directory, resolving that to nothing. Every check in this file was green
+  # for the whole of that time. A layout bug and a documentation bug that agree
+  # with each other are invisible to any check that reads only one of them, and
+  # the file they disagreed about is the one thirteen repos were told to depend
+  # on.
+  #
+  # So this asserts the agreement directly, in the places it can drift:
+  #
+  #   1. the file is at the path callers are told to use
+  #   2. it declares `on: workflow_call` (parseable, and actually callable)
+  #   3. every real `uses:` that names kit — in the docs' fenced yaml blocks and
+  #      in this repo's own workflow files — is exactly that path, cross-repo
+  #      with a ref, or local with `./` for kit calling itself
+  #   4. kit's own CI calls it with the LOCAL form, so the self-proof is a
+  #      self-proof and not a network fetch of some other ref
+  #   5. there is exactly one copy of it in the tree
+  #
+  # Point 5 is not paranoia. A mirror — canonical file here, callable copy
+  # there — is one of the two layouts the packet offered, and it is only
+  # acceptable with a check that fails when the copies differ. kit chose the
+  # move, so this walks the tree and refuses to find a second one. Same
+  # reasoning as the outbox/`registries` duplication this repo already refuses.
+  #
+  # Only *executable* call sites are read: the `uses:` keys of parsed yaml.
+  # Prose that quotes a wrong path to explain why it is wrong — which README
+  # and AGENTS.md both now do — is not a call site, and a check that flags its
+  # own explanation is a check people delete.
+  callable_check() {
+    "$PY" - "$ROOT" "$WORKFLOW" <<'PY3'
+import os
+import re
+import sys
+
+import yaml
+
+root = sys.argv[1]
+workflow = sys.argv[2]
+remote = "cafaye/kit/" + workflow
+local = "./" + workflow
+
+problems = []
+
+# --- 1 and 2: the file is where callers are told it is, and it is callable ----
+path = os.path.join(root, workflow)
+if not os.path.isfile(path):
+    problems.append(
+        f"callers are documented to write `uses: cafaye/kit/{workflow}@<ref>`, and "
+        f"{workflow} does not exist — GitHub resolves a reusable workflow only "
+        f"from .github/workflows/, so nothing can call kit"
+    )
+else:
+    with open(path, encoding="utf-8") as fh:
+        doc = yaml.safe_load(fh)
+    # `on:` is read by PyYAML 1.1 as the boolean True.
+    triggers = doc.get("on") or doc.get(True) or {}
+    if not isinstance(triggers, dict) or "workflow_call" not in triggers:
+        problems.append(
+            f"{workflow} does not declare `on: workflow_call`; GitHub rejects the "
+            f"call before it reads a single input, so a caller gets a red build "
+            f"with no explanation"
+        )
+
+
+def uses_values(node):
+    """Every value assigned to a `uses:` key, at any depth."""
+    found = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "uses" and isinstance(value, str):
+                found.append(value)
+            else:
+                found.extend(uses_values(value))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(uses_values(item))
+    return found
+
+
+# --- 3: every real call site resolves to the one path ------------------------
+call_sites = []  # (where, value)
+
+# 3a. the fenced yaml blocks in the two documents a reader copies from.
+for doc_name in ("README.md", "AGENTS.md"):
+    body = open(os.path.join(root, doc_name), encoding="utf-8").read()
+    found_remote = 0
+    for n, block in enumerate(re.findall(r"```yaml\n(.*?)```", body, re.S), 1):
+        try:
+            parsed = yaml.safe_load(block)
+        except Exception:
+            continue  # not a workflow fragment; another check reports real yaml
+        for value in uses_values(parsed):
+            if "cafaye/kit" not in value and not value.startswith("./"):
+                continue
+            call_sites.append((f"{doc_name} yaml block #{n}", value))
+            if value.startswith("cafaye/kit"):
+                found_remote += 1
+    # Both documents must show the call. AGENTS.md is not decoration: it is the
+    # file a contributor reads before touching the workflow, and it was the one
+    # telling people to edit `workflows/ci.reusable.yml` for six months.
+    if found_remote == 0:
+        problems.append(
+            f"{doc_name} shows no `uses: cafaye/kit/{workflow}@<ref>` example, so "
+            f"a reader of that file has no call to copy"
+        )
+
+# 3b. this repo's own workflow files. Comments are not yaml and are skipped by
+#     parsing, so the header of the reusable workflow — which shows the same
+#     call as an example — is documentation, not a call site, and is not
+#     double-counted here.
+live_dir = os.path.join(root, ".github", "workflows")
+for name in sorted(os.listdir(live_dir)) if os.path.isdir(live_dir) else []:
+    if not name.endswith((".yml", ".yaml")):
+        continue
+    with open(os.path.join(live_dir, name), encoding="utf-8") as fh:
+        try:
+            parsed = yaml.safe_load(fh)
+        except Exception as exc:
+            problems.append(f".github/workflows/{name} is not valid YAML: {exc}")
+            continue
+    for value in uses_values(parsed):
+        if "cafaye/kit" in value or value.startswith("./"):
+            call_sites.append((f".github/workflows/{name}", value))
+
+if not call_sites:
+    problems.append(
+        "no `uses:` anywhere calls kit, so nothing in this repository exercises "
+        "the callable path"
+    )
+
+for where, value in call_sites:
+    if value.startswith("./"):
+        if value != local:
+            problems.append(
+                f"{where}: `uses: {value}` does not resolve; kit's own copy is at "
+                f"`{local}`"
+            )
+        continue
+    if not value.startswith("cafaye/kit/"):
+        problems.append(f"{where}: `uses: {value}` is not a reference to kit")
+        continue
+    # Split the ref off before comparing. Comparing the whole string to the
+    # path made every correct `...@master` look wrong, which is the check
+    # failing on the very line it exists to bless.
+    ref_path, _, ref = value.partition("@")
+    if ref_path != remote:
+        # It names kit, and it is not the path. Say what the right one is,
+        # because the reader of this message is a person who is about to paste
+        # a `uses:` line into thirteen repositories.
+        problems.append(
+            f"{where}: `uses: {value}` is not a path GitHub can resolve; callers "
+            f"must write `uses: {remote}@<ref>`"
+        )
+    elif not ref:
+        problems.append(
+            f"{where}: `uses: {value}` has an empty @ref, which resolves to nothing"
+        )
+
+# --- 4: kit's own CI calls it locally ---------------------------------------
+self_call = os.path.join(root, ".github", "workflows", "ci.yml")
+if not os.path.isfile(self_call):
+    problems.append(
+        "no .github/workflows/ci.yml, so the repository defining the standard is "
+        "not held to it and the callable path is never exercised in CI"
+    )
+else:
+    with open(self_call, encoding="utf-8") as fh:
+        parsed = yaml.safe_load(fh)
+    jobs = (parsed or {}).get("jobs") or {}
+    # Both spellings count: the cross-repo one, and the local `./` form kit is
+    # the only repository that can legitimately write. Filtering on
+    # `cafaye/kit` alone read kit's own self-call as "no reusable workflow at
+    # all", which is the same class of false negative this check exists to
+    # remove.
+    kit_jobs = {
+        name: job
+        for name, job in jobs.items()
+        if isinstance(job, dict)
+        and ("cafaye/kit" in str(job.get("uses", "")) or str(job.get("uses", "")).startswith("./"))
+    }
+    if not kit_jobs:
+        problems.append(
+            ".github/workflows/ci.yml calls no reusable workflow: kit does not run "
+            "its own gate in CI"
+        )
+    for name, job in kit_jobs.items():
+        if job.get("uses") != local:
+            problems.append(
+                f".github/workflows/ci.yml job {name}: `uses: {job.get('uses')}` — "
+                f"kit must call its own workflow with `{local}`, so the job proves "
+                f"the local path resolves instead of fetching some other ref from "
+                f"the network"
+            )
+
+# --- 5: one copy, at the reachable path -------------------------------------
+# Walked rather than globbed, because the whole failure mode is a file parked
+# somewhere the documented path does not point. `.git` and the gate's own
+# gitignored `.venv` are the only trees skipped; everything else is fair game.
+copies = []
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [
+        d for d in dirnames if d not in (".git", ".venv", "__pycache__")
+    ]
+    for filename in filenames:
+        full = os.path.join(dirpath, filename)
+        rel = os.path.relpath(full, root)
+        if rel == workflow:
+            continue
+        try:
+            with open(full, encoding="utf-8") as fh:
+                head = fh.read(65536)
+        except (OSError, UnicodeDecodeError):
+            continue
+        if "workflow_call" not in head:
+            continue
+        # A third-party reference in a comment is not a copy.
+        if re.search(r"^\s*workflow_call\s*:", head, re.M):
+            copies.append(rel)
+
+if copies:
+    problems.append(
+        f"a second workflow declaring `workflow_call` exists at {copies}. Two copies "
+        f"of the CI standard is the drift kit exists to prevent, and only "
+        f"{workflow} is reachable by a caller"
+    )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY3
+  }
+  check "$WORKFLOW  (callable: exists, on: workflow_call, docs agree)" callable_check
 fi
 
 # ===========================================================================
@@ -1069,7 +1620,7 @@ fi
 
 if [ "$RUN_SELF_TEST" -eq 1 ]; then
   section 'self_test: this gate is able to fail'
-  if check 'tests/self_test.sh  (eleven breakages, eleven reds)' \
+  if check 'tests/self_test.sh  (eighteen breakages, eighteen reds)' \
     bash "$ROOT/tests/self_test.sh"; then
     :
   fi

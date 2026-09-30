@@ -10,10 +10,17 @@
 #     contents: read
 #   jobs:
 #     ci:
-#       uses: cafaye/kit/workflows/ci.reusable.yml@master
+#       uses: cafaye/kit/.github/workflows/ci.reusable.yml@master
 #       with:
 #         language: go
 #         working-dir: .
+#
+# The `.github/workflows/` in that path is not decoration. GitHub resolves a
+# reusable workflow at `{owner}/{repo}/.github/workflows/{file}@{ref}` and
+# documents that subdirectories of the workflows directory are not supported, so
+# this file has no reachable path from anywhere else in the tree. It is also the
+# only place a workflow may live at all if the repository that defines it is to
+# call it with `uses: ./.github/workflows/ci.reusable.yml`.
 #
 # One job per language exists on purpose: six services, six toolchains, and a
 # `language` x `version` matrix would multiply CI minutes the org cannot spend.
@@ -35,7 +42,9 @@ on:
   workflow_call:
     inputs:
       language:
-        description: 'Toolchain to build, lint, and test. One job runs; the rest skip.'
+        description: >-
+          Toolchain to build, lint, and test. One job runs; the rest skip. Use
+          'none' for a repository with no service manifest at all.
         required: true
         type: string
         options:
@@ -46,6 +55,7 @@ on:
           - node
           - bun
           - rust
+          - none
       # Descriptions are folded, not quoted: a long description that is reflowed
       # to fit line-length is unreadable, and Actions has no width limit on
       # `description`. Our own lint/yamllint.yml caps source lines at 120.
@@ -102,6 +112,47 @@ env:
   GOFLAGS: '-buildvcs=false'
 
 jobs:
+  # ----------------------------------------------------- configuration-only
+  # `language: none` — a repository with no service manifest. No go.mod, no
+  # Gemfile, no pyproject.toml: the seven jobs above each open with a manifest
+  # they cannot find, and a caller passing one of them gets a red build on a
+  # repository that has nothing to compile.
+  #
+  # It exists because of that, and because of a second, sharper reason: this is
+  # kit, and the repository that defines the standard should be the first
+  # repository held to it. Without it kit could not call its own workflow at
+  # all — `uses: ./.github/workflows/ci.reusable.yml` still needs a `language`,
+  # `language` is required, and every value in `options` named a toolchain this
+  # repository does not have. The repository that ships the standard was
+  # structurally excluded from using it.
+  #
+  # It runs the repository's own gate, `tests/validate.sh`, and FAILS when that
+  # file is absent. A caller who asks for the configuration gate and ships no
+  # gate has asked for a green checkmark on nothing, which is the same defect
+  # as a coverage threshold left at 0. Deliberately strict, and the failure
+  # message says which file is missing.
+  none:
+    name: none
+    if: ${{ inputs.language == 'none' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - name: kit gate
+        working-directory: ${{ inputs.working-dir }}
+        # The gate bootstraps its own dependencies (PyYAML, yamllint, hadolint)
+        # into a gitignored .venv/, so a runner with nothing installed runs
+        # the same command a developer runs on a fresh clone. See the header of
+        # tests/validate.sh.
+        run: |
+          set -euo pipefail
+          if [ ! -f tests/validate.sh ]; then
+            echo "::error::language 'none' runs this repository's own gate, and"
+            echo "::error::tests/validate.sh does not exist. Either ship the gate,"
+            echo "::error::or pass a real language."
+            exit 1
+          fi
+          bash tests/validate.sh
+
   # ------------------------------------------------------------- compiled
   go:
     name: go

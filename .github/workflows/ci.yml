@@ -1,0 +1,51 @@
+---
+# kit gating itself.
+#
+# The point of this file is one line, and it is the `uses:`:
+#
+#     uses: ./.github/workflows/ci.reusable.yml
+#
+# GitHub resolves a cross-repository reusable workflow at
+# `{owner}/{repo}/.github/workflows/{file}@{ref}` and documents that
+# subdirectories of the workflows directory are not supported. For six months
+# the file kit handed the fleet sat at `workflows/ci.reusable.yml`, where no
+# caller could reach it, and every service README documented a `uses:` string
+# that did not resolve. Nothing detected the disagreement, because a layout bug
+# and a documentation bug agree with each other perfectly.
+#
+# So the repository that defines the standard calls its own standard, with the
+# local `./` form. This is the cheapest end-to-end proof that the callable path
+# works: if this job cannot resolve, no one else can either, and it is red on
+# kit's own commit rather than discovered by the first service that adopts it.
+#
+# `language: none` because kit has no service manifest — no go.mod, no Gemfile,
+# no pyproject.toml. The seven language jobs each open by reading one, so
+# calling any of them here would be a red build on a repository that has nothing
+# to compile. That job runs `tests/validate.sh`: the same gate, one command, on
+# a clean runner with no `.venv` — which is the only place the bootstrap gets
+# exercised for real.
+name: ci
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+  # A caller that adds an input this file does not pass still runs; nothing here
+  # gates on a path that may stop existing. Kept explicit so the trigger list is
+  # readable rather than inferred.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: gate
+    uses: ./.github/workflows/ci.reusable.yml
+    with:
+      language: none
+      working-dir: .

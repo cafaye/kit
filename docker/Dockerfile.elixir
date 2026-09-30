@@ -9,6 +9,9 @@
 #   - deps are compiled in the builder, in release mode, and `_build` is copied
 #     as-is. Compiling in the runtime stage means a slower first boot and an
 #     image that changes whenever MIX_ENV leaks in from the environment.
+#   - The final stage runs non-root, as `app` (uid 10001), created with a fixed
+#     numeric uid so the image is reproducible. A container running as root is a
+#     container where a bug is a host compromise.
 #   - hex/rebar are installed as the app user, in the runtime stage, writing to
 #     /app/.mix — never as root into /root/.mix, which the app user cannot read.
 ARG ELIXIR_VERSION=1.18.3
