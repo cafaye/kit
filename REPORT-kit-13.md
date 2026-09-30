@@ -270,7 +270,9 @@ Three details worth stating:
 
 **The one FAIL is `fleet (no stale copy, no weakened boundary, no dead config,
 every ref pinned)`, and it is red by design** — §5.1 names all six repositories
-and all thirteen findings. Every other phase of the full run is green:
+and all thirteen findings. A reader who sees only `FAIL: 1 check(s) failed`
+cannot tell a designed failure from a regression, so it is named here rather than
+left to the summary line. Every other phase of the full run is green:
 
 | Phase | Result |
 |---|---|
