@@ -1980,17 +1980,18 @@ for entry in sorted(os.listdir(dash_dir)):
                 f"{entry} / {title}: says type={ds.get('type')!r} for uid {uid!r}, "
                 f"but datasources.yml provisions it as {provisioned[uid]!r}"
             )
-        if uid not in LANGUAGES:
+        if provisioned[uid] not in LANGUAGES:
             problems.append(
-                f"{entry} / {title}: uid {uid!r} is not a backend this check "
-                f"knows how to route ({', '.join(sorted(LANGUAGES))})"
+                f"{entry} / {title}: datasource type {provisioned[uid]!r} is not a "
+                f"backend this check knows how to route "
+                f"({', '.join(sorted(LANGUAGES))})"
             )
             continue
-        if LANGUAGES[uid]["lang"] != want:
+        if LANGUAGES[provisioned[uid]]["lang"] != want:
             problems.append(
                 f"{entry} / {title}: a {want} query bound to {uid!r}, which "
-                f"serves {LANGUAGES[uid]['lang']}. Bound to the wrong backend this "
-                f"is a parse error, not an empty result."
+                f"serves {LANGUAGES[provisioned[uid]]['lang']}. Bound to the wrong "
+                f"backend this is a parse error, not an empty result."
             )
 
 # The alert rules are dashboards with a different trigger, and they carried the
@@ -1998,16 +1999,37 @@ for entry in sorted(os.listdir(dash_dir)):
 # which is a PARSE ERROR in PromQL because OTLP ingestion mangles the dot to an
 # underscore. A rule that cannot be parsed never fires and never reports that it
 # cannot be parsed.
+#
+# Scoped to the `expr` strings, not the whole file. The rules DOCUMENT these
+# names in their descriptions — "`error.type` is a bounded class" is correct
+# English about the OTLP attribute and must not be rewritten — and a scan over
+# the serialised document cannot tell a sentence from a query. It can also only
+# see what it was given, which is why the earlier version of this regex was
+# matching the word "error" out of a description and reporting that a label
+# called `error` should be `error`.
 with open(f"{base}/alerting/rules.yml", encoding="utf-8") as fh:
     rules = yaml.safe_load(fh) or {}
-blob = json.dumps(rules)
-for dotted in set(re.findall(r"\b(otel|error|http|service|span)\.[a-z_]+", blob)):
-    problems.append(
-        f"alerting/rules.yml references {dotted!r}. OTLP ingestion mangles a dot "
-        f"in a label name to an underscore, so what a Prometheus backend holds is "
-        f"'{dotted.replace('.', '_')}'. A matcher on the dotted spelling is a "
-        f"parse error, and an alert that cannot be parsed never fires."
-    )
+exprs = []
+for holder in [rules, *(rules.get("groups") or [])]:
+    if not isinstance(holder, dict):
+        continue
+    for rule in holder.get("rules") or []:
+        for source in [rule, *(rule.get("data") or [])]:
+            if not isinstance(source, dict):
+                continue
+            model = source.get("model")
+            expr = model.get("expr") if isinstance(model, dict) else source.get("expr")
+            if isinstance(expr, str):
+                exprs.append((rule.get("title", "(rule)"), expr))
+for title, expr in exprs:
+    for dotted in set(re.findall(r"\b(?:otel|error|http|service|span|messaging|db)\.[a-z_]+", expr)):
+        problems.append(
+            f"alerting/rules.yml rule {title!r} uses {dotted!r} in a PromQL expr. "
+            f"OTLP ingestion mangles a dot in a label name to an underscore, so "
+            f"what the backend holds is '{dotted.replace('.', '_')}'. A matcher on "
+            f"the dotted spelling is a parse error, and an alert that cannot be "
+            f"parsed never fires and never says so."
+        )
 
 if problems:
     sys.exit("; ".join(problems))
