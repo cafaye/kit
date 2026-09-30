@@ -11,17 +11,23 @@
 #   caught by a *different* check, so a passing self_test means the checks are
 #   independent and not one lucky assertion standing in for all of them.
 #
-# THE FOUR BREAKAGES
+# THE ELEVEN BREAKAGES
 #   1. delete a language template   -> the artifact-presence check goes red
 #   2. ship a collector exporter   -> the privacy check goes red
 #   3. corrupt the python codec    -> the executed test suite goes red
 #   4. hardcode a compose port     -> the parameterization check goes red
 #   5. flip the CI input default   -> the "consumers stay green" check goes red
+#   6-11. one semantic mutation per language implementation -> THAT language's
+#         suite goes red. A suite that has never failed has never been proven to
+#         test anything, and six suites that only one language's mutation covers
+#         is five suites that might assert nothing at all.
 #
 # WHAT IT IS NOT
-#   It is not mutation testing of the six language implementations; a full
-#   mutation run is a tool kit does not have and would not trust. It proves the
-#   gate can fail and that its checks are not interchangeable.
+#   This is not exhaustive mutation testing. Each implementation gets exactly one
+#   mutant, chosen to be the bug a reviewer would not see: a dropped bit mask, an
+#   alphabet that quietly grows a second case, a limit raised until it never
+#   fires. One mutant per language proves the suite bites; it does not prove the
+#   suite is complete, and nothing here should be read as claiming that is.
 
 set -euo pipefail
 
@@ -34,6 +40,7 @@ WORK="$(mktemp -d "${TMPDIR:-/tmp}/kit-self-test.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
 failures=0
+skips=0
 copy_name=""
 
 # A fresh throwaway copy per breakage: one breakage must never mask the next,
@@ -88,6 +95,82 @@ expect_green() {
   fi
 }
 
+# expect_red_lang <label> <dir> <lang> <file> <old> <new>
+#
+# The per-language mutation. Copies one implementation out, breaks one spec rule
+# in it, and asserts THAT language's suite goes red — not the whole gate, and
+# certainly not a neighbouring language's. A green result here means the suite
+# for that language asserts nothing about that rule.
+#
+# Each mutant is semantic: it compiles, it parses, it runs. Replacing a call with
+# a syntax error would prove only that the toolchain is installed, which is not
+# in question.
+expect_red_lang() {
+  local label="$1" dir="$2" lang="$3" file="$4" old="$5" new="$6"
+  local work="$WORK/mutant-$lang"
+
+  rm -rf "$work"
+  cp -R "$dir/templates/otel/$lang" "$work"
+
+  if ! edit "$work/$file" "$old" "$new" 2>/dev/null; then
+    # `edit` fails when the source has moved past the mutation. That is a real
+    # failure: the proof this breakage was written to provide no longer exists.
+    printf 'FAIL self_test: %s — the mutation no longer applies\n' "$label"
+    printf '       %s\n' "$file"
+    failures=$((failures + 1))
+    return
+  fi
+
+  # A missing toolchain is a SKIP, reported as such. It is not a pass: an
+  # unexecuted mutation proves nothing, and the summary counts it.
+  local runner
+  case "$lang" in
+    go) runner=go ;;
+    ruby) runner=ruby ;;
+    elixir) runner=elixir ;;
+    python) runner=python3 ;;
+    node) runner=node ;;
+    rust) runner=rustc ;;
+  esac
+  if ! command -v "$runner" >/dev/null 2>&1; then
+    printf 'SKIP self_test: %s — %s not installed\n' "$label" "$runner"
+    skips=$((skips + 1))
+    return
+  fi
+
+  # Captured immediately, with no `&&`/`||` between the run and the read: a
+  # compound command there reports the exit code of the *last* branch, which is
+  # how a broken suite once read as a passing gate.
+  local out ec
+  case "$lang" in
+    go)
+      out=$(cd "$work" && GOFLAGS=-mod=mod GOPROXY=off GOTOOLCHAIN=local go test ./... 2>&1)
+      ec=$?
+      ;;
+    ruby) out=$(ruby "$work/test_traceparent.rb" 2>&1); ec=$? ;;
+    elixir) out=$(elixir -r "$work/traceparent.ex" "$work/test_traceparent.exs" 2>&1); ec=$? ;;
+    python) out=$(python3 "$work/test_traceparent.py" 2>&1); ec=$? ;;
+    node) out=$(node --test "$work/traceparent.test.mjs" 2>&1); ec=$? ;;
+    rust)
+      if rustc --test --edition 2021 -o "$work/kit-mutant-rust" "$work/traceparent.rs" \
+        >"$work/build.log" 2>&1; then
+        out=$("$work/kit-mutant-rust" 2>&1)
+        ec=$?
+      else
+        out=$(cat "$work/build.log")
+        ec=99
+      fi
+      ;;
+  esac
+
+  if [ "$ec" -eq 0 ]; then
+    printf 'FAIL self_test: %s — the suite stayed GREEN on a broken codec\n' "$label"
+    failures=$((failures + 1))
+  else
+    printf 'PASS self_test: %s\n' "$label"
+  fi
+}
+
 printf -- '-- self_test: a gate that cannot fail is not a gate\n'
 
 # The control. If the unbroken tree is already red, the four breakages below
@@ -131,9 +214,67 @@ five="$(fresh_copy ci-not-opt-in)"
 edit "$five/workflows/ci.reusable.yml" "default: 'false'" "default: 'true'"
 expect_red "breakage 5: the telemetry CI job is no longer opt-in" "$five" --static-only
 
+# 6-11. One semantic mutation per language implementation, each against a
+# different spec rule, and each asserting THAT language's suite goes red.
+#
+# These all read from the same throwaway copy as breakage 1 rather than taking a
+# fresh one each: the copy is only mutated inside a per-language temp dir, so no
+# language can see another's breakage.
+base="$(fresh_copy language-mutants)"
+
+#   go    §3.2.2.5  stop masking trace-flags on read. Still compiles, still runs,
+#                  and quietly forwards reserved bits to the next service.
+expect_red_lang 'breakage  6: go stops masking trace-flags (§3.2.2.5)' \
+  "$base" go traceparent.go \
+  'Flags:      tp.Flags & sampledFlag,' \
+  'Flags:      tp.Flags,'
+
+#   ruby  §3.2.2  widen the alphabet to accept uppercase hex. The classic bug:
+#                one service folds case, the next rejects the header, and a trace
+#                breaks at the hop between them.
+expect_red_lang 'breakage  7: ruby accepts uppercase hex (§3.2.2)' \
+  "$base" ruby traceparent.rb \
+  '!str.empty? && str.match?(/\A[0-9a-f]+\z/)' \
+  '!str.empty? && str.match?(/\A[0-9a-fA-F]+\z/)'
+
+#   elixir §3.2.2.2  stop rejecting trailing data on a version-00 header. Nothing
+#                   crashes; the header is just no longer the format we claim to
+#                   implement.
+expect_red_lang 'breakage  8: elixir accepts trailing junk on version 00 (§3.2.2.2)' \
+  "$base" elixir traceparent.ex \
+  'defp check_trailing(value, 0), do: if(byte_size(value) == @min_header_len, do: :ok, else: {:error, :invalid})' \
+  'defp check_trailing(_value, 0), do: :ok'
+
+#   node  §3.3.1.5  raise the tracestate limit until truncation never fires. A
+#                   limit nobody enforces is a limit nobody wrote on purpose.
+expect_red_lang 'breakage  9: node never truncates tracestate (§3.3.1.5)' \
+  "$base" node traceparent.mjs \
+  'const TRACESTATE_LIMIT = 512;' \
+  'const TRACESTATE_LIMIT = 100000;'
+
+#   rust  §3.2.2.3  accept an all-zero trace-id. The spec forbids it outright; a
+#                   codec that allows it merges unrelated traces into one.
+expect_red_lang 'breakage 10: rust accepts an all-zero trace-id (§3.2.2.3)' \
+  "$base" rust traceparent.rs \
+  'if trace_id == ZERO_TRACE_ID || parent_id == ZERO_SPAN_ID {' \
+  'if parent_id == ZERO_SPAN_ID {'
+
+#   python §3.2.2.5  the same dropped mask as go, in a different language, on
+#                   purpose: a rule asserted in one suite and not the other is a
+#                   rule two services will disagree about.
+expect_red_lang 'breakage 11: python stops masking trace-flags (§3.2.2.5)' \
+  "$base" python traceparent.py \
+  'flags=parsed.flags & SAMPLED,' \
+  'flags=parsed.flags,'
+
 printf '\n'
 if [ "$failures" -ne 0 ]; then
   echo "FAIL: self_test — $failures breakage(s) the gate did not catch."
+  [ "$skips" -eq 0 ] || echo "note: $skips breakage(s) skipped (no toolchain) — reported above."
   exit 1
 fi
-echo "PASS: self_test — all 5 breakages went red, and the unbroken tree is green."
+if [ "$skips" -ne 0 ]; then
+  echo "FAIL: self_test — $skips breakage(s) skipped for a missing toolchain. A skipped proof is not a proof."
+  exit 1
+fi
+echo "PASS: self_test — all 11 breakages went red, and the unbroken tree is green."
