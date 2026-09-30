@@ -120,8 +120,13 @@ make_service() {
   mkdir -p "$dir/bin"
   cp "$ROOT/templates/bin/dev.sh" "$dir/bin/dev"
   chmod +x "$dir/bin/dev"
+  # The pin goes in `kit.ref`, a COMMITTED one-liner at the repository root —
+  # not in `.env`, which is git-ignored and would make the pin a per-machine
+  # secret. A fixture that put it in `.env` would pass against a `bin/dev` that
+  # reads it from either, and the difference is the whole point of the file
+  # existing: two people on the same commit must run the same stack.
+  printf '%s\n' "${2-$PIN_SHA}" >"$dir/kit.ref"
   cat >"$dir/.env" <<ENV
-KIT_STACK_REF=${2-$PIN_SHA}
 KIT_STACK_URL=file://$REMOTE
 KIT_STACK_HOME=${3-$WORK/cache}
 ENV

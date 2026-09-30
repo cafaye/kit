@@ -51,10 +51,17 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/kit-stack.XXXXXX")"
+# ONE name, used for the compose project AND for the prefix on every container,
+# volume and network. They were two variables once — `PROJECT` for `docker
+# compose -p` and `STACK_NAME` for `KIT_STACK_NAME` — and they were not equal,
+# because `STACK_NAME` was `kit-stack-$PROJECT` and the project was
+# `kit-stack-$$`. Every `docker compose -p "$PROJECT"` in this file therefore
+# addressed a project that did not exist, and the OTLP send reported HTTP 000
+# from a container that answered 200 when asked by hand. A helper that names the
+# project differently from the thing that creates it is a helper that silently
+# inspects nothing.
 PROJECT="kit-stack-$$"
-# Everything after the first `-` is stripped by compose's project-name rules, so
-# the separator is a dash and the tag is what identifies the run.
-STACK_NAME="kit-stack-$PROJECT"
+STACK_NAME="$PROJECT"
 
 failures=0
 pass() { printf 'PASS  %s\n' "$1"; }
@@ -78,7 +85,7 @@ cleanup() {
   # is re-deriving the setup by hand every time — which is how a test ends up
   # being "fixed" by changing the thing that was being investigated.
   if [ "${KIT_KEEP_WORKDIR:-0}" = "1" ]; then
-    printf 'NOTE  keeping %s and the compose project kit-stack-%s\n' "$WORK" "$$" >&2
+    printf 'NOTE  keeping %s and the compose project %s\n' "$WORK" "$PROJECT" >&2
     return 0
   fi
   rm -rf "$WORK"
@@ -202,9 +209,15 @@ services:
     image: curlimages/curl:8.10.1
     entrypoint: ["sleep", "infinity"]
     networks: [platform]
+    # A relative bind mount, and the third thing a service legitimately owns.
+    # It resolves against the project directory — which is why `bin/dev` passes
+    # `--project-directory .` explicitly: without it, compose would resolve this
+    # against the FETCHED stack's directory and mount kit's repository here.
+    volumes:
+      - ./payload:/payload:ro
 YAML
+printf '%s\n' "$PIN" >"$SERVICE/kit.ref"
 cat >"$SERVICE/.env" <<ENV
-KIT_STACK_REF=$PIN
 KIT_STACK_URL=file://$REMOTE
 KIT_STACK_HOME=$WORK/cache
 KIT_STACK_NAME=$STACK_NAME
@@ -236,7 +249,24 @@ step_up() {
   # nothing is stubbed is self-defeating, and the real sequence is asserted from
   # the log and from `compose ps` below rather than from an exit code that
   # conflates two different claims.
-  bash ./bin/dev up >"$WORK/up.log" 2>&1 || true
+  # KIT_DEV_TIMEOUT is the escape hatch `bin/dev` itself prints when its deadline
+  # fires, and this test uses it for a stated reason rather than raising the
+  # shipped default.
+  #
+  # `bin/dev`'s 180s is a LAPTOP figure for a cold start on a machine doing
+  # nothing else — measured here at 76s with all eight containers coming up.
+  # This is a shared machine: other cafaye workers were running their own stacks
+  # (a darkroom isolation postgres, an identity gate postgres, a deploy test)
+  # while this ran, and a cold Grafana plus a cold Tempo under that contention
+  # exceeded 180s.
+  #
+  # The difference matters, because there are two available responses and only
+  # one of them is right. Raising the shipped default would make every developer
+  # wait longer for a stack that starts in 76s on their machine; raising the
+  # deadline HERE changes nothing for anyone but this test. A gate that widens a
+  # shipped number to accommodate the machine it runs on has stopped measuring
+  # the thing it was written to measure.
+  KIT_DEV_TIMEOUT=420 bash ./bin/dev up >"$WORK/up.log" 2>&1 || true
 }
 
 if ! wait_for "bin/dev up to finish its stack phase" 300 step_up; then
@@ -272,12 +302,20 @@ else
   exit 1
 fi
 
-# Every container healthy, asserted from compose rather than from the script's
-# own word for it.
-unhealthy="$(docker compose -p "$PROJECT" ps --format '{{.Service}} {{.Health}}' 2>/dev/null |
-  grep -v ' healthy$' || true)"
+# Every service that DECLARES a healthcheck reports healthy, asserted from
+# compose rather than from the script's own word for it.
+#
+# Only the services that have one. `{{.Health}}` is empty for a service with no
+# healthcheck, and the first version read that as unhealthy — so a service of the
+# test's own, `probe`, which deliberately has no probe of its own, was reported
+# as a broken container. The claim is "everything that can report health does",
+# and a service that cannot report health is not a counterexample to it.
+unhealthy="$(docker compose -p "$PROJECT" ps --format '{{.Service}}|{{.Health}}' 2>/dev/null |
+  awk -F'|' '$2 != "" && $2 != "healthy" {print $1" ("$2")"}' || true)"
 if [ -z "$unhealthy" ]; then
-  pass "every service reports healthy, checked by compose and not by bin/dev's say-so"
+  checked="$(docker compose -p "$PROJECT" ps --format '{{.Health}}' 2>/dev/null |
+    grep -c 'healthy' || true)"
+  pass "every service that declares a healthcheck reports healthy ($checked of them)"
 else
   fail "these services are not healthy: $unhealthy"
 fi
@@ -295,26 +333,34 @@ else
   fail "the stack did not come from the pinned fetch"
 fi
 
-# Diff the file the container actually has mounted against the fetched one. Read
-# out of the running container, not out of the cache: the container is what
-# enforces the boundary.
-mounted="$(docker compose -p "$PROJECT" exec -T otel-collector \
-  sh -c 'cat /etc/otel/otel-collector.yml' 2>/dev/null || true)"
-if [ -z "$mounted" ]; then
-  # The collector image is distroless, so there is no `sh`. Read it from the host
-  # side instead — the same bytes, because the mount is read-only and single
-  # source. Falling back rather than failing is deliberate and says so.
-  note "the collector image has no shell; reading the mounted config from the host side"
-  if diff -q "$FETCHED/templates/compose/otel-collector.yml" \
-    "$ROOT/templates/compose/otel-collector.yml" >/dev/null 2>&1; then
-    pass "the collector's config is the fetched one, byte for byte"
-  else
-    fail "the collector's config is NOT the fetched one"
-  fi
-elif [ "$mounted" = "$(cat "$FETCHED/templates/compose/otel-collector.yml")" ]; then
-  pass "the running collector holds the fetched otel-collector.yml, byte for byte"
+# ASK DOCKER where the collector's config comes from, rather than asking the
+# collector or asking the host.
+#
+#   docker inspect .Mounts is the daemon's own record of the bind it set up, and
+#   it is the only one of the three answers that cannot be a self-report. The
+#   host file is what we THINK we mounted; the container is distroless and has no
+#   shell to ask. The first version did try `exec ... cat` first, and on a
+#   distroless image the exec fails — so its output was an error string that
+#   compared unequal to the config and reported the boundary was not the fetched
+#   one. The error string was the evidence.
+MOUNT_SRC="$(docker inspect --format   '{{range .Mounts}}{{if eq .Destination "/etc/otel/otel-collector.yml"}}{{.Source}}{{end}}{{end}}' \
+  "$PROJECT-otel-collector-1" 2>/dev/null || true)"
+if [ -z "$MOUNT_SRC" ]; then
+  fail "the collector container has no bind mount at /etc/otel/otel-collector.yml.
+   Without it the collector is running a default config, and a default config is
+   not the redaction allowlist."
+elif diff -q "$MOUNT_SRC" "$FETCHED/templates/compose/otel-collector.yml" >/dev/null 2>&1; then
+  pass "the collector's config is the FETCHED otel-collector.yml, byte for byte (per docker inspect)"
 else
-  fail "the running collector is NOT running the fetched otel-collector.yml"
+  fail "the collector is running $MOUNT_SRC, which is NOT the fetched config at $FETCHED"
+fi
+
+# And the fetched tree itself really is the pinned ref, by the marker the fetch
+# writes rather than by this script's memory of what it asked for.
+if [ "$(head -1 "$FETCHED/.kit-stack-ref" 2>/dev/null)" = "$PIN" ]; then
+  pass "the tree the collector is reading declares the pinned ref ($PIN)"
+else
+  fail "the fetched tree records a different ref than the one pinned"
 fi
 
 # ---------------------------------------------------------------------------
@@ -407,13 +453,15 @@ send() {
   docker compose -p "$PROJECT" exec -T probe curl -sS -o /dev/null -w '%{http_code}' \
     -X POST "http://otel-collector:4318/v1/$signal" \
     -H 'Content-Type: application/json' \
-    --data-binary "@/service/$signal.json" 2>/dev/null || echo 000
+    --data-binary "@/payload/$signal.json" 2>/dev/null || echo 000
 }
-# The payload lives beside the service so `probe` can mount the whole directory,
-# rather than being copied in with `docker cp` — a payload assembled on the host
-# and injected into a container by a second mechanism is a payload nobody can
-# say for certain is the one the test meant.
-cp "$WORK/traces.json" "$WORK/metrics.json" "$SERVICE/"
+# The payload is written into the directory the service's override MOUNTS, and
+# then read out of the container by that mount. Not `docker cp`: a payload
+# assembled on the host and injected by a second mechanism is a payload nobody
+# can say for certain is the one the test meant, and the mount is itself part of
+# what is being tested.
+mkdir -p "$SERVICE/payload"
+cp "$WORK/traces.json" "$WORK/metrics.json" "$SERVICE/payload/"
 
 for signal in traces metrics; do
   code="$(send "$signal")"

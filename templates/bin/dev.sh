@@ -4,6 +4,8 @@
 #
 #   bin/dev            # compose up --wait, migrate, seed an admin, print URLs
 #   bin/dev stack      # resolve the pinned kit ref and print where it landed
+#                      #   (no side effects; reaching the resolution needs no
+#                      #    docker, which is what tests/fetch_test.sh drives)
 #   bin/dev pin <ref>  # DELIBERATELY move to another kit ref, and say what moved
 #   bin/dev down       # stop the stack, keep the volumes
 #   bin/dev nuke       # stop the stack and DELETE the volumes
@@ -22,7 +24,7 @@
 # THE STACK IS FETCHED, NOT COPIED
 #   There is no `docker-compose.yml` of kit's in this repository, and there is no
 #   `otel-collector.yml`, no `tempo/`, no `loki/`, no `mimir/`, no `grafana/`.
-#   `bin/dev` fetches kit at the ref named by `KIT_STACK_REF` and runs
+#   `bin/dev` fetches kit at the ref named by `kit.ref` and runs
 #   `templates/compose/docker-compose.yml` from that tree BESIDE your own
 #   `docker-compose.yml`:
 #
@@ -35,11 +37,20 @@
 #   contract, and it is why nine services stopped each carrying its own copy of
 #   the same 400 lines.
 #
-#   `KIT_STACK_REF` MUST BE A PIN. A 40-character commit sha, or a `v<semver>`
-#   tag. A branch name is refused, loudly, before any network call — because a
-#   moving reference is a gate that changes under you, and by the time a fetch
-#   has returned it has already changed. `bin/dev pin <ref>` is how you move,
+#   `kit.ref` MUST BE A PIN. A 40-character commit sha, or a `v<semver>` tag. A
+#   branch name is refused, loudly, before any network call — because a moving
+#   reference is a gate that changes under you, and by the time a fetch has
+#   returned it has already changed. `bin/dev pin <ref>` is how you move,
 #   deliberately, and it prints the stack diff between the two refs.
+#
+#   WHY THE PIN IS ITS OWN FILE AND NOT A LINE IN `.env`
+#   `.env` is git-ignored, because it holds a developer's port overrides and
+#   whatever else is machine-specific. A pin in a git-ignored file is a pin that
+#   exists on exactly one machine, which is the opposite of what a pin is for: it
+#   is the thing that makes "this is what we run" a reviewable statement. So the
+#   ref lives in `kit.ref` — one line, committed, whose entire content is the
+#   pin — and `.env` never carries it. A first `bin/dev` on a fresh clone then
+#   works with no `.env` at all, which is the whole point of not requiring one.
 #
 #   The service's own `docker-compose.yml` is OPTIONAL. A service with nothing
 #   to add — one that only needs a database and a collector — needs no compose
@@ -60,8 +71,11 @@
 #   - `nuke` is the only destructive step and it is the only one that is not the
 #     default. It is spelled out rather than aliased, and it asks nothing — a
 #     prompt here is a prompt someone will pipe `yes` into.
-#   - Nothing is written to git. `.env` is created from the FETCHED
-#     `.env.example` if absent, and is git-ignored by every adopting repo.
+#   - Nothing is written to git by an ordinary run. `.env` is created from the
+#     FETCHED `.env.example` if absent, and is git-ignored by every adopting
+#     repo. The ONE file `bin/dev` writes that IS tracked is `kit.ref`, and only
+#     `bin/dev pin` writes it - never a bare `bin/dev`. That asymmetry is the
+#     point: the pin changes when a person says so, in a commit that says why.
 #   - Connection URLs are printed, never written anywhere else. A developer
 #     pasting one into a ticket is the developer's choice, not this script's.
 #   - The observability profile comes UP, and this is the load-bearing decision
@@ -150,6 +164,21 @@ stack_home() { stack_setting KIT_STACK_HOME "${XDG_CACHE_HOME:-$HOME/.cache}/caf
 # it has to DECLARE its ref rather than merely exist.
 vendor_dir() { stack_setting KIT_VENDOR_DIR ".kit/stack"; }
 
+# THE PIN'S HOME. One committed file at the service root, one line, whose entire
+# content is the ref.
+#
+# Not `.env`, and not a default baked into this script, and the reason is the
+# one above in the header: `.env` is git-ignored, so a pin kept there exists on
+# one developer's machine and on no CI runner, and "one command, always current"
+# becomes "one command, whatever this laptop last fetched". The name is not a
+# variable — it is the contract `tests/fleet_check.py` reads, and a check that
+# had to be told where to look would be a check whose location is a second thing
+# to keep in step. That is also why the check reads `kit.ref` by the same
+# name-resolution rule this script uses, rather than by a glob: two readers of
+# "where is the pin" that disagree are how a gate passes on a file the tool
+# ignores.
+REF_FILE="kit.ref"
+
 # Set by `resolve_stack`, read by everything after it. Empty means "not resolved
 # yet", and every consumer treats that as a bug rather than a default.
 STACK_DIR=""
@@ -161,10 +190,64 @@ die() {
   exit "${2:-1}"
 }
 
-usage() { sed -n '2,68p' "$SELF"; }
+# The leading comment block, found rather than counted.
+#
+# It was `sed -n '2,68p'` — a hardcoded line range — and the header grew past 68
+# lines the moment this script learned to fetch kit, so `--help` silently
+# truncated the section explaining the pin. A number in a script that has to be
+# edited every time the prose above it grows is a number that eventually is not,
+# and a help message that stops one paragraph early is a help message nobody
+# notices is wrong. So it is derived: everything from line 2 to the first blank
+# line, which is where the header ends and the code begins.
+usage() { sed -n '2,/^$/p' "$SELF" | sed '$d'; }
 
 # --------------------------------------------------------------------------
 # the pin
+
+# stack_ref — the ref this repository runs, or empty if nothing names one.
+#
+# TWO SOURCES, IN THIS ORDER, AND THE ORDER IS THE ARGUMENT:
+#
+#   1. KIT_STACK_REF in the process environment. A person overriding for ONE run
+#      — `KIT_STACK_REF=$(git -C ../kit rev-parse HEAD) bin/dev up` — while
+#      they are working on kit itself. It is deliberately NOT read from `.env`:
+#      an override that a file could also set is two sources for one fact, and
+#      the file is the one that wins silently.
+#   2. `$REF_FILE`, the committed one-liner. This is the pin.
+#
+# Everything downstream — the cache directory, a vendored copy, a mismatch
+# message - names the SAME string, because `resolve_stack` reads it exactly once
+# and passes it down. A second reader of the pin would be a second answer to
+# "which bytes of kit is this".
+stack_ref() {
+  local from_env
+  from_env="$(eval "printf '%s' \"\${KIT_STACK_REF:-}\"")"
+  if [ -n "$from_env" ]; then
+    printf '%s' "$from_env"
+    return 0
+  fi
+  [ -f "$REF_FILE" ] || return 0
+  # First non-blank, non-comment line, trimmed. Comments are allowed because a
+  # one-line file that cannot carry a note cannot carry a reason, and a pin
+  # nobody wrote a reason for is a pin nobody will move deliberately.
+  #
+  # `|| true` and NOT omitted, and this is the second time this line has needed
+  # it. A `kit.ref` holding nothing but a blank line — the single most likely
+  # first-run mistake, and the one the file's own header warns about — makes
+  # `grep -v '^$'` find nothing and exit 1. Under `set -o pipefail` that is the
+  # PIPELINE's status, so `ref="$(stack_ref)"` fails, `set -e` aborts the script,
+  # and the developer gets a non-zero exit and NO MESSAGE AT ALL. The careful
+  # "your pin file does not name one" branch in `validate_ref` — the one written
+  # specifically for this case — is never reached, because the script died three
+  # lines earlier trying to notice.
+  #
+  # Silence on the most likely mistake is worse than a wrong message: it is the
+  # failure where the reader learns nothing and assumes the tool is broken.
+  sed -e 's/[[:space:]]*$//' -e 's/^[[:space:]]*//' "$REF_FILE" 2>/dev/null |
+    grep -v '^#' | grep -v '^$' | head -1 || true
+  return 0
+}
+
 # --------------------------------------------------------------------------
 #
 # A PINNED REF IS A 40-CHARACTER COMMIT SHA, OR A v<semver> TAG.
@@ -195,7 +278,7 @@ validate_ref() {
   if [ "${#ref}" -eq 40 ]; then
     case "$ref" in
       *[!0-9a-f]*)
-        die "KIT_STACK_REF='$ref' is 40 characters but is not a commit sha (lowercase hex)."
+        die "$REF_FILE holds '$ref': 40 characters but not a commit sha (lowercase hex)."
         ;;
     esac
     return 0
@@ -227,7 +310,7 @@ validate_ref() {
           patch="${patch%%.*}"
           ;;
         *)
-          die "KIT_STACK_REF='$ref' is not a v<MAJOR>.<MINOR>.<PATCH> tag."
+          die "$REF_FILE holds '$ref', which is not a v<MAJOR>.<MINOR>.<PATCH> tag."
           ;;
       esac
       # Each component must be digits and nothing else. A `case` and not a
@@ -237,7 +320,7 @@ validate_ref() {
       for part in "$major" "$minor" "$patch"; do
         case "$part" in
           '' | *[!0-9]*)
-            die "KIT_STACK_REF='$ref' is not a v<MAJOR>.<MINOR>.<PATCH> tag with numeric parts."
+            die "$REF_FILE holds '$ref', which is not a v<MAJOR>.<MINOR>.<PATCH> tag with numeric parts."
             ;;
         esac
       done
@@ -245,7 +328,7 @@ validate_ref() {
       local suffix="${version#"$numeric"}"
       case "$suffix" in
         *[!0-9A-Za-z.+-]*)
-          die "KIT_STACK_REF='$ref' is not a v<MAJOR>.<MINOR>.<PATCH> tag; a pre-release or
+          die "$REF_FILE holds '$ref', which is not a v<MAJOR>.<MINOR>.<PATCH> tag; a pre-release or
    build suffix may contain only letters, digits, dots and hyphens."
           ;;
       esac
@@ -253,12 +336,17 @@ validate_ref() {
       ;;
   esac
   if [ -z "$ref" ]; then
-    die "KIT_STACK_REF is empty. Set it in .env to a 40-character kit commit sha, or to a v<semver> tag.
-   It is a PIN, and a pin is what makes 'one command, always current' mean something:
-   an unpinned ref is a gate that changes between two runs of the same command.
-   To move deliberately:  bin/dev pin <ref>"
+    die "no kit ref, and $REF_FILE does not name one.
+   The pin is the ref of kit this repository runs, and it is committed here so that
+   'one command, always current' means the same thing on every machine and in CI.
+   Write one line into $REF_FILE:
+     git -C /path/to/a/kit/checkout rev-parse HEAD > $REF_FILE
+   Accepted: a 40-character commit sha (lowercase hex), or a v<MAJOR>.<MINOR>.<PATCH> tag.
+   Refused: a branch — 'master' is a MOVING reference, and the stack you get on Tuesday
+   would not be the stack you reviewed on Monday.
+   To move deliberately once there is one:  bin/dev pin <ref>"
   fi
-  die "KIT_STACK_REF='$ref' is not a pin.
+  die "$REF_FILE holds '$ref', which is not a pin.
    Accepted: a 40-character commit sha (lowercase hex), or a v<MAJOR>.<MINOR>.<PATCH> tag.
    Refused: branch names — 'master', 'main', anything without a ref suffix — because a
    branch is a MOVING reference. \`bin/dev\` would fetch whatever it points at today, and
@@ -371,7 +459,7 @@ fetch_stack() {
 
 resolve_stack() {
   local ref
-  ref="$(env_value KIT_STACK_REF)"
+  ref="$(stack_ref)"
   validate_ref "$ref"
 
   # 1. An explicit directory. Read through `stack_setting`, so a `KIT_STACK_DIR`
@@ -424,7 +512,7 @@ resolve_stack() {
      git -C $vendor rev-parse HEAD > $vendor/.kit-stack-ref"
     fi
     if [ "$vendored_ref" != "$ref" ]; then
-      die "$vendor is vendored at $vendored_ref, and KIT_STACK_REF is $ref.
+      die "$vendor is vendored at $vendored_ref, and $REF_FILE pins $ref.
    Using it anyway would run a stack you did not pin. Move the pin deliberately —
    bin/dev pin $vendored_ref — or update the vendored copy to $ref."
     fi
@@ -631,7 +719,7 @@ warn_stale_env_example() {
   info "back to those defaults for anything your .env does not set. So this file is"
   info "now dead weight that will read as authoritative and will not be."
   info "  git rm .env.example"
-  info "Keep .env itself: it is where your overrides and your KIT_STACK_REF live."
+  info "Keep .env itself: it is where your overrides live. Your kit pin is $REF_FILE."
 }
 
 # --------------------------------------------------------------------------
@@ -649,7 +737,7 @@ up() {
   ensure_env
   warn_stale_env_example
 
-  step "starting the stack from kit@$(env_value KIT_STACK_REF) (deadline: ${STACK_TIMEOUT}s)"
+  step "starting the stack from kit@$(stack_ref) (deadline: ${STACK_TIMEOUT}s)"
   # The wall-clock is measured here and printed at the end, because "the dev
   # loop is slow" is a claim everyone makes and nobody measures, and the whole
   # point of shipping five more containers is that it is not slow. A number in
@@ -816,7 +904,7 @@ stack_cmd() {
   step "resolving kit"
   resolve_stack
   printf 'resolved: %s\n' "$STACK_DIR"
-  printf 'ref: %s\n' "$(env_value KIT_STACK_REF)"
+  printf 'ref: %s\n' "$(stack_ref)"
   printf 'compose files:\n'
   printf '  %s (kit, pinned)\n' "$STACK_DIR/templates/compose/docker-compose.yml"
   [ -f docker-compose.yml ] &&
@@ -839,23 +927,23 @@ stack_cmd() {
 #
 # THE UPGRADE IS A COMMAND, NOT AN EDIT, and the reason is the diff.
 #
-# Moving `KIT_STACK_REF` is the one edit in a service repository that changes
+# Moving the pin in `$REF_FILE` is the one edit in a service repository that changes
 # every container it starts, so the interesting question is never "can I write
 # this sha" — it is "what changes if I do". `bin/dev pin` prints the stack
 # diff between the old ref and the new one, and refuses to write anything until
 # it has.
 #
-# It writes the pin and nothing else. It does not touch `.env` beyond that one
-# line, does not run compose, and does not upgrade the images: the containers
-# that come up next are a separate, visible step, and folding them in would make
-# "what changed" answerable only after it had already happened.
+# It writes the pin and nothing else. It does not touch `.env` at all, does not
+# run compose, and does not upgrade the images: the containers that come up next
+# are a separate, visible step, and folding them in would make "what changed"
+# answerable only after it had already happened.
 pin_cmd() {
   local new="${1:-}"
   [ -n "$new" ] || die "bin/dev pin needs a ref:  bin/dev pin v0.4.0   |   bin/dev pin <40-char sha>"
   validate_ref "$new"
 
   local old
-  old="$(env_value KIT_STACK_REF)"
+  old="$(stack_ref)"
 
   local old_dir="" new_dir
   new_dir="$(stack_home)/$new"
@@ -894,20 +982,31 @@ pin_cmd() {
   fi
 
   step "writing the pin"
-  # Appended if absent, replaced in place if present. `sed -i` differs between
-  # GNU and BSD, so a temporary file and a `mv` is the portable form — and the
-  # `mv` is atomic, so a crashed `bin/dev pin` cannot leave a half-written .env.
+  # ONE file, replaced whole, and the replacement is written before the old one
+  # is moved away. A `mv` within a filesystem is atomic, so a `bin/dev pin` that
+  # is killed mid-write leaves the previous pin intact rather than a file with
+  # half a sha in it — and half a sha is a pin the validator refuses, which would
+  # present as "your stack stopped working" for a reason that happened once, in
+  # a crash, and left no trace.
+  #
+  # The file is COMMITTED, so the write is visible in `git status` and the bump
+  # is a reviewable line in a pull request. That is the whole reason the pin is
+  # not in `.env`: a pin nobody can review is a pin nobody moves deliberately,
+  # and a pin nobody moves deliberately is one that goes stale.
   local tmp
-  tmp="$(mktemp "${TMPDIR:-/tmp}/kit-dev-env.XXXXXX")"
-  if [ -f .env ] && grep -qE '^[[:space:]]*(export[[:space:]]+)?KIT_STACK_REF=' .env; then
-    sed -E "s|^([[:space:]]*(export[[:space:]]+)?KIT_STACK_REF=).*|\\1$new|" .env >"$tmp"
-  else
-    [ -f .env ] && cat .env >"$tmp"
-    printf 'KIT_STACK_REF=%s\n' "$new" >>"$tmp"
-  fi
-  chmod --reference=.env "$tmp" 2>/dev/null || mv .env "$tmp" 2>/dev/null || true
-  mv "$tmp" .env
-  info ".env now pins KIT_STACK_REF=$new"
+  tmp="$REF_FILE.new.$$"
+  {
+    printf '# The kit ref this repository runs. One line: a 40-character commit'
+    printf '# sha, or a v<semver> tag. NEVER a branch.
+'
+    printf '# Move it with:  bin/dev pin <ref>   (it prints the stack diff first)
+'
+    printf '%s\n' "$new"
+  } >"$tmp"
+  mv "$tmp" "$REF_FILE"
+  info "$REF_FILE now pins kit@$new"
+  info "Commit it. The stack a repository runs is a reviewed statement, not a"
+  info "value that happens to be on this laptop."
   info "Nothing has been started. Run \`bin/dev\` to bring the stack up on the new ref."
 }
 
