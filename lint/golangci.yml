@@ -31,7 +31,7 @@
 #   - There is no `extends`. Measured: the v2 JSON Schema sets
 #     `additionalProperties: false` and `extends` is not a key, so a config that
 #     tries to inherit one is rejected or ignored. Deviation is therefore a
-#     documented workflow input, not a file — see the `lint-extra-args` input.
+#     documented workflow input, not a file — see the `lint-args` input.
 version: '2'
 run:
   go: '1.24'

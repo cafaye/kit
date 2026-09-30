@@ -11,8 +11,9 @@
 #   *different* check, so a passing self_test means the checks are independent
 #   and not one lucky assertion standing in for all of them.
 #
-# THE TWENTY-THREE BREAKAGES   (20 from the tier work, 21 from the
-#                               fan-out work, 18 of them shared)
+# THE THIRTY-TWO BREAKAGES, and one GREEN control   (20 from the tier work,
+#                               21 from the fan-out work, 23-28c from the lint
+#                               work; 18 shared before the lint packet)
 #   1. delete a language template   -> the artifact-presence check goes red
 #   2. add a collector exporter    -> the privacy check goes red
 #   2b. DELETE the tempo exporter   -> the same check goes red from the other
@@ -61,24 +62,107 @@
 #   22. report an undeclared core pin as `current` -> staleness_test.sh goes red.
 #         Two real repositories are in that state today, which is what makes the
 #         difference between `undeclared` and `current` load-bearing.
+#   23-26. the four ways the "lint runs from kit" mechanism stops being a GATE
+#         while everything else stays green, all caught by `lint_wiring_check`
+#         and all NAMING it, because a check that has quietly stopped being
+#         load-bearing should fail here rather than being found months later by
+#         the policy it stopped policing:
+#           23. a language job's `lint` step DELETED -> the job no longer lints
+#           24. that step made ADVISORY — `continue-on-error: true`, the
+#                breakage that matters most, because the step still runs, still
+#                prints every finding, and the job is green. A linter that only
+#                warns is a report, and this is how a report is born without
+#                anybody deciding to write one.
+#           24b. the same defect written the other way it can be written,
+#                `|| true` at the end of the run body. Continue-on-error in
+#                shell, and it reads to nobody as anything but a deliberate
+#                choice.
+#           25. the kit CHECKOUT deleted, so `--config` names a file that is not
+#                there and each linter quietly falls back to its own defaults —
+#                five linters for golangci-lint, MethodLength 10 for rubocop,
+#                no rules at all for eslint. All green, all much weaker, and
+#                invisible in the YAML, because the step still says `--config`.
+#           26. the config WEAKENED in place. The sharpest of the four, because
+#                every other check can be green while it happens: the file still
+#                parses, the workflow still points at it, and the policy is now
+#                whatever was left. So the linter list is asserted BY VALUE.
+# 27. a SERVICE carries a lint config INCONSISTENT with kit's -> the drift
+#        check goes red. The failure this whole packet exists to end, at the
+#        layer where it lands: a service's own lint config, disagreeing with
+#        kit's, in a repository that calls kit.
+#
+#        The MECHANISM was measured before it was written down, and the first
+#        version of this comment was wrong. `--config` WINS: `golangci-lint run
+#        -v` prints exactly one `[config_reader] Used config file`, and with the
+#        flag it names kit's — a repo-root `.golangci.yml` that disables
+#        `misspell` does not survive it, and RuboCop behaves the same way. So a
+#        stale copy does NOT hijack kit's CI, and this breakage is not about
+#        that. What a copy does is SPLIT the policy: every other invocation in
+#        that repository reads it while CI reads kit's, and it becomes live
+#        again the instant the flag is lost — silently, because a copy is always
+#        weaker than the thing it was copied from. That is the finding, and it is
+#        why the check reports the DIFFERENCE rather than banning the file.
+#   28-28c. the SEAM, in the three ways `lint_args_seam_check` can stop being a
+#         control. The seam is `lint-args`, the one input a service uses to ask
+#         for a stricter linter, and its narrowness is a list of refused flags
+#         held in a `lint-args guard` step in each lint job:
+#           28. the guard DELETED from one job. The other two keep working, so
+#                this is the shape of an accident — one merge, one job, no other
+#                signal anywhere.
+#           28b. the guard KEPT and its list SHORTENED by one token. The edit a
+#                well-meaning commit makes when somebody wants `--no-config`:
+#                rather than argue about the seam, the token comes out. The
+#                build stays green for every service that sets it and the
+#                workflow still contains a step called `lint-args guard`. This
+#                is the sharpest of the three, and it is only caught because the
+#                token list is asserted against a copy held in validate.sh.
+#           28c. the guard MOVED after the linter. It still runs, still reads the
+#                variable, and still refuses everything it refused — after the
+#                linter has been handed `--no-config` and already exited 0. A
+#                control that runs after the thing it controls is the most
+#                comfortable kind of dead code, because read top to bottom it
+#                looks exactly like a live one.
+#   ...and one GREEN control, which is the other half of 27's claim: a service
+#        config that AGREES with kit's must PASS, because a check that failed on
+#        the mere presence of the file would train every service to delete a file
+#        it is allowed to keep. It is written here as prose rather than as a
+#        numbered entry because it is a control and not a breakage — and because
+#        `self_test_claims` counts only the red-expecting helpers, so a numbered
+#        entry here would be reported as a header claim with no recipe.
 #
 #   These are numbered 20-22 rather than 19-21 because 19 is the allowlist
 #   breakage above, from the tier work. Both packets numbered their first entry
 #   independently and the collision is only visible in the union — which is what
 #   the header/recipe check in validate.sh is for.
 #
-#   Eight of them (7-10, 11, 12, 19, 20) additionally assert WHICH check went
-#         red. Every other breakage only proves the gate can fail; those prove
-#         the check written for that defect is still load-bearing, which is a
-#         different claim and the one that decays silently. 21 and 22 assert the
-#         same thing about the two scripts that are themselves proofs.
+#   Seventeen of them (7-10, 11, 12, 19, 20, 23, 24, 24b, 25, 26, 27, 28, 28b,
+#                     28c) additionally
+#         assert WHICH check went red. Every other breakage only proves the gate
+#         can fail; those prove the check written for that defect is still
+#         load-bearing, which is a different claim and the one that decays
+#         silently. 21 and 22 assert the same thing about the two scripts that
+#         are themselves proofs. The six lint-packet entries all NAME the check
+#         they must be caught by, and that is the point of naming it: a deleted
+#         checkout and a `continue-on-error` are defects a dozen other checks
+#         would also catch, and a proof that cannot tell which one fired is a
+#         proof that stops being evidence the moment one of the others moves.
 #
-#   The counts here were wrong twice and both times a check caught it rather
-#   than a reader: the header said "seven" over a four-wide range, and it
-#   numbered a second entry 19 while the recipes numbered it 20. A header that
-#   drifts from the recipes is not documentation, it is a second, unchecked copy
-#   of the truth — which is the entire thing validate.sh's header/recipe check
-#         exists to prevent.
+#   And one GREEN control, which is a claim the numbered breakages cannot make.
+#         27b asserts the gate is green on a copy whose service config MATCHES
+#         kit's. A check that failed on the mere presence of a `.golangci.yml`
+#         would be satisfied by this packet and would teach every service to
+#         delete a file it is allowed to keep — a silent outcome, and a worse one
+#         than the drift it was written to catch.
+#
+#   The counts here were wrong three times and every time a check caught it
+#         rather than a reader: the header said "seven" over a four-wide range,
+#         it numbered a second entry 19 while the recipes numbered it 20, and it
+#         kept saying "twenty-three" after the lint packet added six more. A
+#         header that drifts from the recipes is not documentation, it is a
+#         second, unchecked copy of the truth — which is the entire thing
+#         validate.sh's header/recipe check exists to prevent. That check COUNTS
+#         the recipes and diffs them against this header, so the third error was
+#         caught the same way as the first two: mechanically, not by reading.
 #
 # WHAT IT IS NOT
 #   This is not exhaustive mutation testing. Each implementation gets exactly one
@@ -114,9 +198,27 @@ copy_name=""
 
 # A fresh throwaway copy per breakage: one breakage must never mask the next,
 # and no breakage may touch the worktree this script was invoked from.
+#
+# EACH COPY GETS ITS OWN PARENT DIRECTORY, and that is load-bearing rather than
+# tidiness. `fleet_repos` in tests/validate.sh finds a service fleet by globbing
+# `$ROOT/..`, so a copy that sat directly in the shared `$WORK` would see all
+# THIRTY of its siblings as the fleet. That is not a tidiness problem, it is a
+# correctness one in both directions:
+#
+#   - every breakage's gate run would be red because a LATER breakage's copy
+#     carries a `.golangci.yml`, so a breakage could be "caught" by a defect it
+#     did not introduce; and
+#   - breakage 27b, which asserts the gate is GREEN on a copy whose config
+#     MATCHES kit's, would be red because breakage 27's copy — a sibling, in the
+#     same directory — has one that does not.
+#
+# A control that goes red for a reason another test created is worse than no
+# control, because it reads as evidence. One directory per copy makes each
+# breakage's fleet exactly itself: deterministic, and each result attributable
+# to the breakage under test and nothing else.
 fresh_copy() {
   copy_name="$1"
-  local dst="$WORK/$copy_name"
+  local dst="$WORK/$copy_name/kit"
   mkdir -p "$dst"
   # `.github` is in this list and not an afterthought: the reusable workflow it
   # holds is the artifact every check that reads the workflow's inputs reads by
@@ -124,6 +226,10 @@ fresh_copy() {
   # `core` is here for the same reason `.github` is: the breakages below mutate
   # files in it, and a copy without it would fail on a missing path rather than
   # on the defect under test — which is a self_test that proves nothing.
+  # `lint` is here for the same reason `.github` is: the breakages below mutate
+  # files in it and read files in it, and a copy without it would fail on a
+  # missing path rather than on the defect under test — which is a self_test
+  # that proves nothing.
   for entry in .github AGENTS.md README.md CHANGELOG.md core docker lint templates tests; do
     [ -e "$ROOT/$entry" ] && cp -R "$ROOT/$entry" "$dst/"
   done
@@ -859,6 +965,80 @@ twentyseven_b="$(fresh_copy service-config-agrees-with-kit)"
 cp "$twentyseven_b/lint/golangci.yml" "$twentyseven_b/.golangci.yml"
 expect_green 'breakage 27b: a service config that MATCHES kit is not a failure' \
   "$twentyseven_b" --static-only
+
+# 28-28c. THE SEAM. Three claims, and each decays on its own: the guard can be
+#       deleted, moved, or kept but emptied. The third matters most, because it
+#       is the shortest edit in the file and it widens the deviation seam for
+#       every service in the fleet while the workflow still reads as it did.
+#
+#       All three name `lint_args_seam_check`, for the reason 23-27 do: a deleted
+#       guard also leaves the YAML valid, the lint step untouched and the build
+#       green, and nothing else in this repository has an opinion about it.
+SEAM='the seam  (narrow, guarded before the linter, and wired to it)'
+
+# 28. The guard deleted from ONE job. The seam keeps working in the other two,
+#     so this is the shape of an accident: one merge, one job, no other signal.
+twentyeight="$(fresh_copy seam-guard-deleted)"
+"$PY" - "$twentyeight/.github/workflows/ci.reusable.yml" <<'PYDEL28'
+import sys
+
+import yaml
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    doc = yaml.safe_load(fh)
+job = (doc.get("jobs") or {}).get("ruby") or {}
+steps = job.get("steps") or []
+kept = [s for s in steps if s.get("name") != "lint-args guard"]
+if len(steps) == len(kept):
+    sys.exit("self_test: the ruby job had no `lint-args guard` to delete")
+job["steps"] = kept
+with open(path, "w", encoding="utf-8") as fh:
+    yaml.safe_dump(doc, fh, sort_keys=False, default_flow_style=False)
+PYDEL28
+expect_red_check 'breakage 28: one lint job no longer guards the seam' \
+  "$twentyeight" "$SEAM" --static-only
+
+# 28b. The guard KEPT, and its list shortened by one token. This is the edit a
+#      well-meaning commit makes: `--no-config` is a flag somebody wants, and
+#      rather than argue about the seam the token comes out. The build stays
+#      green for every service that sets it, and the workflow still contains a
+#      step called `lint-args guard`.
+twentyeight_b="$(fresh_copy seam-list-shortened)"
+edit "$twentyeight_b/.github/workflows/ci.reusable.yml" \
+  '              --config|-c|--no-config|--no-config-lookup|--force-default-config|' \
+  '              --config|-c|--no-config-lookup|--force-default-config|'
+expect_red_check 'breakage 28b: the guard no longer refuses --no-config' \
+  "$twentyeight_b" "$SEAM" --static-only
+
+# 28c. The guard moved AFTER the linter. It still runs, still reads the variable,
+#      and still refuses everything it refused — after the linter has already
+#      been handed `--no-config` and already exited 0. A control that runs after
+#      the thing it controls is the most comfortable kind of dead code, because
+#      reading the workflow top to bottom it looks exactly like a live one.
+twentyeight_c="$(fresh_copy seam-guard-after-the-linter)"
+"$PY" - "$twentyeight_c/.github/workflows/ci.reusable.yml" <<'PYDEL28C'
+import sys
+
+import yaml
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    doc = yaml.safe_load(fh)
+for lang in ("go", "ruby", "node"):
+    job = (doc.get("jobs") or {}).get(lang) or {}
+    steps = job.get("steps") or []
+    guard = next((s for s in steps if s.get("name") == "lint-args guard"), None)
+    if guard is None:
+        sys.exit("self_test: job " + lang + " had no `lint-args guard` to move")
+    steps.remove(guard)
+    steps.append(guard)
+    job["steps"] = steps
+with open(path, "w", encoding="utf-8") as fh:
+    yaml.safe_dump(doc, fh, sort_keys=False, default_flow_style=False)
+PYDEL28C
+expect_red_check 'breakage 28c: the seam guard runs AFTER the linter it guards' \
+  "$twentyeight_c" "$SEAM" --static-only
 
 printf '\n'
 if [ "$failures" -ne 0 ]; then

@@ -3,7 +3,9 @@
 All notable changes to `kit` are recorded here. kit has no releases yet and no
 semver contract — it is consumed by *calling*
 `.github/workflows/ci.reusable.yml@master` and by *copying* files out of
-`lint/`, `docker/`, and `templates/`.
+`docker/` and `templates/`. `lint/` is the exception and no longer belongs to
+that sentence: the reusable workflow reads it at run time, so a service inherits
+it without a copy (see kit-12 below).
 
 > Entries under **Earlier**, and the three `workflows/ci.reusable.yml` bullets
 > below, record the path the file had *at the time*. It was
@@ -11,7 +13,105 @@ semver contract — it is consumed by *calling*
 
 ## Unreleased
 
+### Changed
+
+- **kit-12 — lint runs from kit. The `cp` is gone.**
+  `lint/` was 249 lines of golangci, rubocop, eslint, yamllint and hadolint
+  configuration that **not one service in the fleet had ever copied**, and every
+  check in this repository was green the whole time. Adoption correlated
+  *inversely* with how much a file did: `uses: cafaye/kit/...@master` is 8/8
+  because it is live, and `cp lint/golangci.yml` is 0/9 because a snapshot has
+  no propagation and rots silently. So the config moved to where the step already
+  is, and adoption becomes 9/9 with no per-service action.
+
+  - **`kit-lint-ref` and a sparse `lint/` checkout, in the go, ruby and node
+    jobs.** The workflow file and the configs are two different things:
+    `uses: cafaye/kit/...@X` pins the *workflow*, and a reusable workflow is not
+    handed its own ref — so the configs are fetched by name, and the name has to
+    be an input. Pin it to the **same** ref you pinned `uses:` to; a caller who
+    pins one and not the other gets that SHA's workflow with today's lint
+    policy, which nothing detects automatically and is therefore documented in
+    the input and in README.md rather than pretended to be automatic.
+  - **The ESLint config is checked out *inside* the repository, at
+    `<working-dir>/.kit`.** Measured, not preferred: node resolves an ESM import
+    from the config file's own directory upward, so a config beside the
+    repository finds no `@eslint/js` and the run dies with
+    `ERR_MODULE_NOT_FOUND` — a red build that has linted nothing. One location
+    serves all three linters.
+  - **`lint/eslint.config.mjs` ignores `.kit/**`.** Without it the run is red
+    with a parse error about *kit's own* config file, in a service that did
+    nothing wrong, on a file the service never wrote.
+  - **`lint-args` is the deviation seam**, and it is deliberately narrow: it is
+    appended *after* kit's flags, so a service can add and cannot remove the
+    `--config`; and it is a string rather than a path, so there is no
+    service-side file to rot. What it may not do — change which config is read,
+    what is linted, or whether a finding fails the build — is a list of 15
+    refused flags enforced by a **`lint-args guard` step in the workflow**, not
+    by kit's gate, because `lint-args` is the caller's value and kit has never
+    got it. `lint_args_seam_check` asserts the guard is in all three lint jobs,
+    that the copies are byte-identical, that it runs *before* the linter, and
+    that its token list is the one written in the gate.
+  - **ESLint runs directly, not `npm run lint`.** `npm run lint` is whatever
+    script the repository happens to define — a repository that defines none gets
+    a confusing "Missing script" rather than a lint, and one that defines it is
+    running its own config, which is the copy this packet exists to end.
+
 ### Added
+
+- **kit-12 — the gate now knows whether a linter ran.**
+  - **`tests/lint_test.sh` (a sixth phase, `lint`, deliberately outside the
+    `RUN_STATIC` guard).** Four linters are **executed** against a throwaway
+    service built to violate exactly one rule, with kit's config, each paired
+    with a control that must answer differently. `lint/` spent its whole life
+    behind a parse check — `yaml.safe_load` on `golangci.yml`, `node --check` on
+    the eslint config — and both are green on a file no linter has ever been
+    pointed at. This phase is the only thing that tells a working config from a
+    valid one, and it is **fatal on a skip**: the claim under test is "kit's
+    configs work", and a run in which no linter executed has not tested it.
+  - **`lint drift`, which reads BOTH files and reports the DIFFERENCE.** A
+    service carrying a `.golangci.yml` that disagrees with kit's is told which
+    linters it dropped or added. Banning the file was the first version and it is
+    worse than the drift: a config that agrees with kit's has reached the same
+    policy by another route, and failing it teaches the lesson that kit's config
+    is a thing you get shouted at for having. Self-test breakage 27b asserts the
+    agreeing copy **passes**, so the check cannot be satisfied by deleting it.
+  - **`lint/drift-allowlist`**, for a difference that cannot be deleted yet:
+    reason, owner, `since`, `until`, and four rules of which the fourth is the
+    load-bearing one — **an entry that no longer describes a real difference
+    fails**, modelled on ESLint's `reportUnusedDisableDirectives`. One entry is
+    live: `identity`, whose `.golangci.yml` enables no linter and exists only to
+    exclude one generated file.
+
+### Fixed
+
+- **A promise this repository made in a comment, with no control behind it.**
+  The `lint-args` input's own description said `lint_wiring_check` "fails on
+  exactly that string" for `--no-config`, and `lint_wiring_check` had no such
+  assertion anywhere in it. The reason it *could* not have one is worth
+  recording: `lint-args` is the **caller's** value, and kit's gate never sees
+  it. So the control moved to where the value is — a `lint-args guard` step in
+  every lint job — and kit's gate now asserts the guard exists, is identical in
+  all three jobs, runs before the linter, is handed the variable, and still
+  refuses all 15 flags. A comment promising a check is worse than no comment:
+  the second one stops the reader looking for the first.
+- **A claim this repository made about golangci-lint, before running it.** The
+  drift check was written on the belief that a repo-root `.golangci.yml` is
+  discovered "ahead of any flag the workflow passes", so a stale copy silently
+  hijacked CI. **That is backwards.** `golangci-lint run -v` prints exactly one
+  `[config_reader] Used config file`, and with `--config` it names kit's; a local
+  config that disables `misspell` does not survive it, and RuboCop agrees. A copy
+  does not hijack the build — it **splits** the policy, because every other
+  invocation in that repository reads it while CI reads kit's, and it becomes
+  live again the instant the flag is lost. That is still a finding, and it is the
+  honest one. `GOLANGCI_LINT_CONFIG` **is** confirmed unread in v2, as claimed.
+- **An allowlist rule that was red on a correct tree.** "An entry that no longer
+  describes a difference" treated a repository that was *not in this checkout's
+  fleet* as one that had stopped differing, so every run on a copy of kit — which
+  is what `self_test.sh` does, twenty-odd times — reported the whole allowlist as
+  dead. The rule is now scoped to repositories the run actually looked at; an
+  entry naming one that was not looked at is reported as **unverified**, which is
+  neither a pass nor a failure.
+
 
 - **kit-07 — the declared tier, and the allowlist that is supposed to shrink.**
   A tier is a class of test that needs a real dependency. The failure this

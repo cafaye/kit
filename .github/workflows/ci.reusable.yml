@@ -93,9 +93,13 @@ on:
       #     for a linter to read and therefore none to rot. The failure this
       #     packet ends is a file nobody propagates; a seam that reintroduces
       #     the file reinstates the failure.
-      #   - It may not be used to turn kit's config off. `--no-config` here
-      #     would restore the linter's defaults, and `lint_wiring_check` in
-      #     tests/validate.sh fails on exactly that string.
+      #   - It may not be used to turn kit's config off, to lint a diff instead
+      #     of the tree, or to stop a finding from failing the build. The
+      #     `lint-args guard` step in every lint job refuses those flags, and it
+      #     is in the WORKFLOW rather than in kit's gate because `lint-args` is
+      #     the caller's value and kit has never got it. The guard's token list
+      #     is asserted against a copy in `tests/validate.sh`, so shortening it is
+      #     a red build rather than a quiet widening of this input.
       #
       # What it is FOR: a repository that needs a stricter setting than the
       # fleet's, and nothing else. If a flag is wanted often enough to be
@@ -103,9 +107,13 @@ on:
       lint-args:
         description: >-
           Extra arguments appended to the linter's command line, after kit's
-          own flags. For a service that needs a stricter setting than the
-          fleet's. May not disable kit's config; a value here is a place a
-          per-service lint policy can rot, so prefer a change in kit.
+          own flags, for a service that needs a STRICTER setting than the
+          fleet's. May not change which config is read, what is linted, or
+          whether a finding fails the build: the `lint-args guard` step that
+          runs before every linter refuses those flags, and kit's gate fails
+          if that step is ever deleted, moved after the linter, or shortened.
+          A value here is a place a per-service lint policy can rot, so prefer
+          a change in kit, where every service gets it free.
         required: false
         type: string
         default: ''
@@ -303,6 +311,70 @@ jobs:
           sparse-checkout: lint
           sparse-checkout-cone-mode: false
           persist-credentials: false
+      # THE SEAM'S OWN GUARD, and it lives HERE rather than in kit's gate
+      # because of a fact about the input: `lint-args` is set by the CALLER, and
+      # kit never sees that value. A check in `tests/validate.sh` can assert the
+      # input exists, is a string and defaults to empty — all of which it does —
+      # and it can assert this step exists in three jobs and that the three
+      # copies are byte-identical. It cannot check the value, because kit has
+      # never got it. So the rule that makes the seam narrow has to run where
+      # the value is: in the service.
+      #
+      # WHAT IT REFUSES, and the one sentence that is the whole policy: the seam
+      # may make the lint STRICTER, and it may not change WHICH CONFIG IS READ,
+      # WHAT IS LINTED, or WHETHER A FINDING FAILS THE BUILD. Every token below
+      # is one of those three, and every one was read out of the linter's own
+      # `--help` rather than remembered:
+      #
+      #   which config   --config / -c (rubocop) / --no-config (golangci-lint)
+      #                  / --no-config-lookup (eslint) / --force-default-config
+      #   what is linted --new, --new-from-rev, --new-from-patch,
+      #                  --new-from-merge-base (a diff, not the tree)
+      #   does it fail   --issues-exit-code (golangci-lint; `=0` is a linter that
+      #                  cannot fail), --fail-level (rubocop), --quiet (eslint:
+      #                  "report errors only", which is looser, not stricter),
+      #                  --no-error-on-unmatched-pattern (an unmatched path is
+      #                  green, so a renamed file is silently unlinted)
+      #
+      # `--auto-gen-config` and `--regenerate-todo` are here for a different
+      # reason and it is the packet's own reason: both WRITE a config file into
+      # the tree. A linter that generates its own config is the copy mechanism
+      # arriving through the back door, and it would be a copy nobody reviews.
+      #
+      # The list is duplicated in `tests/validate.sh` and asserted against this
+      # one, so shortening it here is a red build rather than a quiet widening
+      # of the seam.
+      - name: lint-args guard
+        run: |
+          set -euo pipefail
+          # Empty is the fleet's state, and it is not a failure: every service
+          # lints with kit's policy and nothing else.
+          [ -n "${KIT_LINT_ARGS:-}" ] || exit 0
+          # Deliberate word splitting — the seam is a command line, and this is
+          # the list the shell will hand the linter. shellcheck disable=SC2086
+          # for exactly that one line.
+          # shellcheck disable=SC2086
+          for tok in $KIT_LINT_ARGS; do
+            # `--config=path` and `--config path` are the same request, so the
+            # value is stripped before the name is matched.
+            name="${tok%%=*}"
+            case "$name" in
+              --config|-c|--no-config|--no-config-lookup|--force-default-config|\
+              --issues-exit-code|--fail-level|--quiet|\
+              --no-error-on-unmatched-pattern|--auto-gen-config|--regenerate-todo|\
+              --new|--new-from-rev|--new-from-patch|--new-from-merge-base)
+                echo "::error::lint-args may not contain '$name'." >&2
+                echo "::error::The seam is for a STRICTER setting. '$name' changes" >&2
+                echo "::error::which config is read, what is linted, or whether a" >&2
+                echo "::error::finding fails the build — so a green build would stop" >&2
+                echo "::error::meaning what it says it means." >&2
+                echo "::error::If the fleet should have it, add it to kit/lint and" >&2
+                echo "::error::every service gets it free. See README.md," >&2
+                echo "::error::'The deviation seam'." >&2
+                exit 1
+                ;;
+            esac
+          done
       - name: lint
         uses: golangci/golangci-lint-action@v9
         with:
@@ -478,6 +550,70 @@ jobs:
       # RED under those defaults and GREEN under kit's (Max: 15). A repo whose
       # lint step lost this flag goes from kit's policy to RuboCop's without
       # failing anything.
+      # THE SEAM'S OWN GUARD, and it lives HERE rather than in kit's gate
+      # because of a fact about the input: `lint-args` is set by the CALLER, and
+      # kit never sees that value. A check in `tests/validate.sh` can assert the
+      # input exists, is a string and defaults to empty — all of which it does —
+      # and it can assert this step exists in three jobs and that the three
+      # copies are byte-identical. It cannot check the value, because kit has
+      # never got it. So the rule that makes the seam narrow has to run where
+      # the value is: in the service.
+      #
+      # WHAT IT REFUSES, and the one sentence that is the whole policy: the seam
+      # may make the lint STRICTER, and it may not change WHICH CONFIG IS READ,
+      # WHAT IS LINTED, or WHETHER A FINDING FAILS THE BUILD. Every token below
+      # is one of those three, and every one was read out of the linter's own
+      # `--help` rather than remembered:
+      #
+      #   which config   --config / -c (rubocop) / --no-config (golangci-lint)
+      #                  / --no-config-lookup (eslint) / --force-default-config
+      #   what is linted --new, --new-from-rev, --new-from-patch,
+      #                  --new-from-merge-base (a diff, not the tree)
+      #   does it fail   --issues-exit-code (golangci-lint; `=0` is a linter that
+      #                  cannot fail), --fail-level (rubocop), --quiet (eslint:
+      #                  "report errors only", which is looser, not stricter),
+      #                  --no-error-on-unmatched-pattern (an unmatched path is
+      #                  green, so a renamed file is silently unlinted)
+      #
+      # `--auto-gen-config` and `--regenerate-todo` are here for a different
+      # reason and it is the packet's own reason: both WRITE a config file into
+      # the tree. A linter that generates its own config is the copy mechanism
+      # arriving through the back door, and it would be a copy nobody reviews.
+      #
+      # The list is duplicated in `tests/validate.sh` and asserted against this
+      # one, so shortening it here is a red build rather than a quiet widening
+      # of the seam.
+      - name: lint-args guard
+        run: |
+          set -euo pipefail
+          # Empty is the fleet's state, and it is not a failure: every service
+          # lints with kit's policy and nothing else.
+          [ -n "${KIT_LINT_ARGS:-}" ] || exit 0
+          # Deliberate word splitting — the seam is a command line, and this is
+          # the list the shell will hand the linter. shellcheck disable=SC2086
+          # for exactly that one line.
+          # shellcheck disable=SC2086
+          for tok in $KIT_LINT_ARGS; do
+            # `--config=path` and `--config path` are the same request, so the
+            # value is stripped before the name is matched.
+            name="${tok%%=*}"
+            case "$name" in
+              --config|-c|--no-config|--no-config-lookup|--force-default-config|\
+              --issues-exit-code|--fail-level|--quiet|\
+              --no-error-on-unmatched-pattern|--auto-gen-config|--regenerate-todo|\
+              --new|--new-from-rev|--new-from-patch|--new-from-merge-base)
+                echo "::error::lint-args may not contain '$name'." >&2
+                echo "::error::The seam is for a STRICTER setting. '$name' changes" >&2
+                echo "::error::which config is read, what is linted, or whether a" >&2
+                echo "::error::finding fails the build — so a green build would stop" >&2
+                echo "::error::meaning what it says it means." >&2
+                echo "::error::If the fleet should have it, add it to kit/lint and" >&2
+                echo "::error::every service gets it free. See README.md," >&2
+                echo "::error::'The deviation seam'." >&2
+                exit 1
+                ;;
+            esac
+          done
       - name: lint
         working-directory: ${{ inputs.working-dir }}
         run: bundle exec rubocop --parallel --config "$KIT_LINT_DIR/lint/rubocop.yml" ${{ env.KIT_LINT_ARGS }}
@@ -716,6 +852,70 @@ jobs:
       # pinned. With it, a missing eslint is a build failure that says so.
       #
       # `.` rather than a path, so the service lints the same tree it tests.
+      # THE SEAM'S OWN GUARD, and it lives HERE rather than in kit's gate
+      # because of a fact about the input: `lint-args` is set by the CALLER, and
+      # kit never sees that value. A check in `tests/validate.sh` can assert the
+      # input exists, is a string and defaults to empty — all of which it does —
+      # and it can assert this step exists in three jobs and that the three
+      # copies are byte-identical. It cannot check the value, because kit has
+      # never got it. So the rule that makes the seam narrow has to run where
+      # the value is: in the service.
+      #
+      # WHAT IT REFUSES, and the one sentence that is the whole policy: the seam
+      # may make the lint STRICTER, and it may not change WHICH CONFIG IS READ,
+      # WHAT IS LINTED, or WHETHER A FINDING FAILS THE BUILD. Every token below
+      # is one of those three, and every one was read out of the linter's own
+      # `--help` rather than remembered:
+      #
+      #   which config   --config / -c (rubocop) / --no-config (golangci-lint)
+      #                  / --no-config-lookup (eslint) / --force-default-config
+      #   what is linted --new, --new-from-rev, --new-from-patch,
+      #                  --new-from-merge-base (a diff, not the tree)
+      #   does it fail   --issues-exit-code (golangci-lint; `=0` is a linter that
+      #                  cannot fail), --fail-level (rubocop), --quiet (eslint:
+      #                  "report errors only", which is looser, not stricter),
+      #                  --no-error-on-unmatched-pattern (an unmatched path is
+      #                  green, so a renamed file is silently unlinted)
+      #
+      # `--auto-gen-config` and `--regenerate-todo` are here for a different
+      # reason and it is the packet's own reason: both WRITE a config file into
+      # the tree. A linter that generates its own config is the copy mechanism
+      # arriving through the back door, and it would be a copy nobody reviews.
+      #
+      # The list is duplicated in `tests/validate.sh` and asserted against this
+      # one, so shortening it here is a red build rather than a quiet widening
+      # of the seam.
+      - name: lint-args guard
+        run: |
+          set -euo pipefail
+          # Empty is the fleet's state, and it is not a failure: every service
+          # lints with kit's policy and nothing else.
+          [ -n "${KIT_LINT_ARGS:-}" ] || exit 0
+          # Deliberate word splitting — the seam is a command line, and this is
+          # the list the shell will hand the linter. shellcheck disable=SC2086
+          # for exactly that one line.
+          # shellcheck disable=SC2086
+          for tok in $KIT_LINT_ARGS; do
+            # `--config=path` and `--config path` are the same request, so the
+            # value is stripped before the name is matched.
+            name="${tok%%=*}"
+            case "$name" in
+              --config|-c|--no-config|--no-config-lookup|--force-default-config|\
+              --issues-exit-code|--fail-level|--quiet|\
+              --no-error-on-unmatched-pattern|--auto-gen-config|--regenerate-todo|\
+              --new|--new-from-rev|--new-from-patch|--new-from-merge-base)
+                echo "::error::lint-args may not contain '$name'." >&2
+                echo "::error::The seam is for a STRICTER setting. '$name' changes" >&2
+                echo "::error::which config is read, what is linted, or whether a" >&2
+                echo "::error::finding fails the build — so a green build would stop" >&2
+                echo "::error::meaning what it says it means." >&2
+                echo "::error::If the fleet should have it, add it to kit/lint and" >&2
+                echo "::error::every service gets it free. See README.md," >&2
+                echo "::error::'The deviation seam'." >&2
+                exit 1
+                ;;
+            esac
+          done
       - name: lint
         working-directory: ${{ inputs.working-dir }}
         run: npx --no-install eslint --config "$KIT_LINT_DIR/lint/eslint.config.mjs" . ${{ env.KIT_LINT_ARGS }}

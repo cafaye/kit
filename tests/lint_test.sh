@@ -275,6 +275,50 @@ EOF
     run 'go: kit config ACCEPTS a clean file (strict, not broken)' green \
       env -C "$g" GOFLAGS=-mod=mod GOPROXY=off GOTOOLCHAIN=local \
       golangci-lint run "--config=$KIT_GOLANGCI" ./pkg/clean
+
+    # (c) `--config` BEATS a config the repository already has, and this is the
+    #     assertion the whole drift check rests on.
+    #
+    #     The drift check's failure message tells a service that a repo-root
+    #     `.golangci.yml` is inert while kit's workflow passes `--config`. That
+    #     was WRONG when the check was first written — it claimed discovery
+    #     happened "ahead of any flag" — and it is only right because it was
+    #     measured. `golangci-lint run -v` prints exactly one
+    #     `[config_reader] Used config file`; with the flag it names kit's.
+    #
+    #     So this writes the strongest possible local override — one that turns
+    #     OFF the single linter the fixture violates — and asserts the violation
+    #     is still reported. If this ever goes green, the precedence has changed
+    #     and both the workflow's design and the drift check's message are
+    #     describing a tool that no longer behaves this way.
+    #
+    #     The two runs below are in TWO SEPARATE COPIES of the fixture, and that
+    #     is not tidiness. golangci-lint takes a per-directory lock and refuses
+    #     to start while another instance holds it:
+    #
+    #         Error: parallel golangci-lint is running
+    #
+    #     Two runs back to back in one directory are a coin toss on that, and the
+    #     first version of this pair did exactly that — it passed once and failed
+    #     with that message the next time. A flaky assertion is worse than no
+    #     assertion: it trains a reader to re-run until it goes green, which is
+    #     how a real regression gets waved through. Two directories, two locks,
+    #     no sleep, no retry.
+    cp -R "$g" "$WORK/gosvc-local"
+    printf '%s\n' '---' 'version: "2"' 'linters:' '  disable:' '    - misspell' \
+      >"$g/.golangci.yml"
+    printf '%s\n' '---' 'version: "2"' 'linters:' '  disable:' '    - misspell' \
+      >"$WORK/gosvc-local/.golangci.yml"
+    run 'go: a repo-root .golangci.yml disabling misspell is INERT under --config' red \
+      env -C "$g" GOFLAGS=-mod=mod GOPROXY=off GOTOOLCHAIN=local \
+      golangci-lint run "--config=$KIT_GOLANGCI" ./pkg
+    # ...and the other direction, so the pair pins WHICH file won rather than
+    # merely that something was red: with no flag, the very same local file
+    # governs and the misspelling is green.
+    run 'go: ...and that same local file DOES govern the run when no --config is passed' green \
+      env -C "$WORK/gosvc-local" GOFLAGS=-mod=mod GOPROXY=off GOTOOLCHAIN=local \
+      golangci-lint run ./pkg
+    rm -f "$g/.golangci.yml"
   fi
 else
   skip 'go: golangci-lint is not installed' 'the go lint proof did not run'
@@ -521,9 +565,9 @@ EOF
       :
     fi
     if printf '%s\n' "$out" | grep -q '\.kit/lint/'; then
-      fail 'node: the .kit/** ignore keeps kit own config out of the lint' "$out"
+      fail "node: the .kit/** ignore keeps kit's own config out of the lint" "$out"
     else
-      pass 'node: the .kit/** ignore keeps kit own config out of the lint'
+      pass "node: the .kit/** ignore keeps kit's own config out of the lint"
     fi
     # THE CONSTRAINT THAT FORCES THE CHECKOUT PATH, asserted rather than
     # described. Same config, same node, same packages — only the location
