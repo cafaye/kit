@@ -37,13 +37,38 @@ learn.
 
 The reusable workflow is at `.github/workflows/ci.reusable.yml` and nowhere
 else. That is not a style choice: GitHub documents that **subdirectories of the
-workflows directory are not supported**, so `uses: cafaye/kit/workflows/...`
-does not resolve and every caller who copied it has a red build. A repo that
-holds the file in a convenient place and documents a `uses:` string is a repo
-whose documentation and layout have silently disagreed — which is the class of
-defect the `callable path` check in `tests/validate.sh` exists to catch. The
-same reasoning forbids a second copy: one file, and if you ever mirror it, the
-gate must fail when the copies differ.
+workflows directory are not supported**, so a `uses:` line reading
+`cafaye/kit/workflows/ci.reusable.yml@master` resolves to nothing, and every
+caller who copied it has a red build. A repo that holds the file in a convenient
+place and documents a `uses:` string is a repo whose documentation and layout
+have silently disagreed — which is the class of defect the `callable path`
+check in `tests/validate.sh` exists to catch. The same reasoning forbids a
+second copy: one file, and if you ever mirror it, the gate must fail when the
+copies differ.
+
+A caller writes exactly this, and nothing else:
+
+```yaml
+---
+name: ci
+on: [push, pull_request]
+permissions:
+  contents: read
+jobs:
+  ci:
+    uses: cafaye/kit/.github/workflows/ci.reusable.yml@master
+    with:
+      language: go
+```
+
+`kit` itself calls it with the local form instead, which is the whole point of
+having the file here at all:
+
+```yaml
+    uses: ./.github/workflows/ci.reusable.yml
+    with:
+      language: none
+```
 
 ## The gate
 
@@ -65,9 +90,11 @@ Three phases, and all three must pass:
 - **telemetry** — the six W3C traceparent suites are **executed**, one per
   language. Stdlib only and offline on purpose. If they ever need the network,
   a template has grown a dependency and kit has stopped being config-only.
-- **self_test** — twelve breakages of a throwaway copy, asserting the gate goes
+- **self_test** — sixteen breakages of a throwaway copy, asserting the gate goes
   red each time. Six of them are a semantic mutation of one language each, so
-  **every suite is proven able to fail** rather than assumed to.
+  **every suite is proven able to fail** rather than assumed to. Four assert
+  that one *named* check reported `FAIL`, so a check written for a specific
+  defect is proven still load-bearing.
 
 - Tests are written **first** and watched fail before the artifacts exist.
 - `shellcheck` and `node` run when installed and are skipped when not; PyYAML
@@ -86,7 +113,7 @@ Three phases, and all three must pass:
   rubocop ran on kit's own Ruby with kit's own config. That is the only way an
   obsolete key surfaces before six repos inherit it.
 - The suite must be able to fail: `self_test` breaks a throwaway copy of the
-  tree twelve ways and asserts the run goes red. If you change the suite, keep
+  tree sixteen ways and asserts the run goes red. If you change the suite, keep
   that true.
 
 ## Adding a language

@@ -1025,6 +1025,246 @@ if problems:
 PY2
   }
   check 'README.md  (its documented callers match the workflow inputs)' caller_check
+
+  # -------------------------------------------------------------------------
+  # The check this packet exists for.
+  #
+  # kit-02 shipped a reusable workflow at `workflows/ci.reusable.yml`, a README
+  # telling every reader to write
+  #
+  #     uses: cafaye/kit/workflows/ci.reusable.yml@master
+  #
+  # and GitHub, which does not support subdirectories of the workflows
+  # directory, resolving that to nothing. Every check in this file was green
+  # for the whole of that time. A layout bug and a documentation bug that agree
+  # with each other are invisible to any check that reads only one of them, and
+  # the file they disagreed about is the one thirteen repos were told to depend
+  # on.
+  #
+  # So this asserts the agreement directly, in the places it can drift:
+  #
+  #   1. the file is at the path callers are told to use
+  #   2. it declares `on: workflow_call` (parseable, and actually callable)
+  #   3. every real `uses:` that names kit — in the docs' fenced yaml blocks and
+  #      in this repo's own workflow files — is exactly that path, cross-repo
+  #      with a ref, or local with `./` for kit calling itself
+  #   4. kit's own CI calls it with the LOCAL form, so the self-proof is a
+  #      self-proof and not a network fetch of some other ref
+  #   5. there is exactly one copy of it in the tree
+  #
+  # Point 5 is not paranoia. A mirror — canonical file here, callable copy
+  # there — is one of the two layouts the packet offered, and it is only
+  # acceptable with a check that fails when the copies differ. kit chose the
+  # move, so this walks the tree and refuses to find a second one. Same
+  # reasoning as the outbox/`registries` duplication this repo already refuses.
+  #
+  # Only *executable* call sites are read: the `uses:` keys of parsed yaml.
+  # Prose that quotes a wrong path to explain why it is wrong — which README
+  # and AGENTS.md both now do — is not a call site, and a check that flags its
+  # own explanation is a check people delete.
+  callable_check() {
+    "$PY" - "$ROOT" "$WORKFLOW" <<'PY3'
+import os
+import re
+import sys
+
+import yaml
+
+root = sys.argv[1]
+workflow = sys.argv[2]
+remote = "cafaye/kit/" + workflow
+local = "./" + workflow
+
+problems = []
+
+# --- 1 and 2: the file is where callers are told it is, and it is callable ----
+path = os.path.join(root, workflow)
+if not os.path.isfile(path):
+    problems.append(
+        f"callers are documented to write `uses: cafaye/kit/{workflow}@<ref>`, and "
+        f"{workflow} does not exist — GitHub resolves a reusable workflow only "
+        f"from .github/workflows/, so nothing can call kit"
+    )
+else:
+    with open(path, encoding="utf-8") as fh:
+        doc = yaml.safe_load(fh)
+    # `on:` is read by PyYAML 1.1 as the boolean True.
+    triggers = doc.get("on") or doc.get(True) or {}
+    if not isinstance(triggers, dict) or "workflow_call" not in triggers:
+        problems.append(
+            f"{workflow} does not declare `on: workflow_call`; GitHub rejects the "
+            f"call before it reads a single input, so a caller gets a red build "
+            f"with no explanation"
+        )
+
+
+def uses_values(node):
+    """Every value assigned to a `uses:` key, at any depth."""
+    found = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "uses" and isinstance(value, str):
+                found.append(value)
+            else:
+                found.extend(uses_values(value))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(uses_values(item))
+    return found
+
+
+# --- 3: every real call site resolves to the one path ------------------------
+call_sites = []  # (where, value)
+
+# 3a. the fenced yaml blocks in the two documents a reader copies from.
+for doc_name in ("README.md", "AGENTS.md"):
+    body = open(os.path.join(root, doc_name), encoding="utf-8").read()
+    found_remote = 0
+    for n, block in enumerate(re.findall(r"```yaml\n(.*?)```", body, re.S), 1):
+        try:
+            parsed = yaml.safe_load(block)
+        except Exception:
+            continue  # not a workflow fragment; another check reports real yaml
+        for value in uses_values(parsed):
+            if "cafaye/kit" not in value and not value.startswith("./"):
+                continue
+            call_sites.append((f"{doc_name} yaml block #{n}", value))
+            if value.startswith("cafaye/kit"):
+                found_remote += 1
+    # Both documents must show the call. AGENTS.md is not decoration: it is the
+    # file a contributor reads before touching the workflow, and it was the one
+    # telling people to edit `workflows/ci.reusable.yml` for six months.
+    if found_remote == 0:
+        problems.append(
+            f"{doc_name} shows no `uses: cafaye/kit/{workflow}@<ref>` example, so "
+            f"a reader of that file has no call to copy"
+        )
+
+# 3b. this repo's own workflow files. Comments are not yaml and are skipped by
+#     parsing, so the header of the reusable workflow — which shows the same
+#     call as an example — is documentation, not a call site, and is not
+#     double-counted here.
+live_dir = os.path.join(root, ".github", "workflows")
+for name in sorted(os.listdir(live_dir)) if os.path.isdir(live_dir) else []:
+    if not name.endswith((".yml", ".yaml")):
+        continue
+    with open(os.path.join(live_dir, name), encoding="utf-8") as fh:
+        try:
+            parsed = yaml.safe_load(fh)
+        except Exception as exc:
+            problems.append(f".github/workflows/{name} is not valid YAML: {exc}")
+            continue
+    for value in uses_values(parsed):
+        if "cafaye/kit" in value or value.startswith("./"):
+            call_sites.append((f".github/workflows/{name}", value))
+
+if not call_sites:
+    problems.append(
+        "no `uses:` anywhere calls kit, so nothing in this repository exercises "
+        "the callable path"
+    )
+
+for where, value in call_sites:
+    if value.startswith("./"):
+        if value != local:
+            problems.append(
+                f"{where}: `uses: {value}` does not resolve; kit's own copy is at "
+                f"`{local}`"
+            )
+        continue
+    if not value.startswith("cafaye/kit/"):
+        problems.append(f"{where}: `uses: {value}` is not a reference to kit")
+        continue
+    # Split the ref off before comparing. Comparing the whole string to the
+    # path made every correct `...@master` look wrong, which is the check
+    # failing on the very line it exists to bless.
+    ref_path, _, ref = value.partition("@")
+    if ref_path != remote:
+        # It names kit, and it is not the path. Say what the right one is,
+        # because the reader of this message is a person who is about to paste
+        # a `uses:` line into thirteen repositories.
+        problems.append(
+            f"{where}: `uses: {value}` is not a path GitHub can resolve; callers "
+            f"must write `uses: {remote}@<ref>`"
+        )
+    elif not ref:
+        problems.append(
+            f"{where}: `uses: {value}` has an empty @ref, which resolves to nothing"
+        )
+
+# --- 4: kit's own CI calls it locally ---------------------------------------
+self_call = os.path.join(root, ".github", "workflows", "ci.yml")
+if not os.path.isfile(self_call):
+    problems.append(
+        "no .github/workflows/ci.yml, so the repository defining the standard is "
+        "not held to it and the callable path is never exercised in CI"
+    )
+else:
+    with open(self_call, encoding="utf-8") as fh:
+        parsed = yaml.safe_load(fh)
+    jobs = (parsed or {}).get("jobs") or {}
+    # Both spellings count: the cross-repo one, and the local `./` form kit is
+    # the only repository that can legitimately write. Filtering on
+    # `cafaye/kit` alone read kit's own self-call as "no reusable workflow at
+    # all", which is the same class of false negative this check exists to
+    # remove.
+    kit_jobs = {
+        name: job
+        for name, job in jobs.items()
+        if isinstance(job, dict)
+        and ("cafaye/kit" in str(job.get("uses", "")) or str(job.get("uses", "")).startswith("./"))
+    }
+    if not kit_jobs:
+        problems.append(
+            ".github/workflows/ci.yml calls no reusable workflow: kit does not run "
+            "its own gate in CI"
+        )
+    for name, job in kit_jobs.items():
+        if job.get("uses") != local:
+            problems.append(
+                f".github/workflows/ci.yml job {name}: `uses: {job.get('uses')}` — "
+                f"kit must call its own workflow with `{local}`, so the job proves "
+                f"the local path resolves instead of fetching some other ref from "
+                f"the network"
+            )
+
+# --- 5: one copy, at the reachable path -------------------------------------
+# Walked rather than globbed, because the whole failure mode is a file parked
+# somewhere the documented path does not point. `.git` and the gate's own
+# gitignored `.venv` are the only trees skipped; everything else is fair game.
+copies = []
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [
+        d for d in dirnames if d not in (".git", ".venv", "__pycache__")
+    ]
+    for filename in filenames:
+        full = os.path.join(dirpath, filename)
+        rel = os.path.relpath(full, root)
+        if rel == workflow:
+            continue
+        try:
+            with open(full, encoding="utf-8") as fh:
+                head = fh.read(65536)
+        except (OSError, UnicodeDecodeError):
+            continue
+        if "workflow_call" not in head:
+            continue
+        # A third-party reference in a comment is not a copy.
+        if re.search(r"^\s*workflow_call\s*:", head, re.M):
+            copies.append(rel)
+
+if copies:
+    problems.append(
+        f"a second workflow declaring `workflow_call` exists at {copies}. Two copies "
+        f"of the CI standard is the drift kit exists to prevent, and only "
+        f"{workflow} is reachable by a caller"
+    )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY3
+  }
+  check "$WORKFLOW  (callable: exists, on: workflow_call, docs agree)" callable_check
 fi
 
 # ===========================================================================

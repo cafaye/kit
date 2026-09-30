@@ -13,6 +13,22 @@ semver contract — it is consumed by *calling*
 
 ### Added
 
+- A **`callable path` check** in `tests/validate.sh`: the reusable workflow
+  exists at the path callers are documented to use, it declares
+  `on: workflow_call`, every real `uses:` that names kit — in `README.md`,
+  `AGENTS.md` and this repo's own workflow files — is exactly that path,
+  `kit`'s own CI calls it with the local `./` form, and there is exactly one
+  copy of it in the tree. The failure it exists for: for six months the file
+  sat at `workflows/ci.reusable.yml`, the README told every reader to call
+  `cafaye/kit/workflows/ci.reusable.yml@master`, GitHub resolved that to
+  nothing, and **every check in the suite was green throughout**. A layout bug
+  and a documentation bug that agree with each other are invisible to any check
+  that reads only one of them.
+- `expect_red_check` in `tests/self_test.sh`, which asserts that one *named*
+  check reported `FAIL` rather than merely that the gate went red. Breakages
+  7-10 use it, so the check written for each layout/documentation drift is
+  proven load-bearing instead of being one of forty checks that could have
+  gone red for an unrelated reason.
 - `.github/workflows/ci.yml` — kit calling its own reusable workflow with
   `uses: ./.github/workflows/ci.reusable.yml`. The repository that defines the
   standard is now the first repository held to it, and if the callable path ever
@@ -79,8 +95,8 @@ semver contract — it is consumed by *calling*
   ci.reusable.yml@master` line in the README resolved to nothing. No repository
   in the fleet was calling it. It is now a **move, not a mirror**: one file, at
   the only path GitHub will resolve, so there is no second copy to diverge.
-- `self_test.sh` grew from 5 breakages to 12. Six are new: one semantic
-  mutation per language implementation, each against a different W3C section, so
+- `self_test.sh` grew from 5 breakages to 16. Six are per-language semantic
+  mutations, each against a different W3C section, so
   **every** suite is proven able to fail rather than assumed to. A mutant that
   fails to compile is its own verdict rather than a pass, a missing toolchain is
   a skip that fails the run, and an unmatched mutation is a hard failure so the
