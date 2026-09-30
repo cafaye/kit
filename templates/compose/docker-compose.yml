@@ -134,6 +134,31 @@ services:
     # posture of the local stack. Services use
     # http://otel-collector:${KIT_OTEL_HTTP_PORT:-4318} instead.
     command: ["--config=/etc/otel/otel-collector.yml"]
+    # REQUIRED, and easy to miss. otel-collector.yml uses ${env:NAME}, which the
+    # collector resolves from ITS OWN process environment — not from the
+    # compose file's. Docker Compose reads .env to expand ${KIT_*:default} in the
+    # compose file itself; it does not inject those into containers. Without this
+    # block every ${env:...} resolves to an empty string and the collector exits
+    # with:
+    #
+    #   invalid configuration: processors::memory_limiter: 'limit_mib' or
+    #   'limit_percentage' must be greater than zero
+    #
+    # which names a memory limiter and not the missing environment, so it reads
+    # like a config error rather than the wiring error it is.
+    #
+    # Each value is `${KIT_*:default}` for the same reason as everything else in
+    # this file: one place to change it, and .env.example documents it.
+    environment:
+      KIT_OTEL_GRPC_ENDPOINT: ${KIT_OTEL_GRPC_ENDPOINT:-0.0.0.0:4317}
+      KIT_OTEL_HTTP_ENDPOINT: ${KIT_OTEL_HTTP_ENDPOINT:-0.0.0.0:4318}
+      KIT_OTEL_MEMORY_LIMIT_PERCENTAGE: ${KIT_OTEL_MEMORY_LIMIT_PERCENTAGE:-75}
+      KIT_OTEL_MEMORY_SPIKE_PERCENTAGE: ${KIT_OTEL_MEMORY_SPIKE_PERCENTAGE:-15}
+      KIT_OTEL_BATCH_TIMEOUT: ${KIT_OTEL_BATCH_TIMEOUT:-5s}
+      KIT_OTEL_BATCH_SIZE: ${KIT_OTEL_BATCH_SIZE:-512}
+      KIT_OTEL_DEBUG_VERBOSITY: ${KIT_OTEL_DEBUG_VERBOSITY:-normal}
+      KIT_OTEL_HEALTH_ENDPOINT: ${KIT_OTEL_HEALTH_ENDPOINT:-0.0.0.0:13133}
+      KIT_OTEL_LOG_LEVEL: ${KIT_OTEL_LOG_LEVEL:-info}
     volumes:
       - ./otel-collector.yml:/etc/otel/otel-collector.yml:ro
     healthcheck:

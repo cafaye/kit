@@ -500,6 +500,57 @@ PY
   }
   check 'templates/compose/docker-compose.yml  (pinned, healthy, parameterized)' compose_check
 
+  # The wiring check that YAML parsing cannot do, and the one that caught a real
+  # bug. otel-collector.yml interpolates ${env:NAME}, which the collector
+  # resolves from ITS OWN process environment. Docker Compose reads .env to
+  # expand ${KIT_*:default} in the compose file, and does NOT inject those into
+  # containers. So a collector config full of ${env:...} against a compose file
+  # with no `environment:` block parses perfectly, passes every check above, and
+  # then the collector exits at startup with an error naming a memory limiter
+  # rather than the missing environment.
+  #
+  # It did. That stack had never run. Asserting the wiring is cheaper than
+  # running docker in the gate, and it fails with a message that names the cause.
+  collector_wiring_check() {
+    "$PY" - "$ROOT" <<'PY'
+import re
+import sys
+
+import yaml
+
+root = sys.argv[1]
+with open(f"{root}/templates/compose/otel-collector.yml", encoding="utf-8") as fh:
+    yaml.safe_load(fh)
+with open(f"{root}/templates/compose/docker-compose.yml", encoding="utf-8") as fh:
+    compose = yaml.safe_load(fh)
+
+problems = []
+
+# Every ${env:NAME} the collector reads, over the whole document rather than a
+# fixed path: the value can sit at any depth (a processor arg, an exporter's
+# verbosity, an extension endpoint), and a check that only knew the three it
+# was written against would miss the fourth.
+raw = open(f"{root}/templates/compose/otel-collector.yml", encoding="utf-8").read()
+needed = set(re.findall(r"\$\{env:([A-Z0-9_]+)\}", raw))
+
+svc = (compose.get("services") or {}).get("otel-collector")
+if not isinstance(svc, dict):
+    problems.append("no otel-collector service to carry the environment")
+else:
+    provided = set(svc.get("environment") or {})
+    for name in sorted(needed - provided):
+        problems.append(
+            f"otel-collector.yml reads " + "$" + "{env:" + name + "} but "
+            f"docker-compose.yml does not pass {name} into the container; it "
+            f"resolves empty and the collector refuses to start"
+        )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check 'otel-collector env  (every ${env:} reaches the container)' collector_wiring_check
+
   # Every ${VAR} the stack interpolates must be documented in .env.example,
   # with a default, so a fresh clone runs without a hand-written .env.
   env_example_check() {
