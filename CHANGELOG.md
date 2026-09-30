@@ -66,8 +66,10 @@ and by *copying* files out of `lint/`, `docker/`, and `templates/`.
   worse than none", enforced rather than trusted. It also requires `language`
   options and the job set to be the same list, a ref on every `uses:`, no
   branch refs, and every `${{` to close.
-- New checks: the otel-collector environment wiring (see above), and that every
-  `*.snippet` carries an install line and a pinned version.
+- New checks: the otel-collector environment wiring, that every `*.snippet`
+  carries an install line and a pinned version, that every snippet **parses in
+  its own language**, and that the README's documented callers only pass inputs
+  the workflow actually declares.
 - The `telemetry` CI job is a matrix while the seven language jobs stay one-per-
   language: a matrix is right for six stdlib test suites that share nothing, and
   wrong for six toolchains that install different things.

@@ -843,6 +843,145 @@ if problems:
 PY
   }
   check 'README.md  (documents every new template)' readme_check
+
+  # The README's own examples must call the workflow the README says it does.
+  #
+  # Every yaml block in the README that contains `uses: cafaye/kit/workflows/`
+  # is a caller. A caller passing an input the workflow does not declare fails at
+  # run time on the adopting repo's first push — thirteen repos, one stale
+  # sentence in this file. So the examples are parsed and checked against the
+  # workflow's real inputs, and a doc that lies fails the gate.
+  caller_check() {
+    "$PY" - "$ROOT" <<'PY2'
+import re
+import sys
+
+import yaml
+
+root = sys.argv[1]
+readme = open(f"{root}/README.md", encoding="utf-8").read()
+
+# Fenced yaml blocks only, and only the ones that are actually calling kit.
+blocks = re.findall(r"```yaml\n(.*?)```", readme, re.S)
+callers = [b for b in blocks if "uses: cafaye/kit/workflows/" in b]
+if not callers:
+    sys.exit("no documented caller of the reusable workflow found in README.md")
+
+with open(f"{root}/workflows/ci.reusable.yml", encoding="utf-8") as fh:
+    doc = yaml.safe_load(fh)
+triggers = doc.get("on") or doc.get(True) or {}
+declared = ((triggers.get("workflow_call") or {}).get("inputs")) or {}
+required = {k for k, v in declared.items() if (v or {}).get("required")}
+
+def _find_with_keys(node):
+    """Every key set under a `with:` mapping, at any depth."""
+    found = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "with" and isinstance(value, dict):
+                found.append(value.keys())
+            else:
+                found.extend(_find_with_keys(value))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_find_with_keys(item))
+    return found
+
+
+def _find_telemetry(node):
+    """Every value assigned to a `telemetry` key, at any depth.
+
+    The examples are fragments, so the key can sit under `with:`, under a `job`,
+    or under nothing at all. A depth-limited walk would miss the case that
+    matters.
+    """
+    found = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "telemetry":
+                found.append(value)
+            else:
+                found.extend(_find_telemetry(value))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(_find_telemetry(item))
+    return found
+
+
+problems = []
+for n, block in enumerate(callers, 1):
+    try:
+        doc_n = yaml.safe_load(block)
+    except Exception as exc:
+        problems.append(f"documented caller #{n} is not valid YAML: {exc}")
+        continue
+    for job_name, job in (doc_n.get("jobs") or {}).items():
+        if not isinstance(job, dict) or "cafaye/kit/workflows/" not in str(job.get("uses", "")):
+            continue
+        passed = set(job.get("with") or {})
+        unknown = sorted(passed - set(declared))
+        missing = sorted(required - passed)
+        if unknown:
+            problems.append(
+                f"documented caller #{n} job {job_name}: passes {unknown}, which "
+                f"the workflow does not declare"
+            )
+        if missing:
+            problems.append(
+                f"documented caller #{n} job {job_name}: omits required {missing}"
+            )
+
+# Any documented `with:` block names workflow inputs, whether or not the block
+# also carries a `uses:` line. The adoption steps and the telemetry opt-in are
+# both bare `with:` fragments under prose, and they are the two a reader copies
+# line by line — so restricting the input check to complete caller blocks checks
+# the example nobody copies and skips the ones everybody does.
+for n, block in enumerate(blocks, 1):
+    if "with:" not in block:
+        continue
+    try:
+        parsed = yaml.safe_load(block)
+    except Exception:
+        continue
+    for keys in _find_with_keys(parsed):
+        unknown = sorted(set(keys) - set(declared))
+        if unknown:
+            problems.append(
+                f"yaml block #{n}: a `with:` names {unknown}, which the workflow "
+                f"does not declare as an input"
+            )
+
+# `telemetry` must be shown as a STRING everywhere it appears, not only in a
+# full caller block. The input exists precisely because GitHub coerces the bare
+# word `false` to a boolean in some positions, so a README example that writes
+# `telemetry: true` teaches the one spelling that does not work — and a reader
+# who copies it gets an opt-in job running that they did not intend to switch
+# on, in a repo that was green a moment earlier.
+#
+# Checked on every yaml block, including the `with:` fragments that have no
+# `uses:` line to key off. The first version of this check only looked at
+# callers and therefore missed exactly the fragment most likely to be copied.
+for n, block in enumerate(blocks, 1):
+    if "telemetry" not in block:
+        continue
+    try:
+        parsed = yaml.safe_load(block)
+    except Exception:
+        continue  # reported by the caller loop if it is a caller at all
+    found = _find_telemetry(parsed)
+    for value in found:
+        if not isinstance(value, str):
+            problems.append(
+                f"yaml block #{n}: telemetry must be the string 'true' or "
+                f"'false', not {value!r} — a bare boolean is the trap this input "
+                f"type exists to avoid"
+            )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY2
+  }
+  check 'README.md  (its documented callers match the workflow inputs)' caller_check
 fi
 
 # ===========================================================================
