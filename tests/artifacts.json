@@ -1,0 +1,169 @@
+{
+  "_about": [
+    "THE ONE PLACE kit says what it ships, and where a service puts it.",
+    "",
+    "Read by tests/staleness.py (--scope templates) and by the",
+    "parity-allowlist check in tests/validate.sh. Two consumers, one file:",
+    "AGENTS.md's rule is that a property stated in two places is a property",
+    "stated in zero times, and the artefact table is exactly the kind of",
+    "thing that drifts the moment it is written down twice.",
+    "",
+    "A FIELD IS LOAD-BEARING",
+    "",
+    "  id       the name the reporter prints, and the name an allowlist entry",
+    "           uses. It is a key, not a label: renaming one invalidates every",
+    "           entry that named it, which is the correct outcome.",
+    "  source   the path inside the kit checkout. `{lang}` interpolates the",
+    "           service's DECLARED language (see `languageFrom`).",
+    "  dest     the path inside the service repo, relative to its root.",
+    "  bundle   a list of (source, dest) pairs instead of one each. The LGTM",
+    "           stack is one artefact. docker-compose.yml binds FIVE paths, one",
+    "           of which is the whole grafana/provisioning directory, so ten of",
+    "           the eleven non-compose members are reachable from it and the",
+    "           twelfth (.env.example) is `cp`'d to .env. Grading the members",
+    "           separately would report a half-copied stack as a row of",
+    "           successes and a row of absences, which is the thing this",
+    "           grouping exists to prevent. It is deliberately NOT justified by",
+    "           claiming a partial stack cannot start: checked against the real",
+    "           fleet, no service compose file mounts any kit stack file at all,",
+    "           so the seven that hold a compose file are replacements, and",
+    "           `docker compose config` is green on five of the six. A partial",
+    "           copy is a real state, but in THIS fleet it does not occur, and",
+    "           the rationale must not rest on a claim the fleet contradicts.",
+    "  languages which declared languages this artefact applies to. Absent",
+    "           means every service, including one that has declared no",
+    "           language at all — an undeclared service still has a",
+    "           `mise.toml` question to answer.",
+    "  needsLanguage true when the source path itself is `{lang}`-",
+    "           interpolated, so the service must DECLARE a language before",
+    "           the question can be asked at all. It is written out rather",
+    "           than inferred from the presence of `{lang}` in `source`",
+    "           because a wrong inference here is the fail-open direction:",
+    "           the reporter would resolve `{lang}` to a guess and report",
+    "           the guess as a measurement.",
+    "  optional true when kit genuinely does not expect universal adoption.",
+    "           Such an artefact is reported but does not, by itself, make a",
+    "           service look broken."
+  ],
+  "artefacts": [
+    {
+      "id": "bin/prime",
+      "source": "templates/bin-prime/{lang}.sh",
+      "dest": "bin/prime",
+      "needsLanguage": true
+    },
+    {
+      "id": "bin/dev",
+      "source": "templates/bin/dev.sh",
+      "dest": "bin/dev"
+    },
+    {
+      "id": "mise.toml",
+      "source": "templates/mise.toml",
+      "dest": "mise.toml"
+    },
+    {
+      "id": "AGENTS.md",
+      "source": "templates/AGENTS.md",
+      "dest": "AGENTS.md"
+    },
+    {
+      "id": "docker/Dockerfile",
+      "source": "docker/Dockerfile.{lang}",
+      "dest": "docker/Dockerfile",
+      "destAlternatives": ["Dockerfile"],
+      "needsLanguage": true,
+      "_about_dest": "kit's README documents `docker/Dockerfile`, and six of the nine services put theirs at the repository root instead. `destAlternatives` records that rather than leaving it to a human to notice: a path a service legitimately uses is not an absence, and grading a documented, working placement as `absent` is the same class of error as grading a drifted copy as `current` — a report that cries wolf is a report that is muted. The FIRST destination that exists wins, so this never guesses: it is a declared list of paths, resolved by existence, and `absent` still means absent of all of them."
+    },
+    {
+      "id": "lint/yamllint.yml",
+      "source": "lint/yamllint.yml",
+      "dest": ".yamllint.yml"
+    },
+    {
+      "id": "lint/golangci.yml",
+      "source": "lint/golangci.yml",
+      "dest": ".golangci.yml",
+      "languages": ["go"]
+    },
+    {
+      "id": "lint/rubocop.yml",
+      "source": "lint/rubocop.yml",
+      "dest": ".rubocop.yml",
+      "languages": ["ruby"]
+    },
+    {
+      "id": "lint/eslint.config.mjs",
+      "source": "lint/eslint.config.mjs",
+      "dest": "eslint.config.mjs",
+      "languages": ["node", "bun"]
+    },
+    {
+      "id": "lint/hadolint.yaml",
+      "source": "lint/hadolint.yaml",
+      "dest": ".hadolint.yaml"
+    },
+    {
+      "id": "ci.reusable.yml",
+      "source": ".github/workflows/ci.reusable.yml",
+      "dest": "@call",
+      "_about_call": "The ONE artefact a service does not copy. It calls the workflow, so a fix in kit reaches every service on the next run with no per-repo PR. `dest: @call` is what tells the reporter to check for a `uses: cafaye/kit/...@<ref>` line rather than for a file — and the check is that the line names the path the file is ACTUALLY at, because GitHub documents that subdirectories of .github/workflows are not supported and a `uses:` line pointing one resolves to nothing at run time."
+    },
+    {
+      "id": "compose",
+      "source": "templates/compose/docker-compose.yml",
+      "dest": "docker-compose.yml",
+      "_about_bundle": "The local stack. It travels as twelve files because docker-compose.yml binds five of them by path and `cp`s the sixth, so the members are graded as ONE artefact: eleven separately-pinned cells would report a half-copied stack as a row of successes and a row of absences. Graded one way, a service holding eight of them reads as ONE cell with a breakdown. Not justified by claiming a partial stack cannot start — no service in the real fleet mounts any kit stack file, so the seven holding a compose file are replacements, and five of the six parse green.",
+      "bundle": [
+        {
+          "source": "templates/compose/docker-compose.yml",
+          "dest": "docker-compose.yml"
+        },
+        {
+          "source": "templates/compose/otel-collector.yml",
+          "dest": "otel-collector.yml"
+        },
+        {
+          "source": "templates/compose/.env.example",
+          "dest": ".env.example"
+        },
+        {
+          "source": "templates/compose/loki/loki-config.yaml",
+          "dest": "loki/loki-config.yaml"
+        },
+        {
+          "source": "templates/compose/mimir/mimir.yaml",
+          "dest": "mimir/mimir.yaml"
+        },
+        {
+          "source": "templates/compose/tempo/tempo.yaml",
+          "dest": "tempo/tempo.yaml"
+        },
+        {
+          "source": "templates/compose/grafana/provisioning/alerting/rules.yml",
+          "dest": "grafana/provisioning/alerting/rules.yml"
+        },
+        {
+          "source": "templates/compose/grafana/provisioning/datasources/datasources.yml",
+          "dest": "grafana/provisioning/datasources/datasources.yml"
+        },
+        {
+          "source": "templates/compose/grafana/provisioning/dashboards/dashboards.yml",
+          "dest": "grafana/provisioning/dashboards/dashboards.yml"
+        },
+        {
+          "source": "templates/compose/grafana/provisioning/dashboards/cafaye-stack-overview.json",
+          "dest": "grafana/provisioning/dashboards/cafaye-stack-overview.json"
+        },
+        {
+          "source": "templates/compose/grafana/provisioning/dashboards/cafaye-fleet-errors.json",
+          "dest": "grafana/provisioning/dashboards/cafaye-fleet-errors.json"
+        },
+        {
+          "source": "templates/compose/grafana/provisioning/plugins/README.md",
+          "dest": "grafana/provisioning/plugins/README.md"
+        }
+      ]
+    }
+  ]
+}

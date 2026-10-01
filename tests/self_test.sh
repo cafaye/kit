@@ -11,10 +11,11 @@
 #   *different* check, so a passing self_test means the checks are independent
 #   and not one lucky assertion standing in for all of them.
 #
-# THE THIRTY-SEVEN BREAKAGES, and one GREEN control   (20 from the tier work,
+# THE FORTY-FIVE BREAKAGES, and one GREEN control   (20 from the tier work,
 #                               21 from the fan-out work, 24-26 from the fleet
-#                               gate, 27-32c from the lint work; 18 shared
-#                               before the lint packet)
+#                               gate, 27-32c from the lint work, 33-40 from the
+#                               staleness/parity work; 18 shared before the lint
+#                               packet)
 #   1. delete a language template   -> the artifact-presence check goes red
 #   2. add a collector exporter    -> the privacy check goes red
 #   2b. DELETE the tempo exporter   -> the same check goes red from the other
@@ -146,23 +147,60 @@
 #        numbered entry because it is a control and not a breakage — and because
 #        `self_test_claims` counts only the red-expecting helpers, so a numbered
 #        entry here would be reported as a header claim with no recipe.
+
+#  33. a parity-allowlist entry naming an artefact kit does not ship -> the
+#         dead-entry check goes red. The ESLint direction, and the mutation is
+#         well-formed in every other respect, so a shape-only check passes it.
+#  34. an EXPIRED parity-allowlist entry -> the same check goes red. The gate
+#         reads the clock, and this is the first time anything in kit has
+#         actually watched the ratchet fire rather than reading that it exists.
+#  35. `tests/artifacts.json` naming a `{lang}` source kit does not ship for
+#         every language -> the artefact-table check goes red. Half a language is
+#         worse than none, and the table is what says so.
+#  36. report an ABSENT artefact as `current` -> staleness_test.sh goes red.
+#         This is the breakage the packet is for: the reporter treating the
+#         commonest state in the fleet as the one that means everything is fine.
+#  37. grade a copy by RESEMBLANCE rather than by equality -> staleness_test.sh
+#         goes red. The failure mode the packet names: a file that looks like
+#         kit's is not evidence it is kit's.
+#  38. give one of the two programs a third-party import -> the carve-out check
+#         goes red. "Standard library only" was a sentence in AGENTS.md for the
+#         whole life of the rule and nothing checked it; a boundary nobody can
+#         cross is not a boundary.
+#  39. remove one fixture service's `.git`, so the reporter cannot see it ->
+#         staleness_test.sh goes red AND blames the FIXTURE. Observed for real at
+#         load average 160 before it was written: one case failed, 35 passed, and
+#         the failure text named the reporter when the reporter had simply been
+#         handed a smaller fleet. A red that misattributes itself is worse than
+#         no red, so this asserts the EXPLANATION, not only the exit status.
+#  40. delete the one line that consults the ruby toolchain floor, leaving the
+#         probe defined and never called -> the ruby check still runs the suite.
+#         A floor check that is written, admired and never fires is the shape
+#         this breakage is the well-intentioned version of: `have ruby` is three
+#         lines above, so asking whether it is the RIGHT ruby looks redundant.
+#         `Array#filter_map` is a runtime call, so without the floor an old
+#         interpreter reports three NoMethodErrors and the summary blames a
+#         template that is correct.
 #
 #   These are numbered 20-22 rather than 19-21 because 19 is the allowlist
 #   breakage above, from the tier work. Both packets numbered their first entry
 #   independently and the collision is only visible in the union — which is what
 #   the header/recipe check in validate.sh is for.
 #
-#   Seventeen of them (7-10, 11, 12, 19, 20, 27, 28, 28b, 29, 30, 31, 32, 32b,
-#                     32c) additionally
+#   33-40 continue that numbering above, and the reason the copy-is-gone case
+#   gets TWO breakages and not one is that
+#   "report absent as current" and "grade by resemblance" are opposite mistakes
+#   that a single mutation cannot both produce: one removes a finding, the
+#   other invents one, and a gate that can only do one of them is half a gate.
+#
+#   Twenty-one of them (7-10, 11, 12, 19, 20, 24-32c, 33-35, 38, 40) additionally
 #         assert WHICH check went red. Every other breakage only proves the gate
 #         can fail; those prove the check written for that defect is still
 #         load-bearing, which is a different claim and the one that decays
-#         silently. 21 and 22 assert the same thing about the two scripts that
-#         are themselves proofs. The six lint-packet entries all NAME the check
-#         they must be caught by, and that is the point of naming it: a deleted
-#         checkout and a `continue-on-error` are defects a dozen other checks
-#         would also catch, and a proof that cannot tell which one fired is a
-#         proof that stops being evidence the moment one of the others moves.
+#         silently. 21, 22, 36 and 37 assert the same thing about the two scripts
+#         that are themselves proofs, and 39 asserts it about the WORDING: a red
+#         that blames the reporter when the fixture is at fault is a red that
+#         sends the next reader to the wrong file.
 #
 #   And one GREEN control, which is a claim the numbered breakages cannot make.
 #         31b asserts the gate is green on a copy whose service config MATCHES
@@ -340,11 +378,27 @@ expect_red_check() {
 # script goes red is the same claim expect_red_check makes — the check written
 # for this defect is still load-bearing — expressed over a script.
 expect_red_script() {
-  local label="$1" dir="$2" script="$3"
+  local label="$1" dir="$2" script="$3" want="${5:-}"
   shift 3
+  # The optional 4th argument (always pass an empty one) is where a script's own
+  # arguments go; the optional 5th is a string the output MUST contain. A proof
+  # that goes red for the wrong reason is not a proof, and the one case that
+  # needs the stronger claim is a red that would otherwise be MISREPORTED — so
+  # the name is unchanged and the pattern in validate.sh still matches, rather
+  # than a new helper that would read as an undocumented breakage.
   if (cd "$dir" && KIT_PYTHON="$PY" bash "$script" "$@" >/dev/null 2>&1); then
     printf 'FAIL self_test: %s — the proof stayed GREEN\n' "$label"
     failures=$((failures + 1))
+  elif [ -n "$want" ]; then
+    local out
+    out=$(cd "$dir" && KIT_PYTHON="$PY" bash "$script" "$@" 2>&1) || true
+    if grep -qF "$want" <<<"$out"; then
+      printf 'PASS self_test: %s — the proof went red, and said why\n' "$label"
+    else
+      printf 'FAIL self_test: %s — the proof went red but did NOT say %s\n' "$label" "$want"
+      printf '%s\n' "$out" | grep -E '^(FAIL|PASS)' | sed 's/^/       /'
+      failures=$((failures + 1))
+    fi
   else
     printf 'PASS self_test: %s — the proof went red\n' "$label"
   fi
@@ -1370,6 +1424,293 @@ with open(path, "w", encoding="utf-8") as fh:
 PYDEL28C
 expect_red_check 'breakage 32c: the seam guard runs AFTER the linter it guards' \
   "$thirtytwo_c" "$SEAM" --static-only
+
+
+# 33-25. The parity allowlist and the artefact table.
+#
+#     33 is the ESLint shape — an entry naming an artefact kit does not ship.
+#     34 is the ratchet firing. 35 is half a language.
+#
+#     All three entries are well-formed in every OTHER respect. That is the
+#     point: a shape-only check passes all three, and a hygiene rule in a data
+#     file is exactly the shape of a check nobody has ever seen fail.
+#
+#     WHAT THE GATE CANNOT CHECK, AND THE RECIPE THAT CLAIMED IT COULD. An
+#     entry naming a repository that does not exist IS a real failure, and the
+#     REPORTER catches it — it is handed `--repos-dir` and can see what is
+#     there — and `tests/staleness_test.sh` proves it in three shapes, one of
+#     which is exactly that. The first version of this recipe asserted it
+#     against the GATE, which stayed green and the breakage failed: kit's CI has
+#     no sibling checkouts, so no gate in this repository can know which
+#     repositories exist. A recipe that asserts a check which does not exist is
+#     a proof of nothing, and the fix is to re-point it at a property the gate
+#     really has rather than to add a fleet roster to kit so the gate could
+#     answer a question it was never asked.
+PARITY='templates/parity-allowlist  (reason, owner, since, until; dead entries fail)'
+ARTTABLE='tests/artifacts.json  (every declared source exists, for every language)'
+
+# 23. An entry for an artefact kit does not ship. The realistic version is a
+#     rename: `lint/eslint.config.mjs` becomes `lint/eslint.config.ts`, the
+#     entry keeps the old id, and it is now exempting nothing.
+#
+#     The id below is checked against `tests/artifacts.json` FIRST, and the
+#     first version of this recipe used `lint/eslint.config.mjs` — a real id —
+#     so the gate stayed GREEN and the breakage proved nothing. A mutation that
+#     has silently stopped breaking the thing it names is the same defect as a
+#     stale test, and the fix is to make the recipe assert its own premise
+#     rather than to trust that the string looks like an id.
+thirtythree="$(fresh_copy dead-parity-entry)"
+if grep -q 'lint/eslint.config.ts' "$thirtythree/tests/artifacts.json"; then
+  echo "FAIL self_test: breakage 33's dead artefact id is REAL — the recipe no longer mutates anything" >&2
+  failures=$((failures + 1))
+fi
+cat >>"$thirtythree/templates/parity-allowlist" <<'ENTRY'
+diverged billing lint/eslint.config.ts reason="this artefact was renamed in artifacts.json, so this entry exempts nothing" owner=kit since=2026-09-30 until=2026-12-31
+ENTRY
+expect_red_check 'breakage 33: a parity entry naming an artefact kit does not ship' \
+  "$thirtythree" "$PARITY" --static-only
+
+# 24. AN EXPIRED ENTRY — THE RATCHER FIRING.
+#
+#     The first recipe here asserted that a parity entry naming a repository
+#     that does not exist takes the gate red. It does not, and it cannot: kit's
+#     CI has no sibling checkouts, so the gate has no way to know which
+#     repositories exist. The reporter knows (it is handed `--repos-dir`) and
+#     `tests/staleness_test.sh` proves it in three shapes, including this one;
+#     asserting it again against a check that does not exist would be a proof of
+#     nothing. So the recipe is spent on a property the gate really has and
+#     nothing has yet tried to break: **the gate reads the clock**.
+#
+#     The tier skip-allowlist has had that rule for a packet and nothing has
+#     ever watched it fire — its own header says "a gate that has never gone
+#     red is a report", and this is the first time anything in kit has actually
+#     made the statement true. The date is in the past on purpose, and the
+#     entry is well-formed in every other respect: a real artefact, a real
+#     repository, a reason, an owner and a `since`. Only the `until` is wrong.
+thirtyfour="$(fresh_copy expired-parity-entry)"
+cat >>"$thirtyfour/templates/parity-allowlist" <<'ENTRY'
+diverged billing mise.toml reason="this entry is well formed in every other respect; only the date is wrong, which is the point" owner=billing since=2020-01-01 until=2020-12-31
+ENTRY
+expect_red_check 'breakage 34: an expired parity entry — the gate reads the clock' \
+  "$thirtyfour" "$PARITY" --static-only
+
+# 25. A `{lang}` source kit does not ship for one language. `bun` is the one
+#     that matters: it was added late and for a service that had been
+#     hand-rolling a whole workflow for want of it, so it is the language most
+#     likely to be half-adopted again.
+#
+#     The mutation DELETES the source rather than corrupting it, because that is
+#     the defect: not a broken primer, a missing one, which is the one shape
+#     every existing check would sail past.
+thirtyfive="$(fresh_copy half-a-language)"
+rm -f "$thirtyfive/templates/bin-prime/bun.sh"
+expect_red_check 'breakage 35: kit offers `language: bun` but ships no primer for it' \
+  "$thirtyfive" "$ARTTABLE" --static-only
+
+# 26. AN ABSENCE REPORTED AS `current`.
+#
+#     This is the breakage the packet exists for. The templates half's commonest
+#     state in the real fleet is `absent` — 0 of 9 services hold the collector,
+#     1 of 9 holds `bin/dev` — and the one-line way to make all of that
+#     disappear is to grade a path that is not there as fine.
+#
+#     The mutation is in the state table, not in the comparison, because the
+#     comparison is not what is wrong: reading a missing file as "no
+#     difference" is a one-word change in the classification and it turns the
+#     most alarming column of the report into a green one.
+thirtysix="$(fresh_copy absent-reads-current)"
+edit "$thirtysix/tests/staleness.py" \
+  '    if missing:
+        cell["state"] = TPL_ABSENT' \
+  '    if missing:
+        cell["state"] = TPL_CURRENT'
+expect_red_script 'breakage 36: the staleness reporter calls an ABSENT artefact current' \
+  "$thirtysix" tests/staleness_test.sh
+
+# 27. GRADE BY RESEMBLANCE.
+#
+#     The packet's third requirement: never infer a pin from content. The
+#     realistic bug is a well-intentioned threshold — a future reader decides
+#     99.9% identical is close enough, because the alternative (a flag on every
+#     re-copy) is annoying.
+#
+#     `difflib.SequenceMatcher(...).quick_ratio()` is exactly that threshold,
+#     already imported, and it is the shape a helpful patch would take. The
+#     assertion it has to break is the one asserting a ONE-BYTE difference is
+#     `diverged`, which is the property in its smallest form.
+thirtyseven="$(fresh_copy grade-by-resemblance)"
+edit "$thirtyseven/tests/staleness.py" \
+  '        if pair_kit == repo_bytes:' \
+  '        if pair_kit == repo_bytes or matcher_ratio(pair_kit, repo_bytes) > 0.99:'
+cat >>"$thirtyseven/tests/staleness.py" <<'PY'
+
+
+def matcher_ratio(a: bytes, b: bytes) -> float:
+    """The resemblance threshold the packet forbids. Added by self_test 27."""
+    import difflib
+
+    return difflib.SequenceMatcher(None, a, b, autojunk=False).quick_ratio()
+PY
+expect_red_script 'breakage 37: the reporter grades a copy by resemblance, not equality' \
+  "$thirtyseven" tests/staleness_test.sh
+
+# 28. THE CARVE-OUT BOUNDARY.
+#
+#     `core/` ships two programs and AGENTS.md says they are "standard library
+#     only, no import outside json/os/re/sys/argparse/subprocess". Nothing
+#     checked that sentence for the whole life of the rule, which made it a
+#     promise — and a promise nobody can break is decoration. kit is a
+#     configuration repository; a `pip install` in one of these files is a
+#     dependency, and the whole argument for the carve-out is that there are
+#     none.
+#
+#     The mutation is a function-local import, because a function-local import is
+#     what a contributor actually writes when they are being careful about
+#     looking tidy, and it is the shape a grep-based check would miss. The check
+#     walks the AST, so there is nowhere to put one that it cannot see.
+thirtyeight="$(fresh_copy a-third-party-import)"
+"$PY" - "$thirtyeight/tests/staleness.py" <<'PY'
+import sys
+
+path = sys.argv[1]
+body = open(path, encoding="utf-8").read()
+# Appended at the end, at module scope, so the file still parses and still runs:
+# a mutation that broke the program would prove only that Python exists.
+with open(path, "a", encoding="utf-8") as fh:
+    fh.write("\n\ndef _third_party():\n    import requests  # self_test breakage 38\n")
+PY
+expect_red_check 'breakage 38: one of the two programs gains a third-party import' \
+  "$thirtyeight" 'tests/classify.py + tests/staleness.py' --static-only
+
+# 29. A HARNESS THAT LIES ABOUT ITS OWN FLEET.
+#
+#     Observed for real before it was written here. Under load average 160 the
+#     suite failed one case and passed 35, the reporter having measured 8 repos
+#     and 96 cells where the fixture holds 9 and 108 — and the failing case's
+#     text named the reporter, which is precisely what it must not do when the
+#     reporter was reading a smaller fleet rather than misreading a full one.
+#
+#     So the fixture is now checked before any case asserts on it: every service
+#     the cases name must have a cell the reporter measured. This breakage
+#     removes one service's `.git` — the shape a transient `git init` failure
+#     leaves behind — and asserts the suite goes red AND says the failure is in
+#     the fixture rather than in the reporter. A check that only proved the
+#     script exits non-zero would pass on a suite that reported the same
+#     misleading red, so the assertion is on the message.
+thirtynine="$(fresh_copy a-fixture-service-the-reporter-cannot-see)"
+edit "$thirtynine/tests/staleness_test.sh" \
+  'mksvc absent-svc node' \
+  'mksvc absent-svc node
+rm -rf "$TPL/absent-svc/.git"'
+expect_red_script 'breakage 39: the suite cannot tell a broken FIXTURE from a broken reporter' \
+  "$thirtynine" tests/staleness_test.sh '' 'this is NOT a reporter result'
+
+# 30. A TOOLCHAIN FLOOR THAT IS NOT WIRED TO ANYTHING.
+#
+#     The ruby floor check exists because a system ruby 2.6.10 on PATH made the
+#     suite report three NoMethodErrors and the summary blame the template. A
+#     check like that is exactly the kind that is written, admired, and never
+#     fires — the floor function can be defined, the suite can still be invoked
+#     unconditionally, and the gate is green on a machine that cannot run the
+#     template at all.
+#
+#     So the breakage deletes the ONE line that consults the floor, leaving the
+#     probe defined and never called, and asserts the ruby check still reports
+#     the suite. Written as the well-intentioned edit a contributor makes when
+#     the guard "looks redundant" next to a `have ruby` test three lines above:
+#     the tool is present, so why ask whether it is the right one? The assertion
+#     is on the check's own label, so a red from any other check does not pass
+#     for this one.
+#
+#     Only meaningful where ruby is installed, and a missing interpreter is
+#     reported as a SKIP rather than quietly passing — self_test's own rule is
+#     that a skipped proof is a failed proof, so the count below stays honest.
+#
+#     The recipe call is kept at COLUMN 0 even though it is guarded, because the
+#     count is taken with `grep -cE '^expect_red...'`: an indented call runs and
+#     passes while the summary counts one fewer than it ran, and a count that
+#     under-reports is the exact defect this repo treats as a lie told by a
+#     measurement. The guard, not the indentation, is what makes the skip
+#     explicit.
+#
+#     The breakage needs BOTH halves, and the second is the interesting one.
+#     Deleting the guard on a machine with a current ruby proves nothing, because
+#     the suite passes either way and green is the correct answer. So the copy
+#     also gets a `ruby` shim that makes the interpreter old the way 2.6.10 was
+#     old: `undef_method`, which raises NoMethodError at the call site exactly
+#     as a missing method does. That is a simulation of the interpreter rather
+#     than a dependency on one being installed — a self_test that needs a
+#     particular ruby present is a self_test that SKIPs on CI and proves
+#     nothing there, which is the rule this repo keeps restating.
+#
+#     With the shim and the guard in place the gate says the toolchain is too
+#     old. With the shim and the guard DELETED it says the template is broken.
+#     The recipe asserts the second, so the first cannot quietly stop happening:
+#     a check that has stopped firing looks identical to a check that never did.
+if command -v ruby >/dev/null 2>&1; then
+  forty_ready=1
+else
+  forty_ready=0
+fi
+forty=""
+if [ "$forty_ready" -eq 1 ]; then
+  forty="$(fresh_copy a-toolchain-floor-nobody-calls)"
+  # `command -v` is resolved BEFORE the shim goes on PATH, so the shim cannot
+  # find itself and recurse.
+  forty_real_ruby="$(command -v ruby)"
+  mkdir -p "$forty/kit14-oldruby"
+  cat >"$forty/kit14-oldruby/preload.rb" <<'RB'
+# self_test breakage 40: make this interpreter look like one too old for the
+# template. `undef_method` raises NoMethodError at the call site, which is
+# precisely what a method that does not exist does.
+class Array
+  undef_method :filter_map if method_defined?(:filter_map)
+end
+RB
+  {
+    printf '#!/bin/sh\n'
+    printf 'exec %q -r%q "$@"\n' "$forty_real_ruby" "$forty/kit14-oldruby/preload.rb"
+  } >"$forty/kit14-oldruby/ruby"
+  chmod +x "$forty/kit14-oldruby/ruby"
+  # The mutation removes the branch that consults the floor, leaving
+  # `toolchain_floor_ruby` defined and never called — which is what the recipe is
+  # FOR (see REPORT-kit-14.md 10.6).
+  #
+  # THE ANCHOR BELOW IS THE BLOCK FORM, AND THAT IS A SECOND RE-POINTING. The
+  # recipe first named `if [ "$lang" = ruby ] && ! toolchain_floor_ruby; then`,
+  # a one-liner that stopped being the floor check when kit-17 replaced it with
+  # the block form below — the SKIP-versus-FAIL distinction, and `ruby_floor`
+  # read from the template's own `RUBY_FLOOR` constant rather than restated.
+  # `edit` failed closed with "breakage no longer applies", which is exactly
+  # right: the breakage had silently stopped testing anything, and a passing
+  # suite that no longer runs its own recipe is the failure mode this whole file
+  # exists to prevent. It happened a second time here, on the integration branch,
+  # for the same reason and with the same fix.
+  #
+  # It replaces the BLOCK'S GUARD, not its body, so the mutation is the
+  # well-intentioned edit it was always meant to be: the branch that asks
+  # whether the interpreter can run the code is gone, and everything under it
+  # goes with it.
+  edit "$forty/tests/validate.sh" \
+    '    if [ "$lang" = ruby ]; then
+      ruby_seen="$(ruby -e '"'"'print RUBY_VERSION'"'"' 2>/dev/null || true)"' \
+    '    if false; then
+      ruby_seen="$(ruby -e '"'"'print RUBY_VERSION'"'"' 2>/dev/null || true)"'
+  # PATH is exported rather than prefixed onto the call, because a prefixed call
+  # reads `PATH=… expect_red_check` — the first token is no longer `expect_red`,
+  # so the count would miss this recipe. Both counts now allow indentation, so
+  # the call itself may sit inside the `if`.
+  forty_old_path="$PATH"
+  PATH="$forty/kit14-oldruby:$PATH"
+  export PATH
+  expect_red_check 'breakage 40: the toolchain floor is defined but never consulted' \
+    "$forty" 'templates/otel/ruby  (ruby test suite)' --language=ruby --no-self-test
+  PATH="$forty_old_path"
+  export PATH
+else
+  printf 'SKIP self_test: breakage 40: the toolchain floor is defined but never consulted — ruby not installed\n'
+  skips=$((skips + 1))
+fi
 
 printf '\n'
 if [ "$failures" -ne 0 ]; then

@@ -40,15 +40,17 @@ kit/
 │   ├── tier/<lang>/                      # the DECLARED tier, per language
 │   ├── tier/skip-allowlist               # one file for the fleet; four hygiene rules
 │   ├── tier/README.md                    # the format, the rules, and the limits
+│   ├── parity-allowlist                  # WHY each service's copy is not kit's bytes
 │   ├── mise.toml                         # toolchain pin template
 │   └── AGENTS.md                         # skeleton for a service repo
 └── tests/
     ├── validate.sh                       # THE gate
     ├── lint_test.sh                      # the linters RUN, against fixtures
     ├── classify.py  rules.json           # the change classifier, failing closed
-    ├── staleness.py                      # the fleet staleness reporter
+    ├── staleness.py  artifacts.json      # the staleness reporter, and WHAT it measures
     ├── core_fanout_check.py              # structural checks on core/vendir, core/renovate
-    └── gate_declaration_check.py         # no adopter carries a D12/D13 workaround
+    ├── gate_declaration_check.py         # no adopter carries a D12/D13 workaround
+    └── self_test.sh                      # every check, broken once, asserted red
 ```
 
 Flat on purpose. `grep -r` finds everything; there is no plugin system to
@@ -145,18 +147,18 @@ Six phases, and all six must pass:
   is the one that tells a working config from a valid one, and — unlike every
   other phase — it is **fatal on a skip**, because the claim under test is "kit's
   configs work" and a run in which no linter executed has not tested it.
-- **self_test** — thirty-seven breakages of a throwaway copy. Thirty-six assert
+- **self_test** — forty-five breakages of a throwaway copy. Forty-four assert
   the gate goes red; one (23b) asserts the gate stays green while naming a skip,
   because a check that turns a red into an honest skip is load-bearing precisely
   by not going red. One further GREEN control (31b) asserts a service config
   that AGREES with kit's does not fail, because a check satisfied by banning the
   file would train every service to delete one. Six are a semantic mutation of one
   language each, so **every suite is proven able to fail** rather than assumed
-  to. Seventeen assert that one *named* check reported `FAIL`, so a check written
-  for a specific defect is proven still load-bearing. Two assert that a *proof*
-  goes red: one inverts the classifier's fail-closed property, and one makes the
-  staleness reporter call an undeclared pin `current`. A property nobody has tried
-  to break is a property nobody has tested.
+  to. Twenty-one assert that one *named* check reported `FAIL`, so a check
+  written for a specific defect is proven still load-bearing. Two assert that a
+  *proof* goes red: one inverts the classifier's fail-closed property, and one
+  makes the staleness reporter call an undeclared pin `current`. A property
+  nobody has tried to break is a property nobody has tested.
 - **A toolchain's floor is checked against the floor the ARTIFACT declares.**
   `KitOtel::RUBY_FLOOR` says what `templates/otel/ruby` needs and the gate reads
   that constant rather than restating the number. Below the floor is a loud,
@@ -197,10 +199,17 @@ Six phases, and all six must pass:
     is worse than no sweep.
 - **The self-test's copies are the fleet.** `fresh_copy` gives every breakage its
   own parent directory, because `lint_drift_check` finds a fleet by globbing
-  `$ROOT/..`. Copies sharing one directory would each see the other thirty-six
+  `$ROOT/..`. Copies sharing one directory would each see the other forty-four
   as their fleet, and a breakage could be "caught" by a defect it did not
   introduce — a control that goes red for a reason another test created reads as
   evidence and is worse than no control at all.
+- **A breakage recipe asserts its own premise before it mutates.** Two of
+  kit-14's recipes were wrong and the suite caught both: one named an artefact
+  id that `artifacts.json` really declares, so the mutation broke nothing, and
+  one asserted that a check would go red when no such check exists in this
+  repository. `edit` already refuses an unmatched string; the same instinct
+  applies to a recipe whose *subject* has moved. A mutation that has silently
+  stopped breaking the thing it names is a proof of nothing.
 - Tests are written **first** and watched fail before the artifacts exist. A
   config written from documentation instead of from the pinned image is a config
   that breaks on the first `bin/dev up`: Tempo, Loki and Mimir all reject keys
@@ -243,7 +252,7 @@ Six phases, and all six must pass:
   rubocop ran on kit's own Ruby with kit's own config. That is the only way an
   obsolete key surfaces before six repos inherit it.
 - The suite must be able to fail: `self_test` breaks a throwaway copy of the
-  tree thirty-seven ways and asserts the run goes red. If you change the suite,
+  tree forty-five ways and asserts the run goes red. If you change the suite,
   keep that true.
 
 ## The classifier fails closed, and that is a rule about code
@@ -269,6 +278,56 @@ So:
   `required` or `enum`, both provably non-semantic because JSON Schema defines
   those two keywords as sets. Each had to argue for itself. Widening the list is
   a deliberate, diffable act in one file.
+
+## The reporter fails closed too, and so does a copy that is missing
+
+`tests/staleness.py` has two scopes. `--scope core` measures a **pin**; the one
+kit already had. `--scope templates` measures a **file**, and a file has a state
+a pin does not have: it is not there. `templates/` has drifted furthest and the
+commonest state in the fleet is `absent` — 0 of 9 services hold the collector,
+1 of 9 holds `bin/dev` — so the reporter needed a word for it before anything
+else could be said.
+
+Five states, and the vocabulary is the whole design:
+
+| state | meaning | needs a pin? |
+| --- | --- | --- |
+| `current` | byte-identical to what kit ships, at the declared path | no |
+| `diverged` | present, and not byte-identical | **yes** |
+| `absent` | kit ships one and the service holds nothing there | **yes** |
+| `unknown` | it could not be measured | **yes** |
+| `n/a` | kit ships no variant of this artefact for this service's language | no |
+
+`unknown` inherits the rule above rather than copying it. A service that
+declares no `language`, a symlink where a copy should be, an unreadable file, an
+artefact kit has stopped shipping — each is a finding, because the cheap answer
+in every one of those cases is a guess, and a guess reported as a measurement is
+the fail-open direction. `n/a` exists so that `unknown` can stay honest: a Go
+service has no `.rubocop.yml` because it is not a Ruby service, and calling that
+unmeasured would put three permanent, unfixable findings on every service in the
+fleet.
+
+**Never infer a copy from its content.** There is no similarity threshold, no
+percentage, no "closest match", and no search for a file that hashes to kit's
+artefact. A copy is `current` when the bytes at the declared path are equal and
+the path is a real file in the service's own tree, and at no other time. One
+appended byte makes it `diverged`, and `diverged` needs a pin. This is
+self_test breakage 27, written as the well-intentioned patch it would be — a
+`quick_ratio() > 0.99` — because that is the shape a helpful contributor
+reaches for, and the only way to know the rule holds is to try to break it.
+
+**`templates/parity-allowlist` is the same dialect as
+`templates/tier/skip-allowlist`: the same four rules, in the same words, one
+entry per line.** Two dialects of "record why" is how one of them goes stale. It
+adds one rule the tier file does not need — **an unpinned divergence or absence
+is a failure** — because its entries name copies in repositories the gate cannot
+read, so the file is a *record of the fleet*, and a record that silently omits a
+cell is worse than no record: it reads as "handled".
+
+The count is printed on PASS and it is a measurement, not a ledger to shrink.
+It is currently **80**, which is a bad number, and the way to move it is to
+re-copy an artefact and delete the entry — never to delete an entry, which the
+dead-entry rule turns red.
 
 ## Adding a language
 
@@ -310,9 +369,9 @@ an `option` with no `job` is a green build that ran nothing.
     programs rather than configuration. They are here because a standard
     without a thing that enforces it is a standard enforced by whoever reads
     it. They stay inside the boundary deliberately: **standard library only,
-    no import outside `json`/`os`/`re`/`sys`/`argparse`/`subprocess`**, no
-    installable dependency, and **nothing imports them** — the real test of this
-    rule is that nothing here is a library, and a classifier is not. The
+    no import outside `json`/`os`/`re`/`sys`/`argparse`/`subprocess`/`difflib`/`glob`/`urllib`/`__future__`**,
+    no installable dependency, and **nothing imports them** — the real test of
+    this rule is that nothing here is a library, and a classifier is not. The
     reporter prints a table for a scheduled job and **never commits its
     output**, because a committed report is the "generated output" this rule
     forbids and the kind of file that rots. If a third program is proposed, the
@@ -326,6 +385,17 @@ an `option` with no `job` is a green build that ran nothing.
     already carries and the gate already bootstraps — so this is the existing
     carve-out rather than a widened one. A **third** parser in `tests/` is the
     case the rule above still refuses.
+  - **The allowed-import list is ENFORCED, not aspirational.**
+    `difflib` and `glob` arrived with the templates half of the staleness
+    reporter — the first counts the lines two copies differ by, the second
+    resolves a `{lang}` source — and `urllib` was already there and already
+    unnamed, so the sentence was out of date before anybody checked it.
+    `tests/validate.sh`'s `carve-out boundary` check walks the **AST** of both
+    programs, not their text, so a function-local import is read the same as a
+    top-level one, and it asserts that every module it finds is named in **this
+    paragraph**. Widening the list is a deliberate, diffable act in this file
+    *and* a red gate until the check agrees with it. A list that grows by a later
+    commit is not a control — the same argument `advisoryOps` rests on.
 - **Callers override, they never fork.** Anything that differs per service —
   versions, thresholds, names — is an input or a build arg, never a copy of a
   file. Six repos each holding their own workflow is the drift this repo

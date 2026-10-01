@@ -83,7 +83,6 @@ it without a copy (see kit-12 below).
   which are a parser gap in a packet that owns it, not this one). All six
   traceparent suites green, `canary_test.sh` green against a real collector.
 
-||||||| 41f8bcb
 
 ### Changed
 
@@ -134,6 +133,136 @@ it without a copy (see kit-12 below).
     running its own config, which is the copy this packet exists to end.
 
 ### Added
+
+- **kit-14 — the staleness reporter, pointed at `templates/`, and the word
+  `absent`.**
+  kit already had a change classifier and a staleness reporter for `core/`, and
+  both work. Both also **only watched `core/`**, while `templates/` — the
+  directory that has drifted furthest — was watched by nothing.
+
+  This is not "detect drift in `templates/`". Drift detection assumes a copy
+  exists, and in the fleet the copies are gone: of the twelve files in
+  `templates/compose/`, the nine services hold `docker-compose.yml` in seven of
+  them and **none of the collector, Tempo, Loki, Mimir or Grafana provisioning
+  in any of them**. A reporter that only knew `current` and `stale` would have
+  nothing to say about the commonest state in the fleet.
+
+  - **`tests/artifacts.json` — the one place kit says what it ships and where a
+    service puts it.** Twelve artefacts, the language each applies to, and the
+    `compose` bundle's twelve members. Read by the reporter *and* by the gate,
+    because a table written down twice is a table that is right in one of the
+    two places. `destAlternatives` records the six Dockerfiles that live at the
+    repository root rather than at kit's documented `docker/Dockerfile`: a
+    documented, working placement is not an absence, and a reporter that cries
+    wolf over it is a reporter that gets muted.
+  - **`tests/staleness.py --scope templates` — five states.**
+    `current`, `diverged`, **`absent`**, `unknown`, and `n/a`. `absent` is the
+    new word and the whole reason the packet existed. `unknown` inherits the
+    classifier's fail-closed rule rather than copying it: no declared language,
+    a symlink where a copy should be, an unreadable file, an artefact kit has
+    stopped shipping — each is a finding, because the cheap answer in every one
+    of those cases is a guess. `n/a` exists so `unknown` can stay honest; a Go
+    service has no `.rubocop.yml` because it is not a Ruby service, and calling
+    that unmeasured would put three permanent, unfixable findings on every
+    service in the fleet.
+  - **A copy is never inferred from its content.** No similarity threshold, no
+    percentage, no search for a file that hashes to kit's. A copy is `current`
+    when the bytes at the declared path are equal and the path is a real file
+    in the service's own tree, and at no other time. Proved by
+    `tests/self_test.sh` breakage 37, written as the `quick_ratio() > 0.99`
+    patch somebody would write to relax it.
+  - **`templates/parity-allowlist` — why a copy is not kit's bytes.** The tier
+    skip-allowlist's four hygiene rules in the same words and the same one-line
+    dialect, because kit does not have two dialects of "record why". It adds the
+    rule the tier file does not need: **an unpinned divergence or absence is a
+    failure**, since its entries name copies in repositories the gate cannot
+    read, and a record that silently omits a cell reads as "handled". **80
+    entries**, and the count is printed on every green run because 80 is a bad
+    number and everybody should be able to see that it is one.
+  - **Eight new self-test breakages (33–40) and a boundary that finally has a
+    check behind it.** 33 is a dead ledger entry (the ESLint shape) and 34 is an
+    **expired** one — the first time anything in kit has watched a ratchet fire
+    rather than reading that it exists, and it took spending a recipe to find
+    that out. 35 is a `{lang}` source kit offers but does not ship: half a
+    language is worse than none. 36 reports an `absent` artefact as `current`,
+    and 37 grades by resemblance; they are separate because they are opposite
+    mistakes, one removing a finding and the other inventing one, and a gate
+    that can only do one of them is half a gate. 38 gives one of the two
+    programs a third-party import, 39 removes a fixture's `.git` so the
+    reporter cannot see it (and asserts the EXPLANATION, not just the exit
+    status), and 40 deletes the line that consults the ruby toolchain floor.
+  - **Two of those recipes were wrong, and `self_test` is what said so.**
+    33 named an artefact id `artifacts.json` really declares, so the mutation
+    broke nothing; the recipe now asserts its own premise before it mutates.
+    34 asserted that the GATE rejects an entry naming a repository that is not
+    on disk — it cannot, because kit's CI has no sibling checkouts and no gate
+    here knows which repositories exist. The reporter does know, and
+    `staleness_test.sh` proves that case; so 34 was re-pointed at the expiry
+    rule the gate really has, rather than kit gaining a fleet roster so the
+    gate could answer a question nobody asked it.
+  - **`carve-out boundary` — a check, and the sentence it found out of date.**
+    `AGENTS.md` has said "standard library only" since the carve-out was made
+    and nothing verified it. The new check walks the **AST** of both programs —
+    so a function-local import is read the same as a top-level one — and asserts
+    that every module it finds is named in the sentence as well as on the list.
+    It failed on its first run: `glob` arrived with this packet and `urllib` had
+    been imported all along without ever being written down.
+
+- **`tests/staleness.py --scope templates` measured the fleet, and the brief's
+  numbers did not survive it.** `README.md` opens
+  [what the fleet actually adopted](#what-the-fleet-actually-adopted) with the
+  result. The corrections worth stating here: `mise.toml` is 9/9 diverged and
+  the divergence is **adoption working**, because the template is the union of
+  every language's pins (19 tools) and a service keeps the two it needs;
+  `AGENTS.md` is 9/9 diverged and the divergence is the **opposite** — the
+  template was superseded, only 12–40 of its 121 lines survive per service, and
+  `## Observability` survives in **none** of the nine; and
+  `lint/*` is **3 diverged, 3 absent**, not 0/9, because `billing`, `parlor` and
+  `identity` each hold a linter config that is their own — none carrying kit's
+  STRICTNESS NOTES block. The honest sentence is "nobody lints with kit's
+  rules", not "nobody lints".
+
+- **Four numbers in my own first draft were wrong, and all four flattered the
+  measurement.** They are corrected above, in `templates/parity-allowlist` and
+  in the report, and they are written down here because the pattern is the
+  point: a figure that cannot survive being recomputed is a liability in a file
+  whose whole job is to be believed.
+  - **`AGENTS.md` "8–19 lines with markdown comments stripped".** The template
+    has no comments to strip, and normalising the `<...>` placeholders does not
+    shrink the diff either — still 315–669 changed lines. The nine are not
+    filled-in forms, and this is the artefact where the fleet has the **least**
+    of kit's template.
+  - **`mise.toml` "8–19 code lines apart".** Not a number this comparison
+    produces; the real figure is 80–110, and legitimately so.
+  - **`bin/prime` "32 to 63 lines", and "the fleet's versions begin `#!/bin/sh`".**
+    The range is 12–58. Only `caf` and `courier` use that shebang; `darkroom`,
+    `muse` and `parlor` use kit's own, and **`identity/bin/prime` has no shebang
+    at all**. All seven reasons asserted it; it was true for two. `billing`'s
+    is not stale either — it carries the STRICTNESS NOTES block and is 12 lines
+    from kit's ruby template, with Rails commands added.
+  - **`billing/bin/dev` "predates kit's observability profile, brings up postgres
+    and nats only".** It is two lines: `#!/usr/bin/env ruby` and
+    `exec "./bin/rails", "server", *ARGV`. A Rails server shim, not a copy of
+    kit's loop in any era. The claim was inferred from a line count rather than
+    read off the file.
+
+- **One of my own sentences was wrong, which is why it is here.** The first draft
+  of `REPORT-kit-14.md` and of eight ledger entries said a partially-adopted
+  compose stack "cannot start". Checked with `docker compose config`: it does
+  not. None of the six services' compose files mounts any of kit's stack files,
+  each declares one or two services of its own, and five of six pass validation
+  — they are **replacements that kept a filename**, not broken copies. The
+  reporter now says what it measured ("partially adopted: N of 12 members
+  held") and stops there, because comparing bytes cannot tell a replacement from
+  a broken copy.
+
+- **A defect the byte-comparison cannot see, found while checking the sentence
+  above.** `muse/docker-compose.yml` **does not parse**: an unquoted
+  `${MUSE_VAULT_KEY:?…, or run: …}` whose error message contains a colon, and
+  YAML reads the value as the start of a mapping. `docker compose config` fails
+  with `yaml: line 65, column 67`. The reporter calls that cell `diverged`,
+  which is true and is not the interesting thing about it; the ledger entry for
+  `muse` now says so.
 
 - **kit-16 — the first deployment, and the shape the other eight copy.**
   Nine services, nine languages, nine green gates, and not one of them had ever

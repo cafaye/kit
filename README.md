@@ -12,9 +12,80 @@ github.com/cafaye/guard   TypeScript  github.com/cafaye/muse   Python
 github.com/cafaye/darkroom Rust    github.com/cafaye/parlor   TypeScript
 ```
 
-Every one of those repos calls the same workflow, copies the same linter
-configs, and primes a fresh worktree with the same script. A change to how we
-build lands in kit once, and reaches the next service in a pull request.
+Every one of those repos **calls** the same workflow. A change to how we build
+lands in kit once, and reaches the next service on its next run.
+
+Every one of those repos also *copies* the same linter configs and the same
+scripts — and **how much they actually match is measured, not assumed.** See
+[what the fleet actually adopted](#what-the-fleet-actually-adopted) below.
+
+## What the fleet actually adopted
+
+Measured on 2026-09-30 against `41f8bcb`, by `tests/staleness.py --scope
+templates --repos-dir …`, over the nine services (the fleet the packet counts;
+`docs` and `cafaye-{py,rb,ts}` are toolchain repos, not services, and
+`pantry` is a registry that has not called kit's workflow). **Nine of 108 cells are
+byte-identical.** One of them, `guard/bin/prime`, is the only copy in the fleet
+that matches kit exactly — and it matches because `guard` is the service that
+caused kit's `bun` job to exist, so it is the one service that copied a template
+*after* it was written rather than before. That is the whole adoption story in
+one cell.
+
+| artefact | byte-identical | diverged | absent | unknown | not applicable |
+| --- | --- | --- | --- | --- | --- |
+| `ci.reusable.yml` | **8/9** | 0 | 1 | 0 | 0 |
+| `bin/prime` | 1/9 | 7 | 0 | 1 | 0 |
+| `docker/Dockerfile` | 0 | 7 | 1 | 1 | 0 |
+| `mise.toml` | 0 | **9/9** | 0 | 0 | 0 |
+| `AGENTS.md` | 0 | **9/9** | 0 | 0 | 0 |
+| `bin/dev` | 0 | 1 | **8/9** | 0 | 0 |
+| `compose` (12 files) | 0 | 7 | 2 | 0 | 0 |
+| `lint/yamllint.yml` | 0 | 0 | **9/9** | 0 | 0 |
+| `lint/hadolint.yaml` | 0 | 0 | **9/9** | 0 | 0 |
+| `lint/golangci.yml` | 0 | 1 | 1 | 1 | 6 |
+| `lint/rubocop.yml` | 0 | 1 | 0 | 1 | 7 |
+| `lint/eslint.config.mjs` | 0 | 1 | 1 | 1 | 6 |
+| **all twelve** | **9/108** | **43** | **32** | **5** | **19** |
+
+Three findings the packet's brief did not contain, and all three changed what
+was built:
+
+1. **`mise.toml` and `AGENTS.md` are 9/9 *diverged*, and the two divergences
+   mean opposite things.** `mise.toml` is adoption working: the template is
+   kit's **union of every language's tool pins** (19 tools, 74 code lines), so a
+   service keeping two of them and raising the versions reads as 80–110 lines of
+   divergence by construction — `muse` keeps `python` and `uv` out of nineteen.
+   `AGENTS.md` is the opposite: the template is 121 lines and each service
+   wrote its own 281–664 line document, keeping only **12–40** of the
+   template's lines. `## Observability` — the template's largest section, and
+   the one recording the telemetry convention — **survives in none of the
+   nine**, including the eight that adopted that convention through kit's own
+   workflow. The template was superseded, not filled in.
+2. **`lint/*.yml` is not 0/9. It is 3 diverged, 3 absent.** `billing`,
+   `parlor` and `identity` each hold their own linter config, all three
+   differing from kit's, and none of the three carrying kit's STRICTNESS NOTES
+   block — which is where a config records *what* it enforces and why. The
+   honest sentence is "nobody lints with kit's rules", not "nobody lints".
+3. **The local stack is not "drifted", it is *not there*.** Of the twelve files
+   in `templates/compose/`, the fleet holds `docker-compose.yml` in six
+   services and `.env.example` in two, and seven services hold at least one
+   member. The collector, Tempo, Loki, Mimir and
+   the Grafana provisioning are **0 of 12, in all nine services**. Those six
+   compose files are each ~420 lines different from kit's, and the number is
+   the least interesting thing about them. They are also **replacements rather
+   than broken copies**: none of them mounts a single one of kit's stack files
+   (`grep -cE '\./(otel-collector|tempo|loki|mimir|grafana)'` is 0 in all
+   six), each declares one or two services of its own, and
+   `docker compose config` is **green on five of the six** — so they are valid
+   stacks that are simply not this one. The reporter calls the state `diverged`
+   and reports the member breakdown; it does not claim the stack is broken,
+   because comparing bytes cannot tell those two situations apart.
+
+`templates/parity-allowlist` carries all 80 findings — every diverged copy,
+every absence and every unmeasurable cell — as one line each, with a reason, an
+owner, a `since` and an `until`. **80 is a bad number and it is meant to be
+read as one.** The way to shrink the file is to re-copy an artefact and delete
+the entry; deleting the entry to shrink the file is a hard failure of its own.
 
 ## What is in here
 
@@ -41,11 +112,13 @@ build lands in kit once, and reaches the next service in a pull request.
 | `templates/tier/<lang>/` | The **declared tier**, per language — the tests that need a real dependency, declared in the test source and read by the runner's own collector. Never grepped for a sentinel: a sentinel fails open. | Every service, per language |
 | `templates/tier/skip-allowlist` | One file for the fleet. Four hygiene rules — reason, owner, `since`, `until` — and **an entry matching nothing is a failure**. | Every service; the file itself lives here |
 | `templates/tier/README.md` | The normalised result format, the allowlist rules, and what a tier gate **cannot** catch. | Every service |
+| `templates/parity-allowlist` | Why each service's copy of a kit template is **not** kit's bytes. Same four rules, same one-line dialect, and it adds the rule the tier file does not need: **an unpinned divergence or absence is a failure too**. The count is printed on every green run. | The whole fleet; the file itself lives here |
 | `templates/mise.toml` | Toolchain pins, one per language, commented. | Every service, as `mise.toml` |
 | `templates/AGENTS.md` | Skeleton repo-conventions file. | Every service, as `AGENTS.md` |
 | `core/` | The `cafaye/core` fan-out: a `vendir.yml` per consuming repo, the one shared Renovate policy, and what `core` needs to publish semver tags. | Any repo that consumes core's schemas |
 | `tests/classify.py` | Classifies a change to a vendored schema set into `FILE`/`PACKAGE`/`WIRE_JSON`/`WIRE`, and **fails closed** on anything `tests/rules.json` does not name. Stdlib only. | Any repo that vendors core |
-| `tests/staleness.py` | Reads every consuming repo's recorded pin, resolves where `core` is now, prints the distance. `--fail-on-behind` turns it into a gate. | Scheduled, fleet-wide |
+| `tests/staleness.py` | Two scopes. `--scope core` reads every consuming repo's recorded pin and prints the distance. `--scope templates` reports whether each service's copy of a kit template is `current`, `diverged`, **`absent`**, `unknown` or `n/a`, and whether the reason for it is recorded. | Scheduled, fleet-wide |
+| `tests/artifacts.json` | The ONE place kit says what it ships and where a service puts it. Read by the reporter *and* by the gate — a table written down twice is a table that is right in one of the two places. | kit |
 | `tests/validate.sh` | kit's own suite — the gate. | kit |
 
 ## The core fan-out — `core/`
@@ -67,6 +140,52 @@ purpose.
 | [`core/renovate/renovate.json5`](core/renovate/) | The single `inheritConfig` policy for the whole fleet. |
 | [`core/renovate/SETUP.md`](core/renovate/) | The ordered steps to stand the policy repo up, **and what to verify before onboarding a second repository**. |
 | [`core/release/release.yml`](core/release/) | The workflow `core` needs before any of it can move. Ships here; belongs in `core/.github/workflows/`. |
+
+## The templates half — `templates/`
+
+Everything in `templates/`, `lint/` and `docker/` is adopted **by copy**, which
+means a fix in kit reaches a service only when somebody copies the file again.
+Nothing in the fleet made that happen, and the reporter that now measures it is
+`tests/staleness.py --scope templates`.
+
+```sh
+tests/staleness.py --repos-dir .. --scope templates
+```
+
+A **pin** is a record that a copy is deliberately not kit's bytes. Without one,
+a divergence is not "fine", it is **unproven** — and an unproven cell is a
+finding, the same way an undeclared `core` pin is. `templates/parity-allowlist`
+is the file those records live in, and it uses the tier skip-allowlist's format
+exactly:
+
+```
+<verb> <repo> <artefact-id> reason="…" owner=… since=YYYY-MM-DD until=YYYY-MM-DD
+```
+
+with three verbs — `diverged` (held, and different), `absent` (kit ships it,
+the service holds nothing) and `unknown` (kit cannot say what the service would
+have copied). **The verb is checked against what the reporter measured**, so an
+entry cannot excuse a different finding than the one that exists.
+
+Two directions, and the tier allowlist only needs one:
+
+- **an entry that matches nothing is a failure** — ESLint's
+  `reportUnusedDisableDirectives` shape. The artefact is now byte-identical, or
+  the entry names an artefact kit does not ship, or a repository that is gone.
+- **an unpinned cell is a failure** — the reverse. `pantry`'s
+  `ci.reusable.yml` is the example that pays for the rule: it is a real design
+  decision (its CI is a workspace-drift job over thirteen repositories, not a
+  per-language service build) and it is invisible to every reader of that
+  repository until it is written down somewhere.
+
+**A copy is never inferred from content.** There is no similarity threshold and
+no search for a file that hashes to kit's: a copy is `current` when the bytes
+at the declared path are equal and the path is a real file in the service's own
+tree, and at no other time. A symlink to an identical file is `unknown`, not
+`current` — the bytes are right today and the arrangement is a bet that the
+target never moves. `tests/self_test.sh` breakage 27 is that rule written as
+the patch someone would write to relax it, and it has to be tried to be
+believed.
 
 Two things worth knowing before you read any of it, because both were found by
 running the tools rather than by reading about them:
@@ -126,6 +245,15 @@ for the sentence "That is MD12's collect-then-run machinery", because `D12` is a
 substring of `MD12`. All three rules are structural as a result. A check that
 fires on correct work teaches the reader to ignore it, and it had taught on the
 first repository scanned.
+
+The one that reads `core/`'s consumers is `--scope core`, and it is documented in
+[`core/README.md`](core/README.md). The one that reads **this** repository's
+consumers is `--scope templates`, and the difference is not cosmetic: a pin can
+be stale and a file can be **gone**, and `templates/` has drifted far enough
+that gone is the commonest answer. The seven stacks above are the worked
+example — the fleet holds `docker-compose.yml` in six services and none of the
+other eleven files each one needs, which is the finding a drift-only reporter
+has no word for.
 
 ## The local stack — `templates/compose/`
 
@@ -911,14 +1039,14 @@ no `npm ci`, no `cargo fetch`. If these ever need the network, a template has
 grown a dependency and kit has stopped being config-only.
 
 **self_test** — `tests/self_test.sh` breaks a throwaway copy of this tree
-**thirty-seven** ways: thirty-six assert the gate goes red, and one (23b)
+**forty-five** ways: forty-four assert the gate goes red, and one (23b)
 asserts the gate stays **green** while naming the skip that replaced a red. A
 further **green control** (31b) asserts a service config that agrees with kit's
 is *not* a failure. Fourteen breakages are for the static checks; one is a
 semantic mutation of each of the six language implementations, so **every suite
 is proven able to fail** rather than assumed to. A skip fails the run — a
 self_test that skips half its proofs and exits 0 is the "0 passed, 14 ignored"
-shape that verifies nothing. Seventeen of the static ones go further and assert
+shape that verifies nothing. Twenty-one of the static ones go further and assert
 that one *named* check reported `FAIL`, so the check written for a given defect
 is proven still load-bearing rather than being one of fifty checks that could
 have gone red for an unrelated reason.
