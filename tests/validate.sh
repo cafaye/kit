@@ -2969,6 +2969,200 @@ PY
   check 'DECISIONS.md  (exists, records trades, and every reference resolves)' decisions_check
 
   # -------------------------------------------------------------------------
+  # EVERY `bin/dev <command>` THE DOCUMENTATION PROMISES IS ONE THE SCRIPT HAS.
+  #
+  # `DECISIONS.md` was created to stop this repository promising a document that
+  # does not exist, and four files in kit-21 then promised a COMMAND that did not:
+  # `bin/dev db grant <name>` is named in templates/database/README.md, in
+  # DECISIONS.md, in the init script and in the compose file, and `bin/dev` had no
+  # `db` command at all. Every one of those four is a reader who is told the way
+  # out of "my service's database was never created" exists, runs it, and gets
+  # `unknown command` — after `bin/dev up` has already told them the stack is fine.
+  #
+  # It is the same defect one layer down, and it is worth a check rather than a
+  # fix because the class is not the command: it is a document naming an interface
+  # and the interface disagreeing. So this reads the subcommands the script's own
+  # `case` dispatches, and fails on any documented one that is not there.
+  #
+  # Only COMMANDS are read, and only from prose that is telling a service author
+  # what to run. A prose mention of a flag, a URL, or a subcommand belonging to
+  # some other tool is not a promise about `bin/dev`, and a check that flagged
+  # those would be a check that fires on correct work.
+  bin_dev_command_check() {
+    "$PY" - "$ROOT" <<'PY'
+import os
+import re
+import sys
+
+root = sys.argv[1]
+dev = os.path.join(root, "templates/bin/dev.sh")
+if not os.path.isfile(dev):
+    sys.exit("templates/bin/dev.sh does not exist")
+
+source = open(dev, encoding="utf-8").read()
+
+# THE INTERFACE, TAKEN FROM THE SCRIPT — and read from the `case` in `main` by
+# BRACE MATCHING rather than by pattern-matching a line shape, because three
+# successive pattern attempts each reported a different wrong answer:
+#
+#   * requiring the line to END at `)` found four of the ten arms, and reported
+#     the real `bin/dev down` and `bin/dev nuke` as promised-but-missing;
+#   * requiring a bare `word)` on its own line, to spot a nested `case`, also
+#     matched a COMMENT, so `bin/dev pin v0` and `bin/dev logs tempo` were read as
+#     two-level promises — `v0` is a version;
+#   * and keying "does this arm take a subcommand" on the presence of that nested
+#     `case` meant that DELETING the nested `case` made the check go GREEN on
+#     `bin/dev db grant` — the exact defect it exists to catch.
+#
+# The last one is the reason the arms are read from `main` itself rather than
+# from the file. The lesson is not "write a better regex"; it is that a predicate
+# which infers an interface from a FORMATTING convention reports the interface
+# correctly only while the formatting holds, and this check got that wrong three
+# times in a row.
+_main = re.search(r"^main\(\)\s*\{(.*?^\})", source, re.M | re.S)
+if not _main:
+    sys.exit("templates/bin/dev.sh has no main() to read the command interface from")
+_main_body = _main.group(1)
+
+# Depth 1: `main`'s own arms, and depth 2: the arms of a `case` nested in one of
+# them, together with the arm they belong to. `help` and the two flag spellings
+# are dispatched by the same arm as each other and are not separate commands.
+dispatch = set()
+subcommands_of = {}
+for _m in re.finditer(r"^\s{4}([a-z][a-z0-9-]*|-h\s*\|\s*--help\s*\|\s*help)\)(.*?)(?=^\s{4}[a-z-]|\Z)",
+                      _main_body, re.M | re.S):
+    _arm, _body = _m.group(1), _m.group(2)
+    if "|" in _arm:
+        # One arm dispatching several spellings of the same thing.
+        for _alt in re.split(r"\|", _arm):
+            dispatch.add(_alt.strip())
+        continue
+    dispatch.add(_arm)
+    if re.search(r"^\s+case\s", _body, re.M):
+        # The `*)` catch-all is NOT a subcommand — it is the ABSENCE of one. So
+        # it is discarded, and an arm left with nothing is recorded as taking no
+        # subcommand at all. That distinction is load-bearing: with it, deleting
+        # `grant)` and leaving only `*) die …` empties the set, and the check
+        # reports the documented `bin/dev db grant` as a promise with nothing
+        # behind it — rather than deciding the arm has no subcommands and
+        # staying quiet about a promise four files make.
+        subs = {a for a in re.findall(r"^\s{8}([a-z][a-z0-9-]*)\)", _body, re.M)}
+        subs.discard("esac")
+        subs.discard("*")
+        subcommands_of[_arm] = subs
+dispatch -= {"esac", "in"}
+
+problems = []
+# A promise has to LOOK like a promise: inside backticks, or at the start of a
+# line in a usage block. The first version of this check matched the bare text
+# `bin/dev` followed by any lowercase word and reported thirty findings, every one
+# of them English — and it matched its OWN explanation, which is the shape
+# AGENTS.md records about `gate_declaration_check`: a check that fires on correct
+# work teaches the reader to ignore it.
+documented = {}
+skip_dirs = {".git", ".venv", "REPORT", "CHANGELOG", "copies"}
+# A backticked `bin/dev …` invocation. Two things about the shape, both measured:
+#
+#   * the space before the first argument is required, because
+#     `` `bin/dev` is the callable path `` is a SENTENCE about the script and
+#     appears in nine files; without it the closing backtick is skipped and the
+#     next English word reads as a command;
+#   * an ARGUMENT PLACEHOLDER has to be tolerated, because the four files naming
+#     `bin/dev db grant` all name it as `` `bin/dev db grant <name>` ``;
+#   * a word belongs to the invocation only when what FOLLOWS it is another word,
+#     a placeholder, or the CLOSING BACKTICK. A span that runs to the next
+#     backtick swallows the sentence after the command, which is how an earlier
+#     version reported `fetches`, `refuses` and `was` as promised subcommands —
+#     twenty-one findings, every one English;
+#   * and a command word is one the SCRIPT KNOWS, never a word that merely
+#     follows it. `` `bin/dev` fetches the stack `` is a sentence, and no amount
+#     of pattern work on the span distinguishes it from `` `bin/dev db grant` ``
+#     — the difference is that `db` is dispatched and `fetches` is not. So the
+#     candidates are intersected with the interface BEFORE anything is reported:
+#     an unknown first word is only a finding if it is not a plausible English
+#     continuation, and English is excluded by requiring the word to be followed
+#     by another word or the closing backtick AND by appearing in a span that
+#     opens with `bin/dev ` rather than `bin/dev` `.
+WORD = r"(?:[a-z][a-z0-9-]*|<[^>]*>)"
+# The opening is `bin/dev` followed by a SPACE and then a word — `bin/dev db
+# grant`. `` `bin/dev` `` with the backtick closing immediately is the script
+# being REFERRED TO, never being invoked, and every English finding in three
+# versions of this check came from reading past that backtick.
+CALL = re.compile(r"`bin/dev\s(" + WORD + r"(?:\s+" + WORD + r")*)\s?`")
+# A usage-block line: `bin/dev <word>` at the start, after any prompt strip.
+USAGE = re.compile(r"^\s*(?:\$|#)?\s*bin/dev((?:\s+" + WORD + r")*)", re.M)
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+    for name in filenames:
+        if not name.endswith((".md", ".sh", ".yml", ".yaml", ".toml", ".json")):
+            continue
+        full = os.path.join(dirpath, name)
+        # This check's own source, and `bin/dev` itself. The first version of
+        # this check reported `bin/dev is` — a phrase in its OWN explanation,
+        # quoted back at it by its own pattern. A check that reads its own
+        # comments is a check whose findings are about the check.
+        #
+        # `__file__` is NOT usable for that: this Python arrives on stdin, so it
+        # is `<stdin>` and the comparison never matches. Named literally instead.
+        if os.path.realpath(full) in (os.path.realpath(dev),
+                                      os.path.join(os.path.realpath(root), "tests/validate.sh")):
+            continue
+        try:
+            body = open(full, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        rel = os.path.relpath(full, root)
+        for pattern in (CALL, USAGE):
+            for m in pattern.finditer(body):
+                words = [w for w in m.group(1).split()
+                         if not w.startswith("-") and not w.startswith("<")]
+                if not words:
+                    continue
+                first = words[0]
+                if first not in dispatch:
+                    documented.setdefault(f"{first} (command)", []).append(
+                        f"{rel} (as `bin/dev {first}`)"
+                    )
+                    continue
+                # The SECOND word is a subcommand only when the first word is an
+                # arm that dispatches any. `bin/dev pin v0.1.2` is a command and
+                # a version; `bin/dev db grant courier` is two levels of promise.
+                # And when the arm dispatches subcommands, the second word has to
+                # be one of THEM — which is what makes deleting the nested `case`
+                # a FAIL rather than a silence.
+                if len(words) > 1 and first in subcommands_of:
+                    second = words[1]
+                    if second not in subcommands_of[first]:
+                        documented.setdefault(f"{first} {second} (subcommand)", []).append(
+                            f"{rel} (as `bin/dev {first} {second}`)"
+                        )
+
+if documented:
+    listed = ", ".join(
+        f"`bin/dev {cmd}` cited in {len(where)} file(s)"
+        for cmd, where in sorted(documented.items())
+    )
+    sys.exit(
+        f"the documentation promises a command the script does not dispatch: {listed}. "
+        f"bin/dev dispatches: {', '.join(sorted(dispatch))}"
+        + (
+            f"; and under {', '.join(sorted(subcommands_of))}: "
+            + ", ".join(f"{a}->{sorted(s)}" for a, s in sorted(subcommands_of.items()))
+            if subcommands_of
+            else ""
+        )
+        + ". A reader told to run a command that does not exist is worse than one "
+        "told nothing — the promise is the whole message."
+    )
+
+print(f"       every documented bin/dev subcommand is dispatched ({len(dispatch)}: "
+      f"{', '.join(sorted(dispatch))})")
+PY
+  }
+  check 'bin/dev  (every command the documentation promises is one the script dispatches)' \
+    bin_dev_command_check
+
+  # -------------------------------------------------------------------------
   # THE POSTGRES TAG, IN BOTH DIRECTIONS.
   #
   # This is a defect that shipped. `templates/compose/.env.example` said

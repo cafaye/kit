@@ -240,7 +240,7 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   is the one that tells a working config from a valid one, and — unlike every
   other phase — it is **fatal on a skip**, because the claim under test is "kit's
   configs work" and a run in which no linter executed has not tested it.
-- **self_test** — seventy-four breakages of a throwaway copy. Seventy-two assert
+- **self_test** — seventy-seven breakages of a throwaway copy. Seventy-five assert
   the gate goes red; two assert it stays **green** while naming what it said —
   23b a SKIP, because a check that turns a red into an honest skip is
   load-bearing precisely by not going red, and 59 a FINDING, because kit-13's
@@ -248,7 +248,7 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   One further GREEN control (31b) asserts a service config that AGREES with
   kit's does not fail, because a check satisfied by banning the file would train
   every service to delete one. Six are a semantic mutation of one language each,
-  so **every suite is proven able to fail** rather than assumed to. Fifty-four
+  so **every suite is proven able to fail** rather than assumed to. Fifty-seven
   assert that one *named* check reported `FAIL`, so a check written for a specific
   defect is proven still load-bearing. Two assert that a *proof* goes red: one
   inverts the classifier's fail-closed property, and one makes the staleness
@@ -258,6 +258,26 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   most**: a generated config carrying `prepare: :unnamed` on a fleet with no
   pooler is slower and looks entirely correct, so the forbidden-list check is the
   only thing that will ever find it.
+  - **75 is the one worth the second-most, and it exists because a green control
+    was evidencing a different check.** kit-21 turned the cluster into a *built*
+    image, which renamed kit's from `postgres` to `kit-postgres` — and
+    `check_stale_copy`, whose whole job is naming a service running its own copy
+    of the platform, matched on that bare repository name. The two stopped
+    matching, and **five repositories in the real fleet carry their own postgres
+    while the check that names them reported a clean fleet, silently** (still ran,
+    still printed PASS, printed no skip). Breakages 52/59/60 did not catch it
+    because their fixture carries a `ports:` entry, and `check_override_surface`
+    reports a published port by *service name* — a name the rename never
+    touched. So 60 went red on the port half while the image half was dead.
+    **75 is the same mutation with the port removed**, which leaves the image
+    comparison as the only thing that can go red; it is red on the pre-fix code
+    and green after, both measured. The general rule this earns: a control
+    satisfiable by two different checks proves the gate can go red and says
+    nothing about either.
+  - **76 and 77** are the two ways a documented `bin/dev` command can stop
+    existing, and they fail differently — the command gone, and the *subcommand*
+    gone. 77 is the harder one: a check that only asks "is `db` dispatched" is
+    green on it.
 - **A toolchain's floor is checked against the floor the ARTIFACT declares.**
   `KitOtel::RUBY_FLOOR` says what `templates/otel/ruby` needs and the gate reads
   that constant rather than restating the number. Below the floor is a loud,
@@ -267,6 +287,42 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   six that needs this: the other five refuse an old toolchain themselves, at
   build time, with a message naming their own requirement. Ruby 2.6 is the only
   one that loads the template happily and raises on first use.
+- **A green control that two different checks could satisfy proves neither.**
+  This is the `reportUnusedDisableDirectives` rule's other half, and breakage 75
+  exists because it was violated by kit's own self-test. The rule above is about
+  an allowlist entry that never matches; this one is about a proof that goes red
+  for a reason the recipe did not introduce. Both are the same defect — a control
+  whose green is not about the thing it names.
+  - Measured, on the commit that shipped it: `break_stale_copy`'s fixture gives
+    `alpha` a stale `postgres` **with a `ports:` entry**, so two checks can report
+    it — `check_stale_copy` on the image, `check_override_surface` on the
+    published port. Renaming kit's image to `kit-postgres` killed the first and
+    left the second, and breakage 60 stayed green throughout. The check it was
+    proving had been dead for the whole run.
+  - So a fixture that mutates one thing must mutate **one** thing, and where two
+    checks can see the same mutation there is a second fixture with the other
+    half removed. Read the fixture and ask what ELSE could go red.
+- **Never read the gate's output through a pipe, and fix every occurrence at
+  once.** `printf '%s\n' "$out" | grep -q …` is a broken-pipe bug, not a style
+  choice: `grep -q` closes the pipe on its first match, `printf` dies of SIGPIPE,
+  and `set -o pipefail` promotes 141 to the pipeline's status. So the verdict
+  flips on the SIZE of the output rather than on what is in it. Measured, on
+  identical content: 2000 lines returns 0, a 239KB report returns **141 with the
+  match present**.
+  - The threshold is the pipe buffer, so it moves with the machine and returns as
+    a flake on somebody else's packet. The fix is to stop piping, not to bound the
+    output — `contains` is a shell `case` over a variable already in memory.
+  - **This bit twice, and the second time is the reason for the rule.** `1d98e42`
+    fixed it in `expect_red_check`'s `FAIL $want` test and left the `env_skips`
+    branch four lines below it on the old form. The result was four breakages
+    (71, 75, 76, 77) reported as ENVIRONMENT failures on a run where all four had
+    been caught, and one (72) reported as "the gate stayed GREEN" — the *worst*
+    direction to be wrong in, since the false answer is "this is a machine
+    problem", which is the verdict that branch exists to protect.
+  - So: when a check reads a captured variable with a pipe, grep the whole file
+    for that shape. The seven remaining `printf … | grep` calls in
+    `tests/self_test.sh` only **print** diagnostics, where a truncated line costs
+    nothing — and that difference is the whole test for which is which.
 - **No adopter carries a workaround for a fixed core defect.** `core`'s gate
   checker had two defects that forced adopting repositories into local
   workarounds — D12 (`RUN_KEY` could not see a one-line `run:`, core `63fd319`)
@@ -391,7 +447,7 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   rubocop ran on kit's own Ruby with kit's own config. That is the only way an
   obsolete key surfaces before six repos inherit it.
 - The suite must be able to fail: `self_test` breaks a throwaway copy of the
-  tree seventy-four ways and asserts the run goes red. If you change the suite,
+  tree seventy-seven ways and asserts the run goes red. If you change the suite,
   keep that true.
 
 ## The classifier fails closed, and that is a rule about code

@@ -249,6 +249,18 @@ Two consequences worth stating:
 3. Copy `templates/database/<lang>/` from the ref your `kit.ref` names, and change
    the service name in it.
 
+**Step 2 is the one to read twice, because it prints a `REVOKE` and the revoke
+is the boundary.** A database created outside the init script gets Postgres's
+default, which grants `CONNECT` to `PUBLIC` — so a database added by hand and not
+revoked is reachable by **every role in the cluster**, whatever the table grants
+say. `bin/dev db grant` prints that statement alongside the others precisely so
+it is impossible to run the provisioning and miss the boundary. The two
+properties that make this worth the paragraph: the boundary holds **by
+construction** for every database declared in `KIT_POSTGRES_DATABASES` on a fresh
+volume, and a database added afterwards is **the operator's to close**. It is
+the one part of the contract an init script cannot make airtight, because
+initdb runs once and cannot sweep a database that does not exist yet.
+
 ## The two properties to read before trusting any of it
 
 - **`docker-entrypoint-initdb.d` runs once per volume.** Everything above is

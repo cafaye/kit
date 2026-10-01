@@ -13,6 +13,101 @@ it without a copy (see kit-12 below).
 
 ## Unreleased
 
+### Fixed
+
+- **`self_test.sh` classified a caught defect as a machine failure, on a large
+  gate report.** The `env_skips` branch added in `1d98e42` tested for a finding
+  with `printf '%s\n' "$out" | grep -qE '^(FAIL|SKIP)'` — while the verdict three
+  lines above it had been changed to the non-piping `contains` for exactly this
+  reason. **The fix was applied to one branch and missed in the one beside it.**
+
+  The mechanism, measured: on a 239KB gate report whose findings sit at the top,
+  that pipeline exits **141** *with the match present*. `grep -q` closes the pipe
+  on its first match, `printf` dies of SIGPIPE, and `set -o pipefail` promotes 141
+  to the pipeline's status — so the verdict flipped on the SIZE of the output
+  rather than on what was in it. The threshold is a property of the pipe buffer,
+  so it moves with the machine.
+
+  And it fails in the worst direction available: the false answer is "this is an
+  ENVIRONMENT failure", which is precisely the verdict that excuse was added to
+  stop being lost. Four breakages — 71, and the three this packet adds (75, 76,
+  77) — were reported as unevaluated on a run where every one of them had in fact
+  been caught, and 72 was reported as "the gate stayed GREEN". Now a `contains`
+  call, like its neighbours.
+
+- **`fleet_check.py` no longer reported a clean fleet while five repositories
+  carried their own Postgres.** `check_stale_copy` — failure mode 1, the check
+  whose entire job is naming a service running its own copy of the shared
+  platform — matched a service's image against kit's by **bare repository
+  name**. kit-21 made the cluster a *built* image (MD21b), so kit's went from
+  `postgres:${KIT_POSTGRES_TAG:-…}` to `kit-postgres:${…}`; a duplicating service
+  still writes `postgres`, and the two stopped matching. Measured on the commit
+  that shipped it:
+
+  ```console
+  $ fleet_check.py --repos-dir <a fleet whose alpha runs postgres:17>
+  PASS fleet: no service carries a copy of kit's stack, none weakens the
+               redaction boundary, no collector config is dead, …
+  ```
+
+  The comparison is now over the **upstream** image kit's stack is built *from*,
+  not over the name of the local artefact kit built it into — a service cannot
+  know to write `kit-postgres`, which is a build tag that exists on one
+  developer's machine.
+
+  It went unnoticed for a reason worth recording, because it is the same shape as
+  the bug: self-test breakages 52/59/60 mutate a fixture to carry a stale copy
+  **with a `ports:` entry**, and `check_override_surface` reports a published
+  port by *service name* — a name the rename never touched. So breakage 60 went
+  red on the port half while the image half was dead, and a green control was
+  evidencing a different check. New **breakage 75** mutates the same fixture
+  *without* the port, so the image comparison is the only thing that can go red;
+  it is red on the pre-fix code and green on the post-fix code, both measured.
+
+- **`bin/dev db grant` now exists.** Four files in this repository told a service
+  author to run it — `templates/database/README.md`, `DECISIONS.md`,
+  `templates/compose/postgres/initdb/10-cluster.sh` and
+  `templates/compose/docker-compose.yml` — and `bin/dev` had no `db` command at
+  all. Every one of those four is a reader who is told the way out of "my
+  service's database was never created" exists, runs it, and gets
+  `unknown command`. `DECISIONS.md` was created to stop this repository
+  referencing a document that did not exist; this was the same defect one layer
+  down, and it is now a check (**breakages 76 and 77**) rather than a fix, since
+  the class is "a document names an interface and the interface disagrees".
+
+  The command **prints** the statements and does not run them: they are
+  `CREATE ROLE` and `CREATE DATABASE` on a cluster a service is about to be
+  handed credentials for, and a wrapper whose failure mode is half-provisioned is
+  not something to perform on a stack it did not start. It prints the
+  `REVOKE ALL ON DATABASE … FROM PUBLIC` with them, which is the whole point —
+  see the next entry.
+
+- **the operator-side half of the isolation boundary is now stated rather than
+  implied.** `DECISIONS.md` listed "the `REVOKE` for a database added by hand"
+  among the things left to the operator, in one line, as a pointer to a command
+  that did not exist. It now says what the position actually is: the boundary
+  holds **by construction** for every database declared in
+  `KIT_POSTGRES_DATABASES` on a fresh volume, and a database added afterwards is
+  **the operator's to close** — because `docker-entrypoint-initdb.d` runs once per
+  volume and cannot sweep a database that does not exist yet. A database created
+  by hand and not revoked is reachable by every role in the cluster, whatever the
+  table grants say. `tests/isolation_test.sh` proves the first half against a real
+  cluster; the second is a documented step, and the document now says so where an
+  adopter will read it.
+
+### Changed
+
+- **`templates/deploy/compose.deploy.yml`'s comment claimed its Postgres was "the
+  same tag `templates/compose/docker-compose.yml` uses", so "a deploy and a
+  `bin/dev up` are running the same database."** Both halves became false at
+  kit-21: the dev stack moved to `postgres:17` because pgvector is a glibc-linked
+  layer (MD21b), and the developer topology became one cluster of N databases
+  rather than one database. The tag is unchanged and the deploy file is
+  deliberately a *different* topology — one database for one service, with no
+  initdb script, no per-service roles and no revoke, because there is nothing to
+  isolate it from. The comment now says that, so the two are not "unified" by a
+  reader in a hurry.
+
 ### Added
 
 - **one Postgres cluster, one database and one role per service, and the database

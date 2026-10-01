@@ -271,13 +271,33 @@ major.
 
 ## Things deliberately left to the operator
 
-- **Credentials.** Every dev role takes `POSTGRES_PASSWORD`. Isolation is by
-  privilege and never by secret — which is exactly what lets
+- **A database added after the cluster was provisioned.** `bin/dev db grant <name>`
+  prints the statements rather than running them, and prints the `REVOKE ALL ON
+  DATABASE … FROM PUBLIC` among them. That is not a convenience: a database
+  created outside `initdb/10-cluster.sh` gets Postgres's default, which grants
+  `CONNECT` to `PUBLIC`, so **an operator who creates a database by hand and
+  forgets the revoke has opened it to every role in the cluster** — a cluster
+  that is now, by the accident of one omitted line, exactly the no-isolation
+  cluster MD21d is about.
+
+  This is the one part of the boundary that is genuinely operator-side, and the
+  reason is worth stating rather than hiding: `docker-entrypoint-initdb.d` runs
+  once per volume, so the sweep at the end of that script cannot re-apply itself
+  to a database that does not exist yet. There is no way to make this airtight
+  from inside the init script — the only fully automatic version is a periodic
+  sweep over `pg_database`, which is a scheduled job and a new thing to operate.
+
+  So the honest position is: **the boundary holds by construction for everything
+  declared in `KIT_POSTGRES_DATABASES` on a fresh volume, and a database added
+  afterwards is the operator's to close.** `tests/isolation_test.sh` proves the
+  first half against a real cluster; the second half is a documented step, not a
+  claim. A reader who adopts this should decide now whether that step is
+  acceptable, because "we will remember" is the only thing holding it.
+- **Credentials in production.** Every dev role takes `POSTGRES_PASSWORD`.
+  Isolation is by privilege and never by secret — which is exactly what lets
   `tests/isolation_test.sh` demonstrate the boundary while knowing every password
   in the cluster. Production roles carry distinct passwords from the deployment
   secret store.
-- **`REVOKE CONNECT` for a database added by hand.** `bin/dev db grant <name>`
-  prints the statements rather than running them.
 - **Backup and restore.** Owned by `templates/kamal/` (kamal + kamal-backup), not
   by this packet. The topology here is one cluster with N databases, and
   kamal-backup's `databases:` is a list, so one job covers all of them.
