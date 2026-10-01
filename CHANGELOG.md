@@ -13,6 +13,98 @@ it without a copy (see kit-12 below).
 
 ## Unreleased
 
+### Added — Kamal deploy and backup configuration, and the custom toolchain removed
+
+- **`templates/kamal/` — the deploy and backup configuration a service copies,
+  in the shape `kamal` and `kamal-backup` already expect.** Four files:
+  `deploy.yml.erb`, `kamal-backup.yml.erb`, `drill.sh`, and a README.
+
+  kit does not ship a deployment tool or a backup tool. `kamal` and
+  `kamal-backup` are both, both are installed wherever cafaye deploys, and
+  kit-20 demonstrated the cost of the alternative by building one: about 1,850
+  lines across `templates/backup/`, `templates/bin/backup.sh`,
+  `docker/Dockerfile.backup` and `tests/backup_test.sh`, reimplementing a command
+  surface that already existed. Every one of those files is **removed**, and
+  `tests/validate.sh` asserts their absence — "we removed it" has no mechanical
+  form until something checks, and self_test breakage 64 resurrects one file to
+  prove that check is load-bearing.
+
+  What each custom feature maps to, and where it went:
+
+  | custom | kamal-backup | 
+  |---|---|
+  | `pg_dump` piped into `restic backup` | `backup` |
+  | `schedule.crontab` | `backup.schedule: 1d` — state in a volume, so a reboot does not trigger a full dump |
+  | retention flags by hand | `restic.retention` |
+  | `restic init` if absent | `restic.init_if_missing` |
+  | `redact.py` wrapped around every command | the gem's own `Redactor`, applied to every command including the drill's check output |
+  | a hand-written restore path | `restore production`, `restore local` |
+  | a hand-written drill | `drill production` |
+  | a hand-written redacted report | `evidence` |
+
+- **`config/kamal-backup.yml` names ONE database, and says why.** The queue,
+  cache and cable databases are rebuildable working data; backing them up
+  snapshots caches and job bookkeeping. The restore is the product: one database
+  means one restore path and one row count an operator can check by eye.
+
+- **`drill.sh` — the two things kamal-backup does not do, both found by reading
+  the gem rather than by using it.** `restore_to_scratch`
+  (`databases/base.rb:52-55`) validates, restores, and does **not drop the
+  scratch database** — the only `DROP SCHEMA` in the gem runs against the *live*
+  database — so cleanup is an operator's job, and a step remembered after a
+  failure is a step that does not happen after a failure. And the gem decides the
+  drill passed by the **exit status** of `--check` (`app.rb:307-325`), which
+  makes `psql -tAc "SELECT count(*) FROM t"` useless: it exits 0 for zero rows, so
+  a restore of an empty database is reported as a successful drill. The wrapper
+  therefore drops the scratch database on every exit path with `WITH (FORCE)`, and
+  generates a `DO $$ … RAISE EXCEPTION` block under `ON_ERROR_STOP=1` so an empty
+  table becomes a non-zero exit. There is no default table list — a drill with no
+  `--table` is a usage error rather than a drill that quietly passes.
+
+- **`tests/kamal_test.sh` — the gate EXECUTES the generated config.** 22 cases,
+  every one against the **real** `kamal` and the real `kamal-backup`. This is the
+  one place kit hands out YAML a third-party binary has to accept, and a parse
+  check cannot do the job: three real defects in these templates' own first draft
+  were valid YAML that `yaml.safe_load` called fine —
+
+  - a doubled registry host. `image: ghcr.io/org/repo` with
+    `registry.server: ghcr.io` resolves to `ghcr.io/ghcr.io/org/repo` (measured:
+    `kamal config` reports it), and `kamal config` still exits **0**. The deploy
+    fails at the push.
+  - a missing `builder.arch`. Valid YAML; kamal refuses the file outright with
+    "Builder arch not set".
+  - a secret named in `config/kamal-backup.yml` and missing from the backup
+    accessory's `env.secret`. **Both files are valid and neither is internally
+    inconsistent** — `kamal-backup validate` builds the accessory's environment
+    from the deploy config alone, so only running the pair finds it.
+
+  self_test breakages 61, 62 and 65 are those three, inverted.
+
+- **Retention is written out rather than inherited.** kamal-backup 0.5.2's
+  `DEFAULT_RETENTION` happens to be exactly the five numbers the template states,
+  so omitting the block would work today. A retention policy living in a
+  dependency's defaults is a policy that changes on a version bump, and the diff
+  at that moment is about the gem rather than about how far back a restore can
+  reach.
+
+- **A missing `KIT_*` variable fails the render by name.** `<%= ENV['X'] %>` with
+  `X` unset renders an empty string, which YAML reads as a null list item and
+  which surfaces three layers away as a deploy that cannot find a host. The
+  templates `raise` and name the variable instead.
+
+### Changed
+
+- **`templates/kamal/README.md` answers the Ruby question explicitly, because it
+  is a boundary and not a caveat.** The service image contains no Ruby. The backup
+  accessory **ships its own**, which is why the `backup` block in `deploy.yml.erb`
+  is an ordinary accessory. `kamal` is a Ruby gem and always has been — an
+  operator deploying with Kamal has Ruby, and that is not a requirement kit adds.
+  A service that wants backups and no `kamal-backup` gem locally **still gets
+  backups**, because the accessory's scheduler loop is what takes snapshots; what
+  it loses is `restore local` and `drill local`, not the backups. ERB costs
+  nothing extra because Kamal evaluates `config/deploy.yml` through
+  `ERB#result` itself.
+
 ### Fixed
 
 - **`templates/compose/docker-compose.yml` defaulted to postgres 16.6 while the

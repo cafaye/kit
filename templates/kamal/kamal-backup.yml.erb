@@ -1,0 +1,130 @@
+---
+<%
+# The one value this file needs from the operator, and the same one
+# `config/deploy.yml` carries. It is read from the environment rather than
+# written here so the two files cannot disagree about the app's name — a
+# mismatch here is a snapshot written under one name and looked for under
+# another, which reads as "the backup is missing".
+#
+# The two files are ONE contract, and kamal-backup is what proves it:
+# `validate` builds the accessory's environment from `config/deploy.yml` and
+# then resolves every `{ secret: NAME }` below out of it. A secret named here
+# but absent from the backup accessory's `env.secret` list is a valid YAML file
+# that fails validation — measured on kamal-backup 0.5.2.
+service = ENV["KIT_SERVICE"].to_s.strip
+raise "config/kamal-backup.yml: KIT_SERVICE is not set. It is the same value config/deploy.yml was rendered with, so render both from the same environment." if service.empty?
+%>
+
+# kamal-backup — the backup configuration for this service.
+#
+# WHY THERE IS NO `paths:` KEY HERE, AND THAT IS A DECISION.
+#
+#   A backup of a database is not a backup of the service. Anything on local
+#   disk that matters — uploaded files, generated artefacts, exports — belongs
+#   in object storage, where it is already replicated, already off the host,
+#   and already covered by that store's own durability story. Snapshotting it a
+#   second time into a restic repository on the same account buys a second copy
+#   of bytes that were never at risk, at the cost of a second thing to restore.
+#
+#   The consequence is that this file has no local paths at all, which is also
+#   why the backup accessory mounts no data volume. A service that DOES keep
+#   state on disk adds a `paths:` list, and the gem then refuses suspicious
+#   roots (`/`, `/etc`, `/var`, …) unless an operator opts in by name — the
+#   refusal is in the tool, not in this comment.
+app: <%= service %>
+
+# Which accessory in `config/deploy.yml` this config belongs to. It must be a
+# name declared under `accessories:` there; the name is how kamal-backup finds
+# the container to run in, and how it finds that container's secrets.
+accessory: backup
+
+# ONE DATABASE, NAMED, WITH A REASON.
+#
+# A service is usually wired to more than one database, and backing all of them
+# is the wrong default for two different reasons that are worth separating:
+#
+#   - CONTENT versus WORKING DATA. The application database holds the rows a
+#     user would miss: accounts, documents, orders, anything whose loss is a
+#     support ticket. A job queue's database holds bookkeeping — which jobs are
+#     pending, which are leased. A cache holds a copy of something derivable.
+#     A backup of those is a snapshot of a cache, which is not a safety net, it
+#     is extra storage that will be restored into a shape nobody wants.
+#   - THE RESTORE IS THE PRODUCT. A backup nobody has restored is a hypothesis.
+#     One database means one restore path, one drill query, and one row count
+#     an operator can check by eye against the live service. Six databases means
+#     six restore paths, none of which gets drilled, because drilling six is
+#     six times the work and the sixth is the one that breaks.
+#
+# `name:` is a LABEL for the snapshot path (`databases/<app>/<name>/postgres.pgdump`)
+# and for the restic tag. It is not a database name — the connection is `url`
+# below. Renaming it orphans every existing snapshot, because restic tracks
+# these paths; set it once.
+databases:
+  - name: primary
+    adapter: postgres
+    url:
+      # The name of a Kamal secret. Resolved from the accessory's environment,
+      # which is populated from the `env.secret` list in `config/deploy.yml`.
+      secret: DATABASE_URL
+    password:
+      # Passed to pg_dump as PGPASSWORD. Separate from the URL because a
+      # connection URL carrying a password puts a credential in an argument,
+      # and `ps` shows arguments to every user on the machine.
+      secret: DATABASE_PASSWORD
+
+restic:
+  # R2 is S3-compatible, so the repository is an S3 endpoint. The whole URL is
+  # a secret here rather than assembled from an account id in this file: the
+  # bucket name is an operator's choice, and a config that guesses it is a
+  # config that writes a full database dump somewhere the operator did not
+  # choose. Format:
+  #   s3:https://<ACCOUNT_ID>.r2.cloudflarestorage.com/<service>-db-backups
+  repository:
+    secret: RESTIC_REPOSITORY
+  # restic's own encryption password. It is the ONLY thing standing between a
+  # leaked bucket and a readable database dump, and it is not the same value as
+  # any credential the application uses.
+  password:
+    secret: RESTIC_PASSWORD
+  # Create the repository if it is absent.
+  #
+  # This is the difference between "backups are on" and "backups are on after
+  # somebody creates the bucket", and the direction of the default is the
+  # point: a first backup that silently does nothing because a bucket was
+  # never created is a service that believes it is protected for as long as
+  # nobody needs it.
+  init_if_missing: true
+  # RETENTION, WRITTEN OUT RATHER THAN INHERITED.
+  #
+  # kamal-backup 0.5.2's defaults happen to be exactly these five numbers
+  # (config.rb, DEFAULT_RETENTION), so leaving the block out would work today.
+  # It is written out anyway, because a retention policy that lives in someone
+  # else's default is a retention policy that changes when their gem releases:
+  # the diff would be a version bump, and the reviewer's eye would be on the
+  # gem rather than on the thing that decides how far back a restore can reach.
+  #
+  # What it buys, in plain terms: every snapshot from the last week, one a day
+  # back a month, one a week back two months, one a month back a year, and two
+  # a year indefinitely. Roughly 26 snapshots.
+  retention:
+    keep_last: 7
+    keep_daily: 7
+    keep_weekly: 4
+    keep_monthly: 6
+    keep_yearly: 2
+  # Verify the repository's structure after each backup. Costs time proportional
+  # to the metadata, not the data; a repository that has been silently losing
+  # blocks is the failure this catches, and it is only detectable while there is
+  # still something to find.
+  check_after_backup: true
+
+backup:
+  # At most one backup per day.
+  #
+  # This REPLACES a crontab, which is the point worth understanding: the
+  # scheduler is a foreground loop inside the backup container, and the
+  # "last backup finished at" timestamp lives in the accessory's state volume.
+  # A cron entry has neither — it fires on wall-clock time whether or not the
+  # last one finished, so a backup that took six hours would be started again
+  # the moment it ended, on a host that was already struggling.
+  schedule: 1d

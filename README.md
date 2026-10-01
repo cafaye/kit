@@ -108,6 +108,10 @@ the entry; deleting the entry to shrink the file is a hard failure of its own.
 | `templates/compose/{tempo,loki,mimir}/` | Vendor **configuration** for the three stores: retention, limits, paths. Read-only mounts over stock images. | **Fetched** — never copied |
 | `templates/compose/grafana/provisioning/` | Datasources, the dashboard provider, the fleet error dashboard and the alert rules — all files, working on first load. Nothing to click together by hand. | **Fetched** — never copied |
 | `templates/compose/.env.example` | Every `${KIT_*}` the stack interpolates, each with a default. **Fetched, not copied** — `bin/dev` writes it into `.env` on first run. | `bin/dev`, on first run |
+| `templates/kamal/deploy.yml.erb` | The Kamal config: service, registry, servers, proxy, and the postgres and backup accessories. ERB for the four values that differ per operator; **every credential is a `NAME`, never a value**. A missing required variable fails the render by name rather than rendering empty. | Every service, as `config/deploy.yml` |
+| `templates/kamal/kamal-backup.yml.erb` | What to back up (ONE database, with the content-vs-working-data reasoning written out), where (restic to R2), and for how long (keep-last 7, daily 7, weekly 4, monthly 6, yearly 2 — stated, not inherited from the gem's defaults). | Every service, as `config/kamal-backup.yml` |
+| `templates/kamal/drill.sh` | A restore drill that drops its scratch database on **every** exit path and **asserts** rows rather than printing a count — the two things kamal-backup does not do, both found by reading the gem. | Every service, as `bin/drill` |
+| `tests/kamal_test.sh` | The proof: generates the config **from the templates** and runs the **real** `kamal` and the real `kamal-backup` against it. 22 cases, all against the binaries. It exists because a doubled registry host, a missing `builder.arch` and a cross-file secret are all valid YAML that parses clean. | kit |
 | `tests/fetch_test.sh` | Executes the fetch against a local bare remote: a pin resolves and the bytes are identical, a branch is refused **before any network call**, and offline mode is real in all four of its states. | kit |
 | `tests/stack_live_test.sh` | Brings the **fetched** stack up, sends real OTLP, and reads a trace out of Tempo, a metric out of Mimir, and no canary into either. | kit |
 | `tests/fleet_check.py` | Reads the **other** repositories: a stale copy of the stack, a weakened redaction boundary, a collector config nothing starts, a published port on a service kit already ships, an unpinned ref. Under the **adoption ceiling**: a `FAIL` inside a repository that has a `kit.ref`, a named `WARN` inside one that has not. | kit, over the sibling checkouts |
@@ -964,6 +968,44 @@ there are three things to wire up (your credential type, your log sinks, your
 public keys) and none of them is automatic, because the harness cannot
 enumerate a process's loggers and a harness that guesses is a harness asserting
 against the wrong contract.
+**7e. Adopt Kamal**, once you have something worth deploying.
+
+```sh
+cp <kit>/templates/kamal/deploy.yml.erb      ./config/deploy.yml
+cp <kit>/templates/kamal/kamal-backup.yml.erb ./config/kamal-backup.yml
+cp <kit>/templates/kamal/drill.sh            ./bin/drill && chmod +x bin/drill
+
+kamal init                                # creates .kamal/secrets
+kamal registry login --password-stdin     # populates it
+```
+
+Then export the five non-secret variables Kamal's ERB reads — `KIT_SERVICE`,
+`KIT_REGISTRY_ORG`, `KIT_REPO`, `KIT_WEB_HOST`, `KIT_APP_DOMAIN` — and
+`kamal setup`.
+
+**The service image needs no Ruby, and the backup accessory ships its own.** A
+service that wants backups and no `kamal-backup` gem on the operator's machine
+still gets them, because the accessory's scheduler loop is what takes snapshots;
+what it loses is `restore local` and `drill local`, not the backups. The
+non-backup deploy path never needed anything kit did not already assume.
+
+**`RESTIC_PASSWORD` is a separate secret from the R2 key**, and that is the point:
+someone with the bucket credentials does not thereby have the key the snapshots
+are encrypted with.
+
+**Drill it before you need to**, and read the row counts rather than the exit
+code:
+
+```sh
+bin/drill --table users --table documents
+```
+
+It restores into a scratch database, fails if either table is empty, and drops
+the scratch database on every exit path including a failure. Full rationale —
+including which of your databases is content and which is rebuildable working
+data, and what R2's lack of Object Lock costs you — is in
+[`templates/kamal/README.md`](templates/kamal/README.md).
+
 **7. Run kit's own gate before you open the PR that adopts it:**
 
 ```sh
@@ -983,6 +1025,16 @@ bash <kit>/tests/validate.sh
 - [ ] `kit.ref` written and committed: a 40-char sha or a `v<semver>` tag, never a branch
 - [ ] `docker-compose.yml` is an OVERRIDE: no `ports:`, no `otel-collector`, no vendor config tree
 - [ ] `mise.toml` copied, every placeholder raised to a shipped version
+- [ ] `config/deploy.yml` and `config/kamal-backup.yml` copied from
+      `templates/kamal/`, and the five `KIT_*` variables exported. **Every secret
+      is a NAME in `env.secret`; no credential may appear in either file.**
+- [ ] Every secret `config/kamal-backup.yml` names is ALSO in the backup
+      accessory's `env.secret` list. `kamal-backup validate` is the check, and it
+      is the only thing that can see a disagreement between the two files.
+- [ ] `bin/drill` copied, `chmod +x`, and run once with real `--table` names.
+      **A backup nobody has restored is a hypothesis.**
+- [ ] `kamal-backup evidence` run and its output kept somewhere a human reads.
+      **A backup whose failure is silent is a file in a bucket.**
 - [ ] `AGENTS.md` copied and filled in
 - [ ] A coverage command exists and `COVERAGE_FAIL_UNDER` is above 0
 - [ ] If you propagate traces: `templates/otel/<lang>/` copied **with its suite**, `telemetry: 'true'`
