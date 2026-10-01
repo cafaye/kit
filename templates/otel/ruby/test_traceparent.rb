@@ -29,7 +29,10 @@ require_relative 'traceparent'
 # https://www.w3.org/TR/trace-context/ that requires it.
 #
 # Runs on a bare `ruby` — no `bundle install`, no Gemfile, no network. If that
-# ever stops being true, this template has grown a dependency.
+# ever stops being true, this template has grown a dependency. "Bare" means no
+# gems; it does not mean any interpreter. The floor is KitOtel::RUBY_FLOOR —
+# 2.7, for `filter_map` — and a run on anything older is a toolchain mistake
+# wearing this suite's clothes, not a finding about trace propagation.
 class TestTraceparent < Minitest::Test
   # Already frozen by the magic comment at the top of this file, which is why
   # an explicit `.freeze` here is RedundantFreeze rather than belt and braces.

@@ -133,14 +133,25 @@ Three phases, and all three must pass:
   guard: a check that only parsed those two files would pass on a classifier
   that waves every change through. They stay runnable when static analysis is
   skipped, because a gate that skips is not green.
-- **self_test** — twenty-three breakages of a throwaway copy, asserting the gate
-  goes red each time. Six of them are a semantic mutation of one language each,
-  so **every suite is proven able to fail** rather than assumed to. Eight assert
-  that one *named* check reported `FAIL`, so a check written for a specific
-  defect is proven still load-bearing. Two assert that a *proof* goes red: one
-  inverts the classifier's fail-closed property, and one makes the staleness
-  reporter call an undeclared pin `current`. A property nobody has tried to
-  break is a property nobody has tested.
+- **self_test** — twenty-five breakages of a throwaway copy. Twenty-four assert
+  the gate goes red; one (23b) asserts the gate stays green while naming a skip,
+  because a check that turns a red into an honest skip is load-bearing precisely
+  by not going red. Six are a semantic mutation of one language each, so **every
+  suite is proven able to fail** rather than assumed to. Eight assert that one
+  *named* check reported `FAIL`, so a check written for a specific defect is
+  proven still load-bearing. Two assert that a *proof* goes red: one inverts the
+  classifier's fail-closed property, and one makes the staleness reporter call an
+  undeclared pin `current`. A property nobody has tried to break is a property
+  nobody has tested.
+- **A toolchain's floor is checked against the floor the ARTIFACT declares.**
+  `KitOtel::RUBY_FLOOR` says what `templates/otel/ruby` needs and the gate reads
+  that constant rather than restating the number. Below the floor is a loud,
+  counted `SKIP` naming both versions — never a `FAIL`, because the template is
+  correct and the interpreter is old, and never a `PASS`, because thirteen
+  unexecuted tests are not a pass. `templates/otel/ruby` is the only one of the
+  six that needs this: the other five refuse an old toolchain themselves, at
+  build time, with a message naming their own requirement. Ruby 2.6 is the only
+  one that loads the template happily and raises on first use.
 - Tests are written **first** and watched fail before the artifacts exist. A
   config written from documentation instead of from the pinned image is a config
   that breaks on the first `bin/dev up`: Tempo, Loki and Mimir all reject keys

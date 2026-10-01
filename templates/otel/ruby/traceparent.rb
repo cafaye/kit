@@ -30,6 +30,13 @@
 #
 # NO DEPENDENCIES. Stdlib only, so this file drops into any Rails service and
 # the test suite runs without `bundle install`.
+#
+# "No dependencies" is not the same claim as "runs on any ruby", and the second
+# one needed saying out loud. This file needs ruby 2.7 or newer; see
+# KitOtel::RUBY_FLOOR below, which is why the number is a constant in the file
+# rather than a sentence in this header that nobody can check. It is far below
+# the pin kit hands a service (templates/mise.toml: 3.4), so a service on the
+# pin it was given is never near the edge.
 
 require 'securerandom'
 
@@ -43,6 +50,25 @@ require 'securerandom'
 # See the file header for the W3C Trace Context sections behind each rule, and
 # `test_traceparent.rb` for the suite that asserts them.
 module KitOtel
+  # The oldest interpreter this file runs on, as `major.minor`.
+  #
+  # It is a constant, and not a sentence in the header, because the failure it
+  # prevents does not read as a version problem. On ruby 2.6 the first call
+  # into `usable_tracestate_entries` raises NoMethodError, three of the
+  # suite's thirteen tests die, and the output says `filter_map` — which looks
+  # exactly like a bug in trace propagation, and was measured as one for three
+  # packets' worth of gate runs before anybody read a version number.
+  #
+  # 2.7 is `Enumerable#filter_map` and nothing else, so this is the file's real
+  # requirement rather than a guess: everything else here and in its suite is
+  # 2.4 or older (`casecmp?` 2.4, `allbits?` 2.5, `&.` 2.3).
+  #
+  # kit's gate READS this constant instead of keeping its own copy of the
+  # number. A version written in both the artifact and the runner is a version
+  # asserted in zero places the first time one of the two moves — the same
+  # reason the classifier's tier lives in rules.json and nowhere else.
+  RUBY_FLOOR = '2.7'
+
   # Bit 0 of trace-flags (3.2.2.5.1). It is a bit in a field, not the field's
   # value: reading `flags == 1` instead of `flags & 1 == 1` is the single most
   # common trace-context bug, and it is why this is a named constant.
