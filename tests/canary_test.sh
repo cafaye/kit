@@ -581,7 +581,7 @@ for key in \
 do
   line="$(grep -F "\"$key" "$CAPTURE" 2>/dev/null | head -1 || true)"
   [ -n "$line" ] || continue
-  if printf '%s' "$line" | grep -q 'redaction\.redacted\.keys'; then
+  if grep -q 'redaction\.redacted\.keys' <<<"$line"; then
     removed_keys+=("${key%\"}")
   else
     fail "key ${key%\"} survived the redaction boundary"

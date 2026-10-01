@@ -10,8 +10,9 @@
 #   bash tests/validate.sh --language=go       # one telemetry language (CI matrix)
 #   bash tests/validate.sh --no-self-test      # skip the "can this go red" proof
 #   bash tests/validate.sh --no-observability  # skip the two docker-requiring proofs
+#   bash tests/validate.sh --no-lint           # skip running the linters themselves
 #
-# Four phases, all of which must pass:
+# Six phases, all of which must pass:
 #   static         every artifact parses, and the strictness decisions are still
 #                  what we wrote them down to be (env-substituted endpoints, every
 #                  compose port parameterized, every placeholder documented, and
@@ -28,6 +29,11 @@
 #   self_test      breaks a throwaway copy of this tree once per kind of check
 #                  and asserts the gate goes red each time. A gate that cannot
 #                  fail is not a gate.
+#   lint           golangci-lint, RuboCop, ESLint and yamllint are RUN against
+#                  a fixture built to violate them, with kit's config, and each
+#                  is paired with a control that must answer differently. This
+#                  is the phase `lint/` never had: 249 lines of configuration
+#                  that parsed cleanly and had never been pointed at anything.
 #
 # One line per check: PASS, FAIL, or SKIP. Any FAIL exits 1. A SKIP is always
 # reported in the summary — never hidden.
@@ -52,6 +58,14 @@ trap 'rm -rf "$TMP"' EXIT
 # exists to fix — see the `callable path` check below.
 WORKFLOW='.github/workflows/ci.reusable.yml'
 
+# The three files that make the secret scanner one decision rather than three.
+# Paths as variables for the same reason WORKFLOW is: the path being wrong is the
+# class of defect this file exists to catch, and a literal repeated in a dozen
+# heredocs is a dozen chances to spell it three ways.
+GITLEAKS_CONFIG='.gitleaks.toml'
+GITLEAKS_GATE='tests/gitleaks_gate.sh'
+ZIZMOR_CONFIG='.github/zizmor.yml'
+
 # The one `language` option that is not a language. `none` means "this
 # repository has no service manifest": no go.mod, no Gemfile, no
 # pyproject.toml. It exists because the repository that defines the workflow
@@ -68,6 +82,7 @@ RUN_STATIC=1
 RUN_TELEMETRY=1
 RUN_SELF_TEST=1
 RUN_OBSERVABILITY=1
+RUN_LINT=1
 LANGS=()
 
 while [ "$#" -gt 0 ]; do
@@ -76,14 +91,16 @@ while [ "$#" -gt 0 ]; do
       RUN_TELEMETRY=0
       RUN_SELF_TEST=0
       RUN_OBSERVABILITY=0
+      RUN_LINT=0
       ;;
     --no-self-test) RUN_SELF_TEST=0 ;;
     --no-observability) RUN_OBSERVABILITY=0 ;;
+    --no-lint) RUN_LINT=0 ;;
     --language=*)
       LANGS+=("${1#*=}")
       ;;
     -h | --help)
-      sed -n '2,26p' "$0"
+      sed -n '2,35p' "$0"
       exit 0
       ;;
     *)
@@ -118,6 +135,14 @@ fi
 . "$ROOT/tests/bootstrap.sh"
 kit_bootstrap_python "$ROOT"
 export KIT_PYTHON="$PY"
+
+# gitleaks' pinned version, for the check messages below. Read from bootstrap.sh
+# rather than re-declared, because two places holding a version number is how the
+# binary that gets sha256-verified and the version the gate claims to have run
+# stop being the same one. `:-unknown` so the gate still runs against a
+# bootstrap.sh older than the secret-scanner checks, rather than dying on an
+# unbound variable in its own bookkeeping.
+KIT_GITLEAKS_VERSION="${KIT_GITLEAKS_VERSION:-unknown}"
 
 # ---------------------------------------------------------------------------
 # static helpers
@@ -163,6 +188,30 @@ check() { # check <label> <command...>
     if [ -n "$out" ]; then
       printf '%s\n' "$out" | sed 's/^/       /'
     fi
+  else
+    report FAIL "$label"
+    printf '%s\n' "$out" | sed 's/^/       /'
+  fi
+}
+
+# check_verbose — `check`, but it shows the proof on success too.
+#
+# `check` swallows a passing run's output, which is right for most checks: a
+# suite that prints nothing is a suite whose output is a summary. It is wrong for
+# the canary harness, whose output is the RED PROOF lines — the evidence that
+# each of the five detectors actually fired rather than quietly asserting nothing.
+#
+# So those lines are echoed when the check passes, and the whole output when it
+# fails. The first version of this used `check` and shipped with the proofs
+# invisible on a green run, which is precisely the "a proof nobody can see is a
+# proof nobody ran" failure the harness's own comments argue against.
+check_verbose() { # check_verbose <label> <proof-regex> <command...>
+  local label="$1" proof="$2" out ec=0
+  shift 2
+  out="$("$@" 2>&1)" || ec=$?
+  if [ "$ec" -eq 0 ]; then
+    report PASS "$label"
+    printf '%s\n' "$out" | grep -E "$proof" | sed 's/^/       /' || true
   else
     report FAIL "$label"
     printf '%s\n' "$out" | sed 's/^/       /'
@@ -225,6 +274,97 @@ version_at_least() {
     return 1
   done
   return 0
+}
+
+
+# ---------------------------------------------------------------------------
+# bounded_check <label> <bound-seconds> <command...>
+# ---------------------------------------------------------------------------
+#
+# `check` with a CEILING on how long it may take, and — this is the part that
+# matters — a fourth, named outcome when the ceiling is reached.
+#
+# WHY IT EXISTS. The gate grew past what one process can finish on a loaded
+# box: three docker stacks brought up and torn down, and thirty-two throwaway
+# copies of a 193 KB script each running their own bootstrap. The previous full
+# run on this branch was SIGKILLed (exit 137 — the kernel's OOM killer, not a
+# test failure) partway through the observability collector tier, which means
+# the gate reported *nothing* about the tiers it had not reached. A gate that is
+# killed is a gate whose green is a claim about however far it got.
+#
+# `timeout N` alone would fix the symptom and hide the disease in a new place:
+# a timed-out `check` prints FAIL with a two-word diagnostic that names neither
+# the tier nor the bound, and the next reader files it under "flaky". So the
+# bound is a verdict of its own — `BOUND` — carrying the tier, the bound and the
+# tail of what it had printed. It is counted separately in the summary, because
+# a bound that is reported as a PASS is exactly the silent skip the gate's own
+# rules forbid, and one reported as a FAIL is indistinguishable from a defect
+# in the tree.
+#
+# WHY IT IS NOT A SKIP. Nothing about a timed-out tier is unknown: we know it
+# did not finish, and the claim it exists to prove is therefore unexercised. A
+# SKIP is for a check that CANNOT run (no docker, no toolchain) and says so
+# about the environment. A bound is this machine being too busy, which is a
+# fact about the run and not about the tree — and it is the reason the gate
+# carries a bound at all rather than being allowed to be killed.
+#
+# `timeout` IS NOT PORTABLE and pretending otherwise would be the same class of
+# defect as the port rules this packet writes about: GNU coreutils ships it as
+# `timeout`, macOS has no `/usr/bin/timeout` at all, and Homebrew's coreutils
+# installs `gtimeout`. So it is RESOLVED, and a machine with neither runs the
+# tier unbounded and says so in the summary — a bound that silently did not
+# apply is worse than no bound, because the reader is told a ceiling exists.
+bounded_ran=0
+# Tiers that actually REACHED their bound. A separate counter from `bounded_ran`
+# on purpose: the summary line has to say "N tiers ran under a bound, M hit it",
+# and one counter cannot state both. An earlier version incremented one variable
+# in both places and printed "4 tier(s) hit their time bound" for a run in which
+# exactly one did — a summary that overstates a machine problem by 4x is the
+# fastest way to make a reader ignore the line entirely.
+bounded_hit=0
+_timeout_bin() {
+  for candidate in timeout gtimeout; do
+    if have "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+bounded_check() {
+  local label="$1" bound="$2"
+  shift 2
+  local runner out ec=0
+  if runner="$(_timeout_bin)"; then
+    bounded_ran=$((bounded_ran + 1))
+    # `--kill-after` so a tier that ignores SIGTERM is still ended: without it
+    # the bound is only a request, and the whole point is that the run ENDS.
+    out="$("$runner" --kill-after=30s "$bound" "$@" 2>&1)" || ec=$?
+  else
+    out="$("$@" 2>&1)" || ec=$?
+  fi
+  if [ "$ec" -eq 0 ]; then
+    report PASS "$label"
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out" | sed 's/^/       /'
+    fi
+  elif [ "$ec" -eq 124 ]; then
+    # 124 is `timeout`'s own code for "the bound was reached", and it is the
+    # only status here that means the command's verdict is unknown.
+    bounded_hit=$((bounded_hit + 1))
+    printf '%-4s %s\n' BOUND "$label"
+    printf '       exceeded its %ss bound on this machine. The tier did not finish, so\n' "$bound"
+    printf '       the claim it exists to prove is UNEXERCISED — this is not a defect in\n'
+    printf '       the tree, and it is not a pass. Re-run on a quieter box; every tier is\n'
+    printf '       bounded, so a run that reaches the end has exercised all of them.\n'
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out" | tail -12 | sed 's/^/       /'
+    fi
+  else
+    report FAIL "$label"
+    printf '%s\n' "$out" | sed 's/^/       /'
+  fi
 }
 
 # ===========================================================================
@@ -433,6 +573,38 @@ PY
           report SKIP "$path  (elixir not installed)"
         fi
         ;;
+      # The lint drift allowlist, which has no extension because it is not
+      # meant to look like a config a linter would read — it is a list of
+      # PEOPLE, and naming it `.yml` would invite exactly the `cp` this packet
+      # exists to stop. It has no parser of its own; the drift check below IS
+      # its parser, and it reads it as text and reports a malformed line.
+      #
+      # Without this case the loop's `*)` branch printed
+      # `SKIP … (no parser for this file type)` for it, which is a claim that
+      # would have been false — the file is read on every run of this gate.
+      "$ROOT"/lint/drift-allowlist)
+        # Shape only, and deliberately NOT a second copy of the drift check's
+        # rules. Those four — reason, owner, dates, and an entry that no longer
+        # describes a real difference — all live in `lint_drift_check` below, and
+        # the last one can only be evaluated there because it needs the fleet.
+        # Duplicating any of them here would be a second, unchecked copy of a
+        # rule, which is the mistake this repository's classifier section
+        # documents at length.
+        #
+        # What is checked here is the one property that is cheap and that the
+        # drift check's own parser cannot report nicely: every content line
+        # begins an entry. A wrapped entry shows up as a line that does not, and
+        # the drift check would call it "malformed" without saying that the
+        # obvious cause is a wrapped line.
+        # Counted, both sides, and compared. The first version of this was a
+        # `!` on one end of a pipeline, which negates the LAST stage's status
+        # rather than the one the author is thinking about — so it passed on a
+        # file with a wrapped entry, which is the exact case it was written for.
+        # Two counts and an equality have no stage to get wrong.
+        check "$path  (every content line starts one entry)" bash -c \
+          "[ \"\$(grep -cE '^[[:space:]]*[^#[:space:]]' '$f')\" \
+             -eq \"\$(grep -c '^diverged ' '$f')\" ]"
+        ;;
       "$ROOT"/templates/tier/go/*.go)
         # gofmt is run over the whole tree's Go templates in the telemetry phase
         # below, so it is deliberately not reported twice here. `go build` would
@@ -460,8 +632,22 @@ PY
 
   # Every script kit hands out is executable. `chmod -x bin/dev` in a commit is
   # a one-character diff that silently breaks six repos the next they adopt.
+  #
+  # tests/ is in this list and not an afterthought: tests/gitleaks_gate.sh and
+  # tests/zizmor_gate.sh are run BY the reusable workflow, from a service's
+  # repository, against that service's tree. A gate script that is not executable
+  # is a `secrets` job that dies at the first step in thirteen repos.
+  # The two gate scripts are in this list and not an afterthought: they are run
+  # BY the reusable workflow, from a service's repository, against that service's
+  # tree. A gate script that is not executable is a `secrets` job that dies at
+  # its first step in thirteen repos.
+  #
+  # `tests/bootstrap.sh` is deliberately NOT in the list: it is sourced, never
+  # executed, and it says so at the top. A check that required it to be
+  # executable would be asking a file to claim a contract it does not have.
   section 'static: handed-out scripts are executable'
-  for f in "$ROOT"/templates/bin-prime/* "$ROOT"/templates/bin/*; do
+  for f in "$ROOT"/templates/bin-prime/* "$ROOT"/templates/bin/* \
+    "$ROOT/$GITLEAKS_GATE" "$ROOT/tests/zizmor_gate.sh"; do
     [ -f "$f" ] || continue
     path="${f#"$ROOT"/}"
     if [ -x "$f" ]; then
@@ -615,6 +801,29 @@ PY
   }
   check 'templates/otel/*/*.snippet  (installable, versioned, not vendored)' snippet_check
 
+  # -------------------------------------------------------------------------
+  # The canary harness's Go sources must PARSE, and must parse in Go's own
+  # parser rather than in a regex.
+  #
+  # The gate executes the suite (telemetry phase), so a syntax error is caught
+  # there — but only on a machine with Go installed, where it would be reported
+  # as a telemetry SKIP's opposite and a developer would read it as "the canary
+  # is fine". A parse here runs with no toolchain at all, so a missing template
+  # or a bad edit is a static failure on any machine, which is the property the
+  # otel snippets were given for the same reason.
+  section 'static: the canary harness parses in Go'
+  if have gofmt; then
+    # gofmt is a real parser: it exits non-zero on a file it cannot parse, and
+    # unlike `go build` it needs no module, no resolver and no network.
+    for f in "$ROOT"/templates/secrets/go/*.go "$ROOT"/templates/secrets/go/internal/*/*.go; do
+      [ -f "$f" ] || continue
+      path="${f#"$ROOT"/}"
+      check "$path  (gofmt parses)" gofmt -e "$f"
+    done
+  else
+    report SKIP 'templates/secrets/go  (gofmt not installed — cannot parse)'
+  fi
+
   # Every snippet must PARSE in its own language. This is not a style check and
   # not a stretch: a snippet is the file a service copies, so a syntax error in
   # one ships as a service that does not boot.
@@ -670,7 +879,7 @@ SNIPPETS
     ex_copy="$snippet_dir/phoenix_telemetry.ex"
     cp "$ROOT/templates/otel/elixir/phoenix_telemetry.ex.snippet" "$ex_copy"
     ex_out="$(elixir -r "$ROOT/templates/otel/elixir/traceparent.ex" "$ex_copy" 2>&1 || true)"
-    if printf '%s\n' "$ex_out" | grep -qE '\*\* \((Compile|Syntax)Error\)|^\s*error:'; then
+    if grep -qE '\*\* \((Compile|Syntax)Error\)|^\s*error:' <<<"$ex_out"; then
       report FAIL 'otel/elixir/phoenix_telemetry.ex.snippet  (parses as .ex)'
       printf '%s\n' "$ex_out" | head -8 | sed 's/^/       /'
     else
@@ -729,9 +938,16 @@ SNIPPETS
 
   # A template must not declare a dependency. kit is config-only; if these
   # files can `require` something, kit has a lockfile and a supply chain.
-  section 'static: templates/otel declare no third-party dependency'
+  section 'static: templates declare no third-party dependency'
   check 'templates/otel/go/go.mod  (no require)' bash -c \
     "! grep -qE '^[[:space:]]*require' '$ROOT/templates/otel/go/go.mod'"
+  # The canary harness is the other stdlib-only template, and the same rule
+  # applies for a sharper reason: a canary test that pulls in a dependency is a
+  # canary test whose own output has to be trusted not to contain the thing it
+  # is sweeping for. kit has no dependencies, and neither does a thing kit hands
+  # out.
+  check 'templates/secrets/go/go.mod  (no require)' bash -c \
+    "! grep -qE '^[[:space:]]*require' '$ROOT/templates/secrets/go/go.mod'"
   if [ -f "$ROOT/templates/otel/node/package.json" ]; then
     check 'templates/otel/node/package.json  (no dependencies)' bash -c \
       "$PY -c \"import json,sys; d=json.load(open(sys.argv[1])); sys.exit(1 if (d.get('dependencies') or d.get('devDependencies')) else 0)\" \
@@ -2533,12 +2749,25 @@ PY
   # is where the trap bites; a stub `docker` on PATH keeps the test hermetic and
   # fast, because what is under test is the shell, not compose.
   dev_escape_hatch_check() {
-    local stub sandbox out ec=0
+    local stub sandbox out ec=0 kitcheck
     stub="$TMP/dev-hatch-stub"
     sandbox="$TMP/dev-hatch"
-    rm -rf "$stub" "$sandbox"
-    mkdir -p "$stub" "$sandbox/bin" "$sandbox/grafana" "$sandbox/tempo" \
-      "$sandbox/loki" "$sandbox/mimir"
+    # The stub KIT TREE, as a separate directory. The sandbox below is a service
+    # repository, and after this packet a service repository holds NONE of the
+    # stack: no docker-compose.yml of kit's, no otel-collector.yml, no vendor
+    # config directories. Everything `bin/dev` mounts comes from the tree it
+    # fetches, so the fixture has to have one — pointed at with `KIT_STACK_DIR`,
+    # which is a checkout a person named rather than one that was fetched.
+    kitcheck="$TMP/dev-hatch-kit"
+    rm -rf "$stub" "$sandbox" "$kitcheck"
+    mkdir -p "$stub" "$sandbox/bin"
+    mkdir -p "$kitcheck/templates/compose" "$kitcheck/templates/compose/tempo" \
+      "$kitcheck/templates/compose/loki" "$kitcheck/templates/compose/mimir" \
+      "$kitcheck/templates/compose/grafana/provisioning"
+    : >"$kitcheck/templates/compose/docker-compose.yml"
+    : >"$kitcheck/templates/compose/otel-collector.yml"
+    : >"$kitcheck/templates/compose/.env.example"
+    printf '%s\n' "0000000000000000000000000000000000000000" >"$sandbox/kit.ref"
     cat >"$stub/docker" <<'STUB'
 #!/usr/bin/env bash
 # Reports readiness so `bin/dev up` believes the stack came up, and does
@@ -2552,24 +2781,33 @@ esac
 exit 0
 STUB
     chmod +x "$stub/docker"
-    # A compose file and the vendor config trees, so `require_files` passes and
-    # the run reaches `up`, which is where the trap fires. They are empty files
-    # on purpose: nothing here parses them.
-    : >"$sandbox/docker-compose.yml"
-    : >"$sandbox/otel-collector.yml"
-    : >"$sandbox/.env.example"
+    # The sandbox is a service repository and NOTHING ELSE: no compose file of
+    # kit's, no collector config, no `.env`. That is the shape this packet leaves
+    # behind, and the fixture has to be the shape or the check proves a world
+    # that no longer exists — the first version of this sandbox carried five
+    # empty files that `require_files` demanded, and the moment `require_files`
+    # went away the fixture stopped reaching `up` at all.
+    #
+    # `KIT_STACK_DIR` is how the escape hatch is exercised without a network: it
+    # is a checkout a person named on this run, which is source 1 of the four in
+    # `resolve_stack` and the only one that skips git entirely.
     cp "$ROOT/templates/bin/dev.sh" "$sandbox/bin/dev"
 
     # `KIT_DEV_PROFILES=''` and not `KIT_DEV_PROFILES=`: shellcheck reads the
     # latter as a typo, and it is right to.
-    out="$(cd "$sandbox" && KIT_DEV_PROFILES='' PATH="$stub:$PATH" \
-      bash ./bin/dev up 2>&1)" || ec=$?
+    out="$(cd "$sandbox" && KIT_DEV_PROFILES='' KIT_STACK_DIR="$kitcheck" \
+      PATH="$stub:$PATH" bash ./bin/dev up 2>&1)" || ec=$?
     case "$out" in
       *"unbound variable"*)
         echo "the documented escape hatch KIT_DEV_PROFILES= is broken:"
         printf '%s\n' "$out" | head -3
         return 1
         ;;
+      # Both halves are asserted, and the second is not decoration. Reaching the
+      # migration step proves the profile expansion survived; that the run got
+      # all the way there on a sandbox with NO `.env` and no stack of its own
+      # proves the fetch path does not require either. A fixture that wrote a
+      # `.env` would pass the first and silently not be testing the second.
       *"no migration command found"*) return 0 ;;
       *)
         echo "bin/dev with KIT_DEV_PROFILES= exited $ec without reaching the"
@@ -2580,6 +2818,278 @@ STUB
     esac
   }
   check 'templates/bin/dev.sh  (KIT_DEV_PROFILES= escape hatch actually runs)' dev_escape_hatch_check
+
+  # -------------------------------------------------------------------------
+  # THE FLEET GATE, and it is RED on master. That is the point, and the shape is
+  # the same as D4: three repositories that do not spell the same gate the same
+  # way is invisible to any check that reads only one of them, so kit's gate
+  # reads the OTHER repositories rather than trusting that they adopted it.
+  #
+  # Four failure modes, one check each, in tests/fleet_check.py:
+  #   - a service carrying a copy of the shared infrastructure
+  #   - a service that weakened the redaction boundary
+  #   - an otel-collector.yml that exists but that nothing ever starts
+  #   - a pin that is unpinned, or points at a branch
+  #
+  # IT SKIPS LOUDLY WHEN THERE IS NO FLEET, and that is not a detail. A clone of
+  # kit on CI has no siblings, and "no fleet was found" is not "the fleet is
+  # clean" — the same `unknown` vs `current` confusion tests/staleness.py exists
+  # to avoid. A gate that reports the second when it means the first is a gate
+  # that gets muted, and this one is going to be red a lot on purpose.
+  #
+  # `KIT_FLEET` is the seam, and it exists so self_test.sh can point the check at
+  # a FIXTURE fleet. Without it every breakage below would depend on the real
+  # fleet being present and dirty, which is a proof that passes when the fleet is
+  # absent — the exact shape this repository keeps warning about.
+  #
+  # The SKIP decision is `fleet_check.py`'s, not this file's, and the reason is a
+  # disagreement that was real. The first version guarded the call with its own
+  # "are there any sibling entries?" test — `ls -A ..` minus kit's own worktrees.
+  # A self-test's throwaway directory HAS sibling entries (one per breakage) and
+  # none of them is a repository, so the guard said "there is a fleet", ran the
+  # check, and the check exited 2 with "no cafaye repositories". The self-test's
+  # CONTROL would have gone red, which D13 treats as blocking the packet, for a
+  # reason that has nothing to do with the packet.
+  #
+  # So there is exactly one predicate for "is there a fleet", it lives beside the
+  # code that knows what a repository is, and it answers with a machine-readable
+  # marker. `check` cannot express three outcomes, which is why this is written
+  # out rather than delegated: a SKIP is not a PASS that happened quietly.
+  #
+  # THE ADOPTION CEILING, and it is the fourth outcome this block has to express.
+  # `fleet_check.py` answers three questions and this file must not collapse
+  # them: is there a fleet (SKIP), is any ADOPTING repository defective (FAIL),
+  # and is any UNADOPTED repository carrying debt (PASS, with the debt printed).
+  # The three outcomes are read off the exit code plus the `CEILING fleet:` line
+  # the check always prints, rather than from a fourth flag, because a fourth
+  # flag is a fourth thing to keep in step with the check that emits it.
+  #
+  # WHY A PASS CAN CARRY FINDINGS, and why this is not the softening the packet
+  # refuses. The strictness has not moved anywhere weaker; it has moved to WHERE
+  # ADOPTION EXISTS. The same four predicates, the same messages, the same
+  # severity — and the moment a repository commits `git -C ../kit rev-parse HEAD
+  # > kit.ref`, every finding inside it becomes a FAIL with no discretion and no
+  # re-review. A gate that stays red for thirteen findings no repository has
+  # agreed to fix is a gate whose red stops being read, and a gate nobody reads
+  # catches nothing. This is core-16's shape for a missing OpenAPI document, and
+  # it is a WAVE, not a discount: each repository's adoption converts its own
+  # named debt into a failure.
+  #
+  # The count is printed because a ceiling with no number on it cannot be
+  # argued about: "PASS" and "PASS with 13 named warnings across 6 repositories"
+  # are different statements, and only the second is true.
+  section 'static: the fleet adopts the stack rather than copying it'
+  fleet_out='' fleet_ec=0
+  fleet_out="$("$PY" "$ROOT/tests/fleet_check.py" --kit "$ROOT" \
+    --repos-dir "${KIT_FLEET:-$ROOT/..}" --no-fleet 2>&1)" || fleet_ec=$?
+  case "$fleet_out" in
+    *FLEET-ABSENT:*)
+      report SKIP 'fleet adoption (no cafaye repository on this machine — set KIT_FLEET=<dir>)'
+      ;;
+    *)
+      if [ "$fleet_ec" -eq 0 ]; then
+        if printf '%s\n' "$fleet_out" | grep -q '^WARN fleet: '; then
+          fleet_debt=$(printf '%s\n' "$fleet_out" | sed -n 's/^WARN fleet: //p')
+          report PASS "fleet  (adopting repositories clean; $fleet_debt — adoption debt, non-fatal until each repository writes kit.ref)"
+        else
+          report PASS 'fleet  (no stale copy, no weakened boundary, no dead config, every ref pinned)'
+        fi
+        printf '%s\n' "$fleet_out" | sed 's/^/       /'
+      else
+        report FAIL 'fleet  (no stale copy, no weakened boundary, no dead config, every ref pinned)'
+        printf '%s\n' "$fleet_out" | sed 's/^/       /'
+      fi
+      ;;
+  esac
+
+  # -------------------------------------------------------------------------
+  # THE COLLECTOR CONFIG IS MOUNTED FROM THE TREE `bin/dev` FETCHED, and this is
+  # the check for a defect that ONLY RUNNING THE STACK could find.
+  #
+  # `templates/compose/otel-collector.yml` carries the redaction allowlist. Once
+  # the file is no longer copied into the service, the compose file must mount it
+  # from `${KIT_COMPOSE_DIR:-.}`, and `bin/dev` must set that variable to the
+  # FETCHED tree. Get either half wrong and nothing above notices: the compose
+  # file parses, `docker compose config` renders the same project either way, and
+  # every static check in this file stays green — because the value of the
+  # variable is not a property of the YAML.
+  #
+  # What it actually does when it is wrong: the mount resolves to a path that does
+  # not exist, and Docker's answer to a missing bind source is to CREATE A
+  # DIRECTORY. The collector then exits naming a file type:
+  #
+  #   failed to read configFile /etc/tempo/tempo.yaml: is a directory
+  #
+  # which says nothing about the thing that is wrong, and arrives four containers
+  # after a stack that was supposed to come up. `tests/stack_live_test.sh` is what
+  # found it, by bringing the fetched stack up and reading the collector's own
+  # mount back with `docker inspect`. This check is the static half of the same
+  # property, so the defect cannot be re-introduced between one live run and the
+  # next.
+  #
+  # It asserts BOTH halves. Checking the compose file alone would pass on a
+  # `bin/dev` that stopped exporting `KIT_COMPOSE_DIR`; checking `bin/dev` alone
+  # would pass on a compose file that stopped using the variable. The defect is
+  # in their AGREEMENT, so the check is over their agreement.
+  stack_mount_check() {
+    "$PY" - "$ROOT" <<'PY'
+import re
+import sys
+
+root = sys.argv[1]
+compose = open(f"{root}/templates/compose/docker-compose.yml", encoding="utf-8").read()
+dev = open(f"{root}/templates/bin/dev.sh", encoding="utf-8").read()
+
+problems = []
+
+# 1. Every vendor config kit hands out is mounted through the variable, and none
+#    of them through a bare `./`. A bare `./` was correct when the file sat in the
+#    service and is wrong now that it does not, and nothing else in the tree would
+#    notice the difference.
+VENDOR_MOUNTS = {
+    "otel-collector.yml": "/etc/otel/otel-collector.yml",
+    "tempo/tempo.yaml": "/etc/tempo/tempo.yaml",
+    "loki/loki-config.yaml": "/etc/loki/loki-config.yaml",
+    "mimir/mimir.yaml": "/etc/mimir/mimir.yaml",
+    "grafana/provisioning": "/etc/grafana/provisioning",
+}
+for source, destination in VENDOR_MOUNTS.items():
+    mounted = [ln for ln in compose.splitlines()
+               if source in ln and destination in ln]
+    if not mounted:
+        problems.append(
+            f"docker-compose.yml does not mount {source} into {destination} at all"
+        )
+        continue
+    if not any("${KIT_COMPOSE_DIR:-.}" in ln for ln in mounted):
+        problems.append(
+            f"docker-compose.yml mounts {source} without ${KIT_COMPOSE_DIR:-.}. "
+            f"That path is relative to wherever compose runs, and `bin/dev` runs it "
+            f"from the service root - where this file no longer is. Docker creates a "
+            f"DIRECTORY at a missing bind source and the collector exits naming a "
+            f"file type instead of the mount that is wrong."
+        )
+
+# 2. `bin/dev` sets it, to the FETCHED compose directory and not the kit root.
+#    The kit root resolves every mount to `<kit>/grafana/provisioning`, which does
+#    not exist - the same failure, one directory up.
+if "KIT_COMPOSE_DIR=" not in dev:
+    problems.append(
+        "bin/dev never sets KIT_COMPOSE_DIR, so every vendor config mount falls "
+        "back to `.` and resolves against the service root"
+    )
+else:
+    exports = re.findall(
+        r"(?:export\s+)?KIT_COMPOSE_DIR=(?:\"([^\"]*)\"|'([^']*)'|([^\s#]*))", dev
+    )
+    values = [next(g for g in m if g) for m in exports if any(m)]
+    if not values:
+        problems.append("bin/dev mentions KIT_COMPOSE_DIR but never assigns it")
+    else:
+        bad = [v for v in values if "templates/compose" not in v]
+        if bad:
+            problems.append(
+                f"bin/dev assigns KIT_COMPOSE_DIR={bad[0]!r}, which is not the "
+                f"tree's templates/compose directory. Naming it after the thing it "
+                f"points at rather than after the repository it came from is what "
+                f"keeps the hand-copied case and the fetched case the same path with "
+                f"a different prefix, rather than two different shapes."
+            )
+
+# 3. The two files must agree on the DEFAULT too. `.` in the compose file means
+#    "the directory holding this file", which is right for a hand-copied stack and
+#    is the value `bin/dev` overrides. If the default were ever changed to the kit
+#    root, the hand-copied case would silently break instead of the fetched one.
+if "${KIT_COMPOSE_DIR:-.}" not in compose:
+    problems.append(
+        "docker-compose.yml no longer documents the `.` default for "
+        "KIT_COMPOSE_DIR, so the hand-copied stack has no path left to fall back to"
+    )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check 'templates/compose/ + bin/dev  (every vendor config mounts from the fetched tree)' \
+    stack_mount_check
+
+  # -------------------------------------------------------------------------
+  # THE PIN IS `kit.ref`, AND THREE FILES AGREE ON THAT SPELLING.
+  #
+  # `bin/dev` reads the pin, `tests/fleet_check.py` audits it, and
+  # `templates/compose/.env.example` documents where it is NOT. Three files, one
+  # fact, and the failure mode if they disagree is invisible: the fleet gate
+  # reports "kit.ref: ABSENT" on a repository whose `bin/dev` reads `.env`, and
+  # reads it as a broken repository rather than as two kit files that stopped
+  # agreeing — which is what it is, and which only kit can fix.
+  #
+  # This is the same SHAPE as the `callable path` check further down, and it is
+  # here for the same reason: a documented string that stops being true while
+  # every behavioural check stays green. `tests/fetch_test.sh` proves `bin/dev`
+  # honours the pin; this proves `bin/dev` and the gate are talking about the same
+  # one, which no execution of either can show.
+  pin_contract_check() {
+    "$PY" - "$ROOT" <<'PY'
+import re
+import sys
+
+root = sys.argv[1]
+dev = open(f"{root}/templates/bin/dev.sh", encoding="utf-8").read()
+fleet = open(f"{root}/tests/fleet_check.py", encoding="utf-8").read()
+example = open(f"{root}/templates/compose/.env.example", encoding="utf-8").read()
+
+problems = []
+
+# 1. `bin/dev` must actually read a file for the pin, and it must be named the
+#    same way `fleet_check.py` names it.
+assigned = re.search(r'^REF_FILE="([^"]+)"', dev, re.M)
+if not assigned:
+    problems.append(
+        "bin/dev has no REF_FILE assignment, so there is no committed pin file and "
+        "the gate's 'kit.ref: ABSENT' finding would be about a file bin/dev never "
+        "reads"
+    )
+else:
+    ref_file = assigned.group(1)
+    if "kit.ref" not in fleet:
+        problems.append(
+            f"bin/dev reads the pin from {ref_file!r} and fleet_check.py does not "
+            f"mention it, so the fleet gate audits a file nothing reads"
+        )
+    if ref_file not in dev:
+        problems.append(f"REF_FILE is {ref_file!r} but bin/dev never opens it")
+
+# 2. `.env.example` must NOT carry the pin. This is the assertion with teeth: the
+#    file becomes `.env`, `.env` is git-ignored, and a pin there exists on one
+#    machine and on no CI runner. Shipping a `KIT_STACK_REF=` line in the template
+#    is how that state gets reintroduced - and it would look like the pin is
+#    configured, which is worse than its absence.
+for line in example.splitlines():
+    m = re.match(r"^([A-Z_][A-Z0-9_]*)=", line)
+    if m and m.group(1) == "KIT_STACK_REF":
+        problems.append(
+            ".env.example sets KIT_STACK_REF. `.env` is git-ignored, so a pin there "
+            "exists on one machine and on no CI runner; the pin is `kit.ref`, "
+            "committed. Remove the line."
+        )
+        break
+
+# 3. `.env.example` must still TELL a developer where the pin lives. Removing the
+#    line without documenting the alternative leaves the ref undiscoverable, and
+#    the first `bin/dev` on a fresh clone fails with a message about a file
+#    nothing mentions.
+if "kit.ref" not in example:
+    problems.append(
+        ".env.example never mentions kit.ref, so a developer whose `.env` has no "
+        "pin is never told which committed file is supposed to hold one"
+    )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check 'templates/bin/dev.sh + .env.example  (the pin is kit.ref, and the gate reads the same file)' \
+    pin_contract_check
   # ------------------------------------------------------------------ core
   # The fan-out standard: vendir templates, the shared Renovate policy, and the
   # two runnable pieces (the change classifier and the staleness reporter).
@@ -2593,6 +3103,71 @@ STUB
   }
   check 'core/vendir/ + core/renovate/  (structurally what Renovate and vendir need)' \
     core_fanout_check
+
+  # ------------------------------------------------------------------ fleet
+  # NO ADOPTER CARRIES A WORKAROUND FOR A FIXED CORE DEFECT.
+  #
+  # `core` shipped two checker defects that forced repositories which adopted
+  # `gate.yml` into local workarounds: D12 (`RUN_KEY` could not see a one-line
+  # `run:`, fixed in 63fd319) and D13 (proofs matched against bytes carrying
+  # ANSI colour, fixed in c63af27). Both are fixed. A workaround for a fixed
+  # defect is not neutral — it is a second, local, unpolicied copy of a
+  # decision that now lives in core, and it is the kind that rots. So a rule
+  # about it belongs here, in the thing that distributes the gate format, rather
+  # than in a report nobody re-reads.
+  #
+  # THE FLEET ROOT IS FOUND, NOT ASSUMED, and its absence is a reported SKIP
+  # rather than a pass — the same treatment the core-allowlist check above gets,
+  # for the same reason. A sweep that could not read a single declaration has
+  # not found the fleet.
+  #
+  # `$ROOT/..` is checked FIRST and it is where this repository's worktrees live
+  # during a packet, which is the whole point: the check has to see the state
+  # the fleet is in today, not the state on a CI runner that has no siblings.
+  # A CI runner legitimately reaches the SKIP, and the summary says so.
+  fleet_root() {
+    local cand
+    # `..` and `../cafaye`, and NOT `../..`. This was `../..` in the first
+    # version and it found a fleet: a leftover copy of a cafaye repository in a
+    # shared temp directory two levels up, whose branch still carried the D12
+    # workaround this check had just retired. The gate went red on a tree with
+    # nothing wrong with it, naming a file nobody had touched in weeks.
+    #
+    # A sweep that reaches further than it owns is worse than no sweep, so the
+    # search is exactly the two layouts this repository is actually cloned into:
+    # beside its siblings, or inside a directory of them.
+    for cand in "$ROOT/.." "$ROOT/../cafaye"; do
+      # At least one `gate.yml` under it, or it is not a fleet and pointing at
+      # it would report "no adopting repository found" — technically true and
+      # completely useless, which is why this tests for the file rather than the
+      # directory.
+      if [ -n "$(find "$cand" -maxdepth 2 -name gate.yml -not -path '*/.venv/*' 2>/dev/null | head -1)" ]; then
+        (cd "$cand" && pwd)
+        return 0
+      fi
+    done
+    return 1
+  }
+
+  gate_workaround_check() {
+    local root
+    root="$(fleet_root)" || {
+      echo "no fleet root: no directory beside this one holds a gate.yml."
+      echo "set KIT_FLEET=<path> to point at one."
+      return 1
+    }
+    KIT_FLEET="$root" "$PY" "$ROOT/tests/gate_declaration_check.py" "$root"
+  }
+  section 'static: no adopting repository carries a D12/D13 workaround'
+  if [ -n "${KIT_FLEET:-}" ]; then
+    check 'adopting repositories  (no workaround for a fixed core defect)' \
+      "$PY" "$ROOT/tests/gate_declaration_check.py" "$KIT_FLEET"
+  elif fleet_root >/dev/null 2>&1; then
+    check 'adopting repositories  (no workaround for a fixed core defect)' \
+      gate_workaround_check
+  else
+    report SKIP 'adopting repositories  (no fleet beside this one — set KIT_FLEET)'
+  fi
 
   # Dogfood lint/yamllint.yml on every YAML in the tree, not just the two
   # compose templates. kit ships the config and a repo that copies it lints its
@@ -2672,6 +3247,11 @@ STUB
   # The CI workflow gains a job; assert the job exists, is opt-in, and that the
   # default call still runs exactly the six original jobs. A kit change that
   # breaks every consumer's CI is a kit change that does not ship.
+  #
+  # The secrets and zizmor jobs are asserted separately, below, because they are
+  # the two jobs whose absence is silent in a way `option has no job` does not
+  # make silent: a repo without a secrets job has no secret scanning, and every
+  # other check in this file is still green.
   ci_check() {
     "$PY" - "$ROOT" "$CONFIG_ONLY" "$WORKFLOW" <<'PY'
 import re
@@ -3081,6 +3661,951 @@ PY
   check "$WORKFLOW  (required-tier is declared, demanded by every language job, and identical)" \
     tier_demand_check
 
+  # -------------------------------------------------------------------------
+  # LINT RUNS FROM KIT, NOT FROM A COPY. Three claims, and they decay separately.
+  # -------------------------------------------------------------------------
+  #
+  # `lint/` shipped 249 lines of golangci/rubocop/eslint/yamllint/hadolint
+  # configuration and NOT ONE service in the fleet had ever copied it. Adoption
+  # correlated inversely with how much a file did: the small self-contained
+  # artifacts are universal, the large behavioural ones are at zero.
+  #
+  # The reason is structural, and it is worth stating because it is what this
+  # check defends. `uses: cafaye/kit/...@master` is LIVE — change kit and every
+  # service gets it with no action. A copied config has NO propagation at all:
+  # it rots silently, and the file nobody chose still runs while the file nobody
+  # copies just decays. The measured numbers are in README.md; the mechanism
+  # that ends the rot is putting the config where the step already is.
+  #
+  # This check reads the reusable workflow and asserts the three things that
+  # make the lint step a GATE rather than a report. Each has a self_test
+  # breakage, because a check with no counterexample is a claim in a comment.
+  lint_wiring_check() {
+    "$PY" - "$ROOT" "$WORKFLOW" <<'PY'
+import os
+import re
+import sys
+
+import yaml
+
+root, workflow_path = sys.argv[1], sys.argv[2]
+with open(workflow_path, encoding="utf-8") as fh:
+    doc = yaml.safe_load(fh)
+jobs = doc.get("jobs") or {}
+source = open(workflow_path, encoding="utf-8").read()
+
+problems = []
+
+
+def strip_shell_comments(src):
+    """`run:` bodies, with shell comments removed. See the identical helper in
+    the tier_demand check, and the reason it exists there: a check satisfied by
+    the sentence explaining a flag is not a check.
+
+    YAML comments are a second, separate problem here, and they are removed
+    FIRST: this file's own prose names every one of these flags while explaining
+    why each is load-bearing, so a naive substring test over the raw source is
+    satisfied by the documentation of the very step it is meant to police.
+    """
+    without_yaml = "\n".join(
+        ln for ln in src.splitlines() if not ln.lstrip().startswith("#")
+    )
+    out = []
+    for line in without_yaml.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        quote, cut = None, None
+        for i, ch in enumerate(line):
+            if quote:
+                if ch == quote:
+                    quote = None
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+            elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+                cut = i
+                break
+        out.append(line if cut is None else line[:cut])
+    return "\n".join(out)
+
+
+def steps_of(lang):
+    return (jobs.get(lang) or {}).get("steps") or []
+
+
+def lint_step(lang):
+    """The step that runs the language's linter, or None.
+
+    Matched by NAME, not by scanning the job for a linter-shaped command: the
+    name is what a reviewer renames, and a check keyed on the thing being
+    checked cannot notice when the thing it names is gone.
+    """
+    for step in steps_of(lang):
+        if step.get("name") == "lint":
+            return step
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 1. EVERY LANGUAGE JOB THAT LINTS, LINTS WITH KIT'S CONFIG.
+# ---------------------------------------------------------------------------
+#
+# The three languages, and the flag each one needs, are all different. That is
+# not a preference — each was measured on a fixture containing a violation only
+# that linter would catch, and the results are in tests/lint_test.sh. The
+# invariant is the SHAPE, and the shape is the thing that decays:
+#
+#     golangci-lint  `--config=<path>`   GOLANGCI_LINT_CONFIG is NOT read by
+#                                        v2 (measured: silently ignored, the
+#                                        run proceeds on the 5-linter default
+#                                        set, exit 0 on a file kit rejects).
+#     rubocop        `--config=<path>`   measured: a 13-line method is green
+#                                        under kit (Max 15) and red on RuboCop's
+#                                        default (Max 10).
+#     eslint         `--config=<path>`   and the path must be INSIDE the repo,
+#                                        because node resolves the config's own
+#                                        imports upward from the config file.
+#
+# `--config` is the only spelling all three accept, so it is what is asserted.
+# A per-language exception would be a second thing to keep in step, and the
+# measurement says there is nothing to gain by it.
+NEEDS_KIT_CONFIG = {
+    "go": ("golangci", "golangci-lint"),
+    "ruby": ("rubocop",),
+    "node": ("eslint",),
+}
+
+for lang, linters in NEEDS_KIT_CONFIG.items():
+    step = lint_step(lang)
+    if step is None:
+        problems.append(
+            f"job {lang} has no step named `lint`, so nothing checks that it "
+            f"still lints with kit's config. A renamed step is a lint step that "
+            f"stopped being policed, and this check is the only thing that would "
+            f"notice"
+        )
+        continue
+
+    # The run body, for `run:` steps, and the `with:` block, for action steps.
+    # Both are read, because the two mechanisms are different: the go job uses
+    # the golangci-lint ACTION (so the flag lives in `with:`) while ruby and
+    # node use `run:`. A check that only read `run:` would pass on a go job
+    # whose action had lost its args, and that job is the one whose default set
+    # is a plausible-looking five linters.
+    haystack = strip_shell_comments(step.get("run") or "")
+    with_block = step.get("with") or {}
+    haystack += "\n" + "\n".join(
+        f"{k}: {v}" for k, v in (with_block.items() if isinstance(with_block, dict) else [])
+    )
+
+    if not any(tool in haystack for tool in linters):
+        problems.append(
+            f"job {lang}: its `lint` step names none of {linters}, so it is not "
+            f"the linter kit configures. Every check in this file can be green "
+            f"while the step that was supposed to run the linter runs something "
+            f"else"
+        )
+        continue
+
+    if "--config" not in haystack:
+        problems.append(
+            f"job {lang}: its `lint` step does not pass `--config`. Measured: "
+            f"with no config in the repository, each of these linters falls back "
+            f"to its own DEFAULT policy rather than failing — golangci-lint to "
+            f"five linters, rubocop to MethodLength 10, eslint to no rules — so "
+            f"the step still runs, still passes, and is now on a policy nobody "
+            f"chose. This is the exact failure the check exists to end"
+        )
+
+    # The config has to be KIT's, and the only way to say that without a second
+    # copy of the path to rot is to require the path to go through the
+    # environment variable that names the checked-out kit. A path into the
+    # service's own tree is a copy, and a copy is the mechanism this packet
+    # replaces: it has no propagation, so it rots in silence.
+    #
+    # The variable is the seam, not a convenience: the three jobs spell the
+    # path differently (one interpolates `${{ github.workspace }}` and the env
+    # var, two use a shell `$VAR`), and requiring the variable rather than a
+    # literal is what lets them differ without the check having to know how.
+    if "KIT_LINT_DIR" not in haystack or "/lint/" not in haystack:
+        problems.append(
+            f"job {lang}: its `lint` step does not read the config out of the "
+            f"checked-out kit (`$KIT_LINT_DIR/lint/…`). A path inside the "
+            f"service's own tree is a copy, and a copy is the mechanism this "
+            f"packet replaces: it has no propagation, so it rots silently"
+        )
+
+# ---------------------------------------------------------------------------
+# 1b. THE KIT CHECKOUT THAT MAKES `$KIT_LINT_DIR` NAME SOMETHING.
+# ---------------------------------------------------------------------------
+#
+# The claim above is that each lint step reads its config out of a checked-out
+# kit. A step that references the variable perfectly well still reads nothing if
+# the checkout that fills it was deleted — and that is a one-line deletion in a
+# job with eight steps, it leaves the YAML valid, and every other check in this
+# file stays green. The lint step would then be a bare `eslint` with no config,
+# which is precisely the default-policy failure the check above is about.
+#
+# Asserted on the PARSED step rather than by grepping, so a `uses:` inside a
+# comment (this file has several, explaining exactly this mechanism) cannot
+# satisfy it. And `ref` is required to be the INPUT rather than a literal: a
+# checkout pinned to `master` in three places is three places to update, and a
+# ref that is not the input is a ref that disagrees with the caller's own pin
+# without anyone noticing.
+for lang in sorted(NEEDS_KIT_CONFIG):
+    steps = steps_of(lang)
+    kit_steps = [
+        s
+        for s in steps
+        if isinstance(s, dict)
+        and str(s.get("uses", "")).startswith("actions/checkout")
+        and (s.get("with") or {}).get("repository") == "cafaye/kit"
+    ]
+    if not kit_steps:
+        problems.append(
+            f"job {lang}: no step checks out cafaye/kit, so the path its `lint` "
+            f"step reads its config from does not exist. The lint step still runs, "
+            f"still passes, and is now on the linter's defaults — the exact "
+            f"failure this check exists to catch, reached by deleting one step"
+        )
+        continue
+    for step in kit_steps:
+        with_block = step.get("with") or {}
+        ref = str(with_block.get("ref", ""))
+        if "inputs.kit-lint-ref" not in ref:
+            problems.append(
+                f"job {lang}: its kit checkout pins `ref: {ref or '(none)'}`, not "
+                f"`inputs.kit-lint-ref`. A ref hardcoded here is a fourth place a "
+                f"pin lives, and it is the one place the caller cannot see"
+            )
+        # `persist-credentials: false` — the checkout leaves kit's token in a git
+        # config inside the tree the service's own later steps run in. Cheap to
+        # require and the cost of forgetting it is a credential outliving the
+        # step that fetched it.
+        if with_block.get("persist-credentials") is not False:
+            problems.append(
+                f"job {lang}: its kit checkout does not set `persist-credentials: "
+                f"false`, so kit's token is left in a git config inside the tree "
+                f"the service's later steps run in"
+            )
+
+# ---------------------------------------------------------------------------
+# 2. THE LINT STEPS ARE GATES, NOT REPORTS.
+# ---------------------------------------------------------------------------
+#
+# `continue-on-error: true` on a lint step is the single most likely way for
+# this whole packet to become decoration, and it is invisible: the step runs,
+# prints its findings, and the job is green. A linter that only warns is a
+# report. So the assertion is on the PARSED step, and it is a separate claim
+# from the one above — a step can pass kit's config perfectly and still be
+# advisory.
+#
+# `|| true` and `| head` in a run body are the same defect wearing shell
+# clothes, and both are caught by looking at the command rather than the
+# setting, because `set -euo pipefail` is already in force and a pipeline's
+# status is what decides.
+for lang in sorted(NEEDS_KIT_CONFIG):
+    step = lint_step(lang)
+    if not isinstance(step, dict):
+        continue
+    if step.get("continue-on-error") is True:
+        problems.append(
+            f"job {lang}: its `lint` step is `continue-on-error: true`. The step "
+            f"still runs and still prints its findings, and the job is green — a "
+            f"linter that only warns is a report. This is the breakage that "
+            f"matters most, which is why it is asserted on the parsed step rather "
+            f"than left to a reviewer"
+        )
+    body = strip_shell_comments(step.get("run") or "")
+    if re.search(r"\|\|\s*true\b", body):
+        problems.append(
+            f"job {lang}: its `lint` run body swallows the linter's exit status "
+            f"with `|| true`, which is continue-on-error in shell and reads as a "
+            f"deliberate choice to nobody"
+        )
+
+# ---------------------------------------------------------------------------
+# 3. KIT'S CONFIGS ARE STILL WHAT THEY WERE.
+# ---------------------------------------------------------------------------
+#
+# The workflow can point `--config` at `.kit/lint/golangci.yml` on every run and
+# the file can still have been emptied of every linter it enabled. Nothing
+# above notices: the step runs, the config parses, and the job is green on a
+# policy that is now five defaults. So the strictness decisions are asserted
+# ON THE FILES, by value.
+#
+# Read as YAML rather than grepped, so a linter name in a comment cannot satisfy
+# the check — the same rule AGENTS.md states for every other check here.
+REQUIRED_LINTERS = {
+    "golangci.yml": [
+        "bodyclose", "copyloopvar", "errorlint", "exhaustive",
+        "misspell", "noctx", "revive", "unconvert", "wastedassign",
+    ],
+}
+for filename, wanted in REQUIRED_LINTERS.items():
+    path = f"{root}/lint/{filename}"
+    if not os.path.isfile(path):
+        problems.append(f"lint/{filename} is missing")
+        continue
+    with open(path, encoding="utf-8") as fh:
+        cfg = yaml.safe_load(fh) or {}
+    enabled = ((cfg.get("linters") or {}).get("enable")) or []
+    missing = [name for name in wanted if name not in enabled]
+    if missing:
+        problems.append(
+            f"lint/{filename} no longer enables {missing}. The workflow points "
+            f"`--config` at this file on every run, so an emptied config is not a "
+            f"failed check — it is a green build on a policy nobody chose. The "
+            f"list is asserted BY VALUE because this is the file whose weakening "
+            f"is invisible from every other angle"
+        )
+
+# `formatters` is a separate key from `linters` in golangci-lint v2, and a
+# config that kept its linters and lost its formatters still parses. gofmt and
+# goimports are the formatting half of the Go strictness story and they live
+# there.
+with open(f"{root}/lint/golangci.yml", encoding="utf-8") as fh:
+    gcl = yaml.safe_load(fh) or {}
+formatters = ((gcl.get("formatters") or {}).get("enable")) or []
+for name in ("gofmt", "goimports"):
+    if name not in formatters:
+        problems.append(
+            f"lint/golangci.yml no longer enables the `{name}` formatter. "
+            f"`formatters` is a different key from `linters` in golangci-lint v2, "
+            f"so this one is lost without touching the linter list at all"
+        )
+
+if problems:
+    sys.exit("; ".join(problems))
+print(
+    "3 lint jobs pass --config at a checked-out kit; none is advisory; "
+    "the linter list is intact"
+)
+PY
+  }
+  section 'static: lint runs from kit, not from a copy'
+  check 'lint/ + the workflow  (every lint step is a gate on kit config)' \
+    lint_wiring_check
+
+  # -------------------------------------------------------------------------
+  # THE SEAM IS NARROW, AND "NARROW" IS A LIST SOMEONE CAN SHORTEN.
+  # -------------------------------------------------------------------------
+  #
+  # `lint-args` is the deviation seam, and the workflow says in three places
+  # what it may not be used for. A promise in a comment is not a control, and the
+  # first version of this file PROMISED a control that did not exist: the
+  # input's own comment said `lint_wiring_check` "fails on exactly that string",
+  # and `lint_wiring_check` had no such assertion anywhere in it.
+  #
+  # The reason is structural and it is worth stating, because it decides where
+  # the control lives: **`lint-args` is the CALLER's value.** kit's gate can see
+  # that the input exists, that it is a string, and that it defaults to empty. It
+  # cannot see what a service put in it, because kit has never got it. So the
+  # rule that makes the seam narrow has to run in the service — the
+  # `lint-args guard` step, which every lint job has.
+  #
+  # Which leaves exactly the failure this check exists for: three hand-maintained
+  # copies of a policy block, in a repository whose own rule is that duplicated
+  # policy blocks are only safe while something reads them. This asserts all
+  # three: that the guard is in each lint job, that the three bodies are
+  # byte-identical, that the guard runs BEFORE the linter (a guard after it is
+  # decoration — the lint has already had its chance), that the linter actually
+  # receives the variable (a guard over a value nothing passes on is a guard over
+  # nothing), and that the forbidden token list is the one written here.
+  #
+  # The last of those is the one that matters most. Without it, deleting
+  # `--no-config` from the guard's `case` list is a one-token edit that widens
+  # the seam for every service in the fleet and leaves the workflow looking
+  # exactly as it did before.
+  lint_args_seam_check() {
+    "$PY" - "$ROOT" "$WORKFLOW" <<'PY2'
+import re
+import sys
+
+import yaml
+
+root, workflow_path = sys.argv[1], sys.argv[2]
+with open(workflow_path, encoding="utf-8") as fh:
+    doc = yaml.safe_load(fh)
+source = open(workflow_path, encoding="utf-8").read()
+triggers = doc.get("on") or doc.get(True) or {}
+call = (triggers.get("workflow_call") or {}).get("inputs") or {}
+jobs = doc.get("jobs") or {}
+
+LINT_JOBS = ("go", "ruby", "node")
+
+# The forbidden tokens, held HERE as well as in the workflow. Every one was read
+# out of the linter's own `--help` on the version kit pins, not remembered:
+#
+#   which config is read   golangci-lint `--no-config`; eslint
+#                         `--no-config-lookup`; rubocop `--force-default-config`;
+#                         all three spell "use this config" differently
+#   what is linted         golangci-lint `--new*` — a diff, not the tree
+#   whether it fails       golangci-lint `--issues-exit-code` (`=0` cannot fail);
+#                         rubocop `--fail-level`; eslint `--quiet` (errors only,
+#                         which is looser, not stricter) and
+#                         `--no-error-on-unmatched-pattern`
+#   and two that WRITE A FILE, which is this packet's own reason to refuse them:
+#                         rubocop `--auto-gen-config`, `--regenerate-todo`
+FORBIDDEN = (
+    "--config",
+    "-c",
+    "--no-config",
+    "--no-config-lookup",
+    "--force-default-config",
+    "--issues-exit-code",
+    "--fail-level",
+    "--quiet",
+    "--no-error-on-unmatched-pattern",
+    "--auto-gen-config",
+    "--regenerate-todo",
+    "--new",
+    "--new-from-rev",
+    "--new-from-patch",
+    "--new-from-merge-base",
+)
+
+problems = []
+
+# ---------------------------------------------------------------- the input
+seam = call.get("lint-args")
+if not isinstance(seam, dict):
+    problems.append(
+        "no `lint-args` workflow_call input, so a service that needs a stricter "
+        "linter has no seam and will fork the workflow instead. Callers override, "
+        "they never fork"
+    )
+else:
+    if str(seam.get("type")) != "string":
+        problems.append(
+            "`lint-args` must be type: string — a list would be split by the "
+            "guard's own word-splitting rules and could smuggle a token past it"
+        )
+    if str(seam.get("default", "x")) != "":
+        problems.append(
+            f"`lint-args` defaults to {seam.get('default')!r}; it must default to "
+            f"the empty string, or every service adopts one team's deviation"
+        )
+    if "guard" not in (seam.get("description") or ""):
+        problems.append(
+            "the `lint-args` description does not point at the `lint-args guard` "
+            "step. The first version of this description promised an enforcement "
+            "in tests/validate.sh that did not exist, and a reader who believed it "
+            "would not go looking for the real one"
+        )
+
+# ------------------------------------------------------- the guard, per job
+bodies = {}
+for lang in LINT_JOBS:
+    steps = (jobs.get(lang) or {}).get("steps") or []
+    names = [s.get("name") for s in steps if isinstance(s, dict)]
+    if "lint-args guard" not in names:
+        problems.append(
+            f"job {lang} has no `lint-args guard` step. The seam's limits are then "
+            f"enforced nowhere: kit's gate cannot see the value (it is the "
+            f"caller's), so a `--no-config` in a caller would restore the "
+            f"linter's defaults and turn kit's policy into five of them"
+        )
+        continue
+    gi = names.index("lint-args guard")
+    li = names.index("lint") if "lint" in names else None
+    if li is not None and gi > li:
+        problems.append(
+            f"job {lang}: the `lint-args guard` runs AFTER the `lint` step, so the "
+            f"linter has already had its argument list and the guard is decoration"
+        )
+    body = next(s for s in steps if s.get("name") == "lint-args guard").get("run") or ""
+    bodies[lang] = body
+
+    # The tokens, read out of the GUARD'S OWN `case` list rather than the whole
+    # body: the guard's comment block names every forbidden flag while explaining
+    # why each is refused, so counting tokens in the body would be satisfied by
+    # the documentation of the very list it is meant to police.
+    m = re.search(r'case\s+"\$name"\s+in(.*?)\besac\b', body, re.S)
+    if not m:
+        problems.append(
+            f"job {lang}: its `lint-args guard` has no `case \"$name\" in ... esac` "
+            f"list, so it refuses nothing"
+        )
+    else:
+        listed = set(re.findall(r"--?[A-Za-z][A-Za-z0-9-]*", m.group(1)))
+        missing = [t for t in FORBIDDEN if t not in listed]
+        if missing:
+            problems.append(
+                f"job {lang}: the `lint-args guard` no longer refuses {missing}. The "
+                f"seam is documented as narrow and this is the list that makes it so; "
+                f"dropping a token widens the input for every service in the fleet and "
+                f"leaves the workflow looking exactly as it did before"
+            )
+
+    # And the guard has to be reading the variable the linter is given.
+    if "KIT_LINT_ARGS" not in body:
+        problems.append(
+            f"job {lang}: its `lint-args guard` does not read KIT_LINT_ARGS, so it "
+            f"guards a variable it was not given"
+        )
+    lint = next((s for s in steps if s.get("name") == "lint"), None)
+    if isinstance(lint, dict):
+        hay = (lint.get("run") or "") + "\n" + "\n".join(
+            f"{k}: {v}" for k, v in (lint.get("with") or {}).items()
+        )
+        if "KIT_LINT_ARGS" not in hay:
+            problems.append(
+                f"job {lang}: its `lint` step does not receive KIT_LINT_ARGS, so the "
+                f"seam is guarded and then discarded — a repo may set a stricter "
+                f"flag, be told it is not allowed to set it, and still get no effect"
+            )
+
+if len(set(bodies.values())) > 1 and len(bodies) == len(LINT_JOBS):
+    problems.append(
+        "the `lint-args guard` steps are not identical across the lint jobs. They "
+        "are duplicated because GitHub reusable workflows cannot share a step, and "
+        "three copies of a policy block that disagree is the drift this repository "
+        "exists to prevent"
+    )
+
+if problems:
+    sys.exit("; ".join(problems))
+print(
+    f"the seam is a string input defaulting to empty, guarded by an identical "
+    f"pre-lint step in all {len(LINT_JOBS)} lint jobs, refusing {len(FORBIDDEN)} "
+    f"flags; and the linter receives it"
+)
+PY2
+  }
+  check 'the seam  (narrow, guarded before the linter, and wired to it)' \
+    lint_args_seam_check
+
+  # -------------------------------------------------------------------------
+  # THE DRIFT CHECK. A service that carries a lint config INCONSISTENT with
+  # kit's is the failure this packet exists to end, and it is invisible from
+  # both sides: kit cannot see the service's tree, and the service's CI goes
+  # green the whole time.
+  #
+  # WHY IT IS NOT "THE FILE MUST NOT EXIST". That version is easier to write and
+  # it is wrong in a way that costs more than the drift it prevents. A service
+  # whose `.golangci.yml` is byte-identical to kit's has not drifted; it has
+  # arrived at the same policy by another route, and failing it teaches the
+  # lesson that kit's config is a thing you get shouted at for having. The
+  # check a moment later asserts exactly this, as breakage 27b's GREEN control.
+  #
+  # So this READS BOTH FILES and reports THE DIFFERENCE, linter by linter. A
+  # reader of the failure message learns which linters the service turned off
+  # and which it added, which is the only information anyone can act on. A check
+  # that only said "unexpected file" would send someone to `diff` by hand.
+  #
+  # SCOPE, and it is a real limitation rather than a convenient one: this reads
+  # the kit working tree plus whatever service checkouts are present beside it
+  # (`../<repo>`), which is how every other fleet-shaped check in this file
+  # works — `core_repo()` above is the same shape. With no sibling checkout the
+  # check SKIPS loudly and says which environment variable points at one. It is
+  # never silently green, because a drift check that could not have run and
+  # reported nothing is the same class of defect as a lint step that cannot fail.
+  # The fleet directories, one per line, that CALL the reusable workflow. A
+  # service repo is one that calls it: a repository that does not is not
+  # governed by kit's policy, and reporting drift in it would be noise that
+  # trains people to ignore this check.
+  #
+  # Resolved in the same way as `core_repo()` above, and for the same reason: a
+  # sibling checkout, or a loud skip. Never a silent pass.
+  fleet_repos() {
+    local base cand
+    for base in "$ROOT/.." "$ROOT/../.." "$ROOT/../../cafaye"; do
+      [ -d "$base" ] || continue
+      for cand in "$base"/*; do
+        [ -d "$cand/.github/workflows" ] || continue
+        if grep -ql 'uses: cafaye/kit/.github/workflows/ci.reusable.yml' \
+          "$cand"/.github/workflows/*.yml 2>/dev/null; then
+          printf '%s\n' "$cand"
+        fi
+      done
+      return 0
+    done
+    return 1
+  }
+
+  # The comparison itself, in Python, because comparing two YAML documents is
+  # not a thing shell does, and approximating it with grep is how a check ends
+  # up comparing the wrong lines.
+  lint_drift_check() {
+    local fleet
+    fleet="$(fleet_repos)"
+    if [ -z "$fleet" ]; then
+      # A SKIP and not a failure, and not a pass. The same call `core_check`
+      # above makes when core is absent, and for the same reason: a
+      # throwaway copy of kit — which is what `self_test.sh` runs the gate
+      # against, twenty-odd times — has no fleet beside it, and a check that
+      # cannot have run and reported nothing must not be indistinguishable from
+      # a check that passed.
+      return 2
+    fi
+    "$PY" - "$ROOT" $fleet "$ROOT/lint/drift-allowlist" <<'PY'
+import datetime
+import os
+import re
+import sys
+
+import yaml
+
+kit_root = sys.argv[1]
+allowlist_path = sys.argv[-1]
+fleet_roots = sorted({os.path.realpath(p) for p in sys.argv[2:-1]})
+
+
+def is_worktree(path):
+    """True when `path` is a git WORKTREE rather than its own repository.
+
+    Same rule and the same reasoning as `tests/staleness.py`: a worktree's
+    `.git` is a file, it shares the parent repository's history, and counting it
+    separately reports one repository's config twice. Here the cost is a
+    duplicated allowlist entry and a finding that looks like two, which is
+    exactly the sort of thing a reader learns to discount.
+    """
+    marker = os.path.join(path, ".git")
+    if not os.path.isfile(marker):
+        return False
+    try:
+        with open(marker, encoding="utf-8") as fh:
+            return fh.read(6).strip() == "gitdir"
+    except OSError:
+        return False
+
+
+# The service-side filenames this check READS. Two facts measured on
+# golangci-lint v2.6.2, and the first one corrected a claim this file made
+# before it was run:
+#
+#   1. DISCOVERY IS THE FALLBACK, NOT THE OVERRIDE. `golangci-lint run -v`
+#      prints `[config_reader] Used config file <path>`, and it is decisive: with
+#      `--config=<kit>` it names kit's file and nothing else, and without the
+#      flag it names the repo-root one. A repo-root `.golangci.yml` that
+#      disables `misspell` is INERT under `--config` — the misspelling is still
+#      reported. This file previously claimed the opposite, that discovery
+#      "beats every flag", and that claim was the whole justification for
+#      reporting drift. It was wrong.
+#   2. So a stale copy does NOT hijack kit's CI. What it does is split the
+#      policy: every OTHER golangci-lint invocation in that repository — a
+#      developer's `golangci-lint run`, an editor integration, a `make lint`, a
+#      pre-commit hook — reads the local file, while kit's CI reads kit's. Two
+#      policies in one repository, one of them enforced nowhere it is written
+#      down. And the copy becomes live again the moment the `--config` flag goes
+#      missing, which is breakage 29, and silently, because a copy is always
+#      weaker than the thing it was copied from.
+#
+# The check is therefore not "the file hijacks the build". It is "the file and
+# kit disagree, and only one of the two is what CI runs" — which is a real
+# finding, and an honest one.
+#
+# `eslint.config.mjs` is deliberately NOT here, and now for a measured reason
+# rather than a rhetorical one: ESLint's `--config` also wins outright, and a
+# service's own `eslint.config.mjs` is only read by something that points at it.
+# The two linters behave the same way, so the difference between listing it and
+# not listing it is intent, not mechanics: a repo's own ESLint config is a
+# legitimate thing to own, and this check is about copies of KIT's policy.
+SERVICE_CONFIGS = (".golangci.yml", ".golangci.yaml")
+
+
+def policy_of(doc):
+    """The comparable part of a golangci config: what it turns on and off.
+
+    Three keys, and the omissions are as deliberate as the inclusions.
+    Settings, exclusions and paths are NOT compared: a service excluding one
+    generated file is a narrow, legitimate, reviewable decision, and comparing
+    it would make this check fire on the one deviation the seam explicitly
+    permits. What is compared is the linter SET, because turning a linter off
+    wholesale is the drift, and it is the drift nobody can see from either side.
+    """
+    linters = (doc or {}).get("linters") or {}
+    return {
+        "enable": frozenset(linters.get("enable") or []),
+        "disable": frozenset(linters.get("disable") or []),
+        "formatters": frozenset(((doc or {}).get("formatters") or {}).get("enable") or []),
+    }
+
+
+def load(path):
+    with open(path, encoding="utf-8") as fh:
+        return yaml.safe_load(fh)
+
+
+kit_policy_path = f"{kit_root}/lint/golangci.yml"
+if not os.path.isfile(kit_policy_path):
+    sys.exit("lint/golangci.yml is missing, so there is no policy to compare against")
+kit_policy = policy_of(load(kit_policy_path))
+
+# --------------------------------------------------------------------------
+# the allowlist
+# --------------------------------------------------------------------------
+#
+# Two services in the fleet carry a `.golangci.yml` today, and this packet
+# cannot fix them — kit does not touch other repositories, and the fix for
+# each is a decision its own team makes. So the drift is REAL and RECORDED, with
+# an owner and an expiry, rather than being reported as a green pass or as a
+# permanently red gate.
+#
+# This is the same shape as `templates/tier/skip-allowlist` and for the same
+# reason. An allowlist nobody can expire is a comment; an allowlist that is only
+# ever added to is a ratchet pointing the wrong way. So:
+#
+#   1. every entry needs a reason, an owner, and both dates;
+#   2. an EXPIRED entry is a FAILURE on the day it expires;
+#   3. a duplicate (repo, path, key) is a FAILURE — one of the two is dead;
+#   4. AN ENTRY THAT NO LONGER DESCRIBES A REAL DIFFERENCE IS A FAILURE.
+#
+# Rule 4 is the one that earns the other three. Modelled on ESLint's
+# `reportUnusedDisableDirectives`, which reports a disable comment that no
+# longer suppresses anything: without it, a fixed repository stays listed, the
+# listing stops being read, and within two quarters the file contains every
+# repository in the fleet. The entry is how you find out first.
+LINE = re.compile(
+    r"^diverged\s+(?P<repo>\S+)\s+(?P<path>\S+)\s+(?P<key>\S+)"
+    r"(?P<fields>(?:\s+[a-z]+=(?:\"[^\"]*\"|\S+))*)\s*$"
+)
+FIELD = re.compile(r'([a-z]+)=("[^"]*"|\S+)')
+WHY = {
+    "reason": 'without one, "we will get to it" is the reason for everything',
+    "owner": "drift nobody owns is drift nobody will ever fix",
+    "since": "the ratchet needs the date the decision was taken",
+    "until": "an entry that cannot expire has stopped being a decision",
+}
+KEYS = ("enable", "disable", "formatters")
+
+allowed = {}
+today = datetime.date.today()
+if not os.path.isfile(allowlist_path):
+    sys.exit(
+        f"{allowlist_path} is missing. A drift check with nowhere to record a "
+        f"known divergence is a check that either reports the fleet as broken or "
+        f"has been taught to report nothing"
+    )
+
+for lineno, raw in enumerate(open(allowlist_path, encoding="utf-8").read().splitlines(), 1):
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    m = LINE.match(line)
+    if not m:
+        sys.exit(
+            f"lint/drift-allowlist:{lineno}: malformed entry. Expected "
+            f"'diverged <repo> <path> <enable|disable|formatters> "
+            f"reason=\"...\" owner=... since=YYYY-MM-DD until=YYYY-MM-DD' on ONE line"
+        )
+    fields = {k: v.strip('"') for k, v in FIELD.findall(m.group("fields"))}
+    for field in ("reason", "owner", "since", "until"):
+        if not fields.get(field):
+            sys.exit(f"lint/drift-allowlist:{lineno}: entry names no {field} — {WHY[field]}")
+    if m.group("key") not in KEYS:
+        sys.exit(
+            f"lint/drift-allowlist:{lineno}: key {m.group('key')!r} is not one of "
+            f"{list(KEYS)}. A key the comparison does not read is an entry that "
+            f"silently matches nothing"
+        )
+    for field in ("since", "until"):
+        try:
+            datetime.date.fromisoformat(fields[field])
+        except ValueError:
+            sys.exit(f"lint/drift-allowlist:{lineno}: {field}={fields[field]!r} is not an ISO date")
+    if datetime.date.fromisoformat(fields["until"]) < today:
+        sys.exit(
+            f"lint/drift-allowlist:{lineno}: EXPIRED on {fields['until']} (today is "
+            f"{today.isoformat()}). Delete the entry, or move the date and write a new "
+            f"reason — a date that rolls forward by itself is not a ratchet"
+        )
+    key = (m.group("repo"), m.group("path"), m.group("key"))
+    if key in allowed:
+        sys.exit(
+            f"lint/drift-allowlist:{lineno}: {key} is already listed on line "
+            f"{allowed[key]}. Two lines for one divergence means one of them is no "
+            f"longer being read"
+        )
+    allowed[key] = lineno
+
+# --------------------------------------------------------------------------
+# the comparison
+# --------------------------------------------------------------------------
+problems = []
+seen_repos = set()
+found = set()
+compared = 0
+
+for root in fleet_roots:
+    if is_worktree(root):
+        continue  # one repository, one entry — see the docstring
+    name = os.path.basename(root)
+    seen_repos.add(name)
+    for service_name in SERVICE_CONFIGS:
+        path = os.path.join(root, service_name)
+        if not os.path.isfile(path):
+            continue
+        compared += 1
+        try:
+            got = policy_of(load(path))
+        except Exception as exc:
+            problems.append(
+                f"{name}/{service_name} does not parse as YAML ({exc}), so nobody can "
+                f"say what policy it applies. An unreadable copy is the worst case of "
+                f"the thing this check is for: a service linted by a config nobody "
+                f"can read, in a build that stays green"
+            )
+            continue
+        for key in KEYS:
+            if kit_policy[key] == got[key]:
+                continue
+            found.add((name, service_name, key))
+            if (name, service_name, key) in allowed:
+                continue
+            missing = sorted(kit_policy[key] - got[key])
+            extra = sorted(got_policy for got_policy in (got[key] - kit_policy[key]))
+            what = []
+            if missing:
+                what.append(f"no longer enables {missing}")
+            if extra:
+                what.append(f"enables {extra}, which kit does not")
+            problems.append(
+                f"{name}/{service_name}: {key} INCONSISTENT with lint/golangci.yml — "
+                f"{'; '.join(what)}. Measured on golangci-lint v2.6.2: `--config` "
+                f"WINS, so this file is inert for kit's CI, and that is the reason "
+                f"this is a finding rather than a non-event. Two policies now govern "
+                f"one repository — kit's, which CI runs, and this one, which every "
+                f"other invocation reads (a developer's `golangci-lint run`, an "
+                f"editor, a `make lint`). And the split is silent in the direction "
+                f"that matters: the moment the workflow's `--config` is dropped, "
+                f"this weaker file governs the build and nothing says so. Either "
+                f"delete it and let kit's policy be the only one, or make the "
+                f"deviation deliberate and visible in the workflow's `lint-args` "
+                f"seam. To record a difference you cannot delete yet, add an entry "
+                f"to lint/drift-allowlist with a reason, an owner and an expiry"
+            )
+
+# "The fleet is not here" is checked BEFORE the unused-entry rule, and the order
+# is load-bearing. Both rules read the same missing information: with no sibling
+# checkouts there is no comparison, so every entry trivially describes no
+# difference. Reporting all of them as unused in that case is a false alarm that
+# says "delete these" about debt nobody has discharged, and it fires in exactly
+# the place it is most damaging — `tests/self_test.sh` runs the gate against a
+# throwaway copy of kit, which has no fleet beside it, so the control would be
+# red on a correct tree.
+#
+# The rule can only be evaluated when there was a fleet to evaluate it against.
+if not seen_repos:
+    sys.exit(
+        "no cafaye service checkout was found beside this one, so the drift check "
+        "had nothing to compare. A drift check that could not have run and reported "
+        "nothing is a check that will not be missed when it matters"
+    )
+
+# Rule 4. An entry that no longer describes a real difference is dead weight,
+# and dead weight in an allowlist is how an allowlist becomes a list of
+# everything.
+#
+# RULE 4 IS SCOPED TO THE REPOSITORIES THIS RUN ACTUALLY LOOKED AT, and that
+# scoping is the whole correctness of the rule rather than a softening of it.
+# "This entry no longer describes a difference" is a claim about a file, and the
+# only way to make it is to have read that file. A repository that is not in the
+# fleet beside this checkout has NOT been read, so nothing is known about it, and
+# reporting its entry as unused is a check inventing a finding out of its own
+# ignorance.
+#
+# It is not a theoretical concern. It fired the moment this file was finished:
+# `tests/self_test.sh` runs this gate against a throwaway COPY of kit, and a
+# copy's fleet is itself rather than the cafaye directory, so every entry in the
+# allowlist named a repository that was not present — and the gate went red on a
+# perfectly correct tree, telling the reader to delete debt that had not been
+# discharged. A rule that cries wolf in its own test suite is a rule people
+# learn to bypass with `--no-`, which is the failure this packet exists to end.
+#
+# The consequence is stated rather than hidden: a repository DELETED from the
+# fleet leaves an entry nothing can flag. That is a real limit and it is paid
+# for deliberately, because the alternative is a gate that is red whenever kit is
+# checked out on its own — which is every fresh clone and every CI runner. What
+# covers the deleted case is `tests/staleness.py`, which reports a repository
+# that calls kit and is not resolvable; this file covers the case where the
+# repository is HERE and no longer differs, and the two are not the same
+# question.
+# Whether this run can speak about a repository it did not see, and the answer
+# is not the same in the two situations kit runs in.
+#
+#   - A REAL checkout: the scan found the fleet, so a repository in the
+#     allowlist that the scan did NOT find is a repository that has been deleted,
+#     renamed, or renamed away. That is a finding, and it is the case rule 4
+#     exists for: the entry is dead weight and nobody will notice without it.
+#   - A COPY of kit, which is what `tests/self_test.sh` runs the gate against
+#     twenty-odd times: the only "fleet" beside it is itself, because a copy has
+#     no cafaye directory next to it. Nothing can be said about `identity` there,
+#     and reporting its entry as dead would be the check inventing a finding out
+#     of its own ignorance — red on a perfectly correct tree, telling the reader
+#     to delete debt that has not been discharged. It fired the moment this file
+#     was finished, on the gate's own test suite.
+#
+# So the two are told apart by asking whether the scan found anything other than
+# this checkout, which is a fact about the run rather than a flag someone can set
+# to make the check quiet.
+only_me = seen_repos <= {os.path.basename(os.path.realpath(kit_root))}
+unverified = 0
+for repo, path_name, key in sorted(set(allowed) - found):
+    if repo not in seen_repos and only_me:
+        # Counted and printed, never failed on. Silence would be the other
+        # mistake: a reader cannot tell "checked and clean" from "never looked".
+        unverified += 1
+        continue
+    if repo not in seen_repos:
+        problems.append(
+            f"lint/drift-allowlist:{allowed[(repo, path_name, key)]}: the entry "
+            f"names {repo}/{path_name} ({key}), and this run found no such "
+            f"repository in the fleet beside this checkout. Either that repository "
+            f"has been deleted or renamed — in which case the entry is dead weight "
+            f"and the file is one step from being a list of every repository the "
+            f"fleet has ever had — or the entry is a typo. Neither is a state you "
+            f"can leave it in"
+        )
+        continue
+    problems.append(
+        f"lint/drift-allowlist:{allowed[(repo, path_name, key)]}: the entry for "
+        f"{repo}/{path_name} ({key}) no longer describes a difference — the "
+        f"repository is here and no longer diverges, so either it adopted kit's "
+        f"policy or the file is wrong. Delete the entry, or this file becomes a "
+        f"list of every repository the fleet has ever had"
+    )
+
+if problems:
+    sys.exit("; ".join(problems))
+
+print(
+    f"{len(seen_repos)} service repo(s) compared against kit's golangci policy; "
+    f"{compared} carried their own config; {len(allowed)} divergence(s) recorded in "
+    f"lint/drift-allowlist, none expired, none unused"
+    + (
+        f"; {unverified} entr(y/ies) named a repository that is not in this "
+        f"checkout's fleet, so this run could not look and did NOT count them as "
+        f"clean (this is a copy of kit with no fleet beside it, not the fleet)"
+        if unverified
+        else ""
+    )
+)
+PY
+  }
+  # `check` cannot express "skip", so the exits are handled here: 2 is this
+  # check's own "there was nothing to compare" and reports a SKIP, which the
+  # summary counts. Anything else is a real finding.
+  #
+  # The output is printed on the passing path rather than swallowed, for the same
+  # reason `core_check`'s is: the count of repositories compared is what makes
+  # "it passed" mean something, and a green line that could equally have come
+  # from a check that examined nothing is the failure this whole file is about.
+  if _drift_out="$(lint_drift_check 2>&1)"; then
+    report PASS 'lint drift  (a service config is compared to kit, not merely forbidden)'
+    [ -n "$_drift_out" ] && printf '%s\n' "$_drift_out" | sed 's/^/       /'
+  else
+    case "$?" in
+      2) report SKIP 'lint drift  (no cafaye service checkout found beside this one)' ;;
+      *)
+        report FAIL 'lint drift  (a service config is compared to kit, not merely forbidden)'
+        printf '%s\n' "$_drift_out" | sed 's/^/       /'
+        ;;
+    esac
+  fi
+
   # (3) The skip allowlist and its four hygiene rules. This is the load-bearing
   #     check of the packet, and rule 4 is the sharpest property in the repo:
   #     AN ENTRY THAT MATCHES NOTHING IS A FAILURE.
@@ -3256,6 +4781,397 @@ PY
   check 'templates/tier/skip-allowlist  (reason, owner, since, until; unused entries fail)' \
     skip_allowlist_check
 
+  # (3b) The PARITY allowlist, and the artefact table it is checked against.
+  #
+  #     Same four hygiene rules as the tier skip allowlist above, in the same
+  #     words, because kit does not have two dialects of "record why". What is
+  #     NEW here is the other direction, and it is the one that matters most:
+  #
+  #     AN UNPINNED DIVERGENCE OR ABSENCE IS A FAILURE.
+  #
+  #     The tier allowlist does not need that rule because its entries name
+  #     tests that are either present or absent for reasons the file's own
+  #     comments explain. This one names copies in repositories kit cannot see
+  #     at gate time, so the file is a RECORD OF THE FLEET, and a record that
+  #     silently omits a cell is worse than no record: it reads as "handled".
+  #
+  #     Which is why the count is printed on PASS, in the sentence a green run
+  #     shows, and why the header says the number is a measurement and not a
+  #     ledger to shrink. Deleting an entry to make the count go down is a
+  #     failure of its own, and the reporter catches it against the fleet.
+  #
+  #     The two checks the gate can run WITHOUT the fleet are the ones it runs:
+  #     an entry that names an `artefact-id` kit does not ship, and an entry
+  #     whose verb is not a verb the reporter can report. The rest — an unpinned
+  #     cell, a dead entry, a verb that disagrees with the measurement — needs
+  #     the fleet, and is proven by `tests/staleness_test.sh` against a fixture
+  #     fleet rather than asserted here. Saying so is the point: a check that
+  #     claims to have compared 80 entries against nine repositories it has
+  #     never read is the kind of claim this repository exists to distrust.
+  parity_allowlist_check() {
+    "$PY" - "$ROOT" <<'PY'
+import datetime
+import json
+import os
+import re
+import sys
+
+root = sys.argv[1]
+ledger = os.path.join(root, "templates", "parity-allowlist")
+table_path = os.path.join(root, "tests", "artifacts.json")
+
+if not os.path.isfile(ledger):
+    sys.exit(
+        "templates/parity-allowlist is missing: kit ships twelve artefacts that "
+        "services copy, and a divergence with no recorded reason is unproven "
+        "rather than fine"
+    )
+if not os.path.isfile(table_path):
+    sys.exit("tests/artifacts.json is missing: there is no declaration of what kit ships")
+
+# The inventory is the artefact table — the SAME file the reporter reads, which
+# is the point of having one. An inventory derived independently here would be a
+# second, unchecked copy of the truth, which is the defect AGENTS.md's
+# header/recipe check exists to prevent and which kit has already had once.
+try:
+    with open(table_path, encoding="utf-8") as fh:
+        table = json.load(fh)
+except (OSError, json.JSONDecodeError) as exc:
+    sys.exit(f"tests/artifacts.json is unreadable: {exc}. A table this gate cannot "
+             f"read is a table it would approve anything against")
+
+ids = {a.get("id") for a in table.get("artefacts", []) if a.get("id")}
+if not ids:
+    sys.exit(
+        "tests/artifacts.json declares no artefact ids, so the unused-entry rule "
+        "would check nothing: an allowlist validated against an empty inventory "
+        "is an allowlist that accepts everything"
+    )
+
+#   diverged  present at the declared path, not byte-identical
+#   absent    not present where kit ships one
+#   unknown   the comparison could not be made (no declared language)
+#
+# Three verbs, and the third is why this is not a two-verb format: an
+# unmeasurable cell is a finding, and a two-verb ledger would have to state
+# something false about it to record something true.
+LINE = re.compile(
+    r'^(?P<verb>diverged|absent|unknown)\s+(?P<repo>\S+)\s+(?P<artefact>\S+)'
+    r'(?P<fields>(?:\s+[a-z]+=(?:"[^"]*"|\S+))*)\s*$'
+)
+FIELD = re.compile(r'([a-z]+)=("[^"]*"|\S+)')
+WHY = {
+    "reason": 'without one, "it is fine" becomes the reason for everything',
+    "owner": "a divergence nobody owns is a divergence nobody will bring back into line",
+    "since": "the ratchet needs the date the decision was taken",
+    "until": "an entry that cannot expire has stopped being a decision",
+}
+
+today = datetime.date.today()
+problems = []
+seen = {}
+entries = 0
+
+for lineno, raw in enumerate(open(ledger, encoding="utf-8").read().splitlines(), 1):
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    entries += 1
+
+    m = LINE.match(line)
+    if not m:
+        problems.append(
+            f"line {lineno}: malformed entry. Expected 'diverged|absent|unknown <repo> "
+            f"<artefact-id> reason=\"...\" owner=… since=YYYY-MM-DD "
+            f"until=YYYY-MM-DD' on ONE line — a wrapped reason is two entries, one "
+            f"of which is a parse error"
+        )
+        continue
+
+    fields = {k: v.strip('"') for k, v in FIELD.findall(m.group("fields"))}
+    key = (m.group("repo"), m.group("artefact"))
+
+    for name in ("reason", "owner", "since", "until"):
+        if not fields.get(name):
+            problems.append(f"line {lineno}: entry names no {name} — {WHY[name]}")
+
+    # The unused-entry rule, against the artefact table. This is ESLint's
+    # `reportUnusedDisableDirectives` shape: an entry for something that no
+    # longer exists excuses nothing, and the entry is how you find out first.
+    # Resolved against the TABLE and not against a directory listing, so a
+    # renamed artefact fails loudly instead of quietly matching whatever now
+    # sits at that path.
+    if m.group("artefact") not in ids:
+        problems.append(
+            f"line {lineno}: entry matches NOTHING — tests/artifacts.json declares "
+            f"no artefact {m.group('artefact')!r}. The artefact was renamed or "
+            f"removed, or the entry was written for a typo. Either way it is dead "
+            f"weight, and a ledger that cannot notice its own dead entries is a "
+            f"ledger that eventually contains the whole fleet"
+        )
+
+    if key in seen:
+        problems.append(
+            f"line {lineno}: duplicate entry for {key[0]}/{key[1]}, already listed "
+            f"on line {seen[key]}. Two records for one cell means one of them is "
+            f"not being read"
+        )
+    seen[key] = lineno
+
+    for name in ("since", "until"):
+        value = fields.get(name)
+        if not value:
+            continue
+        try:
+            parsed = datetime.date.fromisoformat(value)
+        except ValueError:
+            problems.append(f"line {lineno}: {name}={value!r} is not an ISO date (YYYY-MM-DD)")
+            continue
+        if name == "until" and parsed < today:
+            problems.append(
+                f"line {lineno}: EXPIRED on {value} (today is {today.isoformat()}). "
+                f"Re-copy the artefact and delete the entry, or move the date and "
+                f"write a NEW reason — a date that rolls forward by itself is not "
+                f"a ratchet"
+            )
+
+if problems:
+    for p in problems:
+        print("  -", p)
+    sys.exit(1)
+
+# THE TOTAL, PRINTED ON PASS. `check` indents a passing check's stdout under its
+# label, so this is visible in a GREEN run — the only place a growing list is
+# least likely to be noticed, and the whole reason the tier allowlist prints its
+# count too. 80 entries is a bad number, and it is printed so that everybody
+# can see it is a bad number.
+print(
+    f"parity allowlist: {entries} entr{'y' if entries == 1 else 'ies'} across "
+    f"{len({k[0] for k in seen})} repositor{'y' if len({k[0] for k in seen}) == 1 else 'ies'}, "
+    f"every artefact id in artifacts.json, none expired, none dead. THE TOTAL IS "
+    f"THE MEASUREMENT: 80 entries is 80 copies of kit's templates that the fleet "
+    f"has not adopted or has changed, and the way to shrink it is to re-copy, not "
+    f"to delete an entry. Compare against `tests/staleness.py --scope templates "
+    f"--repos-dir …` for the per-cell state."
+)
+PY
+  }
+  check 'templates/parity-allowlist  (reason, owner, since, until; dead entries fail)' \
+    parity_allowlist_check
+
+  # (3c) The artefact table must describe files that EXIST.
+  #
+  #     A table naming a file kit does not ship makes the reporter call every
+  #     service `absent` for it, forever. That output is indistinguishable from
+  #     a migration backlog, which is the dangerous direction: it would put a
+  #     permanent, unactionable finding in front of a reader and be believed.
+  #     So the table is checked against the tree, and the reporter refuses to
+  #     run at all on a table that fails — proved by staleness_test.sh case 28.
+  #
+  #     This is the same check the reporter makes, called directly rather than
+  #     reimplemented, because two implementations of "is this a real path" is
+  #     one implementation too many.
+  artifact_table_check() {
+    "$PY" - "$ROOT" <<'PY'
+import importlib.util
+import os
+import sys
+
+root = sys.argv[1]
+spec = importlib.util.spec_from_file_location(
+    "staleness", os.path.join(root, "tests", "staleness.py")
+)
+if spec is None or spec.loader is None:
+    sys.exit("tests/staleness.py could not be loaded, so the artefact table cannot "
+             "be checked against the tree it describes")
+staleness = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(staleness)
+
+table = staleness.load_table(os.path.join(root, "tests", "artifacts.json"))
+problems = staleness.validate_table_against_kit(table, root)
+
+# A `{lang}` source must resolve for EVERY language the workflow offers. The
+# glob above proves the shape exists, which catches a rename; this catches a
+# template that exists for five of the seven languages, which is a half-adopted
+# language and the exact defect kit's own "half a language is worse than none"
+# rule is about.
+# The languages, read the way the rest of this file reads them: as YAML, from
+# the workflow's real `options`. `validate.sh` already requires PyYAML and
+# already loads this workflow several times, so parsing it here is not a new
+# dependency — it is the difference between asking the question and grepping
+# for it. The first version of this used a regex over the raw text, matched
+# nothing because `description:` sits between the key and `options:`, and
+# reported a FAILURE — which was the check being right about its own blindness
+# and wrong about the tree. A check that could not parse the thing it is
+# checking must say so, and here it did.
+#
+# `none` is excluded: it is not a language, it is the option for a repository
+# with no service manifest, and `templates/bin-prime/none.sh` does not exist and
+# should not.
+import yaml
+
+workflow = os.path.join(root, ".github", "workflows", "ci.reusable.yml")
+languages = set()
+try:
+    with open(workflow, encoding="utf-8") as fh:
+        doc = yaml.safe_load(fh) or {}
+    triggers = doc.get("on") or doc.get(True) or {}
+    declared = ((triggers.get("workflow_call") or {}).get("inputs") or {})
+    options = ((declared.get("language") or {}).get("options")) or []
+    languages = {o for o in options if o and o != "none"}
+except (OSError, yaml.YAMLError) as exc:
+    problems.append(f"the reusable workflow could not be parsed: {exc}")
+if not languages:
+    problems.append(
+        "the reusable workflow declares no `language` options, so the "
+        "{lang}-interpolated artefacts cannot be checked for every language. A "
+        "check that could not ask its question must not report a pass"
+    )
+
+for artefact in table["artefacts"]:
+    if not artefact.get("needsLanguage"):
+        continue
+    for lang in sorted(languages):
+        source = os.path.join(root, artefact["source"].replace("{lang}", lang))
+        if not os.path.isfile(source):
+            problems.append(
+                f"{artefact['id']}: kit offers `language: {lang}` but ships no "
+                f"{artefact['source'].replace('{lang}', lang)}. Half a language is "
+                f"worse than none: a service that adopts it gets a broken primer"
+            )
+
+if problems:
+    for p in problems:
+        print("  -", p)
+    sys.exit(1)
+print(
+    f"artefact table: {len(table['artefacts'])} artefact(s), every source present "
+    f"in this tree, and every {{lang}} source resolving for all "
+    f"{len(languages)} languages the workflow offers"
+)
+PY
+  }
+  check 'tests/artifacts.json  (every declared source exists, for every language)' \
+    artifact_table_check
+
+  # (3d) The carve-out boundary: the two programs import NOTHING from outside the
+  #      standard library, and only from the seven modules AGENTS.md names.
+  #
+  #      AGENTS.md's rules section says "standard library only, no import outside
+  #      json/os/re/sys/argparse/subprocess" and calls that a carve-out rather
+  #      than a precedent. Until now nothing checked it, which made the sentence
+  #      a promise — and a promise nobody can break is decoration. This parses
+  #      every `import` in both programs rather than grepping, so a
+  #      `from x import y`, a function-local import and a module named inside a
+  #      docstring's example are all read the same way.
+  #
+  #      `difflib` is on the list because the templates half of the staleness
+  #      reporter counts the lines two copies differ by, and a list that grows
+  #      by a later commit is not a control — so growing it is a red gate, and
+  #      the only way past is to change this file and this check in the same
+  #      commit.
+  carveout_boundary_check() {
+    "$PY" - "$ROOT" <<'PY'
+import ast
+import os
+import sys
+
+root = sys.argv[1]
+
+# The list is written HERE and in AGENTS.md, and the two are compared against
+# each other by the check below — so the sentence in AGENTS.md cannot quietly
+# stop matching the rule the gate enforces, which is the property that made
+# kit-05's fail-closed headline worth restating.
+ALLOWED = {"__future__", "argparse", "difflib", "glob", "json", "os", "re",
+           "subprocess", "sys", "urllib"}
+
+programs = ["tests/classify.py", "tests/staleness.py"]
+problems = []
+seen_modules = set()
+
+for rel in programs:
+    path = os.path.join(root, rel)
+    if not os.path.isfile(path):
+        problems.append(f"{rel} is missing: the carve-out is a boundary around two programs")
+        continue
+    with open(path, encoding="utf-8") as fh:
+        try:
+            tree = ast.parse(fh.read(), filename=rel)
+        except SyntaxError as exc:
+            problems.append(f"{rel} does not parse: {exc}")
+            continue
+    # ast.walk, not the module body: a function-local import is still an
+    # import, and the whole value of this check is that there is nowhere to put
+    # one that it cannot see.
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            names = [alias.name for alias in node.names]
+        elif isinstance(node, ast.ImportFrom):
+            # `level > 0` is a relative import, which cannot happen in a program
+            # nothing imports — and is checked rather than assumed.
+            if node.level:
+                problems.append(
+                    f"{rel}:{node.lineno} is a RELATIVE import. Nothing here is a "
+                    f"package, and a relative import is the first sign of one"
+                )
+                continue
+            names = [node.module or ""]
+        else:
+            continue
+        for name in names:
+            top = name.split(".")[0]
+            seen_modules.add(top)
+            if top not in ALLOWED:
+                problems.append(
+                    f"{rel}:{getattr(node, 'lineno', '?')} imports {top!r}, which is "
+                    f"not standard library or not on AGENTS.md's list. The two "
+                    f"programs are the ONE carve-out from 'config only', and the "
+                    f"carve-out is what keeps kit a repository with no "
+                    f"dependencies — so a new import is a decision about this "
+                    f"repo's identity, not a convenience"
+                )
+
+# A check that proved nothing because it parsed nothing is a check that ran
+# nothing. Both programs must be present AND the walk must have seen something.
+if not seen_modules:
+    problems.append(
+        "no imports were found in either program, so the carve-out check would "
+        "approve anything: the programs have changed shape and the check has not"
+    )
+
+# AGENTS.md and this list must agree. The list is the enforcement; the sentence
+# in AGENTS.md is what a reader believes, and a reader who believes something
+# else from the one that is enforced is worse off than either.
+#
+# `urllib` and its submodules are the reason this half exists as a separate
+# assertion: the reporter imports `urllib.request` and `urllib.error` for the
+# GitHub-org discovery route, and AGENTS.md's original list did not name them —
+# so the sentence was already out of date before this check, and the only way
+# anyone would ever have found out is if they went looking.
+agents = open(os.path.join(root, "AGENTS.md"), encoding="utf-8").read()
+missing = sorted(m for m in seen_modules if f"`{m}`" not in agents)
+if missing:
+    problems.append(
+        f"AGENTS.md's carve-out sentence does not name {', '.join(missing)}, which "
+        f"the programs import. The sentence a reader trusts and the list the gate "
+        f"enforces are not allowed to be different lists"
+    )
+
+if problems:
+    for p in problems:
+        print("  -", p)
+    sys.exit(1)
+print(
+    f"carve-out boundary: {len(programs)} programs, {len(seen_modules)} distinct "
+    f"imports ({', '.join(sorted(seen_modules))}), all standard library, all named "
+    f"in AGENTS.md. kit has no dependency and cannot grow one without this gate "
+    f"going red."
+)
+PY
+  }
+  check 'tests/classify.py + tests/staleness.py  (stdlib only; the carve-out, enforced)' \
+    carveout_boundary_check
+
   # (4) Never cache a test report.
   #
   #     `actions/cache` `restore-keys` restores STALE caches by PREFIX MATCH, and
@@ -3341,6 +5257,176 @@ PY
   }
   check '.github/workflows/*  (no test report is ever cached)' no_cached_report_check
 
+  # -------------------------------------------------------------------------
+  # The `secrets` job, asserted as a job rather than as a config file.
+  #
+  # Three things, and each is a distinct way this job could stop being a gate
+  # while every other check in the file stayed green:
+  #
+  #   1. it could stop existing — a repo with no secret scanning is a repo that
+  #      has never been scanned, and nothing else here notices
+  #   2. it could become advisory — `continue-on-error` at the job or step level
+  #      is the single most common way a security job is neutralised, and it is
+  #      invisible in a green build. A secret scanner that only warns is a report
+  #   3. it could lose its full history — `fetch-depth` reverting to the
+  #      default shallow clone is a one-line diff that turns a history scan into
+  #      a HEAD scan, and a HEAD scan cannot see a deleted secret
+  secrets_job_check() {
+    "$PY" - "$ROOT" "$WORKFLOW" "$GITLEAKS_GATE" <<'PY'
+import sys
+
+import yaml
+
+workflow, gate = sys.argv[2], sys.argv[3]
+with open(workflow, encoding="utf-8") as fh:
+    doc = yaml.safe_load(fh)
+jobs = doc.get("jobs") or {}
+problems = []
+
+job = jobs.get("secrets")
+if not isinstance(job, dict):
+    problems.append(
+        "no `secrets` job. Every other job in this file is a test the repo asked "
+        "for; this one is the one a repo must not have to ask for, and a "
+        "repository with no secret scanning has never been scanned while every "
+        "other check here is green"
+    )
+else:
+    # Advisory is the failure mode, so it is checked at both levels. A job-level
+    # `continue-on-error: true` makes the whole job non-blocking; a step-level one
+    # makes the scan non-blocking and leaves the job green.
+    if job.get("continue-on-error") is True:
+        problems.append(
+            "the `secrets` job sets continue-on-error: true. That is what makes a "
+            "secret scanner a report: the build goes green having found nothing, "
+            "and a green badge is a claim"
+        )
+
+    steps = job.get("steps") or []
+    # Full history. `fetch-depth: 0` on the checkout, not merely its absence —
+    # an explicit 0 and an absent key look identical to a grep.
+    checkout_depths = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        if str(step.get("uses", "")).startswith("actions/checkout@"):
+            checkout_depths.append((step.get("with") or {}).get("fetch-depth"))
+    if not checkout_depths:
+        problems.append("the `secrets` job has no actions/checkout step")
+    elif not any(str(d) == "0" for d in checkout_depths):
+        problems.append(
+            f"the `secrets` job checks out with fetch-depth {checkout_depths}. The "
+            f"runner default is a SHALLOW clone — one commit. A shallow scan is a "
+            f"diff scan with extra steps, and a diff scan cannot see a secret that "
+            f"was committed and deleted, which is the finding that matters most: it "
+            f"is on every fork and in the packfile of anyone who cloned. fetch-depth "
+            f"must be 0"
+        )
+
+    # The scan must be the shared script, so CI and `bash tests/validate.sh` are
+    # the same scan. A workflow that inlines its own gitleaks command line is two
+    # scanners, and the one that goes red is whichever nobody runs.
+    runs = "\n".join(
+        str(s.get("run", "")) for s in steps if isinstance(s, dict)
+    )
+    if gate not in runs:
+        problems.append(
+            f"the `secrets` job does not run {gate}. kit's gate runs that script and "
+            f"this job inlines its own command line instead, which means the scan a "
+            f"developer runs and the scan CI runs have already drifted, and the one "
+            f"that goes red is whichever nobody runs"
+        )
+
+    # Every step must be blocking.
+    for i, step in enumerate(steps, 1):
+        if isinstance(step, dict) and step.get("continue-on-error") is True:
+            problems.append(
+                f"the `secrets` job step {i} ({step.get('name', step.get('uses', '?'))}) "
+                f"sets continue-on-error: true, which makes the scan advisory"
+            )
+
+    # No `if: always()` or `if: failure()` on the scan step: a scan that only
+    # runs when something else already failed is a report about the failure.
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        cond = str(step.get("if", ""))
+        if "always()" in cond or "failure()" in cond or "success()" in cond:
+            problems.append(
+                f"a `secrets` step is conditional on {cond!r}. A secret scan that runs "
+                f"only under some conditions is a report about those conditions"
+            )
+
+    # And the job must not be opt-in, which is the opposite of every other job
+    # in this file and the one deliberate exception.
+    cond = str(job.get("if", ""))
+    if "inputs." in cond:
+        problems.append(
+            f"the `secrets` job is gated on {cond!r}. It is the one job in this file "
+            f"with no opt-in, deliberately: an opt-in security control is not a "
+            f"control, and a secret scanner that only warns is a report"
+        )
+
+# The zizmor job is opt-in and must say so with a STRING comparison, for the
+# reason every other opt-in input in this file does: GitHub coerces a bare
+# `false` to a boolean in some positions, and `if: inputs.zizmor` is a trap.
+zjob = jobs.get("zizmor")
+if not isinstance(zjob, dict):
+    problems.append(
+        "no `zizmor` job. The audit reads the adopting repo's OWN workflows, which "
+        "kit did not write, so it is opt-in — but a job that has quietly stopped "
+        "existing and an input that is quietly never passed are the same silence"
+    )
+else:
+    cond = str(zjob.get("if", ""))
+    if "inputs.zizmor" not in cond:
+        problems.append(
+            f"the `zizmor` job is not gated on its input ({cond!r}), so it would run "
+            f"in every adopting repo on day one and turn them red for findings in "
+            f"workflows kit did not write"
+        )
+    elif "'true'" not in cond:
+        problems.append(
+            f"the `zizmor` job's condition is {cond!r}; it must compare to the STRING "
+            f"'true'. A bare boolean coerces unpredictably in some positions, which is "
+            f"the exact trap the `telemetry` input exists to avoid"
+        )
+
+# Both new inputs must exist and default to 'false', for the same reason
+# `telemetry` does — a kit change that breaks every consumer's CI does not ship.
+triggers = doc.get("on") or doc.get(True) or {}
+call = (triggers.get("workflow_call") or {}).get("inputs") or {}
+for name in ("zizmor",):
+    declared = call.get(name)
+    if not isinstance(declared, dict):
+        problems.append(f"no `{name}` workflow_call input")
+    else:
+        if str(declared.get("default", "")) not in ("false", "False"):
+            problems.append(
+                f"the `{name}` input defaults to {declared.get('default')!r}; it must "
+                f"default to 'false'"
+            )
+        if str(declared.get("type")) != "string":
+            problems.append(f"the `{name}` input must be type: string (booleans coerce badly)")
+
+# `secrets` must NOT be an input at all: it takes no opt-in, and an input named
+# `secrets` with a default of false would be a way to turn the secret scanner off
+# without anyone noticing the flag.
+if "secrets" in call:
+    problems.append(
+        "the workflow declares a `secrets` input. The secret scanner is the one job "
+        "with no opt-in, and an input is an off switch — a `secrets: false` in a "
+        "caller would be a way to disable secret scanning that looks like "
+        "configuration"
+    )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check "$WORKFLOW  (secrets job: not advisory, full history, not opt-in)" \
+    secrets_job_check
+
   # Every README section a reader is told to copy must exist. A doc that points
   # at a path that was renamed is worse than no doc.
   readme_check() {
@@ -3372,6 +5458,20 @@ for path in (
     "templates/compose/mimir",
     "tests/canary_test.sh",
     "tests/no_telemetry_in_readiness.sh",
+    # The two files the staleness templates half is made of. Both are the kind
+    # of thing a reader would never know to look for: the reporter is
+    # self-explanatory, and the ledger is a list. A reader who does not know
+    # they exist concludes the reporter invents its own inventory, which it
+    # does not — and that a divergence with no recorded reason is fine, which
+    # it is not.
+    "tests/artifacts.json",
+    "templates/parity-allowlist",
+    # The three the fetched-stack packet added. A README that documents the stack
+    # without documenting how it is OBTAINED describes a copy, and this packet's
+    # whole claim is that the copy is gone.
+    "tests/fetch_test.sh",
+    "tests/stack_live_test.sh",
+    "tests/fleet_check.py",
 ):
     if path not in readme:
         problems.append(f"README.md never mentions {path}")
@@ -3390,6 +5490,28 @@ for phrase, why in (
 ):
     if phrase.lower() not in readme.lower():
         problems.append(f"README.md does not state {why} (looked for {phrase!r})")
+
+# `kit.ref` IS NAME-ONLY, deliberately, and it is the one entry in the list above
+# that cannot also be an existence check. kit is the repository being pinned, so
+# it has no `kit.ref` of its own — requiring one would make this repository fail a
+# check about the repositories that consume it, which is the confusion the whole
+# split between "kit's own artifacts" and "the fleet" exists to prevent.
+#
+# It is read by two programs — `bin/dev` at run time and `tests/fleet_check.py`
+# at gate time — so a README that lists it in a table of files without saying what
+# it is has documented a file, not a contract.
+if not re.search(r"`?kit\.ref`?", readme):
+    problems.append(
+        "README.md never names kit.ref, so a reader cannot find where the pin "
+        "lives — and the pin is the one thing in this packet that decides which "
+        "bytes of kit a developer's machine runs."
+    )
+if not re.search(r"(?i)pin", readme):
+    problems.append(
+        "README.md never uses the word `pin`, so kit.ref reads as a filename "
+        "rather than as the thing it is. A reader who does not know it is a pin "
+        "will edit it to `master`."
+    )
 
 # The escape hatch, and the ports. A self-hoster reads the README and not the
 # code, so the variable name has to be in the README and so does the block.
@@ -3762,12 +5884,22 @@ else:
 copies = []
 for dirpath, dirnames, filenames in os.walk(root):
     dirnames[:] = [
-        d for d in dirnames if d not in (".git", ".venv", "__pycache__")
+        # tests/.bin is the gate's own fetched scanners (hadolint, gitleaks).
+        # It is gitignored and a throwaway copy carries it, and a 15MB binary is
+        # not a file to read the first 64KB of looking for a YAML key.
+        d for d in dirnames if d not in (".git", ".venv", ".bin", "__pycache__")
     ]
     for filename in filenames:
         full = os.path.join(dirpath, filename)
         rel = os.path.relpath(full, root)
         if rel == workflow:
+            continue
+        # shell scripts are excluded for the same reason, and because the
+        # walker's own self_test.sh names `workflow_call` in a comment explaining
+        # breakage 8 — which this check reported as a second copy of the CI
+        # standard. A check that fires on the file proving it wrong is a check
+        # that gets deleted.
+        if filename.endswith((".sh", ".toml", ".md", ".pyc")):
             continue
         try:
             with open(full, encoding="utf-8") as fh:
@@ -3792,6 +5924,802 @@ if problems:
 PY3
   }
   check "$WORKFLOW  (callable: exists, on: workflow_call, docs agree)" callable_check
+
+  # -------------------------------------------------------------------------
+  # Secrets. Two scanners and two different questions, and this section is the
+  # part of the gate that proves both of them can fail.
+  #
+  # gitleaks answers "was a secret committed"; the canary harness answers "does
+  # one leave the process while the tests run". Neither is a substitute for the
+  # other, and the second has no off-the-shelf implementation at all — see
+  # templates/secrets/README.md for the measurement behind that.
+  #
+  # The scanner runs in `secrets` / `zizmor`-style jobs in the reusable workflow,
+  # and ALSO here, because a check that only runs in a CI runner is a check whose
+  # first execution is on a stranger's commit. `bash tests/validate.sh` is the
+  # whole procedure on a clean clone, and this is part of it.
+  # The gitleaks config check needs tomllib (python 3.11+). Resolved ONCE, here,
+  # so that a machine without it gets one honest FAIL that names the cause rather
+  # than five separate "could not parse" failures that read as five defects.
+  HAVE_TOMLLIB=1
+  if ! "$PY" -c 'import tomllib' >/dev/null 2>&1; then
+    HAVE_TOMLLIB=0
+  fi
+
+  section 'static: secrets — the scanner is present, configured, and can fail'
+
+  # The scanner is RESOLVED FIRST, before any check that executes it.
+  #
+  # Ordering, and it is not cosmetic: the behavioural check below runs the scan
+  # against a throwaway repository, so it needs a binary. Resolving afterwards
+  # meant the check read an unset variable and reported "unbound variable" —
+  # which is a FAIL for the wrong reason, and a FAIL nobody can act on.
+  #
+  # A FAIL and not a SKIP when gitleaks cannot be installed, for the reason the
+  # hadolint check gives: a gate that reports "I could not check" and exits 0 is
+  # the exact shape PLAN.md §1 calls a gate that is not green. It is also the
+  # shape that let seven Dockerfiles go unlinted.
+  GITLEAKS_BIN=''
+  if [ -n "${KIT_GITLEAKS:-}" ]; then
+    GITLEAKS_BIN="$KIT_GITLEAKS"
+  elif kit_bootstrap_binary gitleaks \
+    "https://github.com/gitleaks/gitleaks/releases/download/v${KIT_GITLEAKS_VERSION}" \
+    "$KIT_GITLEAKS_SHA256S" "$ROOT" \
+    "gitleaks_${KIT_GITLEAKS_VERSION}_@ros@_@arch@.tar.gz" gitleaks; then
+    GITLEAKS_BIN="$BIN"
+    # Exported so the twenty-odd throwaway copies self_test makes share this
+    # binary instead of each downloading its own 15MB archive. Same reasoning as
+    # KIT_PYTHON, one level down: twenty downloads is twenty chances to fail for
+    # a reason that has nothing to do with the breakage under test.
+    export KIT_GITLEAKS="$BIN"
+  else
+    report FAIL 'gitleaks (required: could not be installed — see the note above)'
+  fi
+
+  gitleaks_config() {
+    "$PY" - "$ROOT" "$GITLEAKS_CONFIG" "$HAVE_TOMLLIB" <<'PY'
+import os
+import sys
+
+root, rel, have_tomllib = sys.argv[1], sys.argv[2], sys.argv[3]
+path = os.path.join(root, rel)
+problems = []
+
+if not os.path.isfile(path):
+    sys.exit(
+        f"{rel} does not exist. gitleaks then runs on its DEFAULT rules with no "
+        f"cafaye allowlist, which is a scan that looks configured and is not — "
+        f"and the allowlist is the only part of it anyone wrote"
+    )
+
+# Parsed as TOML, not grepped. Resolved by the caller so a machine without
+# tomllib gets one honest message instead of several that read as several
+# defects — and a config nobody parsed is a config nobody is reading.
+if have_tomllib != "1":
+    sys.exit(
+        f"{rel} could not be parsed: this python has no tomllib (3.11+). The file "
+        f"exists and gitleaks will read it, but nothing in this gate has, and a "
+        f"secret-scanner allowlist that no tool ever parses is not an allowlist"
+    )
+import tomllib
+
+with open(path, "rb") as fh:
+    try:
+        doc = tomllib.load(fh)
+    except Exception as exc:
+        sys.exit(f"{rel} is not valid TOML: {exc}")
+
+# The rules must be gitleaks' own. A repo that redefines a rule has taken
+# responsibility for the regex, and the reason kit can be thirty lines instead of
+# six thousand is that it does not.
+if "rules" in doc:
+    problems.append(
+        f"{rel} defines its own [[rules]]. kit extends gitleaks' defaults "
+        f"(extend.useDefault) so a new provider detection reaches thirteen repos "
+        f"the day gitleaks ships it. A vendored rule set is a rule set that stops "
+        f"receiving providers, which is a secret scanner that has stopped working"
+    )
+
+extend = doc.get("extend") or {}
+if extend.get("useDefault") is not True:
+    problems.append(
+        f"{rel} does not set extend.useDefault = true, so the rules it runs are "
+        f"whatever this file happens to declare — which is none of them"
+    )
+
+# R3: every allowlist entry carries a reason, and an entry with no reason is a
+# failure. This is the ESLint reportUnusedDisableDirectives property and it is
+# the load-bearing one: an allowlist that grows monotonically and is never pruned
+# is not an allowlist, it is a deferred disclosure.
+#
+# A VAGUE reason fails too, and the minimum length is the whole mechanism. The
+# failure mode this rule exists to prevent is not "someone forgot" — it is
+# "someone typed `false positive` and moved on", and a presence check accepts
+# that without noticing. 40 characters is short enough that every honest reason
+# clears it and long enough that every non-reason does not.
+MIN_REASON = 40
+allowlists = doc.get("allowlists") or []
+if not isinstance(allowlists, list):
+    problems.append(f"{rel}: `allowlists` is not a list of tables")
+    allowlists = []
+
+for i, entry in enumerate(allowlists, 1):
+    desc = (entry or {}).get("description") or ""
+    if not desc.strip():
+        problems.append(
+            f"{rel}: allowlist entry #{i} has no description. Every entry is a "
+            f"decision to accept that a scanner will keep reporting something, and "
+            f"the decision needs a name on it — otherwise the next reader cannot "
+            f"tell an accepted false positive from an accepted secret"
+        )
+    elif len(desc.strip()) < MIN_REASON:
+        problems.append(
+            f"{rel}: allowlist entry #{i} has a description of {len(desc.strip())} "
+            f"characters, which is not a reason. State what is allowed AND why, in "
+            f"at least {MIN_REASON} characters. `false positive` is not a reason: "
+            f"it is the absence of one, and a presence check accepts it silently"
+        )
+    # An entry with nothing to allowlist is a no-op that reads like a decision.
+    has_scope = any(
+        entry.get(k) for k in ("paths", "pathsRegex", "regexes", "commits", "stopwords", "targetRules")
+    )
+    if not has_scope:
+        problems.append(
+            f"{rel}: allowlist entry #{i} has a description but no paths, "
+            f"regexes, commits or stopwords — it allows nothing and says why, "
+            f"which is the shape of a comment that will be mistaken for a rule"
+        )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check "$GITLEAKS_CONFIG  (allowlist only, every entry reasoned)" gitleaks_config
+
+  # R3's other half: an allowlist that also exists inline is an allowlist
+  # nobody reviews. gitleaks takes `-i <file>`, and .gitleaksignore is the file
+  # it reads. Neither may exist in the tree, because a scanner finding in a
+  # throwaway copy would be silenced by a file the reviewer never saw.
+  gitleaks_ignore_check() {
+    "$PY" - "$ROOT" <<'PY'
+import os
+import sys
+
+root = sys.argv[1]
+found = []
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [d for d in dirnames if d not in (".git", ".venv", "__pycache__")]
+    for name in filenames:
+        if name == ".gitleaksignore":
+            found.append(os.path.relpath(os.path.join(dirpath, name), root))
+if found:
+    sys.exit(
+        f"a .gitleaksignore exists at {found}. That is the inline allowlist: it "
+        f"lives beside the scanner rather than in {os.path.basename(sys.argv[0])}'s "
+        f"committed config, so it is invisible in review, unversioned, and gone the "
+        f"next time someone runs the scanner by hand. Entries go in the committed "
+        f"config, one per finding, each with a reason"
+    )
+PY
+  }
+  check 'no .gitleaksignore  (the allowlist is the committed config)' gitleaks_ignore_check
+
+  # R1: --redact is load-bearing, and so is the scan's coverage.
+  #
+  # Asserted on the SOURCE of the scan script rather than on the workflow,
+  # because the workflow does not contain the gitleaks command line — it calls
+  # tests/gitleaks_gate.sh, which is the same script this gate runs. Asserting
+  # on the workflow would be asserting that a comment mentions a flag.
+  #
+  # The check is that the flag is UNCONDITIONAL. A `--redact` that appears
+  # inside an `if`, or behind a variable that a caller can set, is not
+  # redaction; it is a default.
+  # R1: --redact is load-bearing, and so is the scan's coverage.
+  #
+  # Asserted by EXECUTING the scan, not by reading it.
+  #
+  # The first version of this check grepped the script for `--redact`, and the
+  # first version of that grep was defeated by a comment: `#   - --redact, always`
+  # satisfies `grep -- --redact`, and the comment is a sentence explaining that
+  # the flag is mandatory. A check that a comment satisfies is a check that
+  # reports the comment. Self_test breakage 43 proved it — the flag removed, the
+  # check still green — which is the only reason this is a behavioural assertion.
+  #
+  # So: run the scan against a tree that contains a detectable credential, and
+  # read the OUTPUT. `--redact` is proven by the output not containing the secret
+  # even though the scan found it.
+  #
+  # This is the reason the probe below is assembled from parts rather than
+  # written out. The scan runs over the whole tree, and a probe committed as a
+  # literal would make tests/validate.sh itself a gitleaks finding — so the real
+  # tree's own scan goes red for a reason that has nothing to do with the tree.
+  # That is not hypothetical: it is what happened the first time, and the gate
+  # reported four leaks in the file that was planting them.
+  probe_secret() {
+    # GitLab's published PAT format sample — gitleaks' `gitlab-pat` rule, and a
+    # documented example value rather than a live credential. Assembled from two
+    # halves, neither of which is a credential on its own.
+    printf 'glpat-%s' 'ABC123def456GHI789jkl012'
+  }
+
+  scan_behaviour_check() {
+    "$PY" - "$ROOT" "$GITLEAKS_GATE" "${GITLEAKS_BIN:-}" <<'PY'
+import os
+import subprocess
+import sys
+import tempfile
+
+root, gate, gitleaks = sys.argv[1], sys.argv[2], sys.argv[3]
+problems = []
+
+if not gitleaks or not os.access(gitleaks, os.X_OK):
+    # Resolved above; reported there as its own FAIL. Nothing to add here, and
+    # saying so is better than a second message about the same missing file.
+    sys.exit(0)
+
+work = tempfile.mkdtemp(prefix="kit-redact-")
+try:
+    # A throwaway git repository, because the history requirement needs one and a
+    # directory scan would not exercise the same code path.
+    def run(*cmd, **kw):
+        return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+    run("git", "init", "-q", work)
+    run("git", "-C", work, "config", "user.email", "t@example.invalid")
+    run("git", "-C", work, "config", "user.name", "t")
+
+    secret = "glpat-" + "ABC123def456GHI789jkl012"
+    with open(os.path.join(work, "config.toml"), "w", encoding="utf-8") as fh:
+        fh.write('private_token = "%s"\n' % secret)
+    run("git", "-C", work, "add", "-A")
+    run("git", "-C", work, "commit", "-qm", "add")
+
+    # The scan, exactly as the gate runs it, plus --verbose.
+    #
+    # --verbose is here for one reason: gitleaks names the rule that fired only
+    # in verbose output, and a check that cannot say WHICH rule fired cannot
+    # distinguish "the scanner works" from "the scanner failed for a reason
+    # nobody has diagnosed yet". It is also the more dangerous output — verbose
+    # prints the finding, the fingerprint and the entropy — so it is the right
+    # place to prove that --redact holds when there is the most to redact.
+    def scan():
+        return run(
+            "bash", os.path.join(root, gate), work, gitleaks, "--verbose"
+        )
+
+    res = scan()
+    combined = res.stdout + res.stderr
+
+    # 1. It must FIND the secret. Without this, everything below is vacuous: a
+    #    scanner that finds nothing would pass a redaction assertion.
+    if res.returncode == 0:
+        problems.append(
+            "the scan over a tree containing a GitLab-PAT-shaped string exited 0, "
+            "so it did not detect it. The redaction assertions below would then be "
+            "satisfied by a scanner that scans nothing"
+        )
+    if "gitlab-pat" not in combined:
+        problems.append(
+            "the scan exited non-zero but did not name the gitlab-pat rule. A scan "
+            "that fails for an unstated reason is a scan whose next failure will be "
+            "a mystery"
+        )
+
+    # 2. It must NOT PRINT it. This is the property. The exit code says the
+    #    secret was found; the absence of the secret from the output says the
+    #    report is safe to paste into an issue.
+    if secret in combined:
+        problems.append(
+            "THE SCAN PRINTED THE SECRET IT FOUND. --redact is not being applied: "
+            "a CI log is a place secrets go to be read, and the scanner finding a "
+            "credential must never be the reason the credential is printed. The "
+            "value is a format sample, not a live credential, so this run proves "
+            "the mechanism and not a disclosure"
+        )
+    # And the verbose output specifically, which is where gitleaks prints the
+    # finding and the fingerprint and would print the value if redaction were off.
+    if "Secret:" in combined and "REDACTED" not in combined:
+        problems.append(
+            "the verbose scan printed a `Secret:` line with no REDACTED marker on "
+            "it. --redact is meant to replace the value, not merely suppress the "
+            "summary line"
+        )
+
+    # 3. It must read the FULL HISTORY. A secret that was committed and then
+    #    deleted is the case that matters, and it is invisible to a HEAD-only or
+    #    shallow scan.
+    os.remove(os.path.join(work, "config.toml"))
+    run("git", "-C", work, "add", "-A")
+    run("git", "-C", work, "commit", "-qm", "remove")
+    res = scan()
+    combined = res.stdout + res.stderr
+    if res.returncode == 0:
+        problems.append(
+            "after the credential was committed and then DELETED, the scan exited "
+            "0. It is not reading history, or is reading only the last commit. A "
+            "secret that was added and removed in one PR is still in the history "
+            "and still on every fork — that is the finding that matters most"
+        )
+    if secret in combined:
+        problems.append("the history scan printed the secret it found; --redact is not applied")
+finally:
+    subprocess.run(["rm", "-rf", work], capture_output=True)
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check "$GITLEAKS_GATE  (finds a real secret, never prints it, reads history)" \
+    scan_behaviour_check
+
+  # R2: `pull_request`, never `pull_request_target`.
+  #
+  # The trigger, not the prose. This reads the PARSED trigger keys of every
+  # workflow in the tree, so the explanation in the header comment — which has
+  # to exist, and which names the string — is not a violation. A grep would fail
+  # on the file that documents why the thing is forbidden, which is how a check
+  # gets deleted.
+  #
+  # The whole tree is read, not just the reusable workflow: kit's own ci.yml
+  # chooses its triggers, and a service adopting kit writes its own caller. A
+  # job is one click from being a credential-theft primitive, and the trigger is
+  # the only thing that makes it one.
+  trigger_check() {
+    "$PY" - "$ROOT" <<'PY'
+import os
+import sys
+
+import yaml
+
+root = sys.argv[1]
+# `pull_request_target` runs in the context of the BASE repository, with that
+# repository's secrets and a writable token, executing code proposed by a FORK.
+# `workflow_run` and `issue_comment` have the same property for the same reason.
+FORBIDDEN = {
+    "pull_request_target": (
+        "runs with the base repository's secrets and a writable token in the "
+        "context of a FORK's code. Any job under it is a credential-theft "
+        "primitive waiting for a reason, and the secret scanner is the job that "
+        "most invites 'let me just pull the base branch in so the scan sees the "
+        "real history'"
+    ),
+    "workflow_run": (
+        "runs with the base repository's secrets, triggered by a run a FORK can "
+        "cause. Same property as pull_request_target"
+    ),
+    "issue_comment": (
+        "runs with repository secrets on an attacker-controlled payload — a "
+        "comment body is not code, but it is input, and issue_comment handlers "
+        "read it"
+    ),
+}
+
+problems = []
+workflows = os.path.join(root, ".github", "workflows")
+if not os.path.isdir(workflows):
+    problems.append("no .github/workflows directory, so no trigger was checked")
+
+for name in sorted(os.listdir(workflows)) if os.path.isdir(workflows) else []:
+    if not name.endswith((".yml", ".yaml")):
+        continue
+    rel = f".github/workflows/{name}"
+    with open(os.path.join(workflows, name), encoding="utf-8") as fh:
+        try:
+            doc = yaml.safe_load(fh)
+        except Exception as exc:
+            problems.append(f"{rel} is not valid YAML: {exc}")
+            continue
+    if not isinstance(doc, dict):
+        continue
+    # `on:` is read by PyYAML 1.1 as the boolean True.
+    triggers = doc.get("on") or doc.get(True) or {}
+    if isinstance(triggers, str):
+        found = {triggers}
+    elif isinstance(triggers, list):
+        found = set(triggers)
+    elif isinstance(triggers, dict):
+        found = set(triggers)
+    else:
+        found = set()
+    for trigger in sorted(found & FORBIDDEN.keys()):
+        problems.append(f"{rel} declares `on: {trigger}`. {FORBIDDEN[trigger]}")
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check '.github/workflows/*  (no dangerous trigger, on parsed keys)' trigger_check
+
+  # R4: unpinned-uses is recorded, never baselined.
+  #
+  # The finding is real, the trade is real, and the costed options are in
+  # DECISIONS.md under MD10. What must NOT happen is the trade being made
+  # invisibly, in a file that looks like routine configuration — which is what
+  # adding it to zizmor's ignore list would be.
+  #
+  # So: zizmor's config must not ignore or disable it, and must not disable
+  # audits wholesale. `tests/zizmor_gate.sh` counts it instead, and prints the
+  # count on every run.
+  unpinned_check() {
+    "$PY" - "$ROOT" "$ZIZMOR_CONFIG" <<'PY'
+import os
+import sys
+
+import yaml
+
+root, rel = sys.argv[1], sys.argv[2]
+path = os.path.join(root, rel)
+problems = []
+
+if not os.path.isfile(path):
+    # Absent is the preferred state, and is asserted as one below.
+    print(f"note: no {rel}; nothing is baselined, which is the correct state")
+    sys.exit(0)
+
+with open(path, encoding="utf-8") as fh:
+    try:
+        doc = yaml.safe_load(fh)
+    except Exception as exc:
+        sys.exit(f"{rel} is not valid YAML: {exc}")
+
+rules = (doc or {}).get("rules") or {}
+rule = rules.get("unpinned-uses") or {}
+if rule.get("disable") is True:
+    problems.append(
+        f"{rel} DISABLES unpinned-uses. The trade it would be suppressing is real "
+        f"and is costed in DECISIONS.md under MD10 — pinning thirteen repositories "
+        f"to SHAs and owning the bump is not free, and not pinning means a change "
+        f"to kit's workflow lands in six services' CI without review. Suppressing "
+        f"it HERE makes that trade invisibly, in a file whose only other purpose "
+        f"is a different trade. Record it instead: tests/zizmor_gate.sh counts "
+        f"and prints every unpinned-uses finding on every run"
+    )
+if rule.get("ignore"):
+    problems.append(
+        f"{rel} IGNORES specific unpinned-uses findings ({rule['ignore']}). Same "
+        f"reason as above: a per-line allowlist for this audit is a baseline with "
+        f"a diff, and a diff is easier to extend than a decision is to revisit"
+    )
+
+# A blanket baseline is the thing that turns a scanner into a report. Three of
+# them, because a blanket can be spelled three ways.
+for audit, conf in (rules or {}).items():
+    if not isinstance(conf, dict):
+        continue
+    if conf.get("ignore") == "*" or conf.get("ignore") == ["*"]:
+        problems.append(
+            f"{rel}: rule {audit} ignores `*`. A blanket baseline means the audit "
+            f"can never report anything again, which is not a stricter check — it "
+            f"is the absence of one"
+        )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check "$ZIZMOR_CONFIG  (unpinned-uses recorded, never baselined)" unpinned_check
+
+  # Every zizmor ignore entry carries a reason.
+  #
+  # zizmor's own ignore syntax is `file.yml[:line[:column]]` with no place for a
+  # reason, so the reason lives in an adjacent comment and this check is what
+  # makes that a rule rather than a convention. A baseline with no reason is how a
+  # scanner becomes a report one commit at a time.
+  zizmor_reason_check() {
+    "$PY" - "$ROOT" "$ZIZMOR_CONFIG" <<'PY'
+import os
+import re
+import sys
+
+root, rel = sys.argv[1], sys.argv[2]
+path = os.path.join(root, rel)
+if not os.path.isfile(path):
+    sys.exit(0)
+
+lines = open(path, encoding="utf-8").read().splitlines()
+problems = []
+
+# A list item under a `rules.<id>.ignore:` block.
+in_ignore = False
+item_indent = None
+for i, line in enumerate(lines, 1):
+    stripped = line.strip()
+    if re.match(r"^ignore:\s*$", stripped):
+        in_ignore = True
+        continue
+    if in_ignore:
+        if not stripped or stripped.startswith("#"):
+            # A comment is the reason, or part of it. Looked at below, not here.
+            continue
+        if stripped.startswith("- "):
+            indent = len(line) - len(line.lstrip())
+            if item_indent is None:
+                item_indent = indent
+            if indent != item_indent:
+                # Dedented out of the list.
+                in_ignore = False
+                continue
+            # Does this entry have a reason? Any of: a comment on the same line,
+            # or one or more comment lines directly above with nothing between.
+            above = []
+            j = i - 2
+            while j >= 0:
+                prev = lines[j].strip()
+                if not prev:
+                    break
+                if not prev.startswith("#"):
+                    break
+                above.append(prev)
+                j -= 1
+            if "#" in line.split("- ", 1)[1]:
+                continue  # trailing comment
+            if not above:
+                problems.append(
+                    f"{rel}:{i}: ignore entry {stripped!r} has no reason. A "
+                    f"baseline with no stated reason is how a scanner becomes a "
+                    f"report one commit at a time: the next reader cannot tell an "
+                    f"accepted false positive from a deferred one"
+                )
+        else:
+            in_ignore = False
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check "$ZIZMOR_CONFIG  (every ignore entry carries a reason)" zizmor_reason_check
+
+  # The scanner itself, executed over kit's own tree and full history. The
+  # behaviour is asserted by the check above; this is the real scan of the real
+  # repository, which is the only one that can report a secret that is actually
+  # in this repository's history.
+  if [ -n "$GITLEAKS_BIN" ]; then
+    if out=$(bash "$ROOT/$GITLEAKS_GATE" "$ROOT" "$GITLEAKS_BIN" 2>&1); then
+      report PASS "gitleaks  ($KIT_GITLEAKS_VERSION, full history, --redact)"
+    else
+      report FAIL "gitleaks  ($KIT_GITLEAKS_VERSION, full history, --redact)"
+      printf '%s\n' "$out" | sed 's/^/       /'
+    fi
+  fi
+
+  # -------------------------------------------------------------------------
+  # The canary harness: the artifacts, and the contract they implement.
+  section 'static: the canary harness — contract, adapter, and every artifact'
+  secrets_readme_check() {
+    "$PY" - "$ROOT" <<'PY'
+import os
+import re
+import sys
+
+root = sys.argv[1]
+problems = []
+
+# The contract. Language-neutral and in the tree, because a canary test that
+# only exists for Go protects one of six services — so the thing every adapter
+# must implement is kit's to own, and it is a document rather than an
+# implementation.
+contract = os.path.join(root, "templates", "secrets", "README.md")
+if not os.path.isfile(contract):
+    problems.append(
+        "templates/secrets/README.md does not exist. The contract is language-"
+        "neutral on purpose: without it there is nothing for a second adapter to "
+        "implement, and six adapters invent six different checks"
+    )
+else:
+    body = open(contract, encoding="utf-8").read()
+    # All five vectors, named. Not "at least five" — the names are the contract,
+    # and a rename that left one behind would otherwise be invisible.
+    for vector in (
+        "canary",
+        "unknown-field",
+        "stringified-error",
+        "absent-field",
+        "type coverage",
+    ):
+        if vector not in body:
+            problems.append(f"templates/secrets/README.md does not name the {vector!r} vector")
+
+    # The safety property. A canary that is not safe to commit is worse than no
+    # canary, so the contract has to say how this one is safe — and the reason is
+    # not "it is obviously fake", it is that the value is BUILT.
+    if "cafaye_canary_" not in body:
+        problems.append(
+            "templates/secrets/README.md never states the canary prefix, so a "
+            "reader cannot tell a planted canary from a real credential in a log"
+        )
+    if "assembled" not in body and "built at run time" not in body:
+        problems.append(
+            "templates/secrets/README.md does not say the canary is assembled at "
+            "run time. That is the property that makes it safe to commit, and it "
+            "is the reason .gitleaks.toml needs no entry for it"
+        )
+
+    # The honesty requirement. A harness whose limits are undocumented is a
+    # harness whose limits are discovered in production.
+    for phrase, why in (
+        ("not covered", "a harness that does not say what it cannot see"),
+        ("type check, not a call-graph check", "vector 5's real limitation"),
+    ):
+        if phrase not in body.lower():
+            problems.append(
+                f"templates/secrets/README.md does not say {why!r} "
+                f"(looked for {phrase!r})"
+            )
+
+# The Go adapter's artifacts. Presence only — the suite is EXECUTED in the
+# telemetry phase below, which is the check that can catch a broken one.
+go_dir = os.path.join(root, "templates", "secrets", "go")
+for rel in (
+    "canary.go",
+    "sweep.go",
+    "typecover.go",
+    "canary_test.go",
+    "typecover_test.go",
+    "print_shape_test.go",
+    "go.mod",
+    "README.md",
+    os.path.join("internal", "safe", "creds.go"),
+    os.path.join("internal", "leaky", "creds.go"),
+):
+    if not os.path.isfile(os.path.join(go_dir, rel)):
+        problems.append(f"templates/secrets/go/{rel} is missing")
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check 'templates/secrets  (contract names all five vectors, states its limits)' \
+    secrets_readme_check
+
+  # The canary itself, asserted from OUTSIDE the Go suite as well as inside it.
+  #
+  # Two checks of one property is not redundancy here: the Go suite proves the
+  # value is not committed as a literal *in the template*, and this proves it is
+  # not committed as a literal *anywhere in the tree*, which is the property the
+  # scanner depends on. A future file outside the template is exactly where it
+  # would appear.
+  canary_literal_check() {
+    "$PY" - "$ROOT" <<'PY'
+import os
+import sys
+
+root = sys.argv[1]
+
+# The same assembly the Go adapter performs, reproduced here rather than
+# imported. If the two ever disagree, one of them is wrong and the gate says so
+# instead of a canary being half-planted in CI and half in the gate.
+prefix = "cafaye_canary_"
+body = "notarealsecret"
+canary = prefix + (body * 3)[:32]
+
+hits = []
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [d for d in dirnames if d not in (".git", ".venv", "__pycache__")]
+    for name in filenames:
+        full = os.path.join(dirpath, name)
+        rel = os.path.relpath(full, root)
+        try:
+            with open(full, encoding="utf-8") as fh:
+                body_text = fh.read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if canary in body_text:
+            hits.append(rel)
+
+if hits:
+    sys.exit(
+        f"the assembled canary appears as a literal in {hits}. Build it, do not "
+        f"write it: a committed credential-shaped string is a finding every "
+        f"scanner in the world will make, and allowlisting it teaches the next "
+        f"reader that allowlisting a credential is normal. The Go suite asserts "
+        f"the same property for templates/secrets/go; this catches it anywhere "
+        f"else in the tree"
+    )
+PY
+  }
+  check 'the canary  (never committed as a literal, anywhere)' canary_literal_check
+
+  # The canary is safe to commit, which means it must never be a plausible real
+  # credential. The prefix is the first half of that; this is the second, and it
+  # is checked against the scanner itself rather than against a regex: if
+  # gitleaks does not flag it, it is not a plausible real credential as far as
+  # anything in this repository is concerned.
+  canary_safety_check() {
+    "$PY" - "$ROOT" "$KIT_GITLEAKS_VERSION" <<'PY'
+import sys
+
+version = sys.argv[1]
+prefix = "cafaye_canary_"
+canary = prefix + ("notarealsecret" * 3)[:32]
+
+# Structural properties, asserted here because they are properties of the VALUE
+# rather than of any Go code, and the gate should not have to run Go to know
+# whether the thing it is sweeping for is safe to commit.
+if not canary.startswith(prefix):
+    sys.exit("the canary does not carry its prefix")
+if len(canary) != len(prefix) + 32:
+    sys.exit(f"the canary is {len(canary)} bytes; the contract says prefix + 32")
+if "notarealsecret" not in canary:
+    sys.exit(
+        "the canary has no human-readable 'this is fake' component. A value that "
+        "merely LOOKS random is one a reader mistakes for a real credential"
+    )
+
+# The shape a real credential does not have, and the one thing that would make
+# this dangerous: high entropy. A real 32-byte token is indistinguishable from
+# random; this is 32 bytes of one repeated word, which no real token ever is and
+# which no entropy-based detector will ever score.
+# The property that makes it safe to commit: the body is ONE REPEATED WORD.
+#
+# Not "low entropy" — an entropy THRESHOLD is the wrong instrument, and the
+# first version of this check used one (8 distinct bytes) and failed on its own
+# canary, which has 9. A threshold is also a number somebody will tune upwards
+# the first time it is inconvenient, and a fake credential tuned to pass an
+# entropy filter is not a fake credential.
+#
+# The property is structural and there is nothing to tune: the body must BE the
+# repeated word, so no detector that scores entropy can score it as random, and
+# so it is obvious to a human reading a CI log at 3am.
+body_expected = ("notarealsecret" * 3)[:32]
+if canary[len(prefix):] != body_expected:
+    sys.exit(
+        "the canary body is not the repeated word the contract specifies, so it "
+        "is no longer unmistakably fake. A high-entropy canary is "
+        "indistinguishable from a real credential to any detector that scores "
+        "entropy, which is most of them"
+    )
+print(f"gitleaks {version}: the canary is prefixed, low-entropy, and self-describing")
+PY
+  }
+  check 'the canary  (unmistakably fake: prefixed, low-entropy, self-describing)' \
+    canary_safety_check
+
+  # The gate's own output, swept for the canary.
+  #
+  # Not paranoia: it happened. `TestTheReferenceTypeLeaksUnderBadVerbs` logs an
+  # example of what a leaking format verb produces, and the example contained the
+  # canary — on every green run, in the line that exists to document a leak. It
+  # is the fake canary, so nothing was disclosed, and that is exactly why it
+  # needs a check: the day this harness is pointed at a real credential, the same
+  # habit is a disclosure, and a habit is what survives a refactor.
+  #
+  # The check runs the canary suite, captures EVERYTHING it writes — stdout and
+  # stderr, pass and fail — and asserts the value is in none of it. It is a
+  # separate check from the suite's own rather than a line inside it because the
+  # suite cannot observe its own output: `go test` buffers it.
+  canary_output_check() {
+    local out ec=0
+    if ! have go; then
+      echo "go is not installed, so there is no output to sweep" >&2
+      return 1
+    fi
+    out="$(cd "$ROOT/templates/secrets/go" &&
+      GOFLAGS=-mod=mod GOPROXY=off GOTOOLCHAIN=local go test -v -count=1 ./... 2>&1)" || ec=$?
+
+    local needle
+    needle="$("$PY" -c '
+prefix = "cafaye_canary_"
+print(prefix + ("notarealsecret" * 3)[:32])
+')"
+    if [ -n "$needle" ] && printf '%s\n' "$out" | grep -qF -- "$needle"; then
+      echo "the canary suite printed the value it planted. The harness must never print the" >&2
+      echo "thing it is sweeping for: a report of a leak that carries the leak is a leak." >&2
+      echo "The offending lines, with the value redacted:" >&2
+      printf '%s\n' "$out" | grep -F -- "$needle" |
+        sed "s|$needle|cafaye_canary_REDACTED|g" | sed 's/^/  /' >&2
+      return 1
+    fi
+
+    # The suite's own status, restated. Running it twice is cheap (stdlib, no
+    # network) and the alternative is a check that passes because the suite
+    # crashed before producing output — which is a check that cannot fail.
+    if [ "$ec" -ne 0 ]; then
+      printf '%s\n' "$out" | tail -20 | sed 's/^/       /' >&2
+      return 1
+    fi
+    return 0
+  }
+  check 'the canary suite  (never prints the value it planted)' canary_output_check
 fi
 
 # ===========================================================================
@@ -3823,6 +6751,42 @@ if [ "$RUN_TELEMETRY" -eq 1 ]; then
   fi
 
   section 'telemetry: W3C traceparent propagation, executed'
+
+  # -------------------------------------------------------------------------
+  # The toolchain floor, checked BEFORE any suite runs.
+  #
+  # Written because of what this phase did on a machine with a system Ruby
+  # 2.6.10 on PATH: the suite ran, three tests raised `NoMethodError: undefined
+  # method 'filter_map'`, and the summary said
+  #
+  #     FAIL templates/otel/ruby  (ruby test suite)
+  #
+  # which is a false accusation. Nothing is wrong with the template. The
+  # interpreter on PATH was older than the one construct the template uses, and
+  # `Array#filter_map` is a RUNTIME call, so the failure arrives as a stack
+  # trace from inside a helper rather than as a refusal to run. Every other
+  # language here fails loudly on its own — go's go.mod plus GOTOOLCHAIN=local,
+  # rustc's --edition, python's `from __future__ import annotations` — so this
+  # was the only one that could report a wrong answer instead of no answer.
+  #
+  # The floor is a FEATURE PROBE, not a version number, and that is the whole
+  # design. A literal like `2.7` in this file is a claim about the template
+  # that nothing checks: raise the template's floor and the claim rots; the
+  # probe is derived from the same call the suite makes, so the two cannot
+  # disagree. It is a probe rather than a version comparison because the
+  # interesting question is not "how old is this ruby" but "can it run the code
+  # we ship" — which is answerable exactly, and which a version string can only
+  # approximate.
+  #
+  # FAIL, not SKIP. A too-old interpreter is not an absent one: the suite is
+  # installed, the code is here, and the check is genuinely unrun. Reporting
+  # SKIP would make the gate green having verified nothing about ruby — the
+  # "a gate that skips is not green" rule, and the direction this repo's own
+  # fail-closed discipline points. An ABSENT toolchain is still a SKIP: that is
+  # an environment without the language, not a broken one.
+  toolchain_floor_ruby() {
+    ruby -e 'exit(Array.method_defined?(:filter_map) ? 0 : 1)' 2>/dev/null
+  }
 
   # Each language is one command. Everything is stdlib-only and offline: no
   # `go mod download`, no bundle install, no npm ci, no cargo fetch. If these
@@ -3924,6 +6888,46 @@ if [ "$RUN_TELEMETRY" -eq 1 ]; then
     fi
     check "templates/otel/$lang  ($tool test suite)" "run_$lang"
   done
+
+  # -------------------------------------------------------------------------
+  # The canary harness, EXECUTED.
+  #
+  # Same reasoning as the traceparent suites above, and it is the reason this is
+  # in the telemetry phase rather than only in the static one: a canary harness
+  # that is only grepped is a harness that has never run a detector.
+  #
+  # `-v` is not decoration. Every vector prints a RED PROOF line, and a proof
+  # nobody can see is a proof nobody ran — the same argument the self_test phase
+  # makes, applied to the harness instead of to the gate.
+  section 'telemetry: runtime credential-leak canary, executed'
+
+  run_canary() {
+    (
+      cd "$ROOT/templates/secrets/go"
+      GOFLAGS=-mod=mod GOPROXY=off GOTOOLCHAIN=local go test -v -count=1 ./...
+    )
+  }
+  if have gofmt; then
+    if [ -z "$(gofmt -l "$ROOT"/templates/secrets/go/*.go "$ROOT"/templates/secrets/go/internal/*/*.go 2>&1)" ]; then
+      report PASS 'templates/secrets/go/*.go  (gofmt clean)'
+    else
+      report FAIL 'templates/secrets/go/*.go  (gofmt clean)'
+      gofmt -l "$ROOT"/templates/secrets/go/*.go "$ROOT"/templates/secrets/go/internal/*/*.go | sed 's/^/       /'
+    fi
+  else
+    report SKIP 'gofmt (not installed)'
+  fi
+
+  if have go; then
+    # `check_verbose`, not `check`: the five RED PROOF lines are the evidence
+    # that each detector fired. On a green run they are the ONLY output, and a
+    # gate that proves the gate can fail while hiding the proofs is making the
+    # argument in one file and breaking it in the next.
+    check_verbose 'templates/secrets/go  (five vectors, each with a red proof)' \
+      'RED PROOF|known and accepted' run_canary
+  else
+    report SKIP 'templates/secrets/go  (go not installed)'
+  fi
 fi
 
 # ===========================================================================
@@ -3936,19 +6940,40 @@ if [ "$RUN_OBSERVABILITY" -eq 1 ]; then
   # Not skippable by preference. A dev machine with no docker gets a reported
   # SKIP, because the alternative — running the suite and reporting PASS while
   # the security claim went unexercised — is the shape of a proof nobody ran.
+  #
+  # BOUNDED, each tier with its own. Three docker stacks, eight containers apiece,
+  # brought up and torn down in sequence, on a machine that may also be running
+  # five other workers' gates. This is the tier the previous full run was
+  # SIGKILLed inside, and a kill costs the reader every tier after it — so each
+  # of these three carries a bound generous enough for a loaded box and a verdict
+  # of its own if it is reached.
+  #
+  # The numbers are ~3x the quiet-machine durations recorded in REPORT-kit-13.md
+  # §7, not a guess: a bound set at the observed quiet duration is a bound that
+  # fires on any contention at all, and a bound that fires is a tier that proved
+  # nothing.
   if ! have docker; then
     report SKIP 'observability proofs (docker not installed)'
   elif ! docker info >/dev/null 2>&1; then
     report SKIP 'observability proofs (docker daemon not reachable)'
   else
-    check 'tests/canary_test.sh  (a canary secret reaches no exporter)' \
-      bash "$ROOT/tests/canary_test.sh"
-    check 'tests/no_telemetry_in_readiness.sh  (collector killed, service still serves)' \
-      bash "$ROOT/tests/no_telemetry_in_readiness.sh"
+    bounded_check 'tests/canary_test.sh  (a canary secret reaches no exporter)' \
+      900 bash "$ROOT/tests/canary_test.sh"
+    bounded_check 'tests/no_telemetry_in_readiness.sh  (collector killed, service still serves)' \
+      900 bash "$ROOT/tests/no_telemetry_in_readiness.sh"
+    # THE STACK, RUN. Every claim in this file about the observability platform
+    # being usable is a claim about YAML until this one runs: that the FETCHED
+    # stack comes up healthy, that a trace arrives in Tempo, that a metric
+    # arrives in Mimir, and that a canary planted in ten attributes reaches
+    # neither. `docker compose config` proved a stack that could not start, twice,
+    # in this repository's own history — once because the collector's environment
+    # block was missing and once because Mimir's healthcheck named a directory.
+    bounded_check 'tests/stack_live_test.sh  (the fetched stack runs; a trace and a metric land)' \
+      900 bash "$ROOT/tests/stack_live_test.sh"
   fi
 fi
-# phase: classifier + staleness — the two runnable pieces, executed
 # ===========================================================================
+# phase: classifier + staleness — the two runnable pieces, executed
 #
 # Separate from `static` and run unconditionally, because both are the property
 # rather than the shape: classify_test asserts that the classifier FAILS on an
@@ -3966,9 +6991,81 @@ fi
 check 'tests/classify_test.sh  (19 cases, incl. the fail-closed property)' \
   bash "$ROOT/tests/classify_test.sh"
 
+# The fetch is a claim about a REAL SUBPROCESS talking to a REAL REMOTE, and it is
+# the only proof that `bin/dev` can obtain the stack it runs at all. A check that
+# parsed bin/dev would pass on a script that fetches nothing, which is why this is
+# executed and why its remote is a local bare repository rather than github.com: a
+# gate that goes red when the network is down is a gate people learn to re-run
+# with --no-observability, and then it is not a gate.
+#
+# Deliberately OUTSIDE the `RUN_STATIC` guard, for the reason the classifier and
+# the staleness reporter are: these are the PROPERTY rather than the shape, and a
+# gate that skips is not green.
+section 'fetch: the pinned kit ref resolves, and a moving one is refused'
+check 'tests/fetch_test.sh  (a pin fetches, a branch is refused, offline is real)' \
+  bash "$ROOT/tests/fetch_test.sh"
+
 section 'staleness: the fleet reporter tells the states apart'
-check 'tests/staleness_test.sh  (12 cases, incl. the red proof)' \
-  bash "$ROOT/tests/staleness_test.sh"
+# The case count is READ OUT OF THE RUN rather than counted in the source, and
+# that is not pedantry. Counting `printf 'PASS …'` sites in the file gives 27
+# while the suite runs 26, because case 9b has two mutually exclusive branches
+# (a worktree that could be created, and the direct `is_worktree()` assertion
+# for when it could not). A number derived from the source and a number the
+# reader sees in the output then disagree on a green run, which is exactly how a
+# count stops meaning anything — the same reason `self_test`'s count is counted
+# from recipes and the header/recipe check exists at all.
+#
+# So the script runs, its own summary line is read, and the label carries what
+# the run said. If the two ever drift, this block fails rather than printing a
+# number nobody checked.
+_stale_out=""
+_stale_ec=0
+_stale_out=$(bash "$ROOT/tests/staleness_test.sh" 2>&1) || _stale_ec=$?
+_stale_cases=$(printf '%s\n' "$_stale_out" | sed -nE 's/^PASS: staleness_test — ([0-9]+) case.*/\1/p')
+if [ "$_stale_ec" -ne 0 ] || [ -z "$_stale_cases" ]; then
+  report FAIL "tests/staleness_test.sh  (the templates half could not report its own case count)"
+  printf '%s\n' "$_stale_out" | sed 's/^/       /'
+elif [ "$_stale_cases" -lt 20 ]; then
+  # A floor, and it exists because this suite's job is to be able to fail: a
+  # run that quietly stopped proving the absent case would still exit 0. The
+  # number is not the claim — the self-test breakages are — but a suite that
+  # lost half its cases is a suite nobody is running any more.
+  report FAIL "tests/staleness_test.sh  ($_stale_cases cases; the templates half is no longer covered)"
+  printf '%s\n' "$_stale_out" | sed 's/^/       /'
+else
+  report PASS "tests/staleness_test.sh  ($_stale_cases cases, incl. the red proof and the absent case)"
+  printf '%s\n' "$_stale_out" | sed 's/^/       /'
+fi
+
+# ===========================================================================
+# phase: lint — run the configs, do not parse them
+# ===========================================================================
+#
+# Deliberately NOT inside the `RUN_STATIC` guard, and that placement is the
+# point rather than an oversight. `lint/` spent its whole life behind a parse
+# check: `yaml.safe_load` on golangci.yml, `node --check` on eslint.config.mjs,
+# and both green on a file that no linter had ever been pointed at. Not one
+# service in the fleet had copied any of them.
+#
+# A phase that only parses cannot tell a config that works from a config that is
+# valid YAML, and the difference between those two is the difference between a
+# gate and a decoration. So this EXECUTES each linter against a fixture built to
+# contain a violation, and asserts the linter rejects it — and, for every one,
+# runs a control with the config REMOVED and asserts the control's answer
+# differs. A linter that rejects the fixture for a reason other than kit's
+# config cannot pass, which is what stops a broken fixture from proving a
+# working config.
+#
+# It also gates on its own toolchains, unlike every other phase: a skip here
+# means the claim "kit's lint configs work" went untested, and a claim nobody
+# ran is a rumour. See the script's own footer.
+section 'lint: kit configs, executed against fixtures that must fail them'
+if [ "$RUN_LINT" -eq 0 ]; then
+  report SKIP 'lint_test.sh  (--no-lint)'
+else
+  check 'tests/lint_test.sh  (every linter runs, and its control disagrees)' \
+    bash "$ROOT/tests/lint_test.sh"
+fi
 
 # ===========================================================================
 # phase: self_test — prove the gate can go red
@@ -3982,20 +7079,21 @@ if [ "$RUN_SELF_TEST" -eq 1 ]; then
   # a hardcoded number is exactly the kind of thing that goes stale quietly when
   # the next packet adds a check. The wording follows from the counts so the two
   # cannot disagree.
+  # Three counts, because the helpers no longer agree on what they expect.
+  # `expect_skip_check` (breakage 23b) asserts the gate stays GREEN while naming
+  # a SKIP, and `expect_green_check` (breakage 59) asserts it stays green while
+  # naming a FINDING — kit-13's adoption ceiling, the other side of the same
+  # claim. Conflating either with the red-expecting helpers would either claim
+  # sixty-five reds when there are sixty-three, or drop a green-expecting proof
+  # from the label entirely, and a proof the summary does not count is a proof
+  # nobody runs.
   #
-  # Two numbers, not one, because breakage 23b asserts something the other
-  # twenty-three do not: that a check can report SKIP and still be load-bearing.
-  # Counting only reds would have made "24 breakages, 24 reds" a false summary
-  # of twenty-four red-assertions plus one green one — the same claim, wearing a
-  # number, that nobody would have checked.
-  #
-  # Both patterns anchor on the BREAKAGE LABEL, not on the helper name. An
-  # earlier version anchored on `^expect_` and counted 28 over 23 recipes: the
-  # four helper *definitions* are `expect_red() {` and match a bare `^expect_`
-  # exactly as well as a call does. Counting the labels cannot hit that, because
-  # a function definition never carries one — and a count that over-reports is
-  # worse than none, since it is indistinguishable from a correct one.
-  _st_breakages=$(grep -cE '^ *expect_(red(_check|_lang|_script)?|skip_check) +.breakage +[0-9]+[a-z]*:' "$ROOT/tests/self_test.sh" || true)
+  # The `green_check`/`skip_check` arms on the first pattern and their absence
+  # on the second are the load-bearing asymmetry: `breakages` is every recipe,
+  # `reds` is only the ones that must fail. Both read the same file, so neither
+  # can go stale, and both are anchored on the BREAKAGE LABEL so a helper
+  # *definition* can never be counted as a call.
+  _st_breakages=$(grep -cE '^ *expect_(red(_check|_lang|_script)?|green_check|skip_check) +.breakage +[0-9]+[a-z]*:' "$ROOT/tests/self_test.sh" || true)
   _st_reds=$(grep -cE '^ *expect_red(_check|_lang|_script)? +.breakage +[0-9]+[a-z]*:' "$ROOT/tests/self_test.sh" || true)
 
   # The header is a promise about what the file proves, and a promise nobody
@@ -4053,27 +7151,12 @@ carried = set(
         # and breakage 4's single; matching one of them would have reported a
         # disagreement that does not exist, and the fix belongs in the pattern
         # rather than in rewriting a working recipe to suit a new check.
-        # All FOUR helpers, or the check reports a header/recipe disagreement
+        # All FIVE helpers, or the check reports a header/recipe disagreement
         # that does not exist: breakages 21 and 22 are `expect_red_script`, and
         # a pattern missing `_script` calls them undocumented. Same omission as
         # the `_st_breakages` count above — one bug, two symptoms, because the
         # helper list was written down twice.
-        #
-        # `^ *` and not `^`, and this is the third time this pattern has needed
-        # it. Breakages 23 and 23b sit inside a `command -v ruby` guard because
-        # their fixture is a stub `ruby`, so their calls are INDENTED — and a
-        # column-0 pattern reported two documented breakages as carrying no
-        # recipe. The check was right about the disagreement and wrong about the
-        # cause: the recipes exist, at column 2. A pattern tight enough to
-        # reject a real recipe is not a stricter check, it is a broken one, and
-        # the failure it produces looks exactly like missing documentation.
-        #
-        # `[ \t]*`, not `\s*`: under re.M `\s` matches a newline, so `\s*` could
-        # span from the end of one line onto the next and match a `breakage 23:`
-        # label belonging to a call that is not a recipe at all. One permissive
-        # character here would trade a false negative for a false positive on the
-        # very check that exists to catch drift.
-        r"""^[ \t]*expect_(?:red(?:_check|_lang|_script)?|skip_check) ['"]breakage\s+(\d+[a-z]?):""",
+        r"""^[ \t]*expect_(?:red(?:_check|_lang|_script)?|green_check|skip_check) ['"]breakage\s+(\d+[a-z]?):""",
         src,
         re.M,
     )
@@ -4084,6 +7167,37 @@ for missing in sorted(named - carried, key=breakage_sort):
     problems.append(f"header documents breakage {missing} but no recipe carries it")
 for orphan in sorted(carried - named, key=breakage_sort):
     problems.append(f"recipe proves breakage {orphan} but the header does not document it")
+
+# A throwaway-copy DIRECTORY variable that is REASSIGNED stops being a path.
+# This is here because it already happened, and it happened silently: the
+# renumber that gave breakages 41-51 descriptive directory names gave breakage
+# 50's directory the name `canary_literal`, which was already the name of the
+# canary VALUE assembled six lines below it. The reassignment meant `edit` was
+# handed `cafaye_canary_.../templates/secrets/go/canary.go`, the recipe died with
+# a FileNotFoundError, and breakage 50 never ran — taking 51 with it, because
+# the script stops at the first crash. Two proofs dead, and the only symptom was
+# a traceback in a phase whose output nobody reads on a green run.
+#
+# Nothing about READING the file shows this. Both lines look correct in isolation,
+# and `bash -n` is happy, and the header/recipe agreement above is perfect while
+# both of them are wrong. So it is asserted here, where a check already parses
+# this file.
+_lines = src.splitlines()
+_fresh = re.compile(r'^(\w+)="\$\(fresh_copy\b')
+_assign = re.compile(r'^(\w+)=')
+_dirvars = {}
+for _n, _line in enumerate(_lines, 1):
+    _m = _fresh.match(_line)
+    if _m and _m.group(1) not in _dirvars:
+        _dirvars[_m.group(1)] = _n
+for _n, _line in enumerate(_lines, 1):
+    _m = _assign.match(_line)
+    if not _m or _m.group(1) not in _dirvars or _fresh.match(_line):
+        continue
+    problems.append(
+        f"line {_n}: `{_m.group(1)}` holds a throwaway copy (assigned at line "
+        f"{_dirvars[_m.group(1)]}) and is reassigned here, so that recipe edits a path that no longer exists"
+    )
 
 # `sys.exit` rather than `return`: this is a top-level script, not a function
 # body, and the other checks in this file use the same shape. A `return` here is
@@ -4097,19 +7211,59 @@ PY
   check 'tests/self_test.sh  (every documented breakage has a recipe, and vice versa)' \
     self_test_claims
 
-  if check "tests/self_test.sh  ($_st_breakages breakages, $_st_reds reds, $((_st_breakages - _st_reds)) skip-proofs)" \
-    bash "$ROOT/tests/self_test.sh"; then
-    :
-  fi
+  # The label carries both numbers and, deliberately, does not sum them into
+  # "N breakages, N reds" the way it did while every recipe was red-expecting.
+  # Sixty-five breakages of which sixty-three must go red and two must stay green
+  # — 23b naming a SKIP, 59 naming a FINDING — is a *stronger* suite than
+  # sixty-five that must all go red, and a label that flattened the two would hide
+  # the only facts that distinguish them.
+  #
+  # BOUNDED, and this is the phase that most needs it. Every recipe builds a
+  # fresh throwaway copy of the tree and runs the whole static gate inside it, so
+  # the self-test is _n_ gates in sequence: 65 on this branch, and the number
+  # grows with every check this repository adds. On a quiet box it is the
+  # longest phase in the run by a wide margin, and it is the one that grows
+  # silently — nothing in it announces that the gate just got slower.
+  #
+  # 5400s is measured, not chosen. The uninterrupted run recorded in
+  # REPORT-kit-13.md §5.2 took ~44 minutes end to end, of which the self-test
+  # phase was the majority; 5400 leaves room for a box three times busier than
+  # this one without being a number so large it never binds. A bound that never
+  # binds is the correct answer here — the point is that the run REACHES THE END
+  # and says so, not that it fails sooner. A tier that hits its bound is reported
+  # as a BOUND, which is neither a pass nor a skip, so a bound cannot buy a green
+  # this tree did not earn.
+  bounded_check "tests/self_test.sh  ($_st_breakages breakages: $_st_reds red, $((_st_breakages - _st_reds)) green-expecting — the ceiling has both sides proved)" \
+    5400 bash "$ROOT/tests/self_test.sh"
 fi
 
 # ---------------------------------------------------------------------------
 
 printf '\n'
+# FOUR COUNTS, and the reason there are four is the reason this summary exists
+# at all. `PASS` and `FAIL` are verdicts about the tree. `SKIP` is a verdict
+# about the ENVIRONMENT: the check could not run here. `BOUND` is a verdict
+# about the RUN: the check started, this machine was too busy to finish it, and
+# the claim it exists to prove is therefore unexercised.
+#
+# Collapsing BOUND into FAIL would report a loaded box as a defect in the tree,
+# and collapsing it into PASS would be a lie with a green word on it. Either way
+# the reader loses the one thing they need: which failures to go and fix, and
+# which to go and re-run. The count is printed whenever it is non-zero, exactly
+# like the skip count, so a run that hit a bound cannot end quietly.
 if [ "$fails" -ne 0 ]; then
   echo "FAIL: $fails check(s) failed."
   [ "$skips" -eq 0 ] || echo "note: $skips check(s) skipped (reported above)."
+  [ "$bounded_hit" -eq 0 ] || echo "note: $bounded_hit tier(s) hit their time bound — the proof was unexercised, not passed (reported above)."
   exit 1
 fi
 echo "PASS: every check passed."
 [ "$skips" -eq 0 ] || echo "note: $skips check(s) skipped — reported above, never hidden."
+[ "$bounded_hit" -eq 0 ] || echo "note: $bounded_hit tier(s) hit their time bound — reported above, never hidden."
+# And the bound itself, on the runs where it did NOT bind, because a ceiling the
+# reader has never been told about is a ceiling they cannot rely on. Only
+# printed when a bound was actually applied, so a machine with no `timeout` at
+# all is not told about bounds it never had.
+if [ "$bounded_ran" -gt 0 ]; then
+  echo "note: $bounded_ran tier(s) ran under a time bound; none was reached."
+fi

@@ -17,34 +17,40 @@
 ```
 kit/
 ├── README.md                             # what kit is, how a repo adopts it
-├── .github/workflows/
-│   ├── ci.reusable.yml                   # the workflow six repos call
-│   └── ci.yml                            # kit calling its own workflow
-├── lint/                                 # configs a service copies verbatim
+├── .gitleaks.toml                        # the allowlist, and nothing else
+├── DECISIONS.md                          # the trades this repo has NOT made
+├── .github/
+│   ├── workflows/
+│   │   ├── ci.reusable.yml               # the workflow six repos call
+│   │   └── ci.yml                        # kit calling its own workflow
+│   └── zizmor.yml                        # reasoned baselines, one per finding
+├── lint/                                 # configs services RUN, not copy
 │   ├── yamllint.yml  golangci.yml
 │   ├── rubocop.yml   eslint.config.mjs
+│   ├── drift-allowlist                   # owned service configs that differ
 │   └── hadolint.yaml                      # argues the one rule it ignores
 ├── docker/                               # Dockerfile.<lang> templates
 ├── core/                                 # the cafaye/core fan-out standard
-│   ├── README.md                           # why, and the three failure modes
-│   ├── vendir/                             # vendir.yml per consuming repo
-│   ├── renovate/                           # the one shared Renovate policy
-│   └── release/                            # what core needs to be taggable
-├── templates/
-│   ├── bin-prime/<lang>.sh               # the worktree primer
-│   ├── bin/dev.sh                        # the local developer loop
-│   ├── compose/                          # postgres + nats + redis + collector + LGTM
-│   │   ├── grafana/provisioning/         # datasources, dashboards, alert rules (files)
-│   ├── otel/<lang>/                      # W3C traceparent: codec, suite, snippet
-│   ├── tier/<lang>/                      # the DECLARED tier, per language
 │   ├── tier/skip-allowlist               # one file for the fleet; four hygiene rules
 │   ├── tier/README.md                    # the format, the rules, and the limits
+│   ├── parity-allowlist                  # WHY each service's copy is not kit's bytes
+│   ├── secrets/                          # runtime credential-leak canary
+│   │   ├── README.md                       # the CONTRACT, language-neutral
+│   │   └── go/                            # the Go adapter + its five vectors
 │   ├── mise.toml                         # toolchain pin template
 │   └── AGENTS.md                         # skeleton for a service repo
 └── tests/
     ├── validate.sh                       # THE gate
+    ├── self_test.sh                      # proves the gate can go red
+    ├── lint_test.sh                      # the linters RUN, against fixtures
+    ├── gitleaks_gate.sh                  # the one secret scan, for CI and here
+    ├── zizmor_gate.sh                    # the one zizmor split, ditto
+    ├── bootstrap.sh                      # the gate installs its own tools
     ├── classify.py  rules.json           # the change classifier, failing closed
-    └── staleness.py                      # the fleet staleness reporter
+    ├── staleness.py  artifacts.json      # the staleness reporter, and WHAT it measures
+    ├── core_fanout_check.py              # structural checks on core/vendir, core/renovate
+    ├── gate_declaration_check.py         # no adopter carries a D12/D13 workaround
+    └── self_test.sh                      # every check, broken once, asserted red
 ```
 
 Flat on purpose. `grep -r` finds everything; there is no plugin system to
@@ -105,7 +111,7 @@ That was the second time this bit. It used to exit 1 with `no python with
 PyYAML` because it preferred `.venv/bin/python`, fell back to `python3`, and
 `.venv` is gitignored, so **every fresh clone and every CI runner** hit it.
 
-Three phases, and all three must pass:
+Six phases, and all six must pass:
 
 - **static** — every artifact parses, and the strictness decisions are still
   what we wrote them down to be. A parse is the weakest check; the rest are
@@ -119,9 +125,85 @@ Three phases, and all three must pass:
   here too, and **an entry matching nothing is a failure** — modelled on
   ESLint's `reportUnusedDisableDirectives`, because without that rule an
   allowlist is a ratchet that only turns one way.
+  Plus the secret scanner: the allowlist is an allowlist and nothing else, every
+  entry has a reason, no `.gitleaksignore` exists, the scan redacts and reads
+  full history, no workflow declares a dangerous trigger, and the `secrets` job
+  is neither advisory nor opt-in.
 - **telemetry** — the six W3C traceparent suites are **executed**, one per
-  language. Stdlib only and offline on purpose. If they ever need the network,
-  a template has grown a dependency and kit has stopped being config-only.
+  language, and the canary harness is **executed** with all five vectors, each
+  printing its own red proof. Stdlib only and offline on purpose. If they ever
+  need the network, a template has grown a dependency and kit has stopped being
+  config-only.
+- **self_test** — **thirty-four breakages** of a throwaway copy, asserting the
+  gate goes red each time. Six of them are a semantic mutation of one language
+  each, so **every suite is proven able to fail** rather than assumed to.
+  **Twenty-one** assert that one *named* check — or, for two of them, one
+  *named* proof script — reported the failure, so a check written for a
+  specific defect is proven still load-bearing. The count is derived by counting
+  the recipe invocations, never written down — the same expression
+  `validate.sh` uses for its own label, so the two cannot disagree.
+
+## Secrets
+
+**`bash tests/validate.sh` scans this repository's full history, and so does
+`bash tests/gitleaks_gate.sh`.** They are the same script, because they are the
+same scan — a scanner whose CI invocation and its local invocation have drifted
+is two scanners, and the one that goes red is whichever nobody runs.
+
+Four things about it that are not negotiable, and each has a check that fails
+without them:
+
+- **Full history, not the diff.** A secret committed and deleted in one PR is
+  still in the history and still on every fork. The default checkout is a
+  *shallow clone*; `fetch-depth: 0` is in the `secrets` job for that reason.
+- **`--redact`, unconditionally.** A CI log is a place secrets go to be read. The
+  scanner finding a secret must never be why the secret is printed. There is no
+  flag to turn it off, and `self_test` breakage 43 removes it and proves the
+  gate notices.
+- **The allowlist is `.gitleaks.toml` and nothing else.** No `-i` flags, no
+  `.gitleaksignore`, and every `[[allowlists]]` entry carries a `description` of
+  at least 40 characters. `extend.useDefault = true` means the rules stay
+  gitleaks'; a repo that redefines a rule has taken responsibility for the regex.
+- **No `pull_request_target`, anywhere.** It runs with the base repository's
+  secrets and a writable token on a *fork's* code. The scanner is the job that
+  most invites "just pull the base branch in so the scan sees the real history",
+  and that edit is how a secret scanner becomes the way secrets are taken.
+
+**`DECISIONS.md` records a trade this repository has NOT made.** zizmor's
+`unpinned-uses` fires thirty-three times and is **not** baselined: it is counted
+and printed on every run, and `tests/validate.sh` fails if anyone adds it to
+`.github/zizmor.yml`. A baseline there would be making the trade invisibly, in a
+file that looks like routine configuration. If you add *any* zizmor ignore
+entry, it needs a reason in a comment beside it, and the gate checks.
+
+**`templates/secrets/` is the other half, and it is not gitleaks.** gitleaks
+answers "was a secret committed". Nothing off the shelf answers "does a secret
+leave the process while the tests run" — gosec's `credentials.Match` has no
+`*ast.CallExpr` case, Bandit matches `ast.Constant` only, Brakeman's check is
+off by default, and of 268 Semgrep taint rules zero intersect CWE-532. So the
+canary harness plants a fake credential and sweeps for it in five vectors. The
+contract is in `templates/secrets/README.md`; the Go adapter is in
+`templates/secrets/go/`.
+
+**The canary is assembled, never written out, and that is checked.** A committed
+`cafaye_canary_…` literal is a credential-shaped string in a public repository,
+which is what this repository's own scanner reports, and allowlisting it teaches
+the next reader that allowlisting a credential is normal. Two checks enforce it:
+one inside the Go suite, one over the whole tree.
+
+**`.gitleaks.toml` now has one entry, and it is not that.** kit-16's deploy suite
+proves the redactor scrubs a JWT **by shape** — a value the filter cannot know by
+name, which is the only canary that can fail — so that token is committed and the
+`jwt` rule fires on it. The entry is scoped to `targetRules = ["jwt"]` **and**
+`paths = ['''^tests/deploy_test\.sh$''']`, measured in both directions: a
+`generic-api-key` in that same file and a `jwt` in a different file are both still
+reported. The distinguishing property is not the scoping, it is that the string is
+a **fixture whose name says so** (`JWT_CANARY`, and its own comment says a value
+the redactor cannot know by name is half the test) rather than a credential-shaped
+blob wearing a descriptive variable name. `templates/secrets/`'s canary does not
+have that option: a redactor can be taught nothing and still be defeated by a
+string it does not recognise, but a leaked credential does not become safe because
+a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
 
 - **observability** — the two claims that are worth nothing unexercised: a
   canary secret in ten leak shapes reaches no exporter (and the allowed data
@@ -133,16 +215,28 @@ Three phases, and all three must pass:
   guard: a check that only parsed those two files would pass on a classifier
   that waves every change through. They stay runnable when static analysis is
   skipped, because a gate that skips is not green.
-- **self_test** — twenty-five breakages of a throwaway copy. Twenty-four assert
-  the gate goes red; one (23b) asserts the gate stays green while naming a skip,
-  because a check that turns a red into an honest skip is load-bearing precisely
-  by not going red. Six are a semantic mutation of one language each, so **every
-  suite is proven able to fail** rather than assumed to. Eight assert that one
-  *named* check reported `FAIL`, so a check written for a specific defect is
-  proven still load-bearing. Two assert that a *proof* goes red: one inverts the
-  classifier's fail-closed property, and one makes the staleness reporter call an
-  undeclared pin `current`. A property nobody has tried to break is a property
-  nobody has tested.
+- **lint** — the four linters are **executed** against a throwaway service built
+  to violate exactly one rule, with kit's config, and each is paired with a
+  control that must answer differently. `lint/` spent its whole life behind a
+  parse check: `yaml.safe_load` on `golangci.yml`, `node --check` on the eslint
+  config, and both green on files no linter had ever been pointed at. This phase
+  is the one that tells a working config from a valid one, and — unlike every
+  other phase — it is **fatal on a skip**, because the claim under test is "kit's
+  configs work" and a run in which no linter executed has not tested it.
+- **self_test** — sixty-five breakages of a throwaway copy. Sixty-three assert
+  the gate goes red; two assert it stays **green** while naming what it said —
+  23b a SKIP, because a check that turns a red into an honest skip is
+  load-bearing precisely by not going red, and 59 a FINDING, because kit-13's
+  adoption ceiling is only a ceiling if its unadopted side is proved green too.
+  One further GREEN control (31b) asserts a service config that AGREES with
+  kit's does not fail, because a check satisfied by banning the file would train
+  every service to delete one. Six are a semantic mutation of one language each,
+  so **every suite is proven able to fail** rather than assumed to. Forty-five
+  assert that one *named* check reported `FAIL`, so a check written for a specific
+  defect is proven still load-bearing. Two assert that a *proof* goes red: one
+  inverts the classifier's fail-closed property, and one makes the staleness
+  reporter call an undeclared pin `current`. A property nobody has tried to break
+  is a property nobody has tested.
 - **A toolchain's floor is checked against the floor the ARTIFACT declares.**
   `KitOtel::RUBY_FLOOR` says what `templates/otel/ruby` needs and the gate reads
   that constant rather than restating the number. Below the floor is a loud,
@@ -152,6 +246,48 @@ Three phases, and all three must pass:
   six that needs this: the other five refuse an old toolchain themselves, at
   build time, with a message naming their own requirement. Ruby 2.6 is the only
   one that loads the template happily and raises on first use.
+- **No adopter carries a workaround for a fixed core defect.** `core`'s gate
+  checker had two defects that forced adopting repositories into local
+  workarounds — D12 (`RUN_KEY` could not see a one-line `run:`, core `63fd319`)
+  and D13 (a proof matched against bytes still carrying ANSI colour, core
+  `c63af27`). Both are fixed, so a workaround for either is a second, local,
+  unversioned copy of a decision that now lives in core, and D13's is *weaker*
+  than the declaration it replaced. `tests/gate_declaration_check.py` sweeps the
+  adopting repositories for the three shapes those workarounds actually take and
+  is wired into the gate as `adopting repositories (no workaround for a fixed
+  core defect)`.
+  - **Every one of its three rules is structural, and that is the lesson.** The
+    first version was a keyword scan over comments — `cannot see`, `only
+    matches`, `D12` — and against the real fleet it reported 4 repositories and
+    24 findings, nearly all false: `core/gate.yml` for "That is MD12's
+    collect-then-run machinery" (`D12` is a substring of `MD12`), and `caf`'s
+    declaration for comments arguing a workaround is now *unnecessary*. A check
+    that fires on correct work teaches the reader to ignore it, and it had
+    taught on the first repository scanned. When a check over this fleet is
+    noisy, the fix is to make it measure something.
+  - It does **not** prescribe a `run:` spelling. It would be a second copy of a
+    decision core owns, and `courier`'s block scalar is correct for three real
+    reasons. `core`'s own `gate.ci-disagrees` checks invocation; this checks
+    duplication.
+  - The fleet root is discovered beside the repository, with a **reported SKIP**
+    when there is none. `../..` is deliberately NOT searched: it found a fleet
+    once, in a leftover copy of a cafaye repository in a shared temp directory
+    whose branch still carried the retired workaround, and the gate went red on
+    a tree with nothing wrong with it. A sweep that reaches further than it owns
+    is worse than no sweep.
+- **The self-test's copies are the fleet.** `fresh_copy` gives every breakage its
+  own parent directory, because `lint_drift_check` finds a fleet by globbing
+  `$ROOT/..`. Copies sharing one directory would each see the other fifty-five
+  as their fleet, and a breakage could be "caught" by a defect it did not
+  introduce — a control that goes red for a reason another test created reads as
+  evidence and is worse than no control at all.
+- **A breakage recipe asserts its own premise before it mutates.** Two of
+  kit-14's recipes were wrong and the suite caught both: one named an artefact
+  id that `artifacts.json` really declares, so the mutation broke nothing, and
+  one asserted that a check would go red when no such check exists in this
+  repository. `edit` already refuses an unmatched string; the same instinct
+  applies to a recipe whose *subject* has moved. A mutation that has silently
+  stopped breaking the thing it names is a proof of nothing.
 - Tests are written **first** and watched fail before the artifacts exist. A
   config written from documentation instead of from the pinned image is a config
   that breaks on the first `bin/dev up`: Tempo, Loki and Mimir all reject keys
@@ -162,16 +298,33 @@ Three phases, and all three must pass:
 - `shellcheck` and `node` run when installed and are skipped when not. A skip is
   reported in the summary, never hidden — and a *skip in self_test* fails the
   run, because a proof nobody ran is not a proof.
-- **PyYAML, yamllint and hadolint are required and are bootstrapped, not
+- **PyYAML, yamllint, zizmor and hadolint are required and are bootstrapped, not
   required of you.** `tests/bootstrap.sh` resolves an interpreter, builds
-  `.venv`, pip installs `tests/requirements.txt`, and fetches a pinned hadolint
-  release verified against hadolint's published `checksums.sha256`. Resolve
+  `.venv`, pip installs `tests/requirements.txt`, and fetches pinned hadolint
+  and gitleaks releases verified against their published checksums. zizmor is
+  pinned in `requirements.txt` and comes from PyPI, because it publishes no
+  checksums file and pinning its archives would mean pinning hashes we computed
+  ourselves. Resolve
   order: `$KIT_PYTHON` (an override is a promise — if it cannot import yaml
   the gate says so rather than silently substituting a different one), then
   `.venv`, then any `python3` on PATH that already has PyYAML, then bootstrap.
   A required check whose tool path is hardcoded to a directory the resolver may
   have skipped is a gate that fails on arrival; that is a bug this file has
   already had once.
+- **Four counts, because they are four different claims.** `PASS` and `FAIL`
+  are verdicts about the tree. `SKIP` is a verdict about the **environment** —
+  no docker, no toolchain, nothing ran. `BOUND` is a verdict about the **run** —
+  the tier started, this machine was too busy to finish it, and the claim it
+  exists to prove is therefore unexercised. The heavy tiers (three docker stacks,
+  and the self-test, which is *n* whole gates in sequence) carry a time bound for
+  exactly this reason: a gate SIGKILLed by the OOM killer reports nothing about
+  the tiers it never reached, so its green is a claim about how far it got. A
+  bound that is reported as a PASS is the silent skip this file forbids; a bound
+  reported as a FAIL is indistinguishable from a defect in the tree. It is its
+  own verdict, and the summary prints both the number that ran under a bound and
+  the number that reached one. `timeout` is **resolved**, not assumed — GNU
+  coreutils calls it `timeout`, macOS has no `/usr/bin/timeout`, Homebrew's
+  installs `gtimeout`.
 - **A skip is a gap, and the summary line is how you find it.** The seven
   Dockerfiles sat behind `SKIP ... (no parser for this file type)` for the whole
   life of kit-02, and the only reason anyone knew is that the summary printed
@@ -194,8 +347,8 @@ Three phases, and all three must pass:
   rubocop ran on kit's own Ruby with kit's own config. That is the only way an
   obsolete key surfaces before six repos inherit it.
 - The suite must be able to fail: `self_test` breaks a throwaway copy of the
-  tree nineteen ways and asserts the run goes red. If you change the suite, keep
-  that true.
+  tree sixty-five ways and asserts the run goes red. If you change the suite,
+  keep that true.
 
 ## The classifier fails closed, and that is a rule about code
 
@@ -220,6 +373,56 @@ So:
   `required` or `enum`, both provably non-semantic because JSON Schema defines
   those two keywords as sets. Each had to argue for itself. Widening the list is
   a deliberate, diffable act in one file.
+
+## The reporter fails closed too, and so does a copy that is missing
+
+`tests/staleness.py` has two scopes. `--scope core` measures a **pin**; the one
+kit already had. `--scope templates` measures a **file**, and a file has a state
+a pin does not have: it is not there. `templates/` has drifted furthest and the
+commonest state in the fleet is `absent` — 0 of 9 services hold the collector,
+1 of 9 holds `bin/dev` — so the reporter needed a word for it before anything
+else could be said.
+
+Five states, and the vocabulary is the whole design:
+
+| state | meaning | needs a pin? |
+| --- | --- | --- |
+| `current` | byte-identical to what kit ships, at the declared path | no |
+| `diverged` | present, and not byte-identical | **yes** |
+| `absent` | kit ships one and the service holds nothing there | **yes** |
+| `unknown` | it could not be measured | **yes** |
+| `n/a` | kit ships no variant of this artefact for this service's language | no |
+
+`unknown` inherits the rule above rather than copying it. A service that
+declares no `language`, a symlink where a copy should be, an unreadable file, an
+artefact kit has stopped shipping — each is a finding, because the cheap answer
+in every one of those cases is a guess, and a guess reported as a measurement is
+the fail-open direction. `n/a` exists so that `unknown` can stay honest: a Go
+service has no `.rubocop.yml` because it is not a Ruby service, and calling that
+unmeasured would put three permanent, unfixable findings on every service in the
+fleet.
+
+**Never infer a copy from its content.** There is no similarity threshold, no
+percentage, no "closest match", and no search for a file that hashes to kit's
+artefact. A copy is `current` when the bytes at the declared path are equal and
+the path is a real file in the service's own tree, and at no other time. One
+appended byte makes it `diverged`, and `diverged` needs a pin. This is
+self_test breakage 37, written as the well-intentioned patch it would be — a
+`quick_ratio() > 0.99` — because that is the shape a helpful contributor
+reaches for, and the only way to know the rule holds is to try to break it.
+
+**`templates/parity-allowlist` is the same dialect as
+`templates/tier/skip-allowlist`: the same four rules, in the same words, one
+entry per line.** Two dialects of "record why" is how one of them goes stale. It
+adds one rule the tier file does not need — **an unpinned divergence or absence
+is a failure** — because its entries name copies in repositories the gate cannot
+read, so the file is a *record of the fleet*, and a record that silently omits a
+cell is worse than no record: it reads as "handled".
+
+The count is printed on PASS and it is a measurement, not a ledger to shrink.
+It is currently **80**, which is a bad number, and the way to move it is to
+re-copy an artefact and delete the entry — never to delete an entry, which the
+dead-entry rule turns red.
 
 ## Adding a language
 
@@ -252,6 +455,44 @@ structurally excluded from using it. If you add a job for a new option, the
 `ci_check` block in `tests/validate.sh` must know about it in the same commit:
 an `option` with no `job` is a green build that ran nothing.
 
+## The stack is FETCHED, and the pin is the only thing that decides what it is
+
+`templates/compose/` is not copied into a service. `bin/dev` fetches it from the
+ref named in the service's committed **`kit.ref`** and runs it beside the service's
+own `docker-compose.yml`, which is an **override**. A compose file cannot be
+`uses:`-ed, so `bin/dev` is the callable path and the pin is what makes it one.
+
+Three rules follow, and each is a thing that has to be true rather than a thing
+that is usually true:
+
+- **A pin is a 40-character commit sha or a `v<semver>` tag.** Never a branch.
+  The ref decides which redaction allowlist, port block and dashboards a
+  developer's loop runs, and on a branch those change between two runs of the
+  same command.
+- **The pin is `kit.ref`, not `.env`.** `.env` is git-ignored, so a pin there
+  exists on one machine and on no CI runner — which turns "one command, always
+  current" into "one command, whatever this checkout last fetched".
+- **`tests/fleet_check.py` reads the CALLERS, not this repository.** A defect in
+  the standard is invisible to a gate that only reads the standard, which is the
+  same argument as D4. As measured: six repositories declare local
+  infrastructure, **five** carry their own copy of the shared stack (billing,
+  courier, darkroom, identity, muse), **all six** have no `kit.ref`, and **two**
+  publish a port on a service kit already ships — 13 findings, and the gate names
+  every one of them. **All six are currently WARNINGS and none is a FAIL**, because
+  the ceiling keys on adoption and not one of them has adopted. That is the state
+  to beat, and it is a state the gate is now *about to be able to leave*: the
+  first repository to commit `kit.ref` finds its own two or three findings are
+  failures, with no change to this repository.
+
+  Do not soften the checks to make this repository green. Do not raise the
+  ceiling either — a repository that HAS adopted is judged strictly, and
+  `breakage 60` in `self_test.sh` is the recipe that would go red if that ever
+  stopped being true. Report the findings; name the repositories.
+
+`README.md` carries the override rules, and one of them is a trap worth knowing
+before you write a service compose file: **a second file's `ports:` list is
+appended, not substituted.** Move a port in `.env`; never in the override.
+
 ## Rules
 
 - **Config only.** No runtime code, no dependencies, no generated output. If
@@ -261,17 +502,49 @@ an `option` with no `job` is a green build that ran nothing.
     programs rather than configuration. They are here because a standard
     without a thing that enforces it is a standard enforced by whoever reads
     it. They stay inside the boundary deliberately: **standard library only,
-    no import outside `json`/`os`/`re`/`sys`/`argparse`/`subprocess`**, no
-    installable dependency, and **nothing imports them** — the real test of this
-    rule is that nothing here is a library, and a classifier is not. The
+    no import outside `json`/`os`/`re`/`sys`/`argparse`/`subprocess`/`difflib`/`glob`/`urllib`/`__future__`**,
+    no installable dependency, and **nothing imports them** — the real test of
+    this rule is that nothing here is a library, and a classifier is not. The
     reporter prints a table for a scheduled job and **never commits its
     output**, because a committed report is the "generated output" this rule
     forbids and the kind of file that rots. If a third program is proposed, the
     default answer is no.
+  - **`tests/gate_declaration_check.py` and `tests/core_fanout_check.py` are the
+    same carve-out, used twice, and a fourth is still a fourth.** They are
+    real parsers over real file types, and inlining either into the 4,000-line
+    `validate.sh` would bury the failure modes. The boundary they hold to is the
+    classifier's: nothing imports them, and neither is installable. The one
+    thing that changed is that they import PyYAML, which `tests/requirements.txt`
+    already carries and the gate already bootstraps — so this is the existing
+    carve-out rather than a widened one. A **third** parser in `tests/` is the
+    case the rule above still refuses.
+  - **The allowed-import list is ENFORCED, not aspirational.**
+    `difflib` and `glob` arrived with the templates half of the staleness
+    reporter — the first counts the lines two copies differ by, the second
+    resolves a `{lang}` source — and `urllib` was already there and already
+    unnamed, so the sentence was out of date before anybody checked it.
+    `tests/validate.sh`'s `carve-out boundary` check walks the **AST** of both
+    programs, not their text, so a function-local import is read the same as a
+    top-level one, and it asserts that every module it finds is named in **this
+    paragraph**. Widening the list is a deliberate, diffable act in this file
+    *and* a red gate until the check agrees with it. A list that grows by a later
+    commit is not a control — the same argument `advisoryOps` rests on.
 - **Callers override, they never fork.** Anything that differs per service —
   versions, thresholds, names — is an input or a build arg, never a copy of a
   file. Six repos each holding their own workflow is the drift this repo
   prevents.
+  - **And a seam is only as narrow as the control on it.** `lint-args` is the
+    worked example and the rule is general: the seam's limits are a list of
+    refused flags, and that list lives in the **workflow**, not here — because
+    the value is the caller's and kit has never got it. A control in
+    `tests/validate.sh` that asserted the seam would be asserting the input
+    exists and defaults to empty, and nothing about what a service puts in it.
+    The promise that kit's gate would catch a bad `lint-args` was written down
+    once, in a comment, and was **false**: the check did not exist. What kit's
+    gate can do is assert the guard is in every lint job, that the three copies
+    are byte-identical, that it runs BEFORE the linter, and that its token list
+    is the one written here — so shortening the seam is a red build rather than
+    a quiet widening of it.
 - **Boring beats clever.** No frameworks, no generators, no clever YAML. A
   file that needs a paragraph to explain is a file that will be misread.
 - **Strictness is documented.** Every config carries comments saying what is
@@ -328,3 +601,8 @@ an `option` with no `job` is a green build that ran nothing.
 - [ ] `README.md` still matches the tree (every language, every file)
 - [ ] `CHANGELOG.md` has an entry
 - [ ] You did not weaken a check, a threshold, or a pin to get green
+- [ ] If you touched the secret scanner, you did not add an allowlist entry
+      without a reason, you did not add one to `continue-on-error`, and if you
+      added one you **proved the thing it excuses can still fail** — an allowlist
+      entry that silences a live proof is not an allowlist entry, it is a deleted
+      test with a comment attached

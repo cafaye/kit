@@ -11,8 +11,12 @@
 #   *different* check, so a passing self_test means the checks are independent
 #   and not one lucky assertion standing in for all of them.
 #
-# THE TWENTY-FIVE BREAKAGES   (20 from the tier work, 21 from the
-#                               fan-out work, 18 of them shared)
+# THE SIXTY-FIVE BREAKAGES, and one GREEN control   (20 from the tier work, 21
+#                               from the fan-out work, 24-26 from the fleet gate,
+#                               27-32c from the lint work, 33-40 from the
+#                               staleness/parity work, 41-51 from the secrets
+#                               work, 52-60 from the fetched-stack work; 18
+#                               shared before the lint packet)
 #   1. delete a language template   -> the artifact-presence check goes red
 #   2. add a collector exporter    -> the privacy check goes red
 #   2b. DELETE the tempo exporter   -> the same check goes red from the other
@@ -69,7 +73,232 @@
 #         skip. The one breakage here that asserts a check while the gate is
 #         green: a floor that turns a red into a silent pass is worse than no
 #         floor, and only this direction can tell the two apart.
+#  24-26. the shapes a workaround for a FIXED core defect takes -> the fleet
+#         check goes red. Two are D12 (core 63fd319: `RUN_KEY` could not see a
+#         one-line `run:`) and one is D13 (core c63af27: a proof matched against
+#         bytes still carrying ANSI colour). Both defects are fixed, so a
+#         workaround for either is a second, unversioned copy of a decision that
+#         now lives in core, and 26's escape runs make the declaration WEAKER
+#         than the same declaration written without them.
+
+# 27-30. the four ways the "lint runs from kit" mechanism stops being a GATE
+#         while everything else stays green, all caught by `lint_wiring_check`
+#         and all NAMING it, because a check that has quietly stopped being
+#         load-bearing should fail here rather than being found months later by
+#         the policy it stopped policing:
+#           27. a language job's `lint` step DELETED -> the job no longer lints
+#           28. that step made ADVISORY — `continue-on-error: true`, the
+#                breakage that matters most, because the step still runs, still
+#                prints every finding, and the job is green. A linter that only
+#                warns is a report, and this is how a report is born without
+#                anybody deciding to write one.
+#           28b. the same defect written the other way it can be written,
+#                `|| true` at the end of the run body. Continue-on-error in
+#                shell, and it reads to nobody as anything but a deliberate
+#                choice.
+#           29. the kit CHECKOUT deleted, so `--config` names a file that is not
+#                there and each linter quietly falls back to its own defaults —
+#                five linters for golangci-lint, MethodLength 10 for rubocop,
+#                no rules at all for eslint. All green, all much weaker, and
+#                invisible in the YAML, because the step still says `--config`.
+#           30. the config WEAKENED in place. The sharpest of the four, because
+#                every other check can be green while it happens: the file still
+#                parses, the workflow still points at it, and the policy is now
+#                whatever was left. So the linter list is asserted BY VALUE.
+#  31. a SERVICE carries a lint config INCONSISTENT with kit's -> the drift
+#        check goes red. The failure this whole packet exists to end, at the
+#        layer where it lands: a service's own lint config, disagreeing with
+#        kit's, in a repository that calls kit.
 #
+#        The MECHANISM was measured before it was written down, and the first
+#        version of this comment was wrong. `--config` WINS: `golangci-lint run
+#        -v` prints exactly one `[config_reader] Used config file`, and with the
+#        flag it names kit's — a repo-root `.golangci.yml` that disables
+#        `misspell` does not survive it, and RuboCop behaves the same way. So a
+#        stale copy does NOT hijack kit's CI, and this breakage is not about
+#        that. What a copy does is SPLIT the policy: every other invocation in
+#        that repository reads it while CI reads kit's, and it becomes live
+#        again the instant the flag is lost — silently, because a copy is always
+#        weaker than the thing it was copied from. That is the finding, and it is
+#        why the check reports the DIFFERENCE rather than banning the file.
+# 32-32c. the SEAM, in the three ways `lint_args_seam_check` can stop being a
+#         control. The seam is `lint-args`, the one input a service uses to ask
+#         for a stricter linter, and its narrowness is a list of refused flags
+#         held in a `lint-args guard` step in each lint job:
+#           32. the guard DELETED from one job. The other two keep working, so
+#                this is the shape of an accident — one merge, one job, no other
+#                signal anywhere.
+#           32b. the guard KEPT and its list SHORTENED by one token. The edit a
+#                well-meaning commit makes when somebody wants `--no-config`:
+#                rather than argue about the seam, the token comes out. The
+#                build stays green for every service that sets it and the
+#                workflow still contains a step called `lint-args guard`. This
+#                is the sharpest of the three, and it is only caught because the
+#                token list is asserted against a copy held in validate.sh.
+#           32c. the guard MOVED after the linter. It still runs, still reads the
+#                variable, and still refuses everything it refused — after the
+#                linter has been handed `--no-config` and already exited 0. A
+#                control that runs after the thing it controls is the most
+#                comfortable kind of dead code, because read top to bottom it
+#                looks exactly like a live one.
+#   ...and one GREEN control, which is the other half of 31's claim: a service
+#        config that AGREES with kit's must PASS, because a check that failed on
+#        the mere presence of the file would train every service to delete a file
+#        it is allowed to keep. It is written here as prose rather than as a
+#        numbered entry because it is a control and not a breakage — and because
+#        `self_test_claims` counts only the red-expecting helpers, so a numbered
+#        entry here would be reported as a header claim with no recipe.
+
+#  33. a parity-allowlist entry naming an artefact kit does not ship -> the
+#         dead-entry check goes red. The ESLint direction, and the mutation is
+#         well-formed in every other respect, so a shape-only check passes it.
+#  34. an EXPIRED parity-allowlist entry -> the same check goes red. The gate
+#         reads the clock, and this is the first time anything in kit has
+#         actually watched the ratchet fire rather than reading that it exists.
+#  35. `tests/artifacts.json` naming a `{lang}` source kit does not ship for
+#         every language -> the artefact-table check goes red. Half a language is
+#         worse than none, and the table is what says so.
+#  36. report an ABSENT artefact as `current` -> staleness_test.sh goes red.
+#         This is the breakage the packet is for: the reporter treating the
+#         commonest state in the fleet as the one that means everything is fine.
+#  37. grade a copy by RESEMBLANCE rather than by equality -> staleness_test.sh
+#         goes red. The failure mode the packet names: a file that looks like
+#         kit's is not evidence it is kit's.
+#  38. give one of the two programs a third-party import -> the carve-out check
+#         goes red. "Standard library only" was a sentence in AGENTS.md for the
+#         whole life of the rule and nothing checked it; a boundary nobody can
+#         cross is not a boundary.
+#  39. remove one fixture service's `.git`, so the reporter cannot see it ->
+#         staleness_test.sh goes red AND blames the FIXTURE. Observed for real at
+#         load average 160 before it was written: one case failed, 35 passed, and
+#         the failure text named the reporter when the reporter had simply been
+#         handed a smaller fleet. A red that misattributes itself is worse than
+#         no red, so this asserts the EXPLANATION, not only the exit status.
+#  40. delete the one line that consults the ruby toolchain floor, leaving the
+#         probe defined and never called -> the ruby check still runs the suite.
+#         A floor check that is written, admired and never fires is the shape
+#         this breakage is the well-intentioned version of: `have ruby` is three
+#         lines above, so asking whether it is the RIGHT ruby looks redundant.
+#         `Array#filter_map` is a runtime call, so without the floor an old
+#         interpreter reports three NoMethodErrors and the summary blames a
+#         template that is correct.
+#
+# 41-42. plant a detectable credential, in history and in the working tree ->
+#            the secret scanner goes red
+# 43-44. remove --redact, then narrow the scan to the last commit -> the
+#            scanner's BEHAVIOUR check goes red. Not its source: a `grep -- --redact`
+#            is satisfied by the comment above the flag that explains why the flag
+#            is mandatory, and that breakage proved exactly that
+# 45. add `pull_request_target` -> the dangerous-trigger check goes red
+# 46. make the `secrets` job `continue-on-error` -> the not-advisory check goes
+#            red. A secret scanner that only warns is a report
+# 47-50. break the canary's reference type in the four ways that turn it into
+#            the leaky one -> THAT VECTOR's suite goes red
+# 51. baseline unpinned-uses in .github/zizmor.yml -> the never-baselined check
+#            goes red
+
+# 52-55. THE FLEET GATE, one breakage per failure mode, each against a FIXTURE
+#         fleet rather than the real one. A fixture fleet is what makes these
+#         mean anything: the real fleet is red on master BY DESIGN, so "the gate
+#         went red" there is satisfied by two clean repositories.
+#           52. a service carrying its own copy of the shared stack (a second
+#               postgres) -> the stale-copy check goes red. Five of the six
+#               repositories that declare local infrastructure are in exactly
+#               this state today, and the mutation is their real shape rather
+#               than a toy.
+#           53. a service that overrides the collector's config mount -> the
+#               weakened-boundary check goes red. The mount is where the
+#               redaction allowlist lives, so this is the failure that leaks
+#               prompt content rather than the one that looks untidy.
+#           54. an `otel-collector.yml` nothing ever starts -> the dead-config
+#               check goes red. Inert is the worst of the four: the file looks
+#               authoritative, every edit to it changes nothing, and a
+#               developer has no way to find out.
+#           55. a `kit.ref` holding `master` -> the pin check goes red.
+# 56-58. the override rules, each against the named check.
+#           56. a vendor config mount that stopped resolving from the fetched
+#               tree. Found by RUNNING the stack; `docker compose config`
+#               renders the same project and every other check stays green.
+#           57. the pin moved back into `.env`, where it is git-ignored and so
+#               exists on exactly one machine.
+#           58. a service publishes a port on a service kit already ships. The
+#               merge appends rather than substitutes, so nothing errors and the
+#               port the developer meant to move is still bound.
+# 59-60. THE ADOPTION CEILING, both sides of it, because a ceiling that only has
+#         one side proved is not a ceiling — it is a deleted check.
+#           59. the SAME stale copy in a repository with NO `kit.ref` -> the gate
+#               stays GREEN and the finding is printed as a WARN naming the
+#               adoption path. This is the half that could have been quietly
+#               wrong: if the unadopted side went red, the ceiling would not
+#               exist and this breakage would have caught it.
+#           60. that repository's `kit.ref` written -> the gate goes RED on the
+#               same defect, same message, same severity. This is the half that
+#               proves nothing was weakened: it is the fixture of breakage 52
+#               plus one committed line.
+#           The pair is also the ratchet proof. 59 and 60 run over the SAME
+#           fixture, so a change that softened the adopted side fails 60 and a
+#           change that hardened the unadopted side fails 59, and there is no
+#           third state in which both pass and the checks are weaker.
+#
+#   33-40 continue that numbering above, and the reason the copy-is-gone case
+#   gets TWO breakages and not one is that
+#   "report absent as current" and "grade by resemblance" are opposite mistakes
+#   that a single mutation cannot both produce: one removes a finding, the
+#   other invents one, and a gate that can only do one of them is half a gate.
+#
+#   Forty-five of them (7-12, 19, 20, 24-32c, 33-35, 38, 40-60) additionally
+#         assert WHICH check went red. Every other breakage only proves the gate
+#         can fail; those prove the check written for that defect is still
+#         load-bearing, which is a different claim and the one that decays
+#         silently. 21, 22, 36 and 37 assert the same thing about the two scripts
+#         that are themselves proofs, 39 asserts it about the WORDING — a red that
+#         blames the reporter when the fixture is at fault is a red that sends
+#         the next reader to the wrong file — and 52-55 and 58-60 assert it over
+#         a FIXTURE fleet rather than over the tree; see `fixture_fleet` below
+#         for why that helper exists at all.
+#
+#   And one GREEN control, which is a claim the numbered breakages cannot make.
+#         31b asserts the gate is green on a copy whose service config MATCHES
+#         kit's. A check that failed on the mere presence of a `.golangci.yml`
+#         would be satisfied by this packet and would teach every service to
+#         delete a file it is allowed to keep — a silent outcome, and a worse one
+#         than the drift it was written to catch.
+#
+#   The counts here were wrong three times and every time a check caught it
+#         rather than a reader: the header said "seven" over a four-wide range,
+#         it numbered a second entry 19 while the recipes numbered it 20, and it
+#         kept saying "twenty-three" after the lint packet added six more. A
+#         header that drifts from the recipes is not documentation, it is a
+#         second, unchecked copy of the truth — which is the entire thing
+#         validate.sh's header/recipe check exists to prevent. That check COUNTS
+#         the recipes and diffs them against this header, so the third error was
+#         caught the same way as the first two: mechanically, not by reading.
+#
+# WHAT IT IS NOT
+#   This is not exhaustive mutation testing. Each implementation gets exactly one
+#   mutant, chosen to be the bug a reviewer would not see: a dropped bit mask, an
+#   alphabet that quietly grows a second case, a limit raised until it never
+#   fires. One mutant per language proves the suite bites; it does not prove the
+#   suite is complete, and nothing here should be read as claiming that is.
+#
+#   The same applies to breakages 41-51. They prove each check CAN fail; they do
+#   not prove the check is complete. A check that fires on the defect it was
+#   written for is the floor, and the floor is what a gate nobody runs has.
+#
+# WHY THE PLANTED PROBES ARE ASSEMBLED RATHER THAN WRITTEN OUT
+#   Breakage 24 plants a credential, 25 plants the same one, and 33 plants a
+#   canary literal. All three are assembled from parts in a throwaway copy, for
+#   one reason: a probe written out is a probe committed, and the scanner and the
+#   canary check would then both report THIS FILE — every breakage caught by the
+#   wrong thing, and a gate that is red for a reason nobody introduced.
+#
+#   It happened, twice, while writing these. `tests/validate.sh` reported four
+#   leaks in the file that was planting them, and the canary check reported the
+#   breakage's own replacement string. Both are recorded in the breakages'
+#   comments, because a proof that only ever worked the first time is a proof
+#   somebody will trust.
+
+
 #   These are numbered 20-22 rather than 19-21 because 19 is the allowlist
 #   breakage above, from the tier work. Both packets numbered their first entry
 #   independently and the collision is only visible in the union — which is what
@@ -122,9 +351,42 @@ copy_name=""
 
 # A fresh throwaway copy per breakage: one breakage must never mask the next,
 # and no breakage may touch the worktree this script was invoked from.
+#
+# EACH COPY GETS ITS OWN PARENT DIRECTORY, and that is load-bearing rather than
+# tidiness. `fleet_repos` in tests/validate.sh finds a service fleet by globbing
+# `$ROOT/..`, so a copy that sat directly in the shared `$WORK` would see all
+# THIRTY of its siblings as the fleet. That is not a tidiness problem, it is a
+# correctness one in both directions:
+#
+#   - every breakage's gate run would be red because a LATER breakage's copy
+#     carries a `.golangci.yml`, so a breakage could be "caught" by a defect it
+#     did not introduce; and
+#   - breakage 31b, which asserts the gate is GREEN on a copy whose config
+#     MATCHES kit's, would be red because breakage 31's copy — a sibling, in the
+#     same directory — has one that does not.
+#
+# A control that goes red for a reason another test created is worse than no
+# control, because it reads as evidence. One directory per copy makes each
+# breakage's fleet exactly itself: deterministic, and each result attributable
+# to the breakage under test and nothing else.
+
+# `$WORK/$name/kit`, NOT `$WORK/$name`, and the reason is a proof that passes for the
+# wrong reason.
+#
+# Every `expect_red_check` runs `validate.sh` inside a throwaway copy, and
+# `validate.sh` asks `fleet_check.py` about `$ROOT/..` — the copy's PARENT. If
+# that parent is `$WORK`, then every fixture fleet an earlier breakage built
+# (`$WORK/fixtures/<name>/{alpha,beta}`, each with a `.git`) is a repository the
+# gate can see, and the first one's `alpha` is still broken. So breakage 52's
+# defect makes EVERY LATER breakage go red, and breakages 53-55 would pass on
+# `FAIL fleet` whether or not the mutation they applied was the defect they name.
+#
+# Four proofs asserting nothing, caused by a directory that was one level too
+# high. `<name>/` is a directory that holds one copy and nothing else, so a copy's
+# parent contains exactly one entry — itself — and that entry has no `.git`.
 fresh_copy() {
   copy_name="$1"
-  local dst="$WORK/$copy_name"
+  local dst="$WORK/$copy_name/kit"
   mkdir -p "$dst"
   # `.github` is in this list and not an afterthought: the reusable workflow it
   # holds is the artifact every check that reads the workflow's inputs reads by
@@ -132,10 +394,48 @@ fresh_copy() {
   # `core` is here for the same reason `.github` is: the breakages below mutate
   # files in it, and a copy without it would fail on a missing path rather than
   # on the defect under test — which is a self_test that proves nothing.
-  for entry in .github AGENTS.md README.md CHANGELOG.md core docker lint templates tests; do
+  # `lint` is here for the same reason `.github` is: the breakages below mutate
+  # files in it and read files in it, and a copy without it would fail on a
+  # missing path rather than on the defect under test — which is a self_test
+  # that proves nothing.
+  # `.gitleaks.toml` is here for the same reason, and its absence is the loudest
+  # version of that failure this file has: kit-08's gitleaks check reads it by
+  # path and REFUSES to run without it, so a copy that left it behind failed the
+  # control — "the gate is RED on an unbroken tree" — for a reason that had
+  # nothing to do with the tree. Three checks went red at once (the allowlist's
+  # own shape, the behavioural `--redact` proof, and the scan), and every one of
+  # them was reporting the missing file.
+  #
+  # The list below is therefore the set of things the gate READS, and it has to
+  # be re-extended whenever a packet adds a check that reads a new path. That is
+  # a real coupling between the harness and the tree, and it is better than the
+  # alternative: a check that silently cannot run in a copy is a proof that
+  # proves nothing while reporting something.
+  for entry in .gitleaks.toml .github AGENTS.md README.md CHANGELOG.md core docker lint templates tests; do
     [ -e "$ROOT/$entry" ] && cp -R "$ROOT/$entry" "$dst/"
   done
-  chmod +x "$dst"/tests/validate.sh "$dst"/tests/self_test.sh 2>/dev/null || true
+  # KIT_GITLEAKS, unlike the other two, must ALSO be resolved before the first
+  # copy runs. It is a fetched binary rather than a python script, so the copy's
+  # `$root/.venv` — which does not exist, because fresh_copy does not copy the
+  # gitignored venv — is not where it would be found. Without this, every copy
+  # re-downloads a 15MB archive, and the twenty-odd copies this script makes per
+  # gate run turn a 90-second suite into a twenty-minute one.
+  #
+  # Precedence is deliberately: the developer's own gitleaks, then the one this
+  # tree fetched, then PATH. A developer's install may be a different version
+  # and that is their business, exactly as it is for hadolint.
+  if [ -z "${KIT_GITLEAKS:-}" ] && [ -x "$ROOT/tests/.bin/gitleaks" ]; then
+    KIT_GITLEAKS="$ROOT/tests/.bin/gitleaks"
+  fi
+  export KIT_GITLEAKS="${KIT_GITLEAKS:-}"
+  # Every script in tests/, not just the two entry points. `cp -R` does NOT
+  # preserve the executable bit on macOS, so a copy arrives with every tests/
+  # script non-executable — and the gate has a check for exactly that (the two
+  # gate scripts are run BY the reusable workflow, so they must be executable).
+  # Without this, every one of the twenty-odd copies fails that check, and the
+  # control run reports the tree red for a reason that has nothing to do with
+  # any breakage under test.
+  chmod +x "$dst"/tests/*.sh 2>/dev/null || true
   printf '%s' "$dst"
 }
 
@@ -179,20 +479,103 @@ expect_red() {
 # exact label validate.sh prints. A rename on either side breaks this loudly,
 # which is the intended behaviour: a renamed check and a stale proof are the
 # same defect.
+#
+# THE MATCH IS A SUBSTRING TEST ON THE VARIABLE, NOT `printf | grep -q`, and it
+# has to be. `grep -q` exits at the FIRST match and closes the pipe, so the
+# writer takes SIGPIPE and dies 141 — and this script runs under `set -o
+# pipefail`, which promotes that 141 to the status of the whole pipeline. The
+# `if` then reads a match as a NON-match.
+#
+# That is not theoretical here; it is what the first run of this merge
+# produced. Breakage 11 (hadolint) and breakage 42 (the working-tree
+# credential) both produce a gate run larger than the 64KB pipe buffer, and both
+# were reported as "the gate went red, but NOT via `<the check that fired>`" —
+# while printing that very check among the FAIL lines it had just proven was
+# there. Underneath the threshold it matches; at or above it, the proof of the
+# best-behaved check in the file failed for a reason that had nothing to do with
+# the check. Same defect `tests/canary_test.sh` already records for
+# `docker logs | grep -q`, and the same rule answers it here: the output is
+# ALREADY captured in a variable, so there is no reason to introduce a pipe at
+# all. Matching the variable is not merely safer than the pipe — it makes the
+# assertion independent of how much the gate prints, which is a property the
+# piped version did not have.
 expect_red_check() {
   local label="$1" dir="$2" want="$3"
   shift 3
   local out ec=0
   out=$(cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" 2>&1) || ec=$?
-  if printf '%s\n' "$out" | grep -qF "FAIL $want"; then
-    printf 'PASS self_test: %s — caught by `%s`\n' "$label" "$want"
-  elif [ "$ec" -eq 0 ]; then
-    printf 'FAIL self_test: %s — the gate stayed GREEN\n' "$label"
+  # A shell pattern, not `printf … | grep -qF`.
+  #
+  # `grep -q` exits the instant it matches, so a large `$out` gives `printf`
+  # SIGPIPE while it is still writing. `set -o pipefail` — which this file sets
+  # — then reports 141 for a pipeline that SUCCEEDED, and a passing breakage
+  # reads as "the gate went red, but NOT via <the named check>".
+  #
+  # It hit breakage 30, whose check emits several hundred lines of report and
+  # therefore the first output in this file big enough to overflow the 64K pipe
+  # buffer. Breakages 7-29 all pass on a small enough output, which is the worst
+  # shape a latent defect has: it looks like a failure of the thing under test
+  # and is actually a failure of the harness reading it.
+  #
+  # Measured, not reasoned about: 2000 lines of output still returns 0 and 5000
+  # returns 141, on the same match and the same grep. The threshold is a property
+  # of the pipe buffer, so it would move with the machine — which is why the fix
+  # is to stop piping rather than to bound the output.
+  case "$out" in
+    *"FAIL $want"*)
+      printf 'PASS self_test: %s — caught by `%s`\n' "$label" "$want"
+      ;;
+    *)
+      if [ "$ec" -eq 0 ]; then
+        printf 'FAIL self_test: %s — the gate stayed GREEN\n' "$label"
+      else
+        printf 'FAIL self_test: %s — the gate went red, but NOT via `%s`\n' "$label" "$want"
+        printf '%s\n' "$out" | grep '^FAIL' | sed 's/^/       /'
+      fi
+      failures=$((failures + 1))
+      ;;
+  esac
+}
+
+# expect_green_check <label> <dir> <check-label> <needle> <validate.sh args...>
+#
+# The mirror of `expect_red_check`, and it exists for exactly one case: a
+# finding the gate is supposed to report WITHOUT failing on. "The gate stayed
+# green" is necessary but far too weak — the gate is green on a tree where the
+# fleet check crashed, or exited 2 and had its SKIP swallowed, or printed
+# nothing at all. So this asserts BOTH halves:
+#
+#   1. the named check reported PASS, and
+#   2. `needle` — a literal string from the finding — is in the output.
+#
+# (1) alone is the "silently skipped" failure this repository keeps warning
+# about, and (2) alone would be satisfied by a check that printed the word
+# somewhere. Together they are the claim: *this* check passed, and it passed
+# while telling you about this specific thing.
+expect_green_check() {
+  local label="$1" dir="$2" want="$3" needle="$4"
+  shift 4
+  local out ec=0
+  out=$(cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" 2>&1) || ec=$?
+  if [ "$ec" -ne 0 ]; then
+    printf 'FAIL self_test: %s — the gate went RED (exit %s), so the ceiling is not in force\n' \
+      "$label" "$ec"
+    printf '%s\n' "$out" | grep -E '^(FAIL|  -|       )' | tail -20 | sed 's/^/       /'
+    failures=$((failures + 1))
+  elif ! printf '%s\n' "$out" | grep -qF "PASS $want"; then
+    printf 'FAIL self_test: %s — the gate stayed GREEN but `%s` did not report PASS\n' \
+      "$label" "$want"
+    printf '%s\n' "$out" | grep -E '^(FAIL|SKIP)' | tail -20 | sed 's/^/       /'
+    failures=$((failures + 1))
+  elif ! printf '%s\n' "$out" | grep -qF "$needle"; then
+    # The dangerous one. A green run that said nothing is a check that ran
+    # nothing, and it is exactly what a deleted ceiling looks like from here.
+    printf 'FAIL self_test: %s — GREEN, but the finding was never named (no %q)\n' \
+      "$label" "$needle"
+    printf '%s\n' "$out" | sed -n '/fleet/,+4p' | sed 's/^/       /'
     failures=$((failures + 1))
   else
-    printf 'FAIL self_test: %s — the gate went red, but NOT via `%s`\n' "$label" "$want"
-    printf '%s\n' "$out" | grep '^FAIL' | sed 's/^/       /'
-    failures=$((failures + 1))
+    printf 'PASS self_test: %s — stayed green and named the debt\n' "$label"
   fi
 }
 
@@ -204,11 +587,27 @@ expect_red_check() {
 # script goes red is the same claim expect_red_check makes — the check written
 # for this defect is still load-bearing — expressed over a script.
 expect_red_script() {
-  local label="$1" dir="$2" script="$3"
+  local label="$1" dir="$2" script="$3" want="${5:-}"
   shift 3
+  # The optional 4th argument (always pass an empty one) is where a script's own
+  # arguments go; the optional 5th is a string the output MUST contain. A proof
+  # that goes red for the wrong reason is not a proof, and the one case that
+  # needs the stronger claim is a red that would otherwise be MISREPORTED — so
+  # the name is unchanged and the pattern in validate.sh still matches, rather
+  # than a new helper that would read as an undocumented breakage.
   if (cd "$dir" && KIT_PYTHON="$PY" bash "$script" "$@" >/dev/null 2>&1); then
     printf 'FAIL self_test: %s — the proof stayed GREEN\n' "$label"
     failures=$((failures + 1))
+  elif [ -n "$want" ]; then
+    local out
+    out=$(cd "$dir" && KIT_PYTHON="$PY" bash "$script" "$@" 2>&1) || true
+    if grep -qF "$want" <<<"$out"; then
+      printf 'PASS self_test: %s — the proof went red, and said why\n' "$label"
+    else
+      printf 'FAIL self_test: %s — the proof went red but did NOT say %s\n' "$label" "$want"
+      printf '%s\n' "$out" | grep -E '^(FAIL|PASS)' | sed 's/^/       /'
+      failures=$((failures + 1))
+    fi
   else
     printf 'PASS self_test: %s — the proof went red\n' "$label"
   fi
@@ -244,14 +643,42 @@ expect_skip_check() {
   fi
 }
 
+
+# ONE run, and its output is CAPTURED rather than re-fetched.
+#
+# The first version ran the gate twice: once discarding the output to read the
+# exit status, and again to print the diagnostic. That is a second chance to
+# lose the throwaway tree, and on the run where it mattered it lost it — the
+# control was reported as
+#
+#   FAIL self_test: unbroken tree — the gate is RED on an unbroken tree
+#   self_test.sh: line 223: cd: /tmp/kit-self-test.XXXX/base: No such file or directory
+#
+# which is a diagnosis of the DIAGNOSTIC, not of the gate. The gate had already
+# said something; nobody could read it. `|| ec=$?` rather than a bare assignment
+# is what keeps `set -e` from killing the harness before the status is read —
+# the same trap `expect_red_lang` documents, and the reason it is written out
+# again here rather than shared: the harness has no library.
 expect_green() {
   local label="$1" dir="$2"
   shift 2
-  if (cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" >/dev/null 2>&1); then
+  local out ec=0
+  if [ -d "$dir" ]; then
+    out="$(cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" 2>&1)" || ec=$?
+  else
+    # Distinct from a red gate, because it is: the tree is gone, not failing.
+    printf 'FAIL self_test: %s — the throwaway copy %s does not exist\n' "$label" "$dir"
+    printf '       Every worker on this machine mktemps under the same TMPDIR, so a\n'
+    printf '       sibling that deleted its own tree broadly can delete this one. That\n'
+    printf '       is an environment failure and NOT evidence about the gate.\n'
+    failures=$((failures + 1))
+    return
+  fi
+  if [ "$ec" -eq 0 ]; then
     printf 'PASS self_test: %s — the gate is green on an unbroken tree\n' "$label"
   else
-    printf 'FAIL self_test: %s — the gate is RED on an unbroken tree\n' "$label"
-    (cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" 2>&1 | tail -20 | sed 's/^/       /')
+    printf 'FAIL self_test: %s — the gate is RED on an unbroken tree (exit %s)\n' "$label" "$ec"
+    printf '%s\n' "$out" | grep -E '^(FAIL|note:|  -|       )' | tail -20 | sed 's/^/       /'
     failures=$((failures + 1))
   fi
 }
@@ -269,6 +696,14 @@ expect_green() {
 expect_red_lang() {
   local label="$1" dir="$2" lang="$3" file="$4" old="$5" new="$6"
   local work="$WORK/mutant-$lang"
+
+  # No counter is incremented here. This function USED to carry its own
+  # `breakages=$((breakages + 1))`, and the omission it was written to fix is
+  # the reason this file counts by grepping itself at the end instead: a counter
+  # incremented in three of four helpers had already under-reported once (the
+  # summary said "all 23" while twenty-nine had run), and a count that
+  # under-reports is worse than no count, because it reads as though proofs were
+  # missing rather than as a bug in the counter.
 
   rm -rf "$work"
   cp -R "$dir/templates/otel/$lang" "$work"
@@ -355,7 +790,210 @@ expect_red_lang() {
   fi
 }
 
+# fixture_fleet <name> — a throwaway FLEET for the four breakages below.
+#
+# WHY A FIXTURE AND NOT THE REAL ONE. The fleet gate is red on master, by design
+# and on purpose. If these breakages ran against the real sibling checkouts, every
+# one of them would be red before it started — and `expect_red_check` answers
+# "did THAT NAMED check go red", so a tree that is red for an unrelated reason
+# makes the proof meaningless in the one direction that matters. A fixture is
+# green, so a red can only have come from the breakage.
+#
+# It is also what makes the proofs hermetic. They need a fleet-shaped directory
+# with two repositories in it, and building two is cheaper and more predictable
+# than depending on whoever is checked out next to kit on the machine.
+#
+# FIXTURE SHAPE, and each part is load-bearing:
+#   alpha/  a service that has adopted the stack: a `kit.ref` with a real pin,
+#           a compose file that is a genuine OVERRIDE (its own service, no
+#           `ports:`, nothing kit ships), and no collector config of its own.
+#   beta/   the same, so a breakage aimed at alpha cannot be masked by beta and a
+#           check that only ever looks at the first repository is caught.
+#
+# `.git` is a directory, not a worktree marker file, because fleet_check.py skips
+# worktrees — a fixture that looked like a worktree would be skipped and every
+# breakage below would pass vacuously.
+fixture_fleet() {
+  # Two `local`s and not one. `local name="$1" root="…$name"` reads `name` while
+  # it is still being assigned, so `root` is built from whatever `name` happened
+  # to be — empty on the first call, so every fixture would be written to one
+  # directory and the breakages would share it and mask each other. shellcheck
+  # says so (SC2318), and the symptom is four proofs that all pass or all fail
+  # together.
+  local name="$1"
+  # `fixtures/`, not `$WORK` directly — for the reason `fresh_copy` writes to
+  # `copies/`. A fixture fleet is a fleet of REPOSITORIES, each with a `.git`;
+  # anywhere a later `expect_red_check` can discover one, an earlier breakage's
+  # still-broken `alpha` makes the next breakage red for the wrong reason. Only
+  # the four fleet breakages set `KIT_FLEET`, and they point it here.
+  local root="$WORK/fixtures/$name"
+  rm -rf "$root"
+  mkdir -p "$root/alpha" "$root/beta"
+  local svc
+  for svc in alpha beta; do
+    mkdir -p "$root/$svc/.git"
+    printf '# %s: the kit this service runs.\n41f8bcb919e34b14e7c809cbb22e24b74ec25099\n' \
+      "$svc" >"$root/$svc/kit.ref"
+    cat >"$root/$svc/docker-compose.yml" <<'YAML'
+# This service's own file, as an OVERRIDE beside the fetched stack. It owns its
+# image and its own database name, and nothing that kit already ships.
+services:
+  alpha:
+    image: cafaye/alpha:dev
+    environment:
+      POSTGRES_DB: alpha
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks: [platform]
+YAML
+  done
+  printf '%s' "$root"
+}
+
+# break_stale_copy <fixture> — give `alpha` a `postgres` of its own.
+#
+# FACTORED OUT of breakage 52 because breakage 60 needs the identical mutation,
+# and the two halves of the adoption-ceiling proof are only a proof if they are
+# the SAME defect in the SAME shape. Two hand-written copies of a nine-line
+# YAML mutation would drift, and the drift would show up as "60 went green
+# because it was mutating something else" — which is indistinguishable from
+# "60 proved the ceiling is airtight".
+#
+# The mutation is the real shape rather than a toy: a service that names its
+# database `db` and pins `postgres:17`. The service name is `db` and not
+# `postgres` on purpose, because that is what five of the six repositories in
+# scope actually do, and the check keys on the IMAGE.
+break_stale_copy() {
+  "$PY" - "$1/alpha/docker-compose.yml" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+body = open(path, encoding="utf-8").read()
+old = "  alpha:\n    image: cafaye/alpha:dev"
+new = (
+    "  db:\n    image: postgres:17\n    environment:\n      POSTGRES_USER: alpha\n"
+    "      POSTGRES_DB: alpha\n    ports:\n      - \"15500:5432\"\n"
+    "    volumes:\n      - alpha-pg:/var/lib/postgresql/data\n    healthcheck:\n"
+    "      test: [\"CMD\", \"pg_isready\", \"-U\", \"alpha\"]\n"
+    "      interval: 10s\n      timeout: 5s\n      retries: 5\n"
+    "  alpha:\n    image: cafaye/alpha:dev"
+)
+if old not in body:
+    sys.exit(f"self_test: break_stale_copy: {old!r} not in {path}")
+open(path, "w", encoding="utf-8").write("volumes:\n  alpha-pg:\n" + body.replace(old, new, 1))
+PYEOF
+}
+
+# unadopt <fixture> — remove every `kit.ref` in a fixture fleet.
+#
+# Every repository, not just `alpha`. The ceiling is per-repository, and a
+# fixture where `beta` still adopted would be testing two things at once: that
+# an unadopted repository warns, and that a clean adopting repository passes.
+# Both are worth proving, but not in one recipe, and not when a failure of the
+# first cannot be told from a failure of the second.
+unadopt() {
+  find "$1" -name kit.ref -type f -delete
+}
+
 printf -- '-- self_test: a gate that cannot fail is not a gate\n'
+
+# --------------------------------------------------------------------------
+# THE SYNTHETIC FLEET
+# --------------------------------------------------------------------------
+#
+# `tests/gate_declaration_check.py` sweeps a directory of adopting
+# repositories — `gate.yml` plus the workflow it names. There is no such
+# directory inside kit, for the same reason `tests/staleness_test.sh` builds its
+# own: kit is one repository and the fleet is fifteen, and a check that read the
+# real working directory would be green on Tuesday and red on Wednesday for a
+# reason that has nothing to do with what it checks.
+#
+# So a clean one is built here, once, and `KIT_FLEET` points every run of
+# `validate.sh` in this script at it. Two consequences, both wanted:
+#
+#   * the control below becomes the fleet check's POSITIVE case. A sweep that
+#     only ever runs on a red fleet has proved it can fail and nothing about
+#     whether it is right;
+#   * a breakage mutates its OWN copy of the fleet and nothing else, so
+#     breakages cannot mask each other, exactly as `fresh_copy` guarantees for
+#     the rest of this file.
+#
+# It is a two-file repository on purpose. Both are the real spellings: a
+# one-line `run:` in the workflow, and a proof pattern with no escape token —
+# which is the state every repository in this fleet is supposed to be in.
+FLEET="$WORK/fleet"
+
+synthetic_repo() {
+  local root="$FLEET/$1"
+  mkdir -p "$root/.github/workflows"
+  cat > "$root/gate.yml" <<'YAML'
+# gate.yml — the clean shape. One line per proof, no escape tolerance, and a
+# `ci` block naming the workflow below.
+version: 1
+name: synthetic
+
+gate:
+  command: [bin/prime]
+  entrypoint: bin/prime
+  proof:
+    - id: suite
+      match: '^([0-9]+)/[0-9]+ passed$'
+      minimum: 12
+
+external:
+  selfContained: true
+  requirements: []
+
+ci:
+  workflow: .github/workflows/ci.yml
+  invokes: [bin/prime]
+YAML
+  cat > "$root/.github/workflows/ci.yml" <<'YAML'
+name: ci
+on: [push]
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: bin/prime
+        run: ./bin/prime
+YAML
+}
+
+# A second, differently-named repository, so the sweep has to enumerate rather
+# than read one hardcoded path — and so a check that only ever saw one name
+# could not pass.
+synthetic_repo clean
+synthetic_repo second-clean
+
+# Exported once, so every `validate.sh` invocation below sweeps THIS fleet
+# rather than whatever happens to sit beside the throwaway copy. A prefix
+# assignment on a function call would not do: in bash an assignment preceding a
+# FUNCTION call persists after it returns, so breakage 24 would silently
+# redirect breakage 25's sweep.
+#
+# THE FLEET IS REBUILT BY `fresh_fleet` FOR EVERY RECIPE, AND RESTORED AFTER
+# THE LAST ONE. Both halves are load-bearing, and the second half was a real
+# cross-packet failure rather than a hypothetical:
+#
+#   * `fresh_fleet` is called again after this point, so the *clean* pair below
+#     is only the starting state, not the state every later recipe sees.
+#   * the last fleet recipe leaves a DELIBERATELY BROKEN repository in `$FLEET`
+#     — that is the whole mechanism, a sweep that cannot go red proves nothing.
+#     With `KIT_FLEET` still exported, every gate run after it inherits that
+#     broken repository. The integration branch hit this exactly: breakage 31b,
+#     which asserts the gate is GREEN on a copy whose config matches kit's,
+#     failed with `FAIL adopting repositories (no workaround for a fixed core
+#     defect)` — a red created by another test, which is the exact failure mode
+#     this harness exists to prevent.
+#
+# So the fleet is put back the way it was found before the file does anything
+# else. `unset` rather than a reset value, because the honest state of the
+# environment on entry is "unset" — and a recipe that must not see a fleet then
+# gets the same behaviour it would get outside this file.
+unset KIT_FLEET
 
 # The control. If the unbroken tree is already red, the breakages below
 # prove nothing, so this runs first and the run is meaningless without it.
@@ -765,6 +1403,1126 @@ else
   skips=$((skips + 2))
 fi
 
+# 24-26. THE D12/D13 WORKAROUNDS, in the three shapes they actually took.
+#
+# `core` shipped two checker defects that forced adopters into local
+# workarounds, and both are now fixed: D12 (`RUN_KEY` could not see a one-line
+# `run:`) in 63fd319, and D13 (proofs matched against bytes carrying ANSI
+# colour) in c63af27. A rule about those lives in `tests/validate.sh` now rather
+# than in a report, and these three are that rule's proof.
+#
+# All three mutate the SYNTHETIC FLEET, not a throwaway copy of the tree: the
+# check reads a directory of adopting repositories and kit is not one. Each
+# takes its own `fresh_fleet` so one cannot mask the next, which is the same
+# discipline `fresh_copy` provides for everything else here.
+#
+# 24 is the shape `cafaye-rb` shipped for six weeks — a step written `run: |`
+# whose entire body is the gate command, plus a comment above it saying the
+# one-liner would be invisible. It is the most important of the three because it
+# is the only one that is BOTH detectable structurally and invisible in
+# behaviour: core reads the step either way, so nothing else in the fleet
+# notices.
+FLEETWORKAROUND='adopting repositories  (no workaround for a fixed core defect)'
+
+# fresh_fleet <name> — the synthetic fleet, rebuilt clean, with one repository
+# added. Not `fresh_copy`, because the unit here is a two-file REPOSITORY inside
+# a directory rather than a copy of this tree. A stale repository would make a
+# later breakage pass for the wrong reason, so each one starts from clean.
+#
+# The `export` lives HERE rather than at the top of the file, and that is the
+# other half of the fix described at the `unset` above. Exported once at the top
+# it would be in force for every gate run in the file, including runs that
+# happen after the last fleet recipe has left a broken repository behind; the
+# scope this function creates is exactly the one recipe that needs it. A prefix
+# assignment would not do — in bash an assignment preceding a FUNCTION call
+# persists after it returns, which is the same trap one line up.
+fresh_fleet() {
+  rm -rf "$FLEET"
+  synthetic_repo clean
+  synthetic_repo second-clean
+  synthetic_repo "$1"
+  export KIT_FLEET="$FLEET"
+}
+
+# 24. D12, the block-scalar spelling plus its justification.
+fresh_fleet d12-block-scalar
+edit "$FLEET/d12-block-scalar/.github/workflows/ci.yml" \
+  '        run: ./bin/prime
+' \
+  '        run: |
+          ./bin/prime
+'
+edit "$FLEET/d12-block-scalar/.github/workflows/ci.yml" \
+  '      - name: bin/prime
+' \
+  '      # A block scalar rather than `run: ./bin/prime` on one line. The `run:`
+      # key above is invisible to `gate.ci-disagrees` without it.
+      - name: bin/prime
+'
+expect_red_check 'breakage 24: D12 — the gate step is a block scalar, justified' \
+  "$base" "$FLEETWORKAROUND" --static-only
+
+# 25. D12 again, and the half that is a false SENTENCE rather than a shape. The
+#     step is already correct here; only the comment is wrong. A check that
+#     looked for the shape would pass this, and the comment would survive — which
+#     is the part that rots, because the next reader cannot tell it is obsolete.
+fresh_fleet d12-stale-comment
+edit "$FLEET/d12-stale-comment/.github/workflows/ci.yml" \
+  '      - name: bin/prime
+' \
+  '      # `run: ./bin/prime` is invisible to `gate.ci-disagrees`, so this step
+      # must be a block scalar. See REPORT-core-10.md.
+      - name: bin/prime
+'
+expect_red_check 'breakage 25: D12 — a correct step with a justification for a fixed defect' \
+  "$base" "$FLEETWORKAROUND" --static-only
+
+# 26. D13, and the one that makes a declaration WEAKER rather than merely
+#     redundant. The escape runs absorb characters a stricter pattern would
+#     reject, so this is not a harmless local convenience: it is a proof that
+#     matches lines the author's own gate did not intend to accept. Core strips
+#     the escapes in exactly one place (c63af27), so nothing else in the fleet
+#     would ever see it.
+fresh_fleet d13-escape-tolerant
+edit "$FLEET/d13-escape-tolerant/gate.yml" \
+  "      match: '^([0-9]+)/[0-9]+ passed$'" \
+  "      match: '^(?:[ ]|\\x1b\\[[0-9;]*m)*([0-9]+)/[0-9]+ passed$'"
+expect_red_check 'breakage 26: D13 — a proof pattern carries escape tolerance' \
+  "$base" "$FLEETWORKAROUND" --static-only
+
+# The fleet goes back to being the environment's business. `$FLEET` still holds
+# `d13-escape-tolerant` — deliberately broken, and the whole reason breakage 26
+# went red — so leaving `KIT_FLEET` pointed at it would make every gate run from
+# here to the end of the file red on a defect this file introduced. See the
+# `unset` where the export used to be for what this cost in the integration.
+unset KIT_FLEET
+
+# 27-32c. THE LINT GATE. Five ways the "lint runs from kit" mechanism can stop
+#       being a gate while every other check in this repository stays green,
+#       and the advisory one is the most likely of the five by a wide margin.
+#
+#       All five name the check that must catch them, because "the gate went red"
+#       is a weak claim when a dozen checks could have gone red: a lint step
+#       that lost its `--config` would also be caught by, at most, one other
+#       thing, and a check that has stopped being load-bearing should fail HERE
+#       rather than being discovered months later by the policy it stopped
+#       policing.
+LINTWIRE='lint/ + the workflow  (every lint step is a gate on kit config)'
+
+# 27. THE LINT STEP DELETED. The crudest form: `ci.reusable.yml` still declares
+#     a language, still has a job for it, still runs a build and a test — and
+#     nothing in it lints. Everything else about the job is untouched, so this is
+#     what "someone removed a step in a hurry" looks like.
+#
+#     The deletion is done with a parser rather than a text edit, for the same
+#     reason breakage 9 was: an `edit` recipe whose anchor no longer matches
+#     must FAIL LOUDLY, and one that silently matches the wrong occurrence is
+#     worse than no recipe at all. Here the whole step is removed by identity.
+twentyseven="$(fresh_copy lint-step-deleted)"
+"$PY" - "$twentyseven/.github/workflows/ci.reusable.yml" <<'PY'
+import sys
+
+import yaml
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    doc = yaml.safe_load(fh)
+# The go job's lint step, by name. Exactly one must go, or the recipe is stale.
+hits = 0
+for job in (doc.get("jobs") or {}).values():
+    steps = (job or {}).get("steps") or []
+    kept = [s for s in steps if not (isinstance(s, dict) and s.get("name") == "lint")]
+    hits += len(steps) - len(kept)
+    if isinstance(job, dict):
+        job["steps"] = kept
+if hits < 1:
+    sys.exit("self_test: no `lint` step existed to delete — the recipe is stale")
+with open(path, "w", encoding="utf-8") as fh:
+    yaml.safe_dump(doc, fh, sort_keys=False, default_flow_style=False)
+PY
+expect_red_check 'breakage 27: a language job no longer lints at all' \
+  "$twentyseven" "$LINTWIRE" --static-only
+
+# 28. THE ADVISORY ONE, and the breakage that matters most. `continue-on-error:
+#     true` leaves the step running, leaves it printing every finding it found,
+#     and turns the job green. Nothing in the YAML is malformed; the build
+#     passes; the lint results are on the page where nobody reads them. A linter
+#     that only warns is a report, and this is how a report is born without
+#     anybody deciding to write one.
+#
+#     It is asserted on the PARSED step, so it also catches the same defect
+#     written the other two ways it can be written: `|| true` at the end of the
+#     run body, which is continue-on-error in shell and reads to nobody as
+#     anything but a deliberate choice. That one is exercised here too, because
+#     the check claims to catch it and a claim nobody has tried to break is a
+#     claim nobody has tested.
+twentyeight="$(fresh_copy lint-made-advisory)"
+edit "$twentyeight/.github/workflows/ci.reusable.yml" \
+  '        uses: golangci/golangci-lint-action@v9
+        with:' \
+  '        uses: golangci/golangci-lint-action@v9
+        continue-on-error: true
+        with:'
+expect_red_check 'breakage 28: the lint step is advisory (continue-on-error) — a report, not a gate' \
+  "$twentyeight" "$LINTWIRE" --static-only
+
+twentyeight_b="$(fresh_copy lint-advisory-in-shell)"
+edit "$twentyeight_b/.github/workflows/ci.reusable.yml" \
+  'run: bundle exec rubocop --parallel --config "$KIT_LINT_DIR/lint/rubocop.yml" ${{ env.KIT_LINT_ARGS }}' \
+  'run: bundle exec rubocop --parallel --config "$KIT_LINT_DIR/lint/rubocop.yml" ${{ env.KIT_LINT_ARGS }} || true'
+expect_red_check 'breakage 28b: the lint step swallows its exit status with `|| true`' \
+  "$twentyeight_b" "$LINTWIRE" --static-only
+
+# 29. THE CONFIG NO LONGER FOUND. The checkout deleted, or the path changed. The
+#     step is untouched, it still says `--config`, it still names a file — and
+#     the file is not there, so the linter falls back to its defaults: five
+#     linters for golangci-lint, MethodLength 10 for rubocop, no rules for
+#     eslint. All green, all much weaker. This is the breakage that the
+#     `--config` flag's existence is defending against and it is invisible from
+#     the YAML alone.
+twentynine="$(fresh_copy kit-not-checked-out)"
+"$PY" - "$twentynine/.github/workflows/ci.reusable.yml" <<'PY'
+import sys
+
+import yaml
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    doc = yaml.safe_load(fh)
+removed = 0
+for job in (doc.get("jobs") or {}).values():
+    if not isinstance(job, dict):
+        continue
+    steps = job.get("steps") or []
+    kept = [
+        s
+        for s in steps
+        if not (
+            isinstance(s, dict)
+            and str(s.get("uses", "")).startswith("actions/checkout")
+            and (s.get("with") or {}).get("repository") == "cafaye/kit"
+        )
+    ]
+    removed += len(steps) - len(kept)
+    job["steps"] = kept
+if removed < 1:
+    sys.exit("self_test: no kit checkout existed to delete — the recipe is stale")
+with open(path, "w", encoding="utf-8") as fh:
+    yaml.safe_dump(doc, fh, sort_keys=False, default_flow_style=False)
+PY
+expect_red_check 'breakage 29: the kit checkout is gone, so `--config` names nothing' \
+  "$twentynine" "$LINTWIRE" --static-only
+
+# 30. THE CONFIG WEAKENED. The sharpest of the five, because every check above
+#     can be green while it happens. The workflow still points `--config` at
+#     `.kit/lint/golangci.yml` on every run, the file still parses, the lint
+#     step still exits nonzero on an error — and the policy is now golangci-
+#     lint's five defaults, which nobody in the fleet chose.
+#
+#     A step that lost its flag is a defect a reader can see in a diff. A config
+#     that lost three linters is a two-line deletion that looks like tidying,
+#     and the build stays green throughout. So the linter list is asserted BY
+#     VALUE, parsed as YAML, which also means the three names cannot be
+#     satisfied by the comment block that explains why they are enabled.
+thirty="$(fresh_copy config-weakened)"
+"$PY" - "$thirty/lint/golangci.yml" <<'PY'
+import sys
+
+import yaml
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    doc = yaml.safe_load(fh)
+enable = ((doc.get("linters") or {}).get("enable")) or []
+before = len(enable)
+# Drop the correctness linters one at a time. Each removal is a plausible
+# "this is noisy" edit, which is exactly why none of them can be left to review.
+doc["linters"]["enable"] = [x for x in enable if x not in ("bodyclose", "noctx", "errorlint")]
+if len(doc["linters"]["enable"]) == before:
+    sys.exit("self_test: none of the weakened linters was present — the recipe is stale")
+with open(path, "w", encoding="utf-8") as fh:
+    yaml.safe_dump(doc, fh, sort_keys=False, default_flow_style=False)
+PY
+expect_red_check 'breakage 30: kit config silently drops correctness linters the policy names' \
+  "$thirty" "$LINTWIRE" --static-only
+
+# 31. A SERVICE DRIFTS BACK TO A COPY. The failure this whole packet exists to
+#     end, at the layer where it actually lands: a repo that used to lint with
+#     kit's config goes back to running its own, and kit has no way to see it
+#     from inside its own repository.
+#
+#     The shape checked here is the one kit CAN see without reading the fleet:
+#     a service's own lint config, sitting in a place the reusable workflow's
+#     steps never read. A file that nothing points at is not a deviation, it is
+#     a copy that has stopped being one — and golangci-lint will still
+#     DISCOVER it, because `.golangci.yml` in the repository root beats
+#     everything. So a service carrying one is being linted by a policy that
+#     kit's CI does not run, and the mismatch is invisible from both sides.
+#
+#     This is the check the brief asked for in the form it asked for: it reads
+#     BOTH files and reports the DIFFERENCE, rather than demanding the file be
+#     absent. A repo with no `.golangci.yml` passes; a repo whose file agrees
+#     with kit's passes; a repo whose file disagrees is told exactly which
+#     linters differ.
+LINTDRIFT='lint drift  (a service config is compared to kit, not merely forbidden)'
+
+thirtyone="$(fresh_copy service-drifted-back-to-a-copy)"
+# A realistic drift: the service keeps kit's linters but drops the linter that
+# was complaining about its generated client, and disables errcheck outright
+# rather than excluding one path. Both are real, both are what a team does under
+# pressure, and neither is visible in kit's own tree.
+cat >"$thirtyone/.golangci.yml" <<'EOF'
+---
+# A service that went back to owning its lint config.
+version: '2'
+linters:
+  enable:
+    - bodyclose
+    - copyloopvar
+    - errorlint
+    - exhaustive
+    - misspell
+    - noctx
+    - revive
+    - unconvert
+    - wastedassign
+  disable:
+    - errcheck
+EOF
+expect_red_check 'breakage 31: a service carries a lint config INCONSISTENT with kit, not merely present' \
+  "$thirtyone" "$LINTDRIFT" --static-only
+
+# 31b. The other half of the same claim, and the reason the check reads both
+#      files: a config that AGREES with kit's must PASS. A check that fails on
+#      the mere presence of a `.golangci.yml` would be satisfied by this packet
+#      and would train every service to delete a file it is allowed to keep —
+#      which is a worse outcome than the drift, because it is a silent one.
+thirtyone_b="$(fresh_copy service-config-agrees-with-kit)"
+cp "$thirtyone_b/lint/golangci.yml" "$thirtyone_b/.golangci.yml"
+expect_green 'breakage 31b: a service config that MATCHES kit is not a failure' \
+  "$thirtyone_b" --static-only
+
+# 32-32c. THE SEAM. Three claims, and each decays on its own: the guard can be
+#       deleted, moved, or kept but emptied. The third matters most, because it
+#       is the shortest edit in the file and it widens the deviation seam for
+#       every service in the fleet while the workflow still reads as it did.
+#
+#       All three name `lint_args_seam_check`, for the reason 31-31 do: a deleted
+#       guard also leaves the YAML valid, the lint step untouched and the build
+#       green, and nothing else in this repository has an opinion about it.
+SEAM='the seam  (narrow, guarded before the linter, and wired to it)'
+
+# 32. The guard deleted from ONE job. The seam keeps working in the other two,
+#     so this is the shape of an accident: one merge, one job, no other signal.
+thirtytwo="$(fresh_copy seam-guard-deleted)"
+"$PY" - "$thirtytwo/.github/workflows/ci.reusable.yml" <<'PYDEL28'
+import sys
+
+import yaml
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    doc = yaml.safe_load(fh)
+job = (doc.get("jobs") or {}).get("ruby") or {}
+steps = job.get("steps") or []
+kept = [s for s in steps if s.get("name") != "lint-args guard"]
+if len(steps) == len(kept):
+    sys.exit("self_test: the ruby job had no `lint-args guard` to delete")
+job["steps"] = kept
+with open(path, "w", encoding="utf-8") as fh:
+    yaml.safe_dump(doc, fh, sort_keys=False, default_flow_style=False)
+PYDEL28
+expect_red_check 'breakage 32: one lint job no longer guards the seam' \
+  "$thirtytwo" "$SEAM" --static-only
+
+# 32b. The guard KEPT, and its list shortened by one token. This is the edit a
+#      well-meaning commit makes: `--no-config` is a flag somebody wants, and
+#      rather than argue about the seam the token comes out. The build stays
+#      green for every service that sets it, and the workflow still contains a
+#      step called `lint-args guard`.
+thirtytwo_b="$(fresh_copy seam-list-shortened)"
+edit "$thirtytwo_b/.github/workflows/ci.reusable.yml" \
+  '              --config|-c|--no-config|--no-config-lookup|--force-default-config|' \
+  '              --config|-c|--no-config-lookup|--force-default-config|'
+expect_red_check 'breakage 32b: the guard no longer refuses --no-config' \
+  "$thirtytwo_b" "$SEAM" --static-only
+
+# 32c. The guard moved AFTER the linter. It still runs, still reads the variable,
+#      and still refuses everything it refused — after the linter has already
+#      been handed `--no-config` and already exited 0. A control that runs after
+#      the thing it controls is the most comfortable kind of dead code, because
+#      reading the workflow top to bottom it looks exactly like a live one.
+thirtytwo_c="$(fresh_copy seam-guard-after-the-linter)"
+"$PY" - "$thirtytwo_c/.github/workflows/ci.reusable.yml" <<'PYDEL28C'
+import sys
+
+import yaml
+
+path = sys.argv[1]
+with open(path, encoding="utf-8") as fh:
+    doc = yaml.safe_load(fh)
+for lang in ("go", "ruby", "node"):
+    job = (doc.get("jobs") or {}).get(lang) or {}
+    steps = job.get("steps") or []
+    guard = next((s for s in steps if s.get("name") == "lint-args guard"), None)
+    if guard is None:
+        sys.exit("self_test: job " + lang + " had no `lint-args guard` to move")
+    steps.remove(guard)
+    steps.append(guard)
+    job["steps"] = steps
+with open(path, "w", encoding="utf-8") as fh:
+    yaml.safe_dump(doc, fh, sort_keys=False, default_flow_style=False)
+PYDEL28C
+expect_red_check 'breakage 32c: the seam guard runs AFTER the linter it guards' \
+  "$thirtytwo_c" "$SEAM" --static-only
+
+
+# 33-25. The parity allowlist and the artefact table.
+#
+#     33 is the ESLint shape — an entry naming an artefact kit does not ship.
+#     34 is the ratchet firing. 35 is half a language.
+#
+#     All three entries are well-formed in every OTHER respect. That is the
+#     point: a shape-only check passes all three, and a hygiene rule in a data
+#     file is exactly the shape of a check nobody has ever seen fail.
+#
+#     WHAT THE GATE CANNOT CHECK, AND THE RECIPE THAT CLAIMED IT COULD. An
+#     entry naming a repository that does not exist IS a real failure, and the
+#     REPORTER catches it — it is handed `--repos-dir` and can see what is
+#     there — and `tests/staleness_test.sh` proves it in three shapes, one of
+#     which is exactly that. The first version of this recipe asserted it
+#     against the GATE, which stayed green and the breakage failed: kit's CI has
+#     no sibling checkouts, so no gate in this repository can know which
+#     repositories exist. A recipe that asserts a check which does not exist is
+#     a proof of nothing, and the fix is to re-point it at a property the gate
+#     really has rather than to add a fleet roster to kit so the gate could
+#     answer a question it was never asked.
+PARITY='templates/parity-allowlist  (reason, owner, since, until; dead entries fail)'
+ARTTABLE='tests/artifacts.json  (every declared source exists, for every language)'
+
+# 23. An entry for an artefact kit does not ship. The realistic version is a
+#     rename: `lint/eslint.config.mjs` becomes `lint/eslint.config.ts`, the
+#     entry keeps the old id, and it is now exempting nothing.
+#
+#     The id below is checked against `tests/artifacts.json` FIRST, and the
+#     first version of this recipe used `lint/eslint.config.mjs` — a real id —
+#     so the gate stayed GREEN and the breakage proved nothing. A mutation that
+#     has silently stopped breaking the thing it names is the same defect as a
+#     stale test, and the fix is to make the recipe assert its own premise
+#     rather than to trust that the string looks like an id.
+thirtythree="$(fresh_copy dead-parity-entry)"
+if grep -q 'lint/eslint.config.ts' "$thirtythree/tests/artifacts.json"; then
+  echo "FAIL self_test: breakage 33's dead artefact id is REAL — the recipe no longer mutates anything" >&2
+  failures=$((failures + 1))
+fi
+cat >>"$thirtythree/templates/parity-allowlist" <<'ENTRY'
+diverged billing lint/eslint.config.ts reason="this artefact was renamed in artifacts.json, so this entry exempts nothing" owner=kit since=2026-09-30 until=2026-12-31
+ENTRY
+expect_red_check 'breakage 33: a parity entry naming an artefact kit does not ship' \
+  "$thirtythree" "$PARITY" --static-only
+
+# 24. AN EXPIRED ENTRY — THE RATCHER FIRING.
+#
+#     The first recipe here asserted that a parity entry naming a repository
+#     that does not exist takes the gate red. It does not, and it cannot: kit's
+#     CI has no sibling checkouts, so the gate has no way to know which
+#     repositories exist. The reporter knows (it is handed `--repos-dir`) and
+#     `tests/staleness_test.sh` proves it in three shapes, including this one;
+#     asserting it again against a check that does not exist would be a proof of
+#     nothing. So the recipe is spent on a property the gate really has and
+#     nothing has yet tried to break: **the gate reads the clock**.
+#
+#     The tier skip-allowlist has had that rule for a packet and nothing has
+#     ever watched it fire — its own header says "a gate that has never gone
+#     red is a report", and this is the first time anything in kit has actually
+#     made the statement true. The date is in the past on purpose, and the
+#     entry is well-formed in every other respect: a real artefact, a real
+#     repository, a reason, an owner and a `since`. Only the `until` is wrong.
+thirtyfour="$(fresh_copy expired-parity-entry)"
+cat >>"$thirtyfour/templates/parity-allowlist" <<'ENTRY'
+diverged billing mise.toml reason="this entry is well formed in every other respect; only the date is wrong, which is the point" owner=billing since=2020-01-01 until=2020-12-31
+ENTRY
+expect_red_check 'breakage 34: an expired parity entry — the gate reads the clock' \
+  "$thirtyfour" "$PARITY" --static-only
+
+# 25. A `{lang}` source kit does not ship for one language. `bun` is the one
+#     that matters: it was added late and for a service that had been
+#     hand-rolling a whole workflow for want of it, so it is the language most
+#     likely to be half-adopted again.
+#
+#     The mutation DELETES the source rather than corrupting it, because that is
+#     the defect: not a broken primer, a missing one, which is the one shape
+#     every existing check would sail past.
+thirtyfive="$(fresh_copy half-a-language)"
+rm -f "$thirtyfive/templates/bin-prime/bun.sh"
+expect_red_check 'breakage 35: kit offers `language: bun` but ships no primer for it' \
+  "$thirtyfive" "$ARTTABLE" --static-only
+
+# 26. AN ABSENCE REPORTED AS `current`.
+#
+#     This is the breakage the packet exists for. The templates half's commonest
+#     state in the real fleet is `absent` — 0 of 9 services hold the collector,
+#     1 of 9 holds `bin/dev` — and the one-line way to make all of that
+#     disappear is to grade a path that is not there as fine.
+#
+#     The mutation is in the state table, not in the comparison, because the
+#     comparison is not what is wrong: reading a missing file as "no
+#     difference" is a one-word change in the classification and it turns the
+#     most alarming column of the report into a green one.
+thirtysix="$(fresh_copy absent-reads-current)"
+edit "$thirtysix/tests/staleness.py" \
+  '    if missing:
+        cell["state"] = TPL_ABSENT' \
+  '    if missing:
+        cell["state"] = TPL_CURRENT'
+expect_red_script 'breakage 36: the staleness reporter calls an ABSENT artefact current' \
+  "$thirtysix" tests/staleness_test.sh
+
+# 27. GRADE BY RESEMBLANCE.
+#
+#     The packet's third requirement: never infer a pin from content. The
+#     realistic bug is a well-intentioned threshold — a future reader decides
+#     99.9% identical is close enough, because the alternative (a flag on every
+#     re-copy) is annoying.
+#
+#     `difflib.SequenceMatcher(...).quick_ratio()` is exactly that threshold,
+#     already imported, and it is the shape a helpful patch would take. The
+#     assertion it has to break is the one asserting a ONE-BYTE difference is
+#     `diverged`, which is the property in its smallest form.
+thirtyseven="$(fresh_copy grade-by-resemblance)"
+edit "$thirtyseven/tests/staleness.py" \
+  '        if pair_kit == repo_bytes:' \
+  '        if pair_kit == repo_bytes or matcher_ratio(pair_kit, repo_bytes) > 0.99:'
+cat >>"$thirtyseven/tests/staleness.py" <<'PY'
+
+
+def matcher_ratio(a: bytes, b: bytes) -> float:
+    """The resemblance threshold the packet forbids. Added by self_test 27."""
+    import difflib
+
+    return difflib.SequenceMatcher(None, a, b, autojunk=False).quick_ratio()
+PY
+expect_red_script 'breakage 37: the reporter grades a copy by resemblance, not equality' \
+  "$thirtyseven" tests/staleness_test.sh
+
+# 28. THE CARVE-OUT BOUNDARY.
+#
+#     `core/` ships two programs and AGENTS.md says they are "standard library
+#     only, no import outside json/os/re/sys/argparse/subprocess". Nothing
+#     checked that sentence for the whole life of the rule, which made it a
+#     promise — and a promise nobody can break is decoration. kit is a
+#     configuration repository; a `pip install` in one of these files is a
+#     dependency, and the whole argument for the carve-out is that there are
+#     none.
+#
+#     The mutation is a function-local import, because a function-local import is
+#     what a contributor actually writes when they are being careful about
+#     looking tidy, and it is the shape a grep-based check would miss. The check
+#     walks the AST, so there is nowhere to put one that it cannot see.
+thirtyeight="$(fresh_copy a-third-party-import)"
+"$PY" - "$thirtyeight/tests/staleness.py" <<'PY'
+import sys
+
+path = sys.argv[1]
+body = open(path, encoding="utf-8").read()
+# Appended at the end, at module scope, so the file still parses and still runs:
+# a mutation that broke the program would prove only that Python exists.
+with open(path, "a", encoding="utf-8") as fh:
+    fh.write("\n\ndef _third_party():\n    import requests  # self_test breakage 38\n")
+PY
+expect_red_check 'breakage 38: one of the two programs gains a third-party import' \
+  "$thirtyeight" 'tests/classify.py + tests/staleness.py' --static-only
+
+# 29. A HARNESS THAT LIES ABOUT ITS OWN FLEET.
+#
+#     Observed for real before it was written here. Under load average 160 the
+#     suite failed one case and passed 35, the reporter having measured 8 repos
+#     and 96 cells where the fixture holds 9 and 108 — and the failing case's
+#     text named the reporter, which is precisely what it must not do when the
+#     reporter was reading a smaller fleet rather than misreading a full one.
+#
+#     So the fixture is now checked before any case asserts on it: every service
+#     the cases name must have a cell the reporter measured. This breakage
+#     removes one service's `.git` — the shape a transient `git init` failure
+#     leaves behind — and asserts the suite goes red AND says the failure is in
+#     the fixture rather than in the reporter. A check that only proved the
+#     script exits non-zero would pass on a suite that reported the same
+#     misleading red, so the assertion is on the message.
+thirtynine="$(fresh_copy a-fixture-service-the-reporter-cannot-see)"
+edit "$thirtynine/tests/staleness_test.sh" \
+  'mksvc absent-svc node' \
+  'mksvc absent-svc node
+rm -rf "$TPL/absent-svc/.git"'
+expect_red_script 'breakage 39: the suite cannot tell a broken FIXTURE from a broken reporter' \
+  "$thirtynine" tests/staleness_test.sh '' 'this is NOT a reporter result'
+
+# 30. A TOOLCHAIN FLOOR THAT IS NOT WIRED TO ANYTHING.
+#
+#     The ruby floor check exists because a system ruby 2.6.10 on PATH made the
+#     suite report three NoMethodErrors and the summary blame the template. A
+#     check like that is exactly the kind that is written, admired, and never
+#     fires — the floor function can be defined, the suite can still be invoked
+#     unconditionally, and the gate is green on a machine that cannot run the
+#     template at all.
+#
+#     So the breakage deletes the ONE line that consults the floor, leaving the
+#     probe defined and never called, and asserts the ruby check still reports
+#     the suite. Written as the well-intentioned edit a contributor makes when
+#     the guard "looks redundant" next to a `have ruby` test three lines above:
+#     the tool is present, so why ask whether it is the right one? The assertion
+#     is on the check's own label, so a red from any other check does not pass
+#     for this one.
+#
+#     Only meaningful where ruby is installed, and a missing interpreter is
+#     reported as a SKIP rather than quietly passing — self_test's own rule is
+#     that a skipped proof is a failed proof, so the count below stays honest.
+#
+#     The recipe call is kept at COLUMN 0 even though it is guarded, because the
+#     count is taken with `grep -cE '^expect_red...'`: an indented call runs and
+#     passes while the summary counts one fewer than it ran, and a count that
+#     under-reports is the exact defect this repo treats as a lie told by a
+#     measurement. The guard, not the indentation, is what makes the skip
+#     explicit.
+#
+#     The breakage needs BOTH halves, and the second is the interesting one.
+#     Deleting the guard on a machine with a current ruby proves nothing, because
+#     the suite passes either way and green is the correct answer. So the copy
+#     also gets a `ruby` shim that makes the interpreter old the way 2.6.10 was
+#     old: `undef_method`, which raises NoMethodError at the call site exactly
+#     as a missing method does. That is a simulation of the interpreter rather
+#     than a dependency on one being installed — a self_test that needs a
+#     particular ruby present is a self_test that SKIPs on CI and proves
+#     nothing there, which is the rule this repo keeps restating.
+#
+#     With the shim and the guard in place the gate says the toolchain is too
+#     old. With the shim and the guard DELETED it says the template is broken.
+#     The recipe asserts the second, so the first cannot quietly stop happening:
+#     a check that has stopped firing looks identical to a check that never did.
+if command -v ruby >/dev/null 2>&1; then
+  forty_ready=1
+else
+  forty_ready=0
+fi
+forty=""
+if [ "$forty_ready" -eq 1 ]; then
+  forty="$(fresh_copy a-toolchain-floor-nobody-calls)"
+  # `command -v` is resolved BEFORE the shim goes on PATH, so the shim cannot
+  # find itself and recurse.
+  forty_real_ruby="$(command -v ruby)"
+  mkdir -p "$forty/kit14-oldruby"
+  cat >"$forty/kit14-oldruby/preload.rb" <<'RB'
+# self_test breakage 40: make this interpreter look like one too old for the
+# template. `undef_method` raises NoMethodError at the call site, which is
+# precisely what a method that does not exist does.
+class Array
+  undef_method :filter_map if method_defined?(:filter_map)
+end
+RB
+  {
+    printf '#!/bin/sh\n'
+    printf 'exec %q -r%q "$@"\n' "$forty_real_ruby" "$forty/kit14-oldruby/preload.rb"
+  } >"$forty/kit14-oldruby/ruby"
+  chmod +x "$forty/kit14-oldruby/ruby"
+  # The mutation removes the branch that consults the floor, leaving
+  # `toolchain_floor_ruby` defined and never called — which is what the recipe is
+  # FOR (see REPORT-kit-14.md 10.6).
+  #
+  # THE ANCHOR BELOW IS THE BLOCK FORM, AND THAT IS A SECOND RE-POINTING. The
+  # recipe first named `if [ "$lang" = ruby ] && ! toolchain_floor_ruby; then`,
+  # a one-liner that stopped being the floor check when kit-17 replaced it with
+  # the block form below — the SKIP-versus-FAIL distinction, and `ruby_floor`
+  # read from the template's own `RUBY_FLOOR` constant rather than restated.
+  # `edit` failed closed with "breakage no longer applies", which is exactly
+  # right: the breakage had silently stopped testing anything, and a passing
+  # suite that no longer runs its own recipe is the failure mode this whole file
+  # exists to prevent. It happened a second time here, on the integration branch,
+  # for the same reason and with the same fix.
+  #
+  # It replaces the BLOCK'S GUARD, not its body, so the mutation is the
+  # well-intentioned edit it was always meant to be: the branch that asks
+  # whether the interpreter can run the code is gone, and everything under it
+  # goes with it.
+  edit "$forty/tests/validate.sh" \
+    '    if [ "$lang" = ruby ]; then
+      ruby_seen="$(ruby -e '"'"'print RUBY_VERSION'"'"' 2>/dev/null || true)"' \
+    '    if false; then
+      ruby_seen="$(ruby -e '"'"'print RUBY_VERSION'"'"' 2>/dev/null || true)"'
+  # PATH is exported rather than prefixed onto the call, because a prefixed call
+  # reads `PATH=… expect_red_check` — the first token is no longer `expect_red`,
+  # so the count would miss this recipe. Both counts now allow indentation, so
+  # the call itself may sit inside the `if`.
+  forty_old_path="$PATH"
+  PATH="$forty/kit14-oldruby:$PATH"
+  export PATH
+  expect_red_check 'breakage 40: the toolchain floor is defined but never consulted' \
+    "$forty" 'templates/otel/ruby  (ruby test suite)' --language=ruby --no-self-test
+  PATH="$forty_old_path"
+  export PATH
+else
+  printf 'SKIP self_test: breakage 40: the toolchain floor is defined but never consulted — ruby not installed\n'
+  skips=$((skips + 1))
+fi
+
+# 41-51. The secret scanner, and the canary harness that answers the question
+#        the scanner cannot.
+#
+#        A scanner that has never gone red is a report, and neither is a
+#        detector that has never fired. Breakages 41-46 make the scanner catch
+#        things; 47-50 make the canary's four reference-type vectors bite. They
+#        are in one place because the two answer different questions about the
+#        same subject, and a packet that added both is only honest if both are
+#        proven able to fail.
+SECRETS='gitleaks  (8.30.1, full history, --redact)'
+
+# THE VARIABLES IN THIS BLOCK ARE NAMED FOR WHAT THEY BREAK, NOT FOR THEIR
+# LABEL, and that is a merge repair rather than a style preference — made twice.
+# kit-08 renumbered kit-04's 13-23 to 24-34, rewrote the labels, and left the
+# variable names behind, so breakage 47 was still called `canary_unexported` and
+# breakage 48 `canary_unredacted`. This integration then renumbered 24-34 to
+# 41-51, and the descriptive names survived it, which is the outcome worth
+# having: a name that says what it breaks cannot collide with a number that a
+# later packet moves. It had worked only because each was written and read
+# before the next write — four pairs of names meaning two different things in
+# one file, where a reordering, an inserted breakage or an early exit would
+# have pointed a recipe at a copy somebody else had already mutated. The
+# names below cannot collide with master's 1-22 because they do not encode a
+# number at all, so the next renumber cannot reintroduce the fault by editing a
+# label and missing a variable.
+
+# 41-25. A detectable credential, in history and in the tree.
+#
+#     THE PROBE IS ASSEMBLED, NOT WRITTEN, and that is the whole difficulty of
+#     this packet. The obvious thing — paste a sample PAT into this file — makes
+#     `tests/self_test.sh` itself a gitleaks finding, so the real tree's own scan
+#     goes red and every breakage here is caught by the wrong thing. It was: the
+#     first version of these two breakages did exactly that, and the gate
+#     reported four leaks in the file that was supposed to be planting them.
+#
+#     Assembling it from parts means no credential-shaped string is ever
+#     committed — which is the same rule the canary harness asserts about itself,
+#     applied to the scanner's own proof. The cost is that a reader cannot see
+#     the value, so the comment above says what it is.
+#
+#     The value is GitLab's own published PAT FORMAT SAMPLE (glpat- followed by
+#     the documented 48-character sample body), taken from gitleaks' test data.
+#     It is a format sample, not a credential, and it has never been a live
+#     token. Nothing in this repository is a live secret, and this packet's
+#     entire subject is not printing one.
+plant_probe() {
+  local dir="$1"
+  mkdir -p "$dir/.self-test-probe"
+  {
+    printf 'endpoint = "https://gitlab.example.invalid"\n'
+    # Split across the two halves gitleaks matches on: the `glpat-` prefix and
+    # the token body. Neither half is a credential on its own, and the
+    # concatenation is what the rule fires on.
+    printf 'private_token = "glpat-%s"\n' 'ABC123def456GHI789jkl012'
+  } >"$dir/.self-test-probe/config.toml"
+}
+
+# 24. Committed and then REMOVED — the shape the full-history requirement exists
+#     for. A HEAD-only scanner sees a clean tree here, and a diff scanner sees
+#     nothing at all, because by the time the commit lands the file is gone.
+probe_history="$(fresh_copy committed-secret)"
+plant_probe "$probe_history"
+expect_red_check 'breakage 41: a credential in history, since removed' \
+  "$probe_history" "$SECRETS" --static-only
+
+# 25. The same credential, still in the tree. A separate breakage from 41
+#     because it is a different code path in the scanner and a different claim:
+#     41 proves the scan reads history, 42 proves it reads uncommitted files. A
+#     scanner that only read history would pass 41 and fail 42, and one that only
+#     read the working tree would do the reverse — so neither alone establishes
+#     that both are covered.
+probe_tree="$(fresh_copy working-tree-secret)"
+plant_probe "$probe_tree"
+expect_red_check 'breakage 42: a credential in the working tree' \
+  "$probe_tree" "$SECRETS" --static-only
+
+# 26. --redact removed from the scan script. The build stays GREEN — nothing
+#     about a secret being printed makes it non-zero — and the CI log now
+#     contains the credential the scanner just found. This is the reason
+#     redaction is asserted in the gate and not left to review: a change that
+#     reads as a cleanup is a change that exfiltrates.
+scan_unredacted="$(fresh_copy scan-without-redact)"
+edit "$scan_unredacted/tests/gitleaks_gate.sh" \
+  '  --redact \
+  --no-banner \' \
+  '  --no-banner \'
+expect_red_check 'breakage 43: the scan stops redacting' \
+  "$scan_unredacted" 'tests/gitleaks_gate.sh  (finds a real secret, never prints it, reads history)' \
+  --static-only
+
+# 27. The scan narrowed to the diff. A shallow or HEAD-only scan cannot see
+#     breakage 41's shape at all, and the check that asserts full history is
+#     what makes narrowing it a failure rather than a quiet reduction in
+#     coverage.
+scan_shallow="$(fresh_copy scan-head-only)"
+edit "$scan_shallow/tests/gitleaks_gate.sh" \
+  "  set -- \"\$@\" --log-opts '-p -U0 --full-history --all'" \
+  "  set -- \"\$@\" --log-opts '-1'"
+expect_red_check 'breakage 44: the scan narrows to the last commit' \
+  "$scan_shallow" 'tests/gitleaks_gate.sh  (finds a real secret, never prints it, reads history)' \
+  --static-only
+
+# 28. `pull_request_target` added as a trigger. The workflow still parses, still
+#     passes every other check, and every job in it now runs with the base
+#     repository's secrets and a writable token on a fork's code. The secret
+#     scanner is the job that most invites this edit, which is why the trigger
+#     is checked on parsed keys rather than left to review.
+dangerous_trigger="$(fresh_copy dangerous-trigger)"
+edit "$dangerous_trigger/.github/workflows/ci.reusable.yml" \
+  '  workflow_call:' \
+  '  pull_request_target:
+  workflow_call:'
+expect_red_check 'breakage 45: a dangerous trigger appears in the workflow' \
+  "$dangerous_trigger" '.github/workflows/*  (no dangerous trigger, on parsed keys)' --static-only
+
+# 29. The `secrets` job made advisory. The single most common way a security job
+#     is neutralised, and completely invisible in a green build: continue-on-error
+#     means the job reports what it found and the badge stays green. A secret
+#     scanner that only warns is a report.
+CANARYJOB='.github/workflows/ci.reusable.yml  (secrets job: not advisory, full history, not opt-in)'
+advisory_secrets_job="$(fresh_copy secrets-job-advisory)"
+edit "$advisory_secrets_job/.github/workflows/ci.reusable.yml" \
+  '  secrets:
+    name: secrets
+    runs-on: ubuntu-latest' \
+  '  secrets:
+    name: secrets
+    continue-on-error: true
+    runs-on: ubuntu-latest'
+expect_red_check 'breakage 46: the secret scanner is made non-blocking' \
+  "$advisory_secrets_job" "$CANARYJOB" --static-only
+
+# 47-33. The canary harness. A detector that has never fired is a detector
+#         asserting nothing, and these break the SAFE reference type in the four
+#         ways that would turn it into the LEAKY one — each caught by a named
+#         vector, so a vector that stops biting fails here rather than being
+#         discovered when a token reaches a log aggregator.
+CANARY='templates/secrets/go  (five vectors, each with a red proof)'
+
+# 30. The exported pointer field becomes an unexported one. This is the shape
+#     that LOOKS safest — unexported, so a reviewer reading the type sees nothing
+#     worrying — and it leaks under every verb, because fmt prints unexported
+#     fields through reflection. The measurement behind that is in
+#     print_shape_test.go; this breakage is what proves the measurement is wired
+#     into a vector rather than sitting in a comment.
+canary_unexported="$(fresh_copy canary-unexported-token)"
+edit "$canary_unexported/templates/secrets/go/internal/safe/creds.go" \
+  '	Token *Token `json:"-"`' \
+  '	token *Token'
+expect_red_check 'breakage 47: the reference type hides its credential in an unexported field' \
+  "$canary_unexported" "$CANARY" --language=go --no-self-test
+
+# 31. The redacting String method is renamed, so the type stops being a
+#     Stringer. Every dispatched verb then prints the value, which is the leak
+#     the whole reference shape exists to prevent — and the `json:"-"` tag is
+#     untouched, so nothing else in the tree notices.
+canary_unredacted="$(fresh_copy canary-no-redaction)"
+edit "$canary_unredacted/templates/secrets/go/internal/safe/creds.go" \
+  'func (t *Token) String() string { return "Token(redacted)" }' \
+  'func (t *Token) Redeemed() string { return "Token(redacted)" }'
+expect_red_check 'breakage 48: the credential type stops redacting when printed' \
+  "$canary_unredacted" "$CANARY" --language=go --no-self-test
+
+# 32. The `json:"-"` is dropped. The credential reaches the wire under a `token`
+#     key, which is vector 2's finding, and an always-present key is vector 4's.
+#     Nothing else changes: the type still redacts, still has no String method,
+#     and every static check in the gate is still green.
+canary_marshals="$(fresh_copy canary-serialises-token)"
+edit "$canary_marshals/templates/secrets/go/internal/safe/creds.go" \
+  '	Token *Token `json:"-"`' \
+  '	Token *Token'
+expect_red_check 'breakage 49: the reference type marshals its credential' \
+  "$canary_marshals" "$CANARY" --language=go --no-self-test
+
+# 33. The canary committed as a literal instead of assembled. The one breakage
+#     whose failure mode is invisible in a CI log: the suite keeps passing,
+#     because the value is the SAME value. What changes is that the repository
+#     now holds a credential-shaped string — a gitleaks finding, and an
+#     allowlist entry somebody will eventually add. The check that catches it is
+#     `the canary (never committed as a literal, anywhere)`.
+# The DIRECTORY is `canary_as_literal`, not `canary_literal`, and that is not
+# taste. `canary_literal` is the name kit-04 used for the assembled VALUE below,
+# and the renumber that gave 41-51 descriptive directory names gave this one
+# the value's name. The directory variable was then reassigned to the value a few
+# lines later, so `edit` was handed
+# `cafaye_canary_…/templates/secrets/go/canary.go` and died with a
+# FileNotFoundError — which killed breakage 50 AND 51, and the run, before the
+# summary printed. Two proofs dead, reported as a crash rather than as a missing
+# check. A directory variable and a value variable must never share a name here;
+# `validate.sh` now checks that, because a name collision is invisible to review
+# and fatal only when the recipe runs.
+canary_as_literal="$(fresh_copy canary-committed-as-literal)"
+# The replacement is the EXACT value the check looks for: prefix plus 49 bytes,
+# and it is ASSEMBLED here for the same reason `plant_probe` assembles its PAT.
+#
+# This one is the sharper version of that trap. A committed canary literal makes
+# this very file a finding for the check it is proving, so the real tree's own
+# `the canary (never committed as a literal, anywhere)` goes red — and every
+# breakage in this script becomes caught by the wrong thing. The first version of
+# this breakage did exactly that: it wrote the literal out, the check fired on
+# tests/self_test.sh, and the breakage reported the right failure for entirely
+# the wrong reason.
+#
+# So the value is built in the throwaway copy, at the moment the defect is
+# introduced, and never exists in a committed file. The defect being introduced is
+# "a contiguous credential-shaped string in a source file" — which is exactly what
+# gets written, into a copy that is deleted when the test finishes.
+canary_prefix='cafaye_canary_'
+canary_body="$(printf 'notarealsecret%.0s' 1 2 3)"
+canary_literal="$canary_prefix${canary_body:0:49}"
+edit "$canary_as_literal/templates/secrets/go/canary.go" \
+  'canary   = CanaryPrefix + strings.Repeat(canaryBody, 3)[:CanaryBytes]' \
+  "canary   = \"$canary_literal\""
+expect_red_check 'breakage 50: the canary is committed as a literal' \
+  "$canary_as_literal" 'the canary  (never committed as a literal, anywhere)' --static-only
+
+# 34. The zizmor config baselines unpinned-uses — the trade made invisibly, in a
+#     file that looks like routine housekeeping. Every finding is still
+#     accounted for and the build is still green, which is exactly what makes it
+#     the failure mode worth a proof.
+zizmor_baseline="$(fresh_copy zizmor-baselines-unpinned)"
+edit "$zizmor_baseline/.github/zizmor.yml" \
+  '  self-repository:' \
+  '  unpinned-uses:
+    ignore:
+      - "**"
+  self-repository:'
+expect_red_check 'breakage 51: the zizmor config baselines unpinned-uses' \
+  "$zizmor_baseline" '.github/zizmor.yml  (unpinned-uses recorded, never baselined)' --static-only
+
+
+# 52-60. THE FLEET GATE, one breakage per failure mode. Four, because the claim
+#        is four separate claims and a check that only proves one of them is a
+#        check that has proved nothing about the other three.
+#
+#        Every one asserts the NAMED check, not merely "the gate went red". The
+#        fleet gate is red on master for the whole fleet, so "the gate went red"
+#        is the WEAKEST possible assertion here: it would be satisfied by a
+#        fixture fleet of two perfectly clean repositories. `expect_red_check`
+#        against a green fixture is the only form of this proof that says
+#        anything.
+FLEETCHECK='fleet  (no stale copy, no weakened boundary, no dead config, every ref pinned)'
+
+# 23. A STALE FULL COPY OF THE STACK. The realistic shape, and the one the packet
+#     was written about: a service running its own `postgres` rather than joining
+#     kit's. Five of the twelve repositories do exactly this today.
+#
+#     The mutation is a real service file, not a toy — the same `db:` service with
+#     the same `image: postgres:17` that billing, courier, darkroom and identity
+#     carry. A fixture that used a name kit does not ship would test a rule nobody
+#     broke, which is precisely the bug in the check's first version: five of the
+#     six repositories in scope call their database `db`, so a check that matched
+#     on the NAME found nothing in any of them.
+fiftytwo_fixture="$(fixture_fleet stale-copy)"
+break_stale_copy "$fiftytwo_fixture"
+export KIT_FLEET="$fiftytwo_fixture"
+expect_red_check 'breakage 52: a service carries its own copy of the shared stack' \
+  "$base" "$FLEETCHECK" --static-only
+
+# 24. A WEAKENED REDACTION BOUNDARY. The service re-points the collector's config
+#     mount at its own `otel-collector.yml` — which is the whole attack: the
+#     allowlist is derived from core's schemas by kit's gate, and a service that
+#     owns the file owns a boundary nobody derived.
+fiftythree_fixture="$(fixture_fleet weakened-boundary)"
+cat >"$fiftythree_fixture/alpha/otel-collector.yml" <<'YAML'
+# A copy of kit's collector config, with the redaction allowlist thrown away. The
+# whole point of the file is that it is DERIVED; a local copy is a boundary
+# nobody keeps in step with core.
+receivers:
+  otlp:
+    protocols:
+      http:
+exporters:
+  debug:
+    verbosity: detailed
+service:
+  pipelines:
+    traces:
+      receivers: [otlp]
+      exporters: [debug]
+YAML
+"$PY" - "$fiftythree_fixture/alpha/docker-compose.yml" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+body = open(path, encoding="utf-8").read()
+body = body.replace(
+    "services:\n  alpha:",
+    "services:\n  otel-collector:\n"
+    "    volumes:\n"
+    "      - ./otel-collector.yml:/etc/otel/otel-collector.yml:ro\n"
+    "  alpha:",
+    1,
+)
+open(path, "w", encoding="utf-8").write(body)
+PYEOF
+export KIT_FLEET="$fiftythree_fixture"
+expect_red_check 'breakage 53: a service re-points the collector config mount' \
+  "$base" "$FLEETCHECK" --static-only
+
+# 25. A COLLECTOR CONFIG NOTHING STARTS. The file is present, plausible, and
+#     inert: nothing mounts it, so the collector that actually runs is reading the
+#     pinned ref's copy. A developer edits this file and nothing changes at all,
+#     which is strictly worse than the file being absent.
+fiftyfour_fixture="$(fixture_fleet dead-collector-config)"
+cp "$ROOT/templates/compose/otel-collector.yml" \
+  "$fiftyfour_fixture/alpha/otel-collector.yml"
+export KIT_FLEET="$fiftyfour_fixture"
+expect_red_check 'breakage 54: an otel-collector.yml that no compose file ever mounts' \
+  "$base" "$FLEETCHECK" --static-only
+
+# 26. AN UNPINNED REF. `master`, in the committed `kit.ref` — the shape that is
+#     one `sed` away from correct and that a gate is the only thing stopping.
+#
+#     The brief calls this out separately from 52-54 and it earns its own entry:
+#     the other three are about a service carrying something it should not, and
+#     this one is about the fleet as a whole running a stack that changes between
+#     Tuesday and Monday. A gate that proved the first three and this one would
+#     still be missing the one that makes "one command, always current" mean
+#     something.
+fiftyfive_fixture="$(fixture_fleet unpinned-ref)"
+printf '# deliberately unpinned\nmaster\n' >"$fiftyfive_fixture/alpha/kit.ref"
+export KIT_FLEET="$fiftyfive_fixture"
+expect_red_check 'breakage 55: a service pins a BRANCH rather than a ref' \
+  "$base" "$FLEETCHECK" --static-only
+
+# 56-29. THE KIT-SIDE AND OVERRIDE RULES. The four above are about the fleet;
+#         these are about kit's own tree, and about what a second `-f` file is
+#         allowed to do to it. They are the halves that make the fleet half mean
+#         anything: a gate that only checks its callers is checking that they call
+#         it correctly, not that it works.
+#
+# 27. A VENDOR CONFIG MOUNT THAT STOPPED RESOLVING FROM THE FETCHED TREE. One
+#     `${KIT_COMPOSE_DIR:-.}` prefix dropped from one mount. The stack still
+#     parses, `docker compose config` still renders the same project, and the
+#     variable's value is not a property of the YAML — so nothing above it in the
+#     gate can see it. What it does is resolve the mount to a path that does not
+#     exist, and Docker's answer to that is to CREATE A DIRECTORY, so the failure
+#     arrives four containers later as
+#     `read /etc/tempo/tempo.yaml: is a directory`. Found by running the stack.
+MOUNTCHECK='templates/compose/ + bin/dev  (every vendor config mounts from the fetched tree)'
+
+fiftysix="$(fresh_copy mount-not-anchored)"
+edit "$fiftysix/templates/compose/docker-compose.yml" \
+  '      - ${KIT_COMPOSE_DIR:-.}/tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro' \
+  '      - ./tempo/tempo.yaml:/etc/tempo/tempo.yaml:ro'
+expect_red_check 'breakage 56: a vendor config mount stopped resolving from the fetched tree' \
+  "$fiftysix" "$MOUNTCHECK" --static-only
+
+# 28. THE PIN MOVED BACK INTO `.env`, where it is git-ignored. The shape is
+#     subtler than "the pin is wrong": the template ships
+#     `KIT_STACK_REF=<sha>` in `.env.example`, so a fresh clone looks configured
+#     and needs no setup. It also means the pin lives in a file that becomes
+#     `.env`, and `.env` is git-ignored — so the pin exists on the laptop of
+#     whoever ran the command last and on no CI runner and no teammate's
+#     checkout. "One command, always current" quietly becomes "one command,
+#     whatever this checkout last fetched".
+#
+#     `bin/dev` reads KIT_STACK_REF from the ENVIRONMENT only, as a one-run
+#     override, so the shipped line decides nothing at run time. A gate that asked
+#     "is the pin pinned?" would still be green; it has to ask WHERE the pin
+#     lives, which is a different question and a different check.
+#
+#     `rm -f kit.ref` is here for the shape a SERVICE sees, not for kit: kit's own
+#     root has no `kit.ref` — the pin belongs to the adopting service. Removing it
+#     is a no-op on this tree, and the red comes entirely from the `.env.example`
+#     line. Kept because the recipe should read as the defect it is proving
+#     rather than as the minimum needed to trip a check.
+PINCHECK='templates/bin/dev.sh + .env.example  (the pin is kit.ref, and the gate reads the same file)'
+
+fiftyseven="$(fresh_copy pin-back-in-env)"
+rm -f "$fiftyseven/kit.ref"
+cat >>"$fiftyseven/templates/compose/.env.example" <<'ENTRY'
+KIT_STACK_REF=0000000000000000000000000000000000000000
+ENTRY
+expect_red_check 'breakage 57: the pin is back in .env, where nothing reads it' \
+  "$fiftyseven" "$PINCHECK" --static-only
+
+# 29. A PORT PUBLISHED ON A SERVICE KIT ALREADY SHIPS. The quietest of the three,
+#     because nothing errors. `ports:` is a LIST, a second `-f` file's list is
+#     APPENDED rather than substituted, and a service that writes
+#
+#         services:
+#           postgres:
+#             ports: ["15433:5432"]
+#
+#     gets postgres listening on kit's 15500 AND on 15433. `docker compose config`
+#     renders both and warns about neither, so the file reads like the override it
+#     was written to be while doing something else — and the port it meant to move
+#     is still bound. The documented way to move a published port is the VARIABLE
+#     in `.env`, which replaces.
+#
+#     No `image:` on the mutation, deliberately: the rule keys on the service NAME
+#     kit ships, not on an image, so this fires the ports rule alone and the
+#     stale-copy rule stays quiet. A breakage that reddened both would not say
+#     which one is load-bearing.
+fiftyeight_fixture="$(fixture_fleet published-port)"
+cat >>"$fiftyeight_fixture/alpha/docker-compose.yml" <<'YAML'
+  postgres:
+    ports:
+      - "15433:5432"
+YAML
+export KIT_FLEET="$fiftyeight_fixture"
+expect_red_check 'breakage 58: a service publishes a port on a service kit already ships' \
+  "$base" "$FLEETCHECK" --static-only
+
+# 59-31. THE ADOPTION CEILING, both sides of it, and the pair is the proof.
+#
+# The fleet gate was red on master for six repositories that have adopted
+# nothing, which is the same shape as a build that has been red for a quarter:
+# the red is true, and it has stopped being information. The ceiling is the
+# response core-16 applied to a missing OpenAPI document — absence is a named
+# warning with the adoption path attached, and it becomes a failure the moment
+# the repository adopts.
+#
+# A ceiling needs BOTH halves proved, and that is why these are two recipes over
+# ONE mutation rather than one recipe over two mutations:
+#
+#   59  the stale copy, with no kit.ref anywhere in the fleet. The gate stays
+#       GREEN, and the finding is PRINTED, with the adoption path. If this one
+#       goes red the ceiling does not exist — the gate is failing unadopted
+#       repositories, which is the state the packet was dispatched to fix.
+#   60  the identical stale copy, with kit.ref committed. The gate goes RED on
+#       the identical finding. If this one stays green then the ceiling is not
+#       a ceiling but a deletion: the checks no longer decide anything at all.
+#
+# 60 is breakage 52 plus one committed line, and that is the entire argument in
+# one diff. Nothing about the predicate, the message or the severity changed
+# between them; what changed is whether the repository has accepted the standard
+# it is being measured against.
+#
+# The needle in 59 is a literal substring of the finding rather than the word
+# `WARN`. A check that printed "WARN" and nothing else would satisfy the weaker
+# assertion, and a check that deleted the finding entirely and left the string
+# in a comment would satisfy it too — which is the shape this repository has
+# already been bitten by once, with a policy stated in both the Python and a
+# rule.
+CEILINGCHECK='fleet  (adopting repositories clean;'
+fiftynine_fixture="$(fixture_fleet ceiling-unadopted)"
+break_stale_copy "$fiftynine_fixture"
+unadopt "$fiftynine_fixture"
+export KIT_FLEET="$fiftynine_fixture"
+expect_green_check 'breakage 59: an UNADOPTED service copies the stack — green, and named' \
+  "$base" "$CEILINGCHECK" "which is the image kit's stack already ships" --static-only
+
+sixty_fixture="$(fixture_fleet ceiling-adopted)"
+break_stale_copy "$sixty_fixture"
+export KIT_FLEET="$sixty_fixture"
+expect_red_check 'breakage 60: the same copy in an ADOPTING service is a hard FAIL' \
+  "$base" "$FLEETCHECK" --static-only
+
+# Cleared, because `export` is not scoped to a command the way `VAR=v cmd` is, and
+# the final recipe above would otherwise leave the fixture in the environment for
+# whatever runs next. The alternative — a `VAR=v` prefix per call — puts
+# `expect_red_check` at column 59, where the breakage counter and validate.sh's
+# header/recipe check (both `grep -cE '^expect_red...'`) stop being able to see it,
+# and a breakage the counter cannot see is a breakage the header is not proved
+# against.
+unset KIT_FLEET
+
 printf '\n'
 if [ "$failures" -ne 0 ]; then
   echo "FAIL: self_test — $failures breakage(s) the gate did not catch."
@@ -776,7 +2534,7 @@ if [ "$skips" -ne 0 ]; then
   exit 1
 fi
 # The count is COUNTED, not written down. Every breakage above calls exactly one
-# of the three red-expecting helpers, so this cannot drift from the recipes the
+# of the four red-expecting helpers, so this cannot drift from the recipes the
 # way a hardcoded "all N breakages" does — and the header's list is checked
 # against it by `tests/validate.sh`, so a breakage added without a header entry
 # (or a header entry with no recipe) is a red gate rather than a doc that lies.
@@ -788,9 +2546,14 @@ fi
 #   side by side, is the defect this repo keeps refusing to ship; the fix is to
 #   count something that cannot be a definition.
 #
-#   Only the reds are counted as reds, and the skip-proofs are named
-#   separately. Breakage 23b asserts a green gate on purpose, and a summary
-#   claiming it "went red" would be a false statement about a proof that passed.
+#   Only the reds are counted as reds, and the green-expecting proofs are named
+#   separately. Breakages 23b and 59 assert a green gate on purpose — 23b names a
+#   SKIP, 59 names a FINDING — and a summary claiming either "went red" would be
+#   a false statement about a proof that passed. kit-12's 31b is an `expect_green`
+#   and is deliberately not in either count: it is a control, and its label
+#   carries a number so the header can name the claim without giving a control a
+#   numbered entry. `tests/validate.sh` says the same thing in the same words.
 counted=$(grep -cE '^ *expect_red(_check|_lang|_script)? +.breakage +[0-9]+[a-z]*:' "$0" || true)
-total=$(grep -cE '^ *expect_(red(_check|_lang|_script)?|skip_check) +.breakage +[0-9]+[a-z]*:' "$0" || true)
-echo "PASS: self_test — all $total breakages hold ($counted assert red, $((total - counted)) assert a green gate with a named skip), and the unbroken tree is green."
+total=$(grep -cE '^ *expect_(red(_check|_lang|_script)?|skip_check|green_check) +.breakage +[0-9]+[a-z]*:' "$0" || true)
+green_check=$(grep -cE '^ *expect_green_check +.breakage +[0-9]+[a-z]*:' "$0" || true)
+echo "PASS: self_test — all $total breakages hold ($counted assert red, $((total - counted - green_check)) assert a green gate with a named skip, $green_check assert a green gate with a named finding), and the unbroken tree is green."
