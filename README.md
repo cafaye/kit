@@ -91,7 +91,9 @@ the entry; deleting the entry to shrink the file is a hard failure of its own.
 
 | Path | What it is | Who uses it |
 |------|-----------|-------------|
-| `.github/workflows/ci.reusable.yml` | One reusable GitHub Actions workflow. Input `language` picks one of seven jobs — install, lint, test, coverage gate. Opt-in `telemetry` input adds the traceparent conformance job; opt-in `required-tier` demands a tier by gate-variable name. No job builds or pushes an image. | Every service, via a 6-line `.github/workflows/ci.yml` |
+| `.github/workflows/ci.reusable.yml` | One reusable GitHub Actions workflow. Input `language` picks one of seven jobs — install, lint, test, coverage gate. Opt-in `telemetry` input adds the traceparent conformance job; opt-in `required-tier` demands a tier by gate-variable name. **Plus two security jobs: `secrets` (no opt-in) and `zizmor` (opt-in).** No job builds or pushes an image. | Every service, via a 6-line `.github/workflows/ci.yml` |
+| `.gitleaks.toml` | The secret-scanner allowlist, and nothing else. `extend.useDefault = true`, so the rules stay gitleaks'. Every entry carries a `description`. One entry is here for kit's own test fixture — **delete it when you copy this file**. | Copied verbatim by every service |
+| `.github/zizmor.yml` | zizmor's reasoned baselines. One entry. `unpinned-uses` is deliberately **absent** — see `DECISIONS.md`. | Every service, copied verbatim |
 | `lint/yamllint.yml` | YAML style, with the three rules Actions forces us to retune. Read at run time via `yamllint -c`, never copied. | Any repo that lints its own YAML; kit's gate uses it on itself |
 | `lint/golangci.yml` | golangci-lint v2, correctness linters on, `errcheck` excluded only for `Close`/`Flush`. Read at run time via `--config`, never copied. | Go services |
 | `lint/rubocop.yml` | RuboCop, `NewCops: enable`, Metrics left on. Read at run time via `--config`, never copied. | Ruby services |
@@ -120,6 +122,47 @@ the entry; deleting the entry to shrink the file is a hard failure of its own.
 | `tests/staleness.py` | Two scopes. `--scope core` reads every consuming repo's recorded pin and prints the distance. `--scope templates` reports whether each service's copy of a kit template is `current`, `diverged`, **`absent`**, `unknown` or `n/a`, and whether the reason for it is recorded. | Scheduled, fleet-wide |
 | `tests/artifacts.json` | The ONE place kit says what it ships and where a service puts it. Read by the reporter *and* by the gate — a table written down twice is a table that is right in one of the two places. | kit |
 | `tests/validate.sh` | kit's own suite — the gate. | kit |
+| `tests/gitleaks_gate.sh` | The one secret scan. Run by the `secrets` job **and** by the gate. | Every service, copied verbatim |
+| `tests/zizmor_gate.sh` | The one zizmor split: `unpinned-uses` recorded, every other audit fatal. | Every service, copied verbatim |
+
+## Secrets — two scanners, two questions
+
+Neither of these substitutes for the other, and the second one has no
+off-the-shelf implementation at all.
+
+**`secrets` (no opt-in).** gitleaks over the **full history** of the adopting
+repo, with `--redact`. It answers *was a credential committed*.
+
+Why gitleaks and not trufflehog: trufflehog is **AGPL-3.0**, which is a
+licensing decision with teeth for a product that sells code, and it is the only
+candidate that verifies live credentials against the issuer's API — exactly the
+wrong behaviour for a fleet whose CI has network access. gitleaks is MIT, a
+single static binary, needs no network, and `--redact` is mandatory so CI never
+prints the secret it just found.
+
+It is the one job in the workflow with **no opt-in**, and that is deliberate: an
+opt-in security control is not a control. `continue-on-error` is the one setting
+that would turn it into a report, and `tests/validate.sh` fails if it appears.
+
+> **Adopting this may make your first build red.** If your repository has a
+> credential anywhere in its history, the scanner will find it. That is the
+> scanner working. **Rotate the credential first** — a scan finding a secret is
+> not a plan for it. Then, if it was a false positive, add an entry to your
+> `.gitleaks.toml` with a `description` explaining why. Do not add
+> `continue-on-error`, and do not add a `.gitleaksignore`: both fail the gate.
+
+**`zizmor` (opt-in).** The GitHub Actions security audit, on your own workflows.
+It answers *what is the shape of your CI*. Off by default because it reads
+workflows kit did not write, and a red build for someone else's finding is not a
+fair day one.
+
+**`templates/secrets/`** answers the question neither of them does: *does a
+credential leave the process while the tests run?* It plants a fake credential
+— `cafaye_canary_` plus 32 bytes, assembled at run time so it is safe to commit
+— and sweeps five vectors: log/stdout/stderr, unknown serialisation fields, the
+whole error chain, keys that are present-but-empty, and Go type coverage. The
+contract is in [`templates/secrets/README.md`](templates/secrets/README.md); the
+Go adapter is in `templates/secrets/go/`, and only Go has one so far.
 
 ## The core fan-out — `core/`
 
@@ -183,7 +226,7 @@ no search for a file that hashes to kit's: a copy is `current` when the bytes
 at the declared path are equal and the path is a real file in the service's own
 tree, and at no other time. A symlink to an identical file is `unknown`, not
 `current` — the bytes are right today and the arrangement is a bet that the
-target never moves. `tests/self_test.sh` breakage 27 is that rule written as
+target never moves. `tests/self_test.sh` breakage 37 is that rule written as
 the patch someone would write to relax it, and it has to be tried to be
 believed.
 
@@ -585,6 +628,51 @@ organization.
 
 Two jobs for two languages? Call it twice with two different `language` values.
 
+**Your first build may be red, and it is probably the secret scanner.** The
+`secrets` job has no opt-in, and it reads the **full history** of your
+repository. If a credential has ever been committed — even one you deleted in
+the same PR — it will find it. That is the scanner working, and it is the reason
+the scan is not diff-only: a deleted secret is still in the packfile of anyone
+who cloned, and still on every fork.
+
+In order:
+
+1. **Treat the credential as compromised and rotate it.** A scanner finding a
+   secret is not a plan for it, and nothing below is a substitute for rotating.
+2. If it was a false positive, copy `.gitleaks.toml` into your repo root and add
+   one `[[allowlists]]` entry with a `description` saying what is allowed and
+   why. A description under 40 characters fails the check, and an entry with
+   none fails harder: an allowlist that grows and is never pruned is not an
+   allowlist, it is a deferred disclosure.
+   - **Delete the entry kit's file already carries.** kit's own allowlist has one
+     entry, for a JWT-shaped test fixture at `tests/deploy_test.sh` — a path your
+     repository does not have. An allowlist that matches nothing excuses nothing,
+     so leaving it cannot weaken your scan, but it is a justification written about
+     somebody else's file, and that is the thing to not copy. Write yours for what
+     *your* finding actually is.
+   - Scope it as narrowly as gitleaks allows: `targetRules` to name the one rule,
+     `paths` to name the one file, and `condition = "AND"` **written out** —
+     gitleaks' default is `OR`, so an entry with two criteria silently becomes a
+     union the day a second one is added.
+3. **Never** add `continue-on-error` to the `secrets` job, and **never** create a
+   `.gitleaksignore`. Both fail `tests/validate.sh`, and both are the two ways a
+   security job becomes a report while the badge stays green.
+
+The `zizmor` job is opt-in, and it is the one to turn on once your own
+workflows are clean:
+
+```yaml
+    with:
+      language: go
+      working-dir: .
+      zizmor: 'true'          # the GitHub Actions security audit
+```
+
+`unpinned-uses` is reported and does **not** fail that job. That is not a
+baseline — the finding is counted and printed on every run, and the decision it
+is waiting on is costed in [`DECISIONS.md`](DECISIONS.md). Every other audit is
+fatal.
+
 `bun` is a first-class `language` value: frozen install from `bun.lock`,
 `typecheck`, `bun test`. It exists because `guard` was hand-rolling an entire
 workflow for want of one — a repo that has adopted `bun` here can delete that
@@ -678,6 +766,19 @@ Setting it commits you to the normalised result format
 the run log and fails **naming the variable** when the tier ran nothing. It is
 opt-in and defaults to `''`, so adopting it never turns a green repo red.
 
+**7d. Adopt the runtime credential-leak canary**, once you have copied
+`templates/secrets/<lang>/`:
+
+```sh
+cp -R <kit>/templates/secrets/go/internal/canary internal/canary   # go
+```
+
+Then, in your test bootstrap, plant the canary and sweep for it. Start by
+reading [`templates/secrets/go/README.md`](templates/secrets/go/README.md) —
+there are three things to wire up (your credential type, your log sinks, your
+public keys) and none of them is automatic, because the harness cannot
+enumerate a process's loggers and a harness that guesses is a harness asserting
+against the wrong contract.
 **7. Run kit's own gate before you open the PR that adopts it:**
 
 ```sh
@@ -702,6 +803,10 @@ bash <kit>/tests/validate.sh
 - [ ] If you have a tier: `templates/tier/<lang>/` copied, `REQUIRED_<TIER>=1` honoured,
       `required-tier` named in the caller
 - [ ] No `actions/cache` step caches a test report
+- [ ] **The `secrets` job ran, and anything it found has been ROTATED**
+- [ ] `.gitleaks.toml` copied to your repo root if you need an allowlist entry
+- [ ] `zizmor: 'true'` set, if your own workflows are clean
+- [ ] If you hold credentials: `templates/secrets/<lang>/` copied **with its suite**
 - [ ] `CHANGELOG.md` has an entry
 - [ ] The workflow is green on the adoption PR
 
@@ -970,15 +1075,22 @@ bash tests/validate.sh
 ```
 
 That is the entire procedure on a clean clone. The gate installs its own
-dependencies — PyYAML and yamllint — into the gitignored `.venv/` on first run
-and prints a `note:` line saying so. There is no prerequisite step, because a
-prerequisite that is documented rather than automated is one that gets skipped
-by exactly the machine you most wanted to hear from.
+dependencies into gitignored directories on first run and prints a `note:` line
+saying so — PyYAML, yamllint and zizmor into `.venv/`, and hadolint and gitleaks
+into `tests/.bin/`. There is no prerequisite step, because a prerequisite that is
+documented rather than automated is one that gets skipped by exactly the machine
+you most wanted to hear from.
 
 This bit twice. It used to exit 1 with `no python with PyYAML` because it
 preferred `.venv/bin/python` and fell back to `python3`, and `.venv` is
 gitignored — so **every fresh clone and every CI runner** hit it, including the
 CI job this repository now runs on itself.
+
+The binaries go in `tests/.bin/` rather than `.venv/bin/` for the same reason
+one level down: `tests/self_test.sh` copies the tree thirty times per gate run —
+34 breakages over 29 copies, because the six language mutants share one, plus the
+unbroken-tree control's own — and a tool in a directory the copy does not carry
+is re-downloaded once per copy.
 
 `tests/validate.sh` runs in three phases and prints one line per check.
 
@@ -1026,8 +1138,30 @@ we wrote them down to be:
   `until`** — and **an entry matching nothing is a failure**. The total is
   printed on every run, green included
 - no `actions/cache` step may cache a test report
+- the `secrets` job must exist, must not be `continue-on-error`, must not be
+  opt-in, and must check out with `fetch-depth: 0` — the runner default is a
+  *shallow clone*, and a shallow scan cannot see a deleted secret
+- no workflow may declare `pull_request_target`, `workflow_run` or
+  `issue_comment`, read off the **parsed trigger keys** so the comment explaining
+  why is not itself a violation
+- `.gitleaks.toml` must extend gitleaks' defaults rather than redefine rules, and
+  every `[[allowlists]]` entry must carry a `description` of at least 40
+  characters. An entry with no reason is a deferred disclosure
+- no `.gitleaksignore` may exist — the allowlist is the committed config
+- **the scanner's behaviour, executed**: over a throwaway git repository
+  containing a detectable credential, the scan must find it, must name the rule
+  that fired, must not print the value, and must still find it after the file is
+  deleted. This is a behavioural check, not a `grep`, because a `grep
+  -- --redact` is satisfied by the comment that explains why the flag is
+  mandatory — and `self_test` breakage 43 proved that
+- `.github/zizmor.yml` must not ignore or disable `unpinned-uses`, must not carry
+  a blanket `ignore: "*"`, and every ignore entry must carry a reason beside it
+- the canary must never appear as a literal anywhere in the tree, and must be
+  structurally unmistakably fake: prefixed, the right length, and a repeated
+  word rather than something a high-entropy detector would score as random
 
-**telemetry** — the W3C traceparent suites are **executed**, one per language:
+**telemetry** — the W3C traceparent suites are **executed**, one per language,
+and so is the canary harness:
 
 ```sh
 bash tests/validate.sh --language=go     # one language
@@ -1038,15 +1172,19 @@ Stdlib only and offline on purpose: no `go mod download`, no `bundle install`,
 no `npm ci`, no `cargo fetch`. If these ever need the network, a template has
 grown a dependency and kit has stopped being config-only.
 
+The canary suite runs with `-v` so every vector's red proof is visible in the
+output. A proof nobody can see is a proof nobody ran — the same argument the
+self_test phase makes, applied to the harness rather than to the gate.
+
 **self_test** — `tests/self_test.sh` breaks a throwaway copy of this tree
-**forty-five** ways: forty-four assert the gate goes red, and one (23b)
+**fifty-six** ways: fifty-five assert the gate goes red, and one (23b)
 asserts the gate stays **green** while naming the skip that replaced a red. A
 further **green control** (31b) asserts a service config that agrees with kit's
 is *not* a failure. Fourteen breakages are for the static checks; one is a
 semantic mutation of each of the six language implementations, so **every suite
 is proven able to fail** rather than assumed to. A skip fails the run — a
 self_test that skips half its proofs and exits 0 is the "0 passed, 14 ignored"
-shape that verifies nothing. Twenty-one of the static ones go further and assert
+shape that verifies nothing. Thirty-seven of the static ones go further and assert
 that one *named* check reported `FAIL`, so the check written for a given defect
 is proven still load-bearing rather than being one of fifty checks that could
 have gone red for an unrelated reason.
@@ -1070,8 +1208,9 @@ correct step, and a proof pattern carrying escape tolerance (D13, core
 kit is one repository and the fleet is fifteen — which also makes the control
 this file's positive case for the check.
 Any `FAIL` exits 1. A `SKIP` is always reported in the summary, never hidden.
-PyYAML, yamllint and hadolint are required and are **bootstrapped by the gate
-itself**; the six language toolchains and `shellcheck` run when present.
+PyYAML, yamllint, zizmor, hadolint and gitleaks are required and are
+**bootstrapped by the gate itself**; the seven language toolchains and
+`shellcheck` run when present.
 
 ### What the gate lints the Dockerfiles with, and why
 

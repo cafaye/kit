@@ -58,6 +58,14 @@ trap 'rm -rf "$TMP"' EXIT
 # exists to fix — see the `callable path` check below.
 WORKFLOW='.github/workflows/ci.reusable.yml'
 
+# The three files that make the secret scanner one decision rather than three.
+# Paths as variables for the same reason WORKFLOW is: the path being wrong is the
+# class of defect this file exists to catch, and a literal repeated in a dozen
+# heredocs is a dozen chances to spell it three ways.
+GITLEAKS_CONFIG='.gitleaks.toml'
+GITLEAKS_GATE='tests/gitleaks_gate.sh'
+ZIZMOR_CONFIG='.github/zizmor.yml'
+
 # The one `language` option that is not a language. `none` means "this
 # repository has no service manifest": no go.mod, no Gemfile, no
 # pyproject.toml. It exists because the repository that defines the workflow
@@ -128,6 +136,14 @@ fi
 kit_bootstrap_python "$ROOT"
 export KIT_PYTHON="$PY"
 
+# gitleaks' pinned version, for the check messages below. Read from bootstrap.sh
+# rather than re-declared, because two places holding a version number is how the
+# binary that gets sha256-verified and the version the gate claims to have run
+# stop being the same one. `:-unknown` so the gate still runs against a
+# bootstrap.sh older than the secret-scanner checks, rather than dying on an
+# unbound variable in its own bookkeeping.
+KIT_GITLEAKS_VERSION="${KIT_GITLEAKS_VERSION:-unknown}"
+
 # ---------------------------------------------------------------------------
 # static helpers
 # ---------------------------------------------------------------------------
@@ -172,6 +188,30 @@ check() { # check <label> <command...>
     if [ -n "$out" ]; then
       printf '%s\n' "$out" | sed 's/^/       /'
     fi
+  else
+    report FAIL "$label"
+    printf '%s\n' "$out" | sed 's/^/       /'
+  fi
+}
+
+# check_verbose — `check`, but it shows the proof on success too.
+#
+# `check` swallows a passing run's output, which is right for most checks: a
+# suite that prints nothing is a suite whose output is a summary. It is wrong for
+# the canary harness, whose output is the RED PROOF lines — the evidence that
+# each of the five detectors actually fired rather than quietly asserting nothing.
+#
+# So those lines are echoed when the check passes, and the whole output when it
+# fails. The first version of this used `check` and shipped with the proofs
+# invisible on a green run, which is precisely the "a proof nobody can see is a
+# proof nobody ran" failure the harness's own comments argue against.
+check_verbose() { # check_verbose <label> <proof-regex> <command...>
+  local label="$1" proof="$2" out ec=0
+  shift 2
+  out="$("$@" 2>&1)" || ec=$?
+  if [ "$ec" -eq 0 ]; then
+    report PASS "$label"
+    printf '%s\n' "$out" | grep -E "$proof" | sed 's/^/       /' || true
   else
     report FAIL "$label"
     printf '%s\n' "$out" | sed 's/^/       /'
@@ -501,8 +541,22 @@ PY
 
   # Every script kit hands out is executable. `chmod -x bin/dev` in a commit is
   # a one-character diff that silently breaks six repos the next they adopt.
+  #
+  # tests/ is in this list and not an afterthought: tests/gitleaks_gate.sh and
+  # tests/zizmor_gate.sh are run BY the reusable workflow, from a service's
+  # repository, against that service's tree. A gate script that is not executable
+  # is a `secrets` job that dies at the first step in thirteen repos.
+  # The two gate scripts are in this list and not an afterthought: they are run
+  # BY the reusable workflow, from a service's repository, against that service's
+  # tree. A gate script that is not executable is a `secrets` job that dies at
+  # its first step in thirteen repos.
+  #
+  # `tests/bootstrap.sh` is deliberately NOT in the list: it is sourced, never
+  # executed, and it says so at the top. A check that required it to be
+  # executable would be asking a file to claim a contract it does not have.
   section 'static: handed-out scripts are executable'
-  for f in "$ROOT"/templates/bin-prime/* "$ROOT"/templates/bin/*; do
+  for f in "$ROOT"/templates/bin-prime/* "$ROOT"/templates/bin/* \
+    "$ROOT/$GITLEAKS_GATE" "$ROOT/tests/zizmor_gate.sh"; do
     [ -f "$f" ] || continue
     path="${f#"$ROOT"/}"
     if [ -x "$f" ]; then
@@ -656,6 +710,29 @@ PY
   }
   check 'templates/otel/*/*.snippet  (installable, versioned, not vendored)' snippet_check
 
+  # -------------------------------------------------------------------------
+  # The canary harness's Go sources must PARSE, and must parse in Go's own
+  # parser rather than in a regex.
+  #
+  # The gate executes the suite (telemetry phase), so a syntax error is caught
+  # there — but only on a machine with Go installed, where it would be reported
+  # as a telemetry SKIP's opposite and a developer would read it as "the canary
+  # is fine". A parse here runs with no toolchain at all, so a missing template
+  # or a bad edit is a static failure on any machine, which is the property the
+  # otel snippets were given for the same reason.
+  section 'static: the canary harness parses in Go'
+  if have gofmt; then
+    # gofmt is a real parser: it exits non-zero on a file it cannot parse, and
+    # unlike `go build` it needs no module, no resolver and no network.
+    for f in "$ROOT"/templates/secrets/go/*.go "$ROOT"/templates/secrets/go/internal/*/*.go; do
+      [ -f "$f" ] || continue
+      path="${f#"$ROOT"/}"
+      check "$path  (gofmt parses)" gofmt -e "$f"
+    done
+  else
+    report SKIP 'templates/secrets/go  (gofmt not installed — cannot parse)'
+  fi
+
   # Every snippet must PARSE in its own language. This is not a style check and
   # not a stretch: a snippet is the file a service copies, so a syntax error in
   # one ships as a service that does not boot.
@@ -770,9 +847,16 @@ SNIPPETS
 
   # A template must not declare a dependency. kit is config-only; if these
   # files can `require` something, kit has a lockfile and a supply chain.
-  section 'static: templates/otel declare no third-party dependency'
+  section 'static: templates declare no third-party dependency'
   check 'templates/otel/go/go.mod  (no require)' bash -c \
     "! grep -qE '^[[:space:]]*require' '$ROOT/templates/otel/go/go.mod'"
+  # The canary harness is the other stdlib-only template, and the same rule
+  # applies for a sharper reason: a canary test that pulls in a dependency is a
+  # canary test whose own output has to be trusted not to contain the thing it
+  # is sweeping for. kit has no dependencies, and neither does a thing kit hands
+  # out.
+  check 'templates/secrets/go/go.mod  (no require)' bash -c \
+    "! grep -qE '^[[:space:]]*require' '$ROOT/templates/secrets/go/go.mod'"
   if [ -f "$ROOT/templates/otel/node/package.json" ]; then
     check 'templates/otel/node/package.json  (no dependencies)' bash -c \
       "$PY -c \"import json,sys; d=json.load(open(sys.argv[1])); sys.exit(1 if (d.get('dependencies') or d.get('devDependencies')) else 0)\" \
@@ -2778,6 +2862,11 @@ STUB
   # The CI workflow gains a job; assert the job exists, is opt-in, and that the
   # default call still runs exactly the six original jobs. A kit change that
   # breaks every consumer's CI is a kit change that does not ship.
+  #
+  # The secrets and zizmor jobs are asserted separately, below, because they are
+  # the two jobs whose absence is silent in a way `option has no job` does not
+  # make silent: a repo without a secrets job has no secret scanning, and every
+  # other check in this file is still green.
   ci_check() {
     "$PY" - "$ROOT" "$CONFIG_ONLY" "$WORKFLOW" <<'PY'
 import re
@@ -4783,6 +4872,176 @@ PY
   }
   check '.github/workflows/*  (no test report is ever cached)' no_cached_report_check
 
+  # -------------------------------------------------------------------------
+  # The `secrets` job, asserted as a job rather than as a config file.
+  #
+  # Three things, and each is a distinct way this job could stop being a gate
+  # while every other check in the file stayed green:
+  #
+  #   1. it could stop existing — a repo with no secret scanning is a repo that
+  #      has never been scanned, and nothing else here notices
+  #   2. it could become advisory — `continue-on-error` at the job or step level
+  #      is the single most common way a security job is neutralised, and it is
+  #      invisible in a green build. A secret scanner that only warns is a report
+  #   3. it could lose its full history — `fetch-depth` reverting to the
+  #      default shallow clone is a one-line diff that turns a history scan into
+  #      a HEAD scan, and a HEAD scan cannot see a deleted secret
+  secrets_job_check() {
+    "$PY" - "$ROOT" "$WORKFLOW" "$GITLEAKS_GATE" <<'PY'
+import sys
+
+import yaml
+
+workflow, gate = sys.argv[2], sys.argv[3]
+with open(workflow, encoding="utf-8") as fh:
+    doc = yaml.safe_load(fh)
+jobs = doc.get("jobs") or {}
+problems = []
+
+job = jobs.get("secrets")
+if not isinstance(job, dict):
+    problems.append(
+        "no `secrets` job. Every other job in this file is a test the repo asked "
+        "for; this one is the one a repo must not have to ask for, and a "
+        "repository with no secret scanning has never been scanned while every "
+        "other check here is green"
+    )
+else:
+    # Advisory is the failure mode, so it is checked at both levels. A job-level
+    # `continue-on-error: true` makes the whole job non-blocking; a step-level one
+    # makes the scan non-blocking and leaves the job green.
+    if job.get("continue-on-error") is True:
+        problems.append(
+            "the `secrets` job sets continue-on-error: true. That is what makes a "
+            "secret scanner a report: the build goes green having found nothing, "
+            "and a green badge is a claim"
+        )
+
+    steps = job.get("steps") or []
+    # Full history. `fetch-depth: 0` on the checkout, not merely its absence —
+    # an explicit 0 and an absent key look identical to a grep.
+    checkout_depths = []
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        if str(step.get("uses", "")).startswith("actions/checkout@"):
+            checkout_depths.append((step.get("with") or {}).get("fetch-depth"))
+    if not checkout_depths:
+        problems.append("the `secrets` job has no actions/checkout step")
+    elif not any(str(d) == "0" for d in checkout_depths):
+        problems.append(
+            f"the `secrets` job checks out with fetch-depth {checkout_depths}. The "
+            f"runner default is a SHALLOW clone — one commit. A shallow scan is a "
+            f"diff scan with extra steps, and a diff scan cannot see a secret that "
+            f"was committed and deleted, which is the finding that matters most: it "
+            f"is on every fork and in the packfile of anyone who cloned. fetch-depth "
+            f"must be 0"
+        )
+
+    # The scan must be the shared script, so CI and `bash tests/validate.sh` are
+    # the same scan. A workflow that inlines its own gitleaks command line is two
+    # scanners, and the one that goes red is whichever nobody runs.
+    runs = "\n".join(
+        str(s.get("run", "")) for s in steps if isinstance(s, dict)
+    )
+    if gate not in runs:
+        problems.append(
+            f"the `secrets` job does not run {gate}. kit's gate runs that script and "
+            f"this job inlines its own command line instead, which means the scan a "
+            f"developer runs and the scan CI runs have already drifted, and the one "
+            f"that goes red is whichever nobody runs"
+        )
+
+    # Every step must be blocking.
+    for i, step in enumerate(steps, 1):
+        if isinstance(step, dict) and step.get("continue-on-error") is True:
+            problems.append(
+                f"the `secrets` job step {i} ({step.get('name', step.get('uses', '?'))}) "
+                f"sets continue-on-error: true, which makes the scan advisory"
+            )
+
+    # No `if: always()` or `if: failure()` on the scan step: a scan that only
+    # runs when something else already failed is a report about the failure.
+    for step in steps:
+        if not isinstance(step, dict):
+            continue
+        cond = str(step.get("if", ""))
+        if "always()" in cond or "failure()" in cond or "success()" in cond:
+            problems.append(
+                f"a `secrets` step is conditional on {cond!r}. A secret scan that runs "
+                f"only under some conditions is a report about those conditions"
+            )
+
+    # And the job must not be opt-in, which is the opposite of every other job
+    # in this file and the one deliberate exception.
+    cond = str(job.get("if", ""))
+    if "inputs." in cond:
+        problems.append(
+            f"the `secrets` job is gated on {cond!r}. It is the one job in this file "
+            f"with no opt-in, deliberately: an opt-in security control is not a "
+            f"control, and a secret scanner that only warns is a report"
+        )
+
+# The zizmor job is opt-in and must say so with a STRING comparison, for the
+# reason every other opt-in input in this file does: GitHub coerces a bare
+# `false` to a boolean in some positions, and `if: inputs.zizmor` is a trap.
+zjob = jobs.get("zizmor")
+if not isinstance(zjob, dict):
+    problems.append(
+        "no `zizmor` job. The audit reads the adopting repo's OWN workflows, which "
+        "kit did not write, so it is opt-in — but a job that has quietly stopped "
+        "existing and an input that is quietly never passed are the same silence"
+    )
+else:
+    cond = str(zjob.get("if", ""))
+    if "inputs.zizmor" not in cond:
+        problems.append(
+            f"the `zizmor` job is not gated on its input ({cond!r}), so it would run "
+            f"in every adopting repo on day one and turn them red for findings in "
+            f"workflows kit did not write"
+        )
+    elif "'true'" not in cond:
+        problems.append(
+            f"the `zizmor` job's condition is {cond!r}; it must compare to the STRING "
+            f"'true'. A bare boolean coerces unpredictably in some positions, which is "
+            f"the exact trap the `telemetry` input exists to avoid"
+        )
+
+# Both new inputs must exist and default to 'false', for the same reason
+# `telemetry` does — a kit change that breaks every consumer's CI does not ship.
+triggers = doc.get("on") or doc.get(True) or {}
+call = (triggers.get("workflow_call") or {}).get("inputs") or {}
+for name in ("zizmor",):
+    declared = call.get(name)
+    if not isinstance(declared, dict):
+        problems.append(f"no `{name}` workflow_call input")
+    else:
+        if str(declared.get("default", "")) not in ("false", "False"):
+            problems.append(
+                f"the `{name}` input defaults to {declared.get('default')!r}; it must "
+                f"default to 'false'"
+            )
+        if str(declared.get("type")) != "string":
+            problems.append(f"the `{name}` input must be type: string (booleans coerce badly)")
+
+# `secrets` must NOT be an input at all: it takes no opt-in, and an input named
+# `secrets` with a default of false would be a way to turn the secret scanner off
+# without anyone noticing the flag.
+if "secrets" in call:
+    problems.append(
+        "the workflow declares a `secrets` input. The secret scanner is the one job "
+        "with no opt-in, and an input is an off switch — a `secrets: false` in a "
+        "caller would be a way to disable secret scanning that looks like "
+        "configuration"
+    )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check "$WORKFLOW  (secrets job: not advisory, full history, not opt-in)" \
+    secrets_job_check
+
   # Every README section a reader is told to copy must exist. A doc that points
   # at a path that was renamed is worse than no doc.
   readme_check() {
@@ -5212,12 +5471,22 @@ else:
 copies = []
 for dirpath, dirnames, filenames in os.walk(root):
     dirnames[:] = [
-        d for d in dirnames if d not in (".git", ".venv", "__pycache__")
+        # tests/.bin is the gate's own fetched scanners (hadolint, gitleaks).
+        # It is gitignored and a throwaway copy carries it, and a 15MB binary is
+        # not a file to read the first 64KB of looking for a YAML key.
+        d for d in dirnames if d not in (".git", ".venv", ".bin", "__pycache__")
     ]
     for filename in filenames:
         full = os.path.join(dirpath, filename)
         rel = os.path.relpath(full, root)
         if rel == workflow:
+            continue
+        # shell scripts are excluded for the same reason, and because the
+        # walker's own self_test.sh names `workflow_call` in a comment explaining
+        # breakage 8 — which this check reported as a second copy of the CI
+        # standard. A check that fires on the file proving it wrong is a check
+        # that gets deleted.
+        if filename.endswith((".sh", ".toml", ".md", ".pyc")):
             continue
         try:
             with open(full, encoding="utf-8") as fh:
@@ -5242,6 +5511,802 @@ if problems:
 PY3
   }
   check "$WORKFLOW  (callable: exists, on: workflow_call, docs agree)" callable_check
+
+  # -------------------------------------------------------------------------
+  # Secrets. Two scanners and two different questions, and this section is the
+  # part of the gate that proves both of them can fail.
+  #
+  # gitleaks answers "was a secret committed"; the canary harness answers "does
+  # one leave the process while the tests run". Neither is a substitute for the
+  # other, and the second has no off-the-shelf implementation at all — see
+  # templates/secrets/README.md for the measurement behind that.
+  #
+  # The scanner runs in `secrets` / `zizmor`-style jobs in the reusable workflow,
+  # and ALSO here, because a check that only runs in a CI runner is a check whose
+  # first execution is on a stranger's commit. `bash tests/validate.sh` is the
+  # whole procedure on a clean clone, and this is part of it.
+  # The gitleaks config check needs tomllib (python 3.11+). Resolved ONCE, here,
+  # so that a machine without it gets one honest FAIL that names the cause rather
+  # than five separate "could not parse" failures that read as five defects.
+  HAVE_TOMLLIB=1
+  if ! "$PY" -c 'import tomllib' >/dev/null 2>&1; then
+    HAVE_TOMLLIB=0
+  fi
+
+  section 'static: secrets — the scanner is present, configured, and can fail'
+
+  # The scanner is RESOLVED FIRST, before any check that executes it.
+  #
+  # Ordering, and it is not cosmetic: the behavioural check below runs the scan
+  # against a throwaway repository, so it needs a binary. Resolving afterwards
+  # meant the check read an unset variable and reported "unbound variable" —
+  # which is a FAIL for the wrong reason, and a FAIL nobody can act on.
+  #
+  # A FAIL and not a SKIP when gitleaks cannot be installed, for the reason the
+  # hadolint check gives: a gate that reports "I could not check" and exits 0 is
+  # the exact shape PLAN.md §1 calls a gate that is not green. It is also the
+  # shape that let seven Dockerfiles go unlinted.
+  GITLEAKS_BIN=''
+  if [ -n "${KIT_GITLEAKS:-}" ]; then
+    GITLEAKS_BIN="$KIT_GITLEAKS"
+  elif kit_bootstrap_binary gitleaks \
+    "https://github.com/gitleaks/gitleaks/releases/download/v${KIT_GITLEAKS_VERSION}" \
+    "$KIT_GITLEAKS_SHA256S" "$ROOT" \
+    "gitleaks_${KIT_GITLEAKS_VERSION}_@ros@_@arch@.tar.gz" gitleaks; then
+    GITLEAKS_BIN="$BIN"
+    # Exported so the twenty-odd throwaway copies self_test makes share this
+    # binary instead of each downloading its own 15MB archive. Same reasoning as
+    # KIT_PYTHON, one level down: twenty downloads is twenty chances to fail for
+    # a reason that has nothing to do with the breakage under test.
+    export KIT_GITLEAKS="$BIN"
+  else
+    report FAIL 'gitleaks (required: could not be installed — see the note above)'
+  fi
+
+  gitleaks_config() {
+    "$PY" - "$ROOT" "$GITLEAKS_CONFIG" "$HAVE_TOMLLIB" <<'PY'
+import os
+import sys
+
+root, rel, have_tomllib = sys.argv[1], sys.argv[2], sys.argv[3]
+path = os.path.join(root, rel)
+problems = []
+
+if not os.path.isfile(path):
+    sys.exit(
+        f"{rel} does not exist. gitleaks then runs on its DEFAULT rules with no "
+        f"cafaye allowlist, which is a scan that looks configured and is not — "
+        f"and the allowlist is the only part of it anyone wrote"
+    )
+
+# Parsed as TOML, not grepped. Resolved by the caller so a machine without
+# tomllib gets one honest message instead of several that read as several
+# defects — and a config nobody parsed is a config nobody is reading.
+if have_tomllib != "1":
+    sys.exit(
+        f"{rel} could not be parsed: this python has no tomllib (3.11+). The file "
+        f"exists and gitleaks will read it, but nothing in this gate has, and a "
+        f"secret-scanner allowlist that no tool ever parses is not an allowlist"
+    )
+import tomllib
+
+with open(path, "rb") as fh:
+    try:
+        doc = tomllib.load(fh)
+    except Exception as exc:
+        sys.exit(f"{rel} is not valid TOML: {exc}")
+
+# The rules must be gitleaks' own. A repo that redefines a rule has taken
+# responsibility for the regex, and the reason kit can be thirty lines instead of
+# six thousand is that it does not.
+if "rules" in doc:
+    problems.append(
+        f"{rel} defines its own [[rules]]. kit extends gitleaks' defaults "
+        f"(extend.useDefault) so a new provider detection reaches thirteen repos "
+        f"the day gitleaks ships it. A vendored rule set is a rule set that stops "
+        f"receiving providers, which is a secret scanner that has stopped working"
+    )
+
+extend = doc.get("extend") or {}
+if extend.get("useDefault") is not True:
+    problems.append(
+        f"{rel} does not set extend.useDefault = true, so the rules it runs are "
+        f"whatever this file happens to declare — which is none of them"
+    )
+
+# R3: every allowlist entry carries a reason, and an entry with no reason is a
+# failure. This is the ESLint reportUnusedDisableDirectives property and it is
+# the load-bearing one: an allowlist that grows monotonically and is never pruned
+# is not an allowlist, it is a deferred disclosure.
+#
+# A VAGUE reason fails too, and the minimum length is the whole mechanism. The
+# failure mode this rule exists to prevent is not "someone forgot" — it is
+# "someone typed `false positive` and moved on", and a presence check accepts
+# that without noticing. 40 characters is short enough that every honest reason
+# clears it and long enough that every non-reason does not.
+MIN_REASON = 40
+allowlists = doc.get("allowlists") or []
+if not isinstance(allowlists, list):
+    problems.append(f"{rel}: `allowlists` is not a list of tables")
+    allowlists = []
+
+for i, entry in enumerate(allowlists, 1):
+    desc = (entry or {}).get("description") or ""
+    if not desc.strip():
+        problems.append(
+            f"{rel}: allowlist entry #{i} has no description. Every entry is a "
+            f"decision to accept that a scanner will keep reporting something, and "
+            f"the decision needs a name on it — otherwise the next reader cannot "
+            f"tell an accepted false positive from an accepted secret"
+        )
+    elif len(desc.strip()) < MIN_REASON:
+        problems.append(
+            f"{rel}: allowlist entry #{i} has a description of {len(desc.strip())} "
+            f"characters, which is not a reason. State what is allowed AND why, in "
+            f"at least {MIN_REASON} characters. `false positive` is not a reason: "
+            f"it is the absence of one, and a presence check accepts it silently"
+        )
+    # An entry with nothing to allowlist is a no-op that reads like a decision.
+    has_scope = any(
+        entry.get(k) for k in ("paths", "pathsRegex", "regexes", "commits", "stopwords", "targetRules")
+    )
+    if not has_scope:
+        problems.append(
+            f"{rel}: allowlist entry #{i} has a description but no paths, "
+            f"regexes, commits or stopwords — it allows nothing and says why, "
+            f"which is the shape of a comment that will be mistaken for a rule"
+        )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check "$GITLEAKS_CONFIG  (allowlist only, every entry reasoned)" gitleaks_config
+
+  # R3's other half: an allowlist that also exists inline is an allowlist
+  # nobody reviews. gitleaks takes `-i <file>`, and .gitleaksignore is the file
+  # it reads. Neither may exist in the tree, because a scanner finding in a
+  # throwaway copy would be silenced by a file the reviewer never saw.
+  gitleaks_ignore_check() {
+    "$PY" - "$ROOT" <<'PY'
+import os
+import sys
+
+root = sys.argv[1]
+found = []
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [d for d in dirnames if d not in (".git", ".venv", "__pycache__")]
+    for name in filenames:
+        if name == ".gitleaksignore":
+            found.append(os.path.relpath(os.path.join(dirpath, name), root))
+if found:
+    sys.exit(
+        f"a .gitleaksignore exists at {found}. That is the inline allowlist: it "
+        f"lives beside the scanner rather than in {os.path.basename(sys.argv[0])}'s "
+        f"committed config, so it is invisible in review, unversioned, and gone the "
+        f"next time someone runs the scanner by hand. Entries go in the committed "
+        f"config, one per finding, each with a reason"
+    )
+PY
+  }
+  check 'no .gitleaksignore  (the allowlist is the committed config)' gitleaks_ignore_check
+
+  # R1: --redact is load-bearing, and so is the scan's coverage.
+  #
+  # Asserted on the SOURCE of the scan script rather than on the workflow,
+  # because the workflow does not contain the gitleaks command line — it calls
+  # tests/gitleaks_gate.sh, which is the same script this gate runs. Asserting
+  # on the workflow would be asserting that a comment mentions a flag.
+  #
+  # The check is that the flag is UNCONDITIONAL. A `--redact` that appears
+  # inside an `if`, or behind a variable that a caller can set, is not
+  # redaction; it is a default.
+  # R1: --redact is load-bearing, and so is the scan's coverage.
+  #
+  # Asserted by EXECUTING the scan, not by reading it.
+  #
+  # The first version of this check grepped the script for `--redact`, and the
+  # first version of that grep was defeated by a comment: `#   - --redact, always`
+  # satisfies `grep -- --redact`, and the comment is a sentence explaining that
+  # the flag is mandatory. A check that a comment satisfies is a check that
+  # reports the comment. Self_test breakage 26 proved it — the flag removed, the
+  # check still green — which is the only reason this is a behavioural assertion.
+  #
+  # So: run the scan against a tree that contains a detectable credential, and
+  # read the OUTPUT. `--redact` is proven by the output not containing the secret
+  # even though the scan found it.
+  #
+  # This is the reason the probe below is assembled from parts rather than
+  # written out. The scan runs over the whole tree, and a probe committed as a
+  # literal would make tests/validate.sh itself a gitleaks finding — so the real
+  # tree's own scan goes red for a reason that has nothing to do with the tree.
+  # That is not hypothetical: it is what happened the first time, and the gate
+  # reported four leaks in the file that was planting them.
+  probe_secret() {
+    # GitLab's published PAT format sample — gitleaks' `gitlab-pat` rule, and a
+    # documented example value rather than a live credential. Assembled from two
+    # halves, neither of which is a credential on its own.
+    printf 'glpat-%s' 'ABC123def456GHI789jkl012'
+  }
+
+  scan_behaviour_check() {
+    "$PY" - "$ROOT" "$GITLEAKS_GATE" "${GITLEAKS_BIN:-}" <<'PY'
+import os
+import subprocess
+import sys
+import tempfile
+
+root, gate, gitleaks = sys.argv[1], sys.argv[2], sys.argv[3]
+problems = []
+
+if not gitleaks or not os.access(gitleaks, os.X_OK):
+    # Resolved above; reported there as its own FAIL. Nothing to add here, and
+    # saying so is better than a second message about the same missing file.
+    sys.exit(0)
+
+work = tempfile.mkdtemp(prefix="kit-redact-")
+try:
+    # A throwaway git repository, because the history requirement needs one and a
+    # directory scan would not exercise the same code path.
+    def run(*cmd, **kw):
+        return subprocess.run(cmd, capture_output=True, text=True, **kw)
+
+    run("git", "init", "-q", work)
+    run("git", "-C", work, "config", "user.email", "t@example.invalid")
+    run("git", "-C", work, "config", "user.name", "t")
+
+    secret = "glpat-" + "ABC123def456GHI789jkl012"
+    with open(os.path.join(work, "config.toml"), "w", encoding="utf-8") as fh:
+        fh.write('private_token = "%s"\n' % secret)
+    run("git", "-C", work, "add", "-A")
+    run("git", "-C", work, "commit", "-qm", "add")
+
+    # The scan, exactly as the gate runs it, plus --verbose.
+    #
+    # --verbose is here for one reason: gitleaks names the rule that fired only
+    # in verbose output, and a check that cannot say WHICH rule fired cannot
+    # distinguish "the scanner works" from "the scanner failed for a reason
+    # nobody has diagnosed yet". It is also the more dangerous output — verbose
+    # prints the finding, the fingerprint and the entropy — so it is the right
+    # place to prove that --redact holds when there is the most to redact.
+    def scan():
+        return run(
+            "bash", os.path.join(root, gate), work, gitleaks, "--verbose"
+        )
+
+    res = scan()
+    combined = res.stdout + res.stderr
+
+    # 1. It must FIND the secret. Without this, everything below is vacuous: a
+    #    scanner that finds nothing would pass a redaction assertion.
+    if res.returncode == 0:
+        problems.append(
+            "the scan over a tree containing a GitLab-PAT-shaped string exited 0, "
+            "so it did not detect it. The redaction assertions below would then be "
+            "satisfied by a scanner that scans nothing"
+        )
+    if "gitlab-pat" not in combined:
+        problems.append(
+            "the scan exited non-zero but did not name the gitlab-pat rule. A scan "
+            "that fails for an unstated reason is a scan whose next failure will be "
+            "a mystery"
+        )
+
+    # 2. It must NOT PRINT it. This is the property. The exit code says the
+    #    secret was found; the absence of the secret from the output says the
+    #    report is safe to paste into an issue.
+    if secret in combined:
+        problems.append(
+            "THE SCAN PRINTED THE SECRET IT FOUND. --redact is not being applied: "
+            "a CI log is a place secrets go to be read, and the scanner finding a "
+            "credential must never be the reason the credential is printed. The "
+            "value is a format sample, not a live credential, so this run proves "
+            "the mechanism and not a disclosure"
+        )
+    # And the verbose output specifically, which is where gitleaks prints the
+    # finding and the fingerprint and would print the value if redaction were off.
+    if "Secret:" in combined and "REDACTED" not in combined:
+        problems.append(
+            "the verbose scan printed a `Secret:` line with no REDACTED marker on "
+            "it. --redact is meant to replace the value, not merely suppress the "
+            "summary line"
+        )
+
+    # 3. It must read the FULL HISTORY. A secret that was committed and then
+    #    deleted is the case that matters, and it is invisible to a HEAD-only or
+    #    shallow scan.
+    os.remove(os.path.join(work, "config.toml"))
+    run("git", "-C", work, "add", "-A")
+    run("git", "-C", work, "commit", "-qm", "remove")
+    res = scan()
+    combined = res.stdout + res.stderr
+    if res.returncode == 0:
+        problems.append(
+            "after the credential was committed and then DELETED, the scan exited "
+            "0. It is not reading history, or is reading only the last commit. A "
+            "secret that was added and removed in one PR is still in the history "
+            "and still on every fork — that is the finding that matters most"
+        )
+    if secret in combined:
+        problems.append("the history scan printed the secret it found; --redact is not applied")
+finally:
+    subprocess.run(["rm", "-rf", work], capture_output=True)
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check "$GITLEAKS_GATE  (finds a real secret, never prints it, reads history)" \
+    scan_behaviour_check
+
+  # R2: `pull_request`, never `pull_request_target`.
+  #
+  # The trigger, not the prose. This reads the PARSED trigger keys of every
+  # workflow in the tree, so the explanation in the header comment — which has
+  # to exist, and which names the string — is not a violation. A grep would fail
+  # on the file that documents why the thing is forbidden, which is how a check
+  # gets deleted.
+  #
+  # The whole tree is read, not just the reusable workflow: kit's own ci.yml
+  # chooses its triggers, and a service adopting kit writes its own caller. A
+  # job is one click from being a credential-theft primitive, and the trigger is
+  # the only thing that makes it one.
+  trigger_check() {
+    "$PY" - "$ROOT" <<'PY'
+import os
+import sys
+
+import yaml
+
+root = sys.argv[1]
+# `pull_request_target` runs in the context of the BASE repository, with that
+# repository's secrets and a writable token, executing code proposed by a FORK.
+# `workflow_run` and `issue_comment` have the same property for the same reason.
+FORBIDDEN = {
+    "pull_request_target": (
+        "runs with the base repository's secrets and a writable token in the "
+        "context of a FORK's code. Any job under it is a credential-theft "
+        "primitive waiting for a reason, and the secret scanner is the job that "
+        "most invites 'let me just pull the base branch in so the scan sees the "
+        "real history'"
+    ),
+    "workflow_run": (
+        "runs with the base repository's secrets, triggered by a run a FORK can "
+        "cause. Same property as pull_request_target"
+    ),
+    "issue_comment": (
+        "runs with repository secrets on an attacker-controlled payload — a "
+        "comment body is not code, but it is input, and issue_comment handlers "
+        "read it"
+    ),
+}
+
+problems = []
+workflows = os.path.join(root, ".github", "workflows")
+if not os.path.isdir(workflows):
+    problems.append("no .github/workflows directory, so no trigger was checked")
+
+for name in sorted(os.listdir(workflows)) if os.path.isdir(workflows) else []:
+    if not name.endswith((".yml", ".yaml")):
+        continue
+    rel = f".github/workflows/{name}"
+    with open(os.path.join(workflows, name), encoding="utf-8") as fh:
+        try:
+            doc = yaml.safe_load(fh)
+        except Exception as exc:
+            problems.append(f"{rel} is not valid YAML: {exc}")
+            continue
+    if not isinstance(doc, dict):
+        continue
+    # `on:` is read by PyYAML 1.1 as the boolean True.
+    triggers = doc.get("on") or doc.get(True) or {}
+    if isinstance(triggers, str):
+        found = {triggers}
+    elif isinstance(triggers, list):
+        found = set(triggers)
+    elif isinstance(triggers, dict):
+        found = set(triggers)
+    else:
+        found = set()
+    for trigger in sorted(found & FORBIDDEN.keys()):
+        problems.append(f"{rel} declares `on: {trigger}`. {FORBIDDEN[trigger]}")
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check '.github/workflows/*  (no dangerous trigger, on parsed keys)' trigger_check
+
+  # R4: unpinned-uses is recorded, never baselined.
+  #
+  # The finding is real, the trade is real, and the costed options are in
+  # DECISIONS.md under MD10. What must NOT happen is the trade being made
+  # invisibly, in a file that looks like routine configuration — which is what
+  # adding it to zizmor's ignore list would be.
+  #
+  # So: zizmor's config must not ignore or disable it, and must not disable
+  # audits wholesale. `tests/zizmor_gate.sh` counts it instead, and prints the
+  # count on every run.
+  unpinned_check() {
+    "$PY" - "$ROOT" "$ZIZMOR_CONFIG" <<'PY'
+import os
+import sys
+
+import yaml
+
+root, rel = sys.argv[1], sys.argv[2]
+path = os.path.join(root, rel)
+problems = []
+
+if not os.path.isfile(path):
+    # Absent is the preferred state, and is asserted as one below.
+    print(f"note: no {rel}; nothing is baselined, which is the correct state")
+    sys.exit(0)
+
+with open(path, encoding="utf-8") as fh:
+    try:
+        doc = yaml.safe_load(fh)
+    except Exception as exc:
+        sys.exit(f"{rel} is not valid YAML: {exc}")
+
+rules = (doc or {}).get("rules") or {}
+rule = rules.get("unpinned-uses") or {}
+if rule.get("disable") is True:
+    problems.append(
+        f"{rel} DISABLES unpinned-uses. The trade it would be suppressing is real "
+        f"and is costed in DECISIONS.md under MD10 — pinning thirteen repositories "
+        f"to SHAs and owning the bump is not free, and not pinning means a change "
+        f"to kit's workflow lands in six services' CI without review. Suppressing "
+        f"it HERE makes that trade invisibly, in a file whose only other purpose "
+        f"is a different trade. Record it instead: tests/zizmor_gate.sh counts "
+        f"and prints every unpinned-uses finding on every run"
+    )
+if rule.get("ignore"):
+    problems.append(
+        f"{rel} IGNORES specific unpinned-uses findings ({rule['ignore']}). Same "
+        f"reason as above: a per-line allowlist for this audit is a baseline with "
+        f"a diff, and a diff is easier to extend than a decision is to revisit"
+    )
+
+# A blanket baseline is the thing that turns a scanner into a report. Three of
+# them, because a blanket can be spelled three ways.
+for audit, conf in (rules or {}).items():
+    if not isinstance(conf, dict):
+        continue
+    if conf.get("ignore") == "*" or conf.get("ignore") == ["*"]:
+        problems.append(
+            f"{rel}: rule {audit} ignores `*`. A blanket baseline means the audit "
+            f"can never report anything again, which is not a stricter check — it "
+            f"is the absence of one"
+        )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check "$ZIZMOR_CONFIG  (unpinned-uses recorded, never baselined)" unpinned_check
+
+  # Every zizmor ignore entry carries a reason.
+  #
+  # zizmor's own ignore syntax is `file.yml[:line[:column]]` with no place for a
+  # reason, so the reason lives in an adjacent comment and this check is what
+  # makes that a rule rather than a convention. A baseline with no reason is how a
+  # scanner becomes a report one commit at a time.
+  zizmor_reason_check() {
+    "$PY" - "$ROOT" "$ZIZMOR_CONFIG" <<'PY'
+import os
+import re
+import sys
+
+root, rel = sys.argv[1], sys.argv[2]
+path = os.path.join(root, rel)
+if not os.path.isfile(path):
+    sys.exit(0)
+
+lines = open(path, encoding="utf-8").read().splitlines()
+problems = []
+
+# A list item under a `rules.<id>.ignore:` block.
+in_ignore = False
+item_indent = None
+for i, line in enumerate(lines, 1):
+    stripped = line.strip()
+    if re.match(r"^ignore:\s*$", stripped):
+        in_ignore = True
+        continue
+    if in_ignore:
+        if not stripped or stripped.startswith("#"):
+            # A comment is the reason, or part of it. Looked at below, not here.
+            continue
+        if stripped.startswith("- "):
+            indent = len(line) - len(line.lstrip())
+            if item_indent is None:
+                item_indent = indent
+            if indent != item_indent:
+                # Dedented out of the list.
+                in_ignore = False
+                continue
+            # Does this entry have a reason? Any of: a comment on the same line,
+            # or one or more comment lines directly above with nothing between.
+            above = []
+            j = i - 2
+            while j >= 0:
+                prev = lines[j].strip()
+                if not prev:
+                    break
+                if not prev.startswith("#"):
+                    break
+                above.append(prev)
+                j -= 1
+            if "#" in line.split("- ", 1)[1]:
+                continue  # trailing comment
+            if not above:
+                problems.append(
+                    f"{rel}:{i}: ignore entry {stripped!r} has no reason. A "
+                    f"baseline with no stated reason is how a scanner becomes a "
+                    f"report one commit at a time: the next reader cannot tell an "
+                    f"accepted false positive from a deferred one"
+                )
+        else:
+            in_ignore = False
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check "$ZIZMOR_CONFIG  (every ignore entry carries a reason)" zizmor_reason_check
+
+  # The scanner itself, executed over kit's own tree and full history. The
+  # behaviour is asserted by the check above; this is the real scan of the real
+  # repository, which is the only one that can report a secret that is actually
+  # in this repository's history.
+  if [ -n "$GITLEAKS_BIN" ]; then
+    if out=$(bash "$ROOT/$GITLEAKS_GATE" "$ROOT" "$GITLEAKS_BIN" 2>&1); then
+      report PASS "gitleaks  ($KIT_GITLEAKS_VERSION, full history, --redact)"
+    else
+      report FAIL "gitleaks  ($KIT_GITLEAKS_VERSION, full history, --redact)"
+      printf '%s\n' "$out" | sed 's/^/       /'
+    fi
+  fi
+
+  # -------------------------------------------------------------------------
+  # The canary harness: the artifacts, and the contract they implement.
+  section 'static: the canary harness — contract, adapter, and every artifact'
+  secrets_readme_check() {
+    "$PY" - "$ROOT" <<'PY'
+import os
+import re
+import sys
+
+root = sys.argv[1]
+problems = []
+
+# The contract. Language-neutral and in the tree, because a canary test that
+# only exists for Go protects one of six services — so the thing every adapter
+# must implement is kit's to own, and it is a document rather than an
+# implementation.
+contract = os.path.join(root, "templates", "secrets", "README.md")
+if not os.path.isfile(contract):
+    problems.append(
+        "templates/secrets/README.md does not exist. The contract is language-"
+        "neutral on purpose: without it there is nothing for a second adapter to "
+        "implement, and six adapters invent six different checks"
+    )
+else:
+    body = open(contract, encoding="utf-8").read()
+    # All five vectors, named. Not "at least five" — the names are the contract,
+    # and a rename that left one behind would otherwise be invisible.
+    for vector in (
+        "canary",
+        "unknown-field",
+        "stringified-error",
+        "absent-field",
+        "type coverage",
+    ):
+        if vector not in body:
+            problems.append(f"templates/secrets/README.md does not name the {vector!r} vector")
+
+    # The safety property. A canary that is not safe to commit is worse than no
+    # canary, so the contract has to say how this one is safe — and the reason is
+    # not "it is obviously fake", it is that the value is BUILT.
+    if "cafaye_canary_" not in body:
+        problems.append(
+            "templates/secrets/README.md never states the canary prefix, so a "
+            "reader cannot tell a planted canary from a real credential in a log"
+        )
+    if "assembled" not in body and "built at run time" not in body:
+        problems.append(
+            "templates/secrets/README.md does not say the canary is assembled at "
+            "run time. That is the property that makes it safe to commit, and it "
+            "is the reason .gitleaks.toml needs no entry for it"
+        )
+
+    # The honesty requirement. A harness whose limits are undocumented is a
+    # harness whose limits are discovered in production.
+    for phrase, why in (
+        ("not covered", "a harness that does not say what it cannot see"),
+        ("type check, not a call-graph check", "vector 5's real limitation"),
+    ):
+        if phrase not in body.lower():
+            problems.append(
+                f"templates/secrets/README.md does not say {why!r} "
+                f"(looked for {phrase!r})"
+            )
+
+# The Go adapter's artifacts. Presence only — the suite is EXECUTED in the
+# telemetry phase below, which is the check that can catch a broken one.
+go_dir = os.path.join(root, "templates", "secrets", "go")
+for rel in (
+    "canary.go",
+    "sweep.go",
+    "typecover.go",
+    "canary_test.go",
+    "typecover_test.go",
+    "print_shape_test.go",
+    "go.mod",
+    "README.md",
+    os.path.join("internal", "safe", "creds.go"),
+    os.path.join("internal", "leaky", "creds.go"),
+):
+    if not os.path.isfile(os.path.join(go_dir, rel)):
+        problems.append(f"templates/secrets/go/{rel} is missing")
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check 'templates/secrets  (contract names all five vectors, states its limits)' \
+    secrets_readme_check
+
+  # The canary itself, asserted from OUTSIDE the Go suite as well as inside it.
+  #
+  # Two checks of one property is not redundancy here: the Go suite proves the
+  # value is not committed as a literal *in the template*, and this proves it is
+  # not committed as a literal *anywhere in the tree*, which is the property the
+  # scanner depends on. A future file outside the template is exactly where it
+  # would appear.
+  canary_literal_check() {
+    "$PY" - "$ROOT" <<'PY'
+import os
+import sys
+
+root = sys.argv[1]
+
+# The same assembly the Go adapter performs, reproduced here rather than
+# imported. If the two ever disagree, one of them is wrong and the gate says so
+# instead of a canary being half-planted in CI and half in the gate.
+prefix = "cafaye_canary_"
+body = "notarealsecret"
+canary = prefix + (body * 3)[:32]
+
+hits = []
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [d for d in dirnames if d not in (".git", ".venv", "__pycache__")]
+    for name in filenames:
+        full = os.path.join(dirpath, name)
+        rel = os.path.relpath(full, root)
+        try:
+            with open(full, encoding="utf-8") as fh:
+                body_text = fh.read()
+        except (OSError, UnicodeDecodeError):
+            continue
+        if canary in body_text:
+            hits.append(rel)
+
+if hits:
+    sys.exit(
+        f"the assembled canary appears as a literal in {hits}. Build it, do not "
+        f"write it: a committed credential-shaped string is a finding every "
+        f"scanner in the world will make, and allowlisting it teaches the next "
+        f"reader that allowlisting a credential is normal. The Go suite asserts "
+        f"the same property for templates/secrets/go; this catches it anywhere "
+        f"else in the tree"
+    )
+PY
+  }
+  check 'the canary  (never committed as a literal, anywhere)' canary_literal_check
+
+  # The canary is safe to commit, which means it must never be a plausible real
+  # credential. The prefix is the first half of that; this is the second, and it
+  # is checked against the scanner itself rather than against a regex: if
+  # gitleaks does not flag it, it is not a plausible real credential as far as
+  # anything in this repository is concerned.
+  canary_safety_check() {
+    "$PY" - "$ROOT" "$KIT_GITLEAKS_VERSION" <<'PY'
+import sys
+
+version = sys.argv[1]
+prefix = "cafaye_canary_"
+canary = prefix + ("notarealsecret" * 3)[:32]
+
+# Structural properties, asserted here because they are properties of the VALUE
+# rather than of any Go code, and the gate should not have to run Go to know
+# whether the thing it is sweeping for is safe to commit.
+if not canary.startswith(prefix):
+    sys.exit("the canary does not carry its prefix")
+if len(canary) != len(prefix) + 32:
+    sys.exit(f"the canary is {len(canary)} bytes; the contract says prefix + 32")
+if "notarealsecret" not in canary:
+    sys.exit(
+        "the canary has no human-readable 'this is fake' component. A value that "
+        "merely LOOKS random is one a reader mistakes for a real credential"
+    )
+
+# The shape a real credential does not have, and the one thing that would make
+# this dangerous: high entropy. A real 32-byte token is indistinguishable from
+# random; this is 32 bytes of one repeated word, which no real token ever is and
+# which no entropy-based detector will ever score.
+# The property that makes it safe to commit: the body is ONE REPEATED WORD.
+#
+# Not "low entropy" — an entropy THRESHOLD is the wrong instrument, and the
+# first version of this check used one (8 distinct bytes) and failed on its own
+# canary, which has 9. A threshold is also a number somebody will tune upwards
+# the first time it is inconvenient, and a fake credential tuned to pass an
+# entropy filter is not a fake credential.
+#
+# The property is structural and there is nothing to tune: the body must BE the
+# repeated word, so no detector that scores entropy can score it as random, and
+# so it is obvious to a human reading a CI log at 3am.
+body_expected = ("notarealsecret" * 3)[:32]
+if canary[len(prefix):] != body_expected:
+    sys.exit(
+        "the canary body is not the repeated word the contract specifies, so it "
+        "is no longer unmistakably fake. A high-entropy canary is "
+        "indistinguishable from a real credential to any detector that scores "
+        "entropy, which is most of them"
+    )
+print(f"gitleaks {version}: the canary is prefixed, low-entropy, and self-describing")
+PY
+  }
+  check 'the canary  (unmistakably fake: prefixed, low-entropy, self-describing)' \
+    canary_safety_check
+
+  # The gate's own output, swept for the canary.
+  #
+  # Not paranoia: it happened. `TestTheReferenceTypeLeaksUnderBadVerbs` logs an
+  # example of what a leaking format verb produces, and the example contained the
+  # canary — on every green run, in the line that exists to document a leak. It
+  # is the fake canary, so nothing was disclosed, and that is exactly why it
+  # needs a check: the day this harness is pointed at a real credential, the same
+  # habit is a disclosure, and a habit is what survives a refactor.
+  #
+  # The check runs the canary suite, captures EVERYTHING it writes — stdout and
+  # stderr, pass and fail — and asserts the value is in none of it. It is a
+  # separate check from the suite's own rather than a line inside it because the
+  # suite cannot observe its own output: `go test` buffers it.
+  canary_output_check() {
+    local out ec=0
+    if ! have go; then
+      echo "go is not installed, so there is no output to sweep" >&2
+      return 1
+    fi
+    out="$(cd "$ROOT/templates/secrets/go" &&
+      GOFLAGS=-mod=mod GOPROXY=off GOTOOLCHAIN=local go test -v -count=1 ./... 2>&1)" || ec=$?
+
+    local needle
+    needle="$("$PY" -c '
+prefix = "cafaye_canary_"
+print(prefix + ("notarealsecret" * 3)[:32])
+')"
+    if [ -n "$needle" ] && printf '%s\n' "$out" | grep -qF -- "$needle"; then
+      echo "the canary suite printed the value it planted. The harness must never print the" >&2
+      echo "thing it is sweeping for: a report of a leak that carries the leak is a leak." >&2
+      echo "The offending lines, with the value redacted:" >&2
+      printf '%s\n' "$out" | grep -F -- "$needle" |
+        sed "s|$needle|cafaye_canary_REDACTED|g" | sed 's/^/  /' >&2
+      return 1
+    fi
+
+    # The suite's own status, restated. Running it twice is cheap (stdlib, no
+    # network) and the alternative is a check that passes because the suite
+    # crashed before producing output — which is a check that cannot fail.
+    if [ "$ec" -ne 0 ]; then
+      printf '%s\n' "$out" | tail -20 | sed 's/^/       /' >&2
+      return 1
+    fi
+    return 0
+  }
+  check 'the canary suite  (never prints the value it planted)' canary_output_check
 fi
 
 # ===========================================================================
@@ -5410,6 +6475,46 @@ if [ "$RUN_TELEMETRY" -eq 1 ]; then
     fi
     check "templates/otel/$lang  ($tool test suite)" "run_$lang"
   done
+
+  # -------------------------------------------------------------------------
+  # The canary harness, EXECUTED.
+  #
+  # Same reasoning as the traceparent suites above, and it is the reason this is
+  # in the telemetry phase rather than only in the static one: a canary harness
+  # that is only grepped is a harness that has never run a detector.
+  #
+  # `-v` is not decoration. Every vector prints a RED PROOF line, and a proof
+  # nobody can see is a proof nobody ran — the same argument the self_test phase
+  # makes, applied to the harness instead of to the gate.
+  section 'telemetry: runtime credential-leak canary, executed'
+
+  run_canary() {
+    (
+      cd "$ROOT/templates/secrets/go"
+      GOFLAGS=-mod=mod GOPROXY=off GOTOOLCHAIN=local go test -v -count=1 ./...
+    )
+  }
+  if have gofmt; then
+    if [ -z "$(gofmt -l "$ROOT"/templates/secrets/go/*.go "$ROOT"/templates/secrets/go/internal/*/*.go 2>&1)" ]; then
+      report PASS 'templates/secrets/go/*.go  (gofmt clean)'
+    else
+      report FAIL 'templates/secrets/go/*.go  (gofmt clean)'
+      gofmt -l "$ROOT"/templates/secrets/go/*.go "$ROOT"/templates/secrets/go/internal/*/*.go | sed 's/^/       /'
+    fi
+  else
+    report SKIP 'gofmt (not installed)'
+  fi
+
+  if have go; then
+    # `check_verbose`, not `check`: the five RED PROOF lines are the evidence
+    # that each detector fired. On a green run they are the ONLY output, and a
+    # gate that proves the gate can fail while hiding the proofs is making the
+    # argument in one file and breaking it in the next.
+    check_verbose 'templates/secrets/go  (five vectors, each with a red proof)' \
+      'RED PROOF|known and accepted' run_canary
+  else
+    report SKIP 'templates/secrets/go  (go not installed)'
+  fi
 fi
 
 # ===========================================================================
@@ -5528,9 +6633,9 @@ if [ "$RUN_SELF_TEST" -eq 1 ]; then
   # cannot disagree.
   #
   # Two numbers, not one, because breakage 23b asserts something the other
-  # forty-four do not: that a check can report SKIP and still be load-bearing.
-  # Counting only reds would have made "45 breakages, 45 reds" a false summary
-  # of forty-four red-assertions plus one green one — the same claim, wearing a
+  # fifty-five do not: that a check can report SKIP and still be load-bearing.
+  # Counting only reds would have made "56 breakages, 56 reds" a false summary
+  # of fifty-five red-assertions plus one green one — the same claim, wearing a
   # number, that nobody would have checked.
   #
   # `expect_green` is deliberately NOT in the pattern. kit-12's breakage 31b is a
@@ -5635,6 +6740,37 @@ for missing in sorted(named - carried, key=breakage_sort):
     problems.append(f"header documents breakage {missing} but no recipe carries it")
 for orphan in sorted(carried - named, key=breakage_sort):
     problems.append(f"recipe proves breakage {orphan} but the header does not document it")
+
+# A throwaway-copy DIRECTORY variable that is REASSIGNED stops being a path.
+# This is here because it already happened, and it happened silently: the
+# renumber that gave breakages 24-34 descriptive directory names gave breakage
+# 33's directory the name `canary_literal`, which was already the name of the
+# canary VALUE assembled six lines below it. The reassignment meant `edit` was
+# handed `cafaye_canary_.../templates/secrets/go/canary.go`, the recipe died with
+# a FileNotFoundError, and breakage 33 never ran — taking 34 with it, because
+# the script stops at the first crash. Two proofs dead, and the only symptom was
+# a traceback in a phase whose output nobody reads on a green run.
+#
+# Nothing about READING the file shows this. Both lines look correct in isolation,
+# and `bash -n` is happy, and the header/recipe agreement above is perfect while
+# both of them are wrong. So it is asserted here, where a check already parses
+# this file.
+_lines = src.splitlines()
+_fresh = re.compile(r'^(\w+)="\$\(fresh_copy\b')
+_assign = re.compile(r'^(\w+)=')
+_dirvars = {}
+for _n, _line in enumerate(_lines, 1):
+    _m = _fresh.match(_line)
+    if _m and _m.group(1) not in _dirvars:
+        _dirvars[_m.group(1)] = _n
+for _n, _line in enumerate(_lines, 1):
+    _m = _assign.match(_line)
+    if not _m or _m.group(1) not in _dirvars or _fresh.match(_line):
+        continue
+    problems.append(
+        f"line {_n}: `{_m.group(1)}` holds a throwaway copy (assigned at line "
+        f"{_dirvars[_m.group(1)]}) and is reassigned here, so that recipe edits a path that no longer exists"
+    )
 
 # `sys.exit` rather than `return`: this is a top-level script, not a function
 # body, and the other checks in this file use the same shape. A `return` here is

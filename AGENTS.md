@@ -17,9 +17,13 @@
 ```
 kit/
 ├── README.md                             # what kit is, how a repo adopts it
-├── .github/workflows/
-│   ├── ci.reusable.yml                   # the workflow six repos call
-│   └── ci.yml                            # kit calling its own workflow
+├── .gitleaks.toml                        # the allowlist, and nothing else
+├── DECISIONS.md                          # the trades this repo has NOT made
+├── .github/
+│   ├── workflows/
+│   │   ├── ci.reusable.yml               # the workflow six repos call
+│   │   └── ci.yml                        # kit calling its own workflow
+│   └── zizmor.yml                        # reasoned baselines, one per finding
 ├── lint/                                 # configs services RUN, not copy
 │   ├── yamllint.yml  golangci.yml
 │   ├── rubocop.yml   eslint.config.mjs
@@ -27,25 +31,21 @@ kit/
 │   └── hadolint.yaml                      # argues the one rule it ignores
 ├── docker/                               # Dockerfile.<lang> templates
 ├── core/                                 # the cafaye/core fan-out standard
-│   ├── README.md                           # why, and the three failure modes
-│   ├── vendir/                             # vendir.yml per consuming repo
-│   ├── renovate/                           # the one shared Renovate policy
-│   └── release/                            # what core needs to be taggable
-├── templates/
-│   ├── bin-prime/<lang>.sh               # the worktree primer
-│   ├── bin/dev.sh                        # the local developer loop
-│   ├── compose/                          # postgres + nats + redis + collector + LGTM
-│   │   ├── grafana/provisioning/         # datasources, dashboards, alert rules (files)
-│   ├── otel/<lang>/                      # W3C traceparent: codec, suite, snippet
-│   ├── tier/<lang>/                      # the DECLARED tier, per language
 │   ├── tier/skip-allowlist               # one file for the fleet; four hygiene rules
 │   ├── tier/README.md                    # the format, the rules, and the limits
 │   ├── parity-allowlist                  # WHY each service's copy is not kit's bytes
+│   ├── secrets/                          # runtime credential-leak canary
+│   │   ├── README.md                       # the CONTRACT, language-neutral
+│   │   └── go/                            # the Go adapter + its five vectors
 │   ├── mise.toml                         # toolchain pin template
 │   └── AGENTS.md                         # skeleton for a service repo
 └── tests/
     ├── validate.sh                       # THE gate
+    ├── self_test.sh                      # proves the gate can go red
     ├── lint_test.sh                      # the linters RUN, against fixtures
+    ├── gitleaks_gate.sh                  # the one secret scan, for CI and here
+    ├── zizmor_gate.sh                    # the one zizmor split, ditto
+    ├── bootstrap.sh                      # the gate installs its own tools
     ├── classify.py  rules.json           # the change classifier, failing closed
     ├── staleness.py  artifacts.json      # the staleness reporter, and WHAT it measures
     ├── core_fanout_check.py              # structural checks on core/vendir, core/renovate
@@ -125,9 +125,85 @@ Six phases, and all six must pass:
   here too, and **an entry matching nothing is a failure** — modelled on
   ESLint's `reportUnusedDisableDirectives`, because without that rule an
   allowlist is a ratchet that only turns one way.
+  Plus the secret scanner: the allowlist is an allowlist and nothing else, every
+  entry has a reason, no `.gitleaksignore` exists, the scan redacts and reads
+  full history, no workflow declares a dangerous trigger, and the `secrets` job
+  is neither advisory nor opt-in.
 - **telemetry** — the six W3C traceparent suites are **executed**, one per
-  language. Stdlib only and offline on purpose. If they ever need the network,
-  a template has grown a dependency and kit has stopped being config-only.
+  language, and the canary harness is **executed** with all five vectors, each
+  printing its own red proof. Stdlib only and offline on purpose. If they ever
+  need the network, a template has grown a dependency and kit has stopped being
+  config-only.
+- **self_test** — **thirty-four breakages** of a throwaway copy, asserting the
+  gate goes red each time. Six of them are a semantic mutation of one language
+  each, so **every suite is proven able to fail** rather than assumed to.
+  **Twenty-one** assert that one *named* check — or, for two of them, one
+  *named* proof script — reported the failure, so a check written for a
+  specific defect is proven still load-bearing. The count is derived by counting
+  the recipe invocations, never written down — the same expression
+  `validate.sh` uses for its own label, so the two cannot disagree.
+
+## Secrets
+
+**`bash tests/validate.sh` scans this repository's full history, and so does
+`bash tests/gitleaks_gate.sh`.** They are the same script, because they are the
+same scan — a scanner whose CI invocation and its local invocation have drifted
+is two scanners, and the one that goes red is whichever nobody runs.
+
+Four things about it that are not negotiable, and each has a check that fails
+without them:
+
+- **Full history, not the diff.** A secret committed and deleted in one PR is
+  still in the history and still on every fork. The default checkout is a
+  *shallow clone*; `fetch-depth: 0` is in the `secrets` job for that reason.
+- **`--redact`, unconditionally.** A CI log is a place secrets go to be read. The
+  scanner finding a secret must never be why the secret is printed. There is no
+  flag to turn it off, and `self_test` breakage 43 removes it and proves the
+  gate notices.
+- **The allowlist is `.gitleaks.toml` and nothing else.** No `-i` flags, no
+  `.gitleaksignore`, and every `[[allowlists]]` entry carries a `description` of
+  at least 40 characters. `extend.useDefault = true` means the rules stay
+  gitleaks'; a repo that redefines a rule has taken responsibility for the regex.
+- **No `pull_request_target`, anywhere.** It runs with the base repository's
+  secrets and a writable token on a *fork's* code. The scanner is the job that
+  most invites "just pull the base branch in so the scan sees the real history",
+  and that edit is how a secret scanner becomes the way secrets are taken.
+
+**`DECISIONS.md` records a trade this repository has NOT made.** zizmor's
+`unpinned-uses` fires thirty-three times and is **not** baselined: it is counted
+and printed on every run, and `tests/validate.sh` fails if anyone adds it to
+`.github/zizmor.yml`. A baseline there would be making the trade invisibly, in a
+file that looks like routine configuration. If you add *any* zizmor ignore
+entry, it needs a reason in a comment beside it, and the gate checks.
+
+**`templates/secrets/` is the other half, and it is not gitleaks.** gitleaks
+answers "was a secret committed". Nothing off the shelf answers "does a secret
+leave the process while the tests run" — gosec's `credentials.Match` has no
+`*ast.CallExpr` case, Bandit matches `ast.Constant` only, Brakeman's check is
+off by default, and of 268 Semgrep taint rules zero intersect CWE-532. So the
+canary harness plants a fake credential and sweeps for it in five vectors. The
+contract is in `templates/secrets/README.md`; the Go adapter is in
+`templates/secrets/go/`.
+
+**The canary is assembled, never written out, and that is checked.** A committed
+`cafaye_canary_…` literal is a credential-shaped string in a public repository,
+which is what this repository's own scanner reports, and allowlisting it teaches
+the next reader that allowlisting a credential is normal. Two checks enforce it:
+one inside the Go suite, one over the whole tree.
+
+**`.gitleaks.toml` now has one entry, and it is not that.** kit-16's deploy suite
+proves the redactor scrubs a JWT **by shape** — a value the filter cannot know by
+name, which is the only canary that can fail — so that token is committed and the
+`jwt` rule fires on it. The entry is scoped to `targetRules = ["jwt"]` **and**
+`paths = ['''^tests/deploy_test\.sh$''']`, measured in both directions: a
+`generic-api-key` in that same file and a `jwt` in a different file are both still
+reported. The distinguishing property is not the scoping, it is that the string is
+a **fixture whose name says so** (`JWT_CANARY`, and its own comment says a value
+the redactor cannot know by name is half the test) rather than a credential-shaped
+blob wearing a descriptive variable name. `templates/secrets/`'s canary does not
+have that option: a redactor can be taught nothing and still be defeated by a
+string it does not recognise, but a leaked credential does not become safe because
+a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
 
 - **observability** — the two claims that are worth nothing unexercised: a
   canary secret in ten leak shapes reaches no exporter (and the allowed data
@@ -147,14 +223,14 @@ Six phases, and all six must pass:
   is the one that tells a working config from a valid one, and — unlike every
   other phase — it is **fatal on a skip**, because the claim under test is "kit's
   configs work" and a run in which no linter executed has not tested it.
-- **self_test** — forty-five breakages of a throwaway copy. Forty-four assert
+- **self_test** — fifty-six breakages of a throwaway copy. Fifty-five assert
   the gate goes red; one (23b) asserts the gate stays green while naming a skip,
   because a check that turns a red into an honest skip is load-bearing precisely
   by not going red. One further GREEN control (31b) asserts a service config
   that AGREES with kit's does not fail, because a check satisfied by banning the
   file would train every service to delete one. Six are a semantic mutation of one
   language each, so **every suite is proven able to fail** rather than assumed
-  to. Twenty-one assert that one *named* check reported `FAIL`, so a check
+  to. Thirty-seven assert that one *named* check reported `FAIL`, so a check
   written for a specific defect is proven still load-bearing. Two assert that a
   *proof* goes red: one inverts the classifier's fail-closed property, and one
   makes the staleness reporter call an undeclared pin `current`. A property
@@ -199,7 +275,7 @@ Six phases, and all six must pass:
     is worse than no sweep.
 - **The self-test's copies are the fleet.** `fresh_copy` gives every breakage its
   own parent directory, because `lint_drift_check` finds a fleet by globbing
-  `$ROOT/..`. Copies sharing one directory would each see the other forty-four
+  `$ROOT/..`. Copies sharing one directory would each see the other fifty-five
   as their fleet, and a breakage could be "caught" by a defect it did not
   introduce — a control that goes red for a reason another test created reads as
   evidence and is worse than no control at all.
@@ -220,10 +296,13 @@ Six phases, and all six must pass:
 - `shellcheck` and `node` run when installed and are skipped when not. A skip is
   reported in the summary, never hidden — and a *skip in self_test* fails the
   run, because a proof nobody ran is not a proof.
-- **PyYAML, yamllint and hadolint are required and are bootstrapped, not
+- **PyYAML, yamllint, zizmor and hadolint are required and are bootstrapped, not
   required of you.** `tests/bootstrap.sh` resolves an interpreter, builds
-  `.venv`, pip installs `tests/requirements.txt`, and fetches a pinned hadolint
-  release verified against hadolint's published `checksums.sha256`. Resolve
+  `.venv`, pip installs `tests/requirements.txt`, and fetches pinned hadolint
+  and gitleaks releases verified against their published checksums. zizmor is
+  pinned in `requirements.txt` and comes from PyPI, because it publishes no
+  checksums file and pinning its archives would mean pinning hashes we computed
+  ourselves. Resolve
   order: `$KIT_PYTHON` (an override is a promise — if it cannot import yaml
   the gate says so rather than silently substituting a different one), then
   `.venv`, then any `python3` on PATH that already has PyYAML, then bootstrap.
@@ -252,7 +331,7 @@ Six phases, and all six must pass:
   rubocop ran on kit's own Ruby with kit's own config. That is the only way an
   obsolete key surfaces before six repos inherit it.
 - The suite must be able to fail: `self_test` breaks a throwaway copy of the
-  tree forty-five ways and asserts the run goes red. If you change the suite,
+  tree fifty-six ways and asserts the run goes red. If you change the suite,
   keep that true.
 
 ## The classifier fails closed, and that is a rule about code
@@ -312,7 +391,7 @@ percentage, no "closest match", and no search for a file that hashes to kit's
 artefact. A copy is `current` when the bytes at the declared path are equal and
 the path is a real file in the service's own tree, and at no other time. One
 appended byte makes it `diverged`, and `diverged` needs a pin. This is
-self_test breakage 27, written as the well-intentioned patch it would be — a
+self_test breakage 37, written as the well-intentioned patch it would be — a
 `quick_ratio() > 0.99` — because that is the shape a helpful contributor
 reaches for, and the only way to know the rule holds is to try to break it.
 
@@ -468,3 +547,8 @@ an `option` with no `job` is a green build that ran nothing.
 - [ ] `README.md` still matches the tree (every language, every file)
 - [ ] `CHANGELOG.md` has an entry
 - [ ] You did not weaken a check, a threshold, or a pin to get green
+- [ ] If you touched the secret scanner, you did not add an allowlist entry
+      without a reason, you did not add one to `continue-on-error`, and if you
+      added one you **proved the thing it excuses can still fail** — an allowlist
+      entry that silences a live proof is not an allowlist entry, it is a deleted
+      test with a comment attached

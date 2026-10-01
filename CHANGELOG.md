@@ -462,6 +462,161 @@ it without a copy (see kit-12 below).
   entry naming one that was not looked at is reported as **unverified**, which is
   neither a pass nor a failure.
 
+
+- **kit-08 — kit-04 landed on a master that had moved, without losing a check
+  or a number.** `worker/kit-04` (secrets: gitleaks over full history, a
+  runtime-leak canary, zizmor) branched before kit-05 and kit-07 and renumbered
+  its breakages from the same base of 18 that master did. A textual union of the
+  two files carries **34 recipes with four labels used twice** — 19, 20, 21 and
+  22 — and `self_test_claims` compares the documented set against the carried
+  set *as sets*, so the duplicates collapse silently and the check reports an
+  agreement that does not exist.
+  - Master's numbering is canonical and did not move. kit-04's **six language
+    mutants** were dropped, not renumbered: they are master's 13–18 byte for
+    byte, and a second copy would prove the same six rules twice under two
+    names. kit-04's **eleven unique breakages** moved to **41–51**.
+  - `tests/validate.sh`: 45 check sites on master, 34 on kit-04, **59
+    merged** — twenty of the sites are shared verbatim, which is why the union is
+    less than the sum. Both sides' checks survive, and what proves it is the
+    *label* set rather than the count: every label on either side is still present
+    in the merged file, except two that were resolved deliberately —
+    `collector_check`, which is one function whose label disagreed (master's
+    fuller revision won) and whose kit-04 version was an earlier, smaller copy of
+    the same function; and the `self_test` invocation site itself, which is the
+    union documented below.
+    Master's `collector_check` also *subsumes* the part of kit-04's that is not
+    superseded: `receivers` and `batch` are asserted per signal rather than for
+    `traces` alone. The rest is deliberately gone — kit-04's "the traces pipeline
+    ships to no non-local exporter" described the pre-fan-out stack, whose only
+    exporter was `debug`, and it would go red against the tempo/loki/mimir
+    fan-out master now ships. Keeping it would have been a check that fails on a
+    correct tree, which is worse than no check.
+  - The `self_test` invocation site now takes the union of both: `check_verbose`
+    (kit-04's — the list of breakages that went red *is* the evidence, and a
+    plain `check` prints one line and throws the rest away) with master's
+    counted label. The count is `grep`-derived in both files from the same
+    expression.
+  - One mechanism replaced two: `self_test.sh` had a runtime `breakages=$((…))`
+    counter *and* the grep. The counter also decremented itself on a skipped
+    language, so a machine missing a toolchain would print a *lower* total than
+    the file contains — which reads as though proofs had been dropped rather
+    than as a missing prerequisite.
+  - **The renumbering was left in two visible states, and both are fixed here.**
+    The recipes ran `1`–`18`, then `41`–`51`, then `19`–`22`, so the file did not
+    read in the order its own header documents it. Recipes `19`–`22` now sit
+    between `18` and `41`, and the file runs in label order.
+  - **`41`–`51` no longer share variable names with `19`–`22`.** The renumber
+    rewrote the labels and left the variable names behind, so breakage `47` was
+    still called `nineteen`; master's `19`–`22` then bound those same four names
+    to a second directory. It worked only because each was read before the next
+    write. Those eleven variables are now named for what they break.
+  - **There is no breakage 23, and it was never a lost recipe.** The block moved
+    by `+11`, carrying kit-04's `23` — the zizmor `unpinned-uses` baseline — to
+    `51`. The gap is now documented where a renumber script will read it as a
+    bug, and README states the scheme.
+
+### Fixed
+
+- **The gitleaks gate was red on kit-16's JWT canary, and the allowlist was empty
+  by design.** `.gitleaks.toml` carried no `[[allowlists]]` entry because kit's own
+  history scanned clean — but the gate runs `git log --all`, and every worker in
+  this fleet is a worktree of one shared repository, so `--all` reaches
+  `worker/kit-16-deploy`'s commit `924b725`: a `jwt` finding on
+  `tests/deploy_test.sh` line 155. It is a fixture. kit-16's deploy story proves
+  the redactor scrubs a token the deploy never supplied, and a canary built from a
+  name the filter already knows would prove nothing — so the token is committed
+  and the `jwt` rule fires on it. **The scanner did the one thing it is for.**
+  The entry is the narrowest the config format allows — `targetRules = ["jwt"]`
+  with `paths = ['''^tests/deploy_test\.sh$''']`, and `condition = "AND"`
+  written out rather than left to the default, which is **OR**
+  (`config/config.go`, `parseAllowlist`: an empty `condition` maps to
+  `AllowlistMatchOr`) and would silently make the entry a union the day somebody
+  adds a second criterion. Measured in a throwaway repository, both directions: a
+  `jwt` in that file is suppressed, while a `generic-api-key` in the **same file**
+  and a `jwt` in a **different file** are both still reported.
+  - **The canary was re-proved after the entry was added**, because allowlisting a
+    canary is only honest if the canary can still fail. `redact.py`'s JWT pattern
+    weakened from `\.[A-Za-z0-9_-]{4,}` to `{99,}` in a scratch export of
+    `worker/kit-16-deploy`, and `tests/deploy_test.sh` went red on **exactly one**
+    claim — "the redactor left a JWT in the output" — with its other 16 green.
+    Reverted, and the scratch copy is byte-identical to the branch.
+  - **The better fix is kit-16's, and it is recorded as such.** The canary could
+    be assembled at run time from a prefix, the way `templates/secrets/` already
+    does, which is the pattern that exists so this file never needs an entry. That
+    branch is not merged here. The entry is written so it decays: if kit-16 stops
+    committing the string it matches nothing, and the next reader deletes it.
+  - **The scan was not narrowed.** `--all` is what catches a secret that only ever
+    existed on a branch, and it is the reason this finding was ever visible: on a
+    single-branch clone the canary is invisible and the gate is green.
+  - **README now says to delete the entry when copying the file.** kit's config is
+    copied verbatim into thirteen repositories, and this entry names
+    `tests/deploy_test.sh`, which none of them has. A `paths` allowlist matching
+    nothing excuses nothing, so it cannot weaken a service's scan — but an entry
+    whose reason is only true of the repository it came from is how the next reader
+    learns that descriptions are optional in practice. gitleaks cannot report a
+    dead allowlist entry the way `templates/tier/skip-allowlist` reports a dead one
+    there, so the obligation is the reader's, and the README is the only place it
+    can be stated.
+- **`templates/otel/ruby` is red on master, and this merge neither caused nor
+  fixed it.** Three `NoMethodError`s for `Array#filter_map` (Ruby 2.7+,
+  `traceparent.rb:278`) under `/usr/bin/ruby` 2.6.10. Re-derived rather than
+  inherited: `run_ruby` is byte-identical to master's, `git diff master --
+  templates/otel/ruby/` is empty, and `git archive master` into a clean directory
+  reproduces `3 errors` with master's own template and master's own runner —
+  while the pinned `ruby 4.0.1` gives `1407 assertions, 0 errors`. The
+  1370-vs-1407 gap is the tell: an interpreter too old to define a method does not
+  skip assertions, it aborts the three tests that reach it. kit-14 has the real fix
+  on `worker/kit-14-stale` (a `toolchain_floor_ruby` feature probe that FAILs
+  naming the toolchain, proven by its breakage 30 — which is **breakage 40** on
+  this branch); that branch was not merged when this was written.
+  Not fixed here: it is pre-existing, it does not reproduce on this box's `PATH`,
+  and a fix for a red I cannot see is a change I cannot verify. Rewriting
+  `traceparent.rb` to avoid `filter_map` is recorded as the fix that is not the fix
+  — it makes the gate green on an old interpreter by removing what the suite
+  exists to exercise.
+- **`expect_red_check` reported a proof as failing when the check it named was
+  the one that fired.** The matcher was `printf '%s\n' "$out" | grep -qF`, and
+  under `set -o pipefail` a writer that takes SIGPIPE makes the whole pipeline
+  non-zero — so `grep -q` exiting at its first match turned a **hit** into a
+  miss. Deterministic on output size, not on load: below the 64KB pipe buffer the
+  assertion is correct, at or above it, `printf` is killed mid-write. Breakages
+  **11** (hadolint) and **42** (the working-tree credential) both exceed it and
+  were both reported as *"the gate went red, but NOT via `<the check that fired>`"*
+  while printing that check among the FAIL lines it had just proven present.
+  Now a substring test on the already-captured `$out`: no pipe, no SIGPIPE, and
+  the assertion no longer depends on how much the gate prints. The same defect
+  and the same answer were already recorded in `tests/canary_test.sh` for
+  `docker logs | grep -q`.
+- `tests/validate.sh` and `templates/secrets/go/sweep.go` cited breakages by their
+  **kit-04** numbers — `15` for the `--redact` removal (now `43`) and `21` for the
+  marshalling canary (now `49`). Both are the renumber's fallout, and both
+  pointed a reader at the wrong recipe.
+- Count drift in the prose, all of it second-hand rather than measured: `AGENTS.md`
+  said *twenty-three* breakages in one place and *thirty-four* in another, *eight*
+  named checks against the real **nineteen** (+2 over proof scripts = twenty-one),
+  and *nineteen ways* in its own pre-commit checklist. `README.md` and
+  `tests/self_test.sh` both counted the named proofs as *twenty* against the
+  **nineteen** their own lists enumerate. Every one of these is a copy of the
+  truth taken by hand, which is the failure the derived count exists to prevent.
+- `tests/self_test.sh`'s header described the thirty-four breakages as *18 from
+  the fan-out work, 17 from the tier work, 11 from the secrets work, 12 shared* —
+  58, for a file that carries 34.
+- A section comment read `# 47-22.` where the canary vectors are `47`–`50`: the
+  renumber script's arithmetic leaking into prose.
+- **Two of the thirty-four proofs were dead, and the renumber is what killed
+  them.** Giving breakages `41`–`51` descriptive directory names named breakage
+  50's copy `canary_literal` — which was already the name of the canary **value**
+  assembled six lines below it. The recipe reassigned the variable to the value,
+  so `edit` was handed `cafaye_canary_…/templates/secrets/go/canary.go` and died
+  with a `FileNotFoundError`. Breakage 50 never ran, and because the script stops
+  at the first crash neither did 51: *"the canary is committed as a literal"* and
+  *"the zizmor config baselines unpinned-uses"* had silently stopped being
+  tested, and the run died before printing its summary. Restored to `kit-04`'s
+  naming, where the directory was `twentytwo` and the value `canary_literal`.
+  Nothing about reading the file shows this — both lines are correct in
+  isolation, `bash -n` is happy, and the header/recipe agreement below is
+  perfect while both are wrong — so `self_test_claims` now also asserts that no
+  throwaway-copy directory variable is ever reassigned.
 - **kit-07 — the declared tier, and the allowlist that is supposed to shrink.**
   A tier is a class of test that needs a real dependency. The failure this
   exists to prevent has already happened in this fleet: a green run in which the
@@ -2495,6 +2650,107 @@ e
   - `templates/AGENTS.md` — an Observability section, so the endpoint contract
     and "telemetry is never in a readiness path" reach the service repo where a
     probe would actually be written.
+
+- **The secret scanner.** A `secrets` job in `ci.reusable.yml` running
+  **gitleaks 8.30.1** over the adopting repository's **full history**, with
+  `--redact`. It is the one job in the workflow with **no opt-in**: an opt-in
+  security control is not a control, and a secret scanner that only warns is a
+  report. `fetch-depth: 0` is load-bearing — the runner default is a shallow
+  clone, and a secret committed and deleted in one PR is still in the packfile
+  of anyone who cloned. **Adopting this can turn a repo's first build red**;
+  README says what to do, and the first thing to do is rotate.
+  - gitleaks rather than trufflehog: trufflehog is **AGPL-3.0**, and it is the
+    only candidate that verifies live credentials against the issuer's API,
+    which for a fleet whose CI has network access is the wrong behaviour for a
+    scanner. gitleaks is MIT, a static binary, and makes no network call.
+  - `tests/gitleaks_gate.sh` is the **one** scan, called by both the `secrets`
+    job and `tests/validate.sh`. A scanner whose CI and local invocations have
+    drifted is two scanners, and the one that goes red is whichever nobody runs.
+  - `.gitleaks.toml` — the allowlist, and **nothing else**. `extend.useDefault`
+    so the rules stay gitleaks', and every `[[allowlists]]` entry must carry a
+    `description` of at least 40 characters. An allowlist that grows and is never
+    pruned is not an allowlist, it is a deferred disclosure. A `.gitleaksignore`
+    fails the gate.
+- **A `zizmor` job** (opt-in, `zizmor: 'true'`), running the GitHub Actions
+  security audit on the adopting repo's own workflows. `tests/zizmor_gate.sh`
+  counts `unpinned-uses` and prints the count and the reason on every run, and
+  **fails on every other audit**. It is recorded, not baselined: see
+  `DECISIONS.md` (MD10a), where the pin trade is costed in three options and none
+  of them has been taken.
+- **`templates/secrets/`** — the runtime credential-leak canary. A
+  **language-neutral contract** (`templates/secrets/README.md`) and the **Go
+  adapter**, with five vectors each carrying its own red proof: log/stdout/stderr,
+  unknown serialisation fields, the whole error chain, keys present-but-empty,
+  and Go type coverage.
+  - It exists because **nothing off the shelf does this**. gosec's
+    `credentials.Match` has no `*ast.CallExpr` case, so it finds literals and not
+    a token passed to a logger. Bandit matches `ast.Constant` only. Brakeman's
+    secret check is off by default. Of 268 Semgrep taint rules, **zero** intersect
+    CWE-532.
+  - The canary is **assembled at run time**, never written as a literal, so it is
+    safe to commit and needs no allowlist entry. Two checks enforce that.
+- **Ten new checks** in `tests/validate.sh` for the above, including one that
+  asserts the scanner's **behaviour** by executing it: over a throwaway git
+  repository holding a detectable credential, the scan must find it, must name
+  the rule that fired, must not print the value, and must still find it after the
+  file is deleted.
+- **Eleven new `self_test` breakages**, each asserting that one *named* check
+  went red: a credential in history, a credential in the working tree,
+  `--redact` removed, the scan narrowed to the last commit,
+  `pull_request_target` added, the `secrets` job made `continue-on-error`, four
+  ways of breaking the canary's reference type, the canary committed as a
+  literal, and `unpinned-uses` baselined in `.github/zizmor.yml`.
+  - These were numbered 13–23 on `worker/kit-04` and are **24–34** here.
+    kit-04's other six breakages (its 24–29) were its copies of the six language
+    mutants, which master already carried as 13–18; those copies are dropped
+    rather than renumbered, so no rule is proved twice under two numbers. The
+    union is **34 breakages**, master's 1–23 unmoved.
+  - `self_test` counts itself by grepping its own recipe calls, the same
+    expression `validate.sh` uses for its label, so the summary and the gate
+    label cannot disagree. It was a literal `18` in two files kept in step by
+    hand, and for one commit a second runtime counter beside it.
+- `tests/gitleaks_gate.sh` and `tests/zizmor_gate.sh`, `chmod +x` and asserted
+  executable — they are run by the reusable workflow from a service's repository,
+  so a missing executable bit is a `secrets` job that dies in thirteen repos.
+
+### Fixed
+
+- **`artipacked` (9 findings) in `ci.reusable.yml`.** Every `actions/checkout`
+  now sets `persist-credentials: false`. No job in the file pushes, so a token
+  left on disk after a checkout is a credential that outlives the job for no
+  reason — and every job here runs `upload-artifact`, which is the combination
+  the audit exists to catch. Found by zizmor, and fixed rather than baselined.
+- **`.github/zizmor.yml` is no longer walked for stray copies of the workflow.**
+  The `callable path` check reported `tests/self_test.sh` as "a second workflow
+  declaring `workflow_call`" — it names the key in a comment explaining breakage
+  8. A check that fires on the file proving it wrong is a check people delete.
+- **Fetched tools now land in `tests/.bin/`, not `.venv/bin/`.** `.venv` is
+  gitignored and `tests/self_test.sh` copies the tree twenty-nine times per run,
+  so hadolint and gitleaks were being re-downloaded once per copy. The copy
+  carries `tests/.bin`; it does not carry `.venv`.
+- **The self_test control run no longer fails on a missing executable bit.**
+  `cp -R` does not preserve mode bits on macOS, so every throwaway copy arrived
+  with `tests/*.sh` non-executable and the new handed-out-scripts check failed in
+  all of them — for a reason that had nothing to do with any breakage under test.
+
+### Changed
+
+- `tests/requirements.txt` pins **`zizmor==1.30.1`**, and an auditor is pinned
+  where a parser is not: a new release adds findings, and a gate whose result
+  depends on when it last ran is a gate nobody can reason about. zizmor comes
+  from PyPI rather than a release archive because it publishes no checksums file,
+  and pinning its archives would mean pinning hashes we computed ourselves.
+- `kit_bootstrap_binary` takes an asset-name template and an inner-path, so it
+  can install a tarball as well as a bare binary, and its sha256 table is keyed
+  by **exact asset filename**. It used to be keyed by `macos-arm64`, which forced
+  every caller's asset name to be derivable from `<name>-<os>-<arch>` — true for
+  hadolint, false for gitleaks, and the reason this function could not install a
+  second tool. There are now three spellings of the OS name in play
+  (`macos`/`darwin`/`apple-darwin`) and all three are mapped explicitly.
+- The `callable path` check's copy-walk skips `.bin` and shell scripts.
+
+### Earlier
+
 - A **`callable path` check** in `tests/validate.sh`: the reusable workflow
   exists at the path callers are documented to use, it declares
   `on: workflow_call`, every real `uses:` that names kit — in `README.md`,

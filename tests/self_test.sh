@@ -11,11 +11,11 @@
 #   *different* check, so a passing self_test means the checks are independent
 #   and not one lucky assertion standing in for all of them.
 #
-# THE FORTY-FIVE BREAKAGES, and one GREEN control   (20 from the tier work,
+# THE FIFTY-SIX BREAKAGES, and one GREEN control   (20 from the tier work,
 #                               21 from the fan-out work, 24-26 from the fleet
 #                               gate, 27-32c from the lint work, 33-40 from the
-#                               staleness/parity work; 18 shared before the lint
-#                               packet)
+#                               staleness/parity work, 41-51 from the secrets
+#                               work; 18 shared before the lint packet)
 #   1. delete a language template   -> the artifact-presence check goes red
 #   2. add a collector exporter    -> the privacy check goes red
 #   2b. DELETE the tempo exporter   -> the same check goes red from the other
@@ -182,10 +182,19 @@
 #         interpreter reports three NoMethodErrors and the summary blames a
 #         template that is correct.
 #
-#   These are numbered 20-22 rather than 19-21 because 19 is the allowlist
-#   breakage above, from the tier work. Both packets numbered their first entry
-#   independently and the collision is only visible in the union — which is what
-#   the header/recipe check in validate.sh is for.
+# 41-42. plant a detectable credential, in history and in the working tree ->
+#            the secret scanner goes red
+# 43-44. remove --redact, then narrow the scan to the last commit -> the
+#            scanner's BEHAVIOUR check goes red. Not its source: a `grep -- --redact`
+#            is satisfied by the comment above the flag that explains why the flag
+#            is mandatory, and that breakage proved exactly that
+# 45. add `pull_request_target` -> the dangerous-trigger check goes red
+# 46. make the `secrets` job `continue-on-error` -> the not-advisory check goes
+#            red. A secret scanner that only warns is a report
+# 47-50. break the canary's reference type in the four ways that turn it into
+#            the leaky one -> THAT VECTOR's suite goes red
+# 51. baseline unpinned-uses in .github/zizmor.yml -> the never-baselined check
+#            goes red
 #
 #   33-40 continue that numbering above, and the reason the copy-is-gone case
 #   gets TWO breakages and not one is that
@@ -193,7 +202,7 @@
 #   that a single mutation cannot both produce: one removes a finding, the
 #   other invents one, and a gate that can only do one of them is half a gate.
 #
-#   Twenty-one of them (7-10, 11, 12, 19, 20, 24-32c, 33-35, 38, 40) additionally
+#   Thirty-seven of them (7-12, 19, 20, 24-32c, 33-35, 38, 40-51) additionally
 #         assert WHICH check went red. Every other breakage only proves the gate
 #         can fail; those prove the check written for that defect is still
 #         load-bearing, which is a different claim and the one that decays
@@ -225,6 +234,23 @@
 #   alphabet that quietly grows a second case, a limit raised until it never
 #   fires. One mutant per language proves the suite bites; it does not prove the
 #   suite is complete, and nothing here should be read as claiming that is.
+#
+#   The same applies to breakages 24-34. They prove each check CAN fail; they do
+#   not prove the check is complete. A check that fires on the defect it was
+#   written for is the floor, and the floor is what a gate nobody runs has.
+#
+# WHY THE PLANTED PROBES ARE ASSEMBLED RATHER THAN WRITTEN OUT
+#   Breakage 24 plants a credential, 25 plants the same one, and 33 plants a
+#   canary literal. All three are assembled from parts in a throwaway copy, for
+#   one reason: a probe written out is a probe committed, and the scanner and the
+#   canary check would then both report THIS FILE — every breakage caught by the
+#   wrong thing, and a gate that is red for a reason nobody introduced.
+#
+#   It happened, twice, while writing these. `tests/validate.sh` reported four
+#   leaks in the file that was planting them, and the canary check reported the
+#   breakage's own replacement string. Both are recorded in the breakages'
+#   comments, because a proof that only ever worked the first time is a proof
+#   somebody will trust.
 
 set -euo pipefail
 
@@ -288,7 +314,28 @@ fresh_copy() {
   for entry in .github AGENTS.md README.md CHANGELOG.md core docker lint templates tests; do
     [ -e "$ROOT/$entry" ] && cp -R "$ROOT/$entry" "$dst/"
   done
-  chmod +x "$dst"/tests/validate.sh "$dst"/tests/self_test.sh 2>/dev/null || true
+  # KIT_GITLEAKS, unlike the other two, must ALSO be resolved before the first
+  # copy runs. It is a fetched binary rather than a python script, so the copy's
+  # `$root/.venv` — which does not exist, because fresh_copy does not copy the
+  # gitignored venv — is not where it would be found. Without this, every copy
+  # re-downloads a 15MB archive, and the twenty-odd copies this script makes per
+  # gate run turn a 90-second suite into a twenty-minute one.
+  #
+  # Precedence is deliberately: the developer's own gitleaks, then the one this
+  # tree fetched, then PATH. A developer's install may be a different version
+  # and that is their business, exactly as it is for hadolint.
+  if [ -z "${KIT_GITLEAKS:-}" ] && [ -x "$ROOT/tests/.bin/gitleaks" ]; then
+    KIT_GITLEAKS="$ROOT/tests/.bin/gitleaks"
+  fi
+  export KIT_GITLEAKS="${KIT_GITLEAKS:-}"
+  # Every script in tests/, not just the two entry points. `cp -R` does NOT
+  # preserve the executable bit on macOS, so a copy arrives with every tests/
+  # script non-executable — and the gate has a check for exactly that (the two
+  # gate scripts are run BY the reusable workflow, so they must be executable).
+  # Without this, every one of the twenty-odd copies fails that check, and the
+  # control run reports the tree red for a reason that has nothing to do with
+  # any breakage under test.
+  chmod +x "$dst"/tests/*.sh 2>/dev/null || true
   printf '%s' "$dst"
 }
 
@@ -332,6 +379,26 @@ expect_red() {
 # exact label validate.sh prints. A rename on either side breaks this loudly,
 # which is the intended behaviour: a renamed check and a stale proof are the
 # same defect.
+#
+# THE MATCH IS A SUBSTRING TEST ON THE VARIABLE, NOT `printf | grep -q`, and it
+# has to be. `grep -q` exits at the FIRST match and closes the pipe, so the
+# writer takes SIGPIPE and dies 141 — and this script runs under `set -o
+# pipefail`, which promotes that 141 to the status of the whole pipeline. The
+# `if` then reads a match as a NON-match.
+#
+# That is not theoretical here; it is what the first run of this merge
+# produced. Breakage 11 (hadolint) and breakage 25 (the working-tree
+# credential) both produce a gate run larger than the 64KB pipe buffer, and both
+# were reported as "the gate went red, but NOT via `<the check that fired>`" —
+# while printing that very check among the FAIL lines it had just proven was
+# there. Underneath the threshold it matches; at or above it, the proof of the
+# best-behaved check in the file failed for a reason that had nothing to do with
+# the check. Same defect `tests/canary_test.sh` already records for
+# `docker logs | grep -q`, and the same rule answers it here: the output is
+# ALREADY captured in a variable, so there is no reason to introduce a pipe at
+# all. Matching the variable is not merely safer than the pipe — it makes the
+# assertion independent of how much the gate prints, which is a property the
+# piped version did not have.
 expect_red_check() {
   local label="$1" dir="$2" want="$3"
   shift 3
@@ -459,6 +526,14 @@ expect_green() {
 expect_red_lang() {
   local label="$1" dir="$2" lang="$3" file="$4" old="$5" new="$6"
   local work="$WORK/mutant-$lang"
+
+  # No counter is incremented here. This function USED to carry its own
+  # `breakages=$((breakages + 1))`, and the omission it was written to fix is
+  # the reason this file counts by grepping itself at the end instead: a counter
+  # incremented in three of four helpers had already under-reported once (the
+  # summary said "all 23" while twenty-nine had run), and a count that
+  # under-reports is worse than no count, because it reads as though proofs were
+  # missing rather than as a bug in the counter.
 
   rm -rf "$work"
   cp -R "$dir/templates/otel/$lang" "$work"
@@ -1711,6 +1786,236 @@ else
   printf 'SKIP self_test: breakage 40: the toolchain floor is defined but never consulted — ruby not installed\n'
   skips=$((skips + 1))
 fi
+
+# 41-51. The secret scanner, and the canary harness that answers the question
+#        the scanner cannot.
+#
+#        A scanner that has never gone red is a report, and neither is a
+#        detector that has never fired. Breakages 41-46 make the scanner catch
+#        things; 47-50 make the canary's four reference-type vectors bite. They
+#        are in one place because the two answer different questions about the
+#        same subject, and a packet that added both is only honest if both are
+#        proven able to fail.
+SECRETS='gitleaks  (8.30.1, full history, --redact)'
+
+# THE VARIABLES IN THIS BLOCK ARE NAMED FOR WHAT THEY BREAK, NOT FOR THEIR
+# LABEL, and that is a merge repair rather than a style preference — made twice.
+# kit-08 renumbered kit-04's 13-23 to 24-34, rewrote the labels, and left the
+# variable names behind, so breakage 47 was still called `canary_unexported` and
+# breakage 48 `canary_unredacted`. This integration then renumbered 24-34 to
+# 41-51, and the descriptive names survived it, which is the outcome worth
+# having: a name that says what it breaks cannot collide with a number that a
+# later packet moves. It had worked only because each was written and read
+# before the next write — four pairs of names meaning two different things in
+# one file, where a reordering, an inserted breakage or an early exit would
+# have pointed a recipe at a copy somebody else had already mutated. The
+# names below cannot collide with master's 1-22 because they do not encode a
+# number at all, so the next renumber cannot reintroduce the fault by editing a
+# label and missing a variable.
+
+# 41-25. A detectable credential, in history and in the tree.
+#
+#     THE PROBE IS ASSEMBLED, NOT WRITTEN, and that is the whole difficulty of
+#     this packet. The obvious thing — paste a sample PAT into this file — makes
+#     `tests/self_test.sh` itself a gitleaks finding, so the real tree's own scan
+#     goes red and every breakage here is caught by the wrong thing. It was: the
+#     first version of these two breakages did exactly that, and the gate
+#     reported four leaks in the file that was supposed to be planting them.
+#
+#     Assembling it from parts means no credential-shaped string is ever
+#     committed — which is the same rule the canary harness asserts about itself,
+#     applied to the scanner's own proof. The cost is that a reader cannot see
+#     the value, so the comment above says what it is.
+#
+#     The value is GitLab's own published PAT FORMAT SAMPLE (glpat- followed by
+#     the documented 48-character sample body), taken from gitleaks' test data.
+#     It is a format sample, not a credential, and it has never been a live
+#     token. Nothing in this repository is a live secret, and this packet's
+#     entire subject is not printing one.
+plant_probe() {
+  local dir="$1"
+  mkdir -p "$dir/.self-test-probe"
+  {
+    printf 'endpoint = "https://gitlab.example.invalid"\n'
+    # Split across the two halves gitleaks matches on: the `glpat-` prefix and
+    # the token body. Neither half is a credential on its own, and the
+    # concatenation is what the rule fires on.
+    printf 'private_token = "glpat-%s"\n' 'ABC123def456GHI789jkl012'
+  } >"$dir/.self-test-probe/config.toml"
+}
+
+# 24. Committed and then REMOVED — the shape the full-history requirement exists
+#     for. A HEAD-only scanner sees a clean tree here, and a diff scanner sees
+#     nothing at all, because by the time the commit lands the file is gone.
+probe_history="$(fresh_copy committed-secret)"
+plant_probe "$probe_history"
+expect_red_check 'breakage 41: a credential in history, since removed' \
+  "$probe_history" "$SECRETS" --static-only
+
+# 25. The same credential, still in the tree. A separate breakage from 41
+#     because it is a different code path in the scanner and a different claim:
+#     41 proves the scan reads history, 42 proves it reads uncommitted files. A
+#     scanner that only read history would pass 41 and fail 42, and one that only
+#     read the working tree would do the reverse — so neither alone establishes
+#     that both are covered.
+probe_tree="$(fresh_copy working-tree-secret)"
+plant_probe "$probe_tree"
+expect_red_check 'breakage 42: a credential in the working tree' \
+  "$probe_tree" "$SECRETS" --static-only
+
+# 26. --redact removed from the scan script. The build stays GREEN — nothing
+#     about a secret being printed makes it non-zero — and the CI log now
+#     contains the credential the scanner just found. This is the reason
+#     redaction is asserted in the gate and not left to review: a change that
+#     reads as a cleanup is a change that exfiltrates.
+scan_unredacted="$(fresh_copy scan-without-redact)"
+edit "$scan_unredacted/tests/gitleaks_gate.sh" \
+  '  --redact \
+  --no-banner \' \
+  '  --no-banner \'
+expect_red_check 'breakage 43: the scan stops redacting' \
+  "$scan_unredacted" 'tests/gitleaks_gate.sh  (finds a real secret, never prints it, reads history)' \
+  --static-only
+
+# 27. The scan narrowed to the diff. A shallow or HEAD-only scan cannot see
+#     breakage 41's shape at all, and the check that asserts full history is
+#     what makes narrowing it a failure rather than a quiet reduction in
+#     coverage.
+scan_shallow="$(fresh_copy scan-head-only)"
+edit "$scan_shallow/tests/gitleaks_gate.sh" \
+  "  set -- \"\$@\" --log-opts '-p -U0 --full-history --all'" \
+  "  set -- \"\$@\" --log-opts '-1'"
+expect_red_check 'breakage 44: the scan narrows to the last commit' \
+  "$scan_shallow" 'tests/gitleaks_gate.sh  (finds a real secret, never prints it, reads history)' \
+  --static-only
+
+# 28. `pull_request_target` added as a trigger. The workflow still parses, still
+#     passes every other check, and every job in it now runs with the base
+#     repository's secrets and a writable token on a fork's code. The secret
+#     scanner is the job that most invites this edit, which is why the trigger
+#     is checked on parsed keys rather than left to review.
+dangerous_trigger="$(fresh_copy dangerous-trigger)"
+edit "$dangerous_trigger/.github/workflows/ci.reusable.yml" \
+  '  workflow_call:' \
+  '  pull_request_target:
+  workflow_call:'
+expect_red_check 'breakage 45: a dangerous trigger appears in the workflow' \
+  "$dangerous_trigger" '.github/workflows/*  (no dangerous trigger, on parsed keys)' --static-only
+
+# 29. The `secrets` job made advisory. The single most common way a security job
+#     is neutralised, and completely invisible in a green build: continue-on-error
+#     means the job reports what it found and the badge stays green. A secret
+#     scanner that only warns is a report.
+CANARYJOB='.github/workflows/ci.reusable.yml  (secrets job: not advisory, full history, not opt-in)'
+advisory_secrets_job="$(fresh_copy secrets-job-advisory)"
+edit "$advisory_secrets_job/.github/workflows/ci.reusable.yml" \
+  '  secrets:
+    name: secrets
+    runs-on: ubuntu-latest' \
+  '  secrets:
+    name: secrets
+    continue-on-error: true
+    runs-on: ubuntu-latest'
+expect_red_check 'breakage 46: the secret scanner is made non-blocking' \
+  "$advisory_secrets_job" "$CANARYJOB" --static-only
+
+# 47-33. The canary harness. A detector that has never fired is a detector
+#         asserting nothing, and these break the SAFE reference type in the four
+#         ways that would turn it into the LEAKY one — each caught by a named
+#         vector, so a vector that stops biting fails here rather than being
+#         discovered when a token reaches a log aggregator.
+CANARY='templates/secrets/go  (five vectors, each with a red proof)'
+
+# 30. The exported pointer field becomes an unexported one. This is the shape
+#     that LOOKS safest — unexported, so a reviewer reading the type sees nothing
+#     worrying — and it leaks under every verb, because fmt prints unexported
+#     fields through reflection. The measurement behind that is in
+#     print_shape_test.go; this breakage is what proves the measurement is wired
+#     into a vector rather than sitting in a comment.
+canary_unexported="$(fresh_copy canary-unexported-token)"
+edit "$canary_unexported/templates/secrets/go/internal/safe/creds.go" \
+  '	Token *Token `json:"-"`' \
+  '	token *Token'
+expect_red_check 'breakage 47: the reference type hides its credential in an unexported field' \
+  "$canary_unexported" "$CANARY" --language=go --no-self-test
+
+# 31. The redacting String method is renamed, so the type stops being a
+#     Stringer. Every dispatched verb then prints the value, which is the leak
+#     the whole reference shape exists to prevent — and the `json:"-"` tag is
+#     untouched, so nothing else in the tree notices.
+canary_unredacted="$(fresh_copy canary-no-redaction)"
+edit "$canary_unredacted/templates/secrets/go/internal/safe/creds.go" \
+  'func (t *Token) String() string { return "Token(redacted)" }' \
+  'func (t *Token) Redeemed() string { return "Token(redacted)" }'
+expect_red_check 'breakage 48: the credential type stops redacting when printed' \
+  "$canary_unredacted" "$CANARY" --language=go --no-self-test
+
+# 32. The `json:"-"` is dropped. The credential reaches the wire under a `token`
+#     key, which is vector 2's finding, and an always-present key is vector 4's.
+#     Nothing else changes: the type still redacts, still has no String method,
+#     and every static check in the gate is still green.
+canary_marshals="$(fresh_copy canary-serialises-token)"
+edit "$canary_marshals/templates/secrets/go/internal/safe/creds.go" \
+  '	Token *Token `json:"-"`' \
+  '	Token *Token'
+expect_red_check 'breakage 49: the reference type marshals its credential' \
+  "$canary_marshals" "$CANARY" --language=go --no-self-test
+
+# 33. The canary committed as a literal instead of assembled. The one breakage
+#     whose failure mode is invisible in a CI log: the suite keeps passing,
+#     because the value is the SAME value. What changes is that the repository
+#     now holds a credential-shaped string — a gitleaks finding, and an
+#     allowlist entry somebody will eventually add. The check that catches it is
+#     `the canary (never committed as a literal, anywhere)`.
+# The DIRECTORY is `canary_as_literal`, not `canary_literal`, and that is not
+# taste. `canary_literal` is the name kit-04 used for the assembled VALUE below,
+# and the renumber that gave 41-51 descriptive directory names gave this one
+# the value's name. The directory variable was then reassigned to the value a few
+# lines later, so `edit` was handed
+# `cafaye_canary_…/templates/secrets/go/canary.go` and died with a
+# FileNotFoundError — which killed breakage 50 AND 51, and the run, before the
+# summary printed. Two proofs dead, reported as a crash rather than as a missing
+# check. A directory variable and a value variable must never share a name here;
+# `validate.sh` now checks that, because a name collision is invisible to review
+# and fatal only when the recipe runs.
+canary_as_literal="$(fresh_copy canary-committed-as-literal)"
+# The replacement is the EXACT value the check looks for: prefix plus 49 bytes,
+# and it is ASSEMBLED here for the same reason `plant_probe` assembles its PAT.
+#
+# This one is the sharper version of that trap. A committed canary literal makes
+# this very file a finding for the check it is proving, so the real tree's own
+# `the canary (never committed as a literal, anywhere)` goes red — and every
+# breakage in this script becomes caught by the wrong thing. The first version of
+# this breakage did exactly that: it wrote the literal out, the check fired on
+# tests/self_test.sh, and the breakage reported the right failure for entirely
+# the wrong reason.
+#
+# So the value is built in the throwaway copy, at the moment the defect is
+# introduced, and never exists in a committed file. The defect being introduced is
+# "a contiguous credential-shaped string in a source file" — which is exactly what
+# gets written, into a copy that is deleted when the test finishes.
+canary_prefix='cafaye_canary_'
+canary_body="$(printf 'notarealsecret%.0s' 1 2 3)"
+canary_literal="$canary_prefix${canary_body:0:49}"
+edit "$canary_as_literal/templates/secrets/go/canary.go" \
+  'canary   = CanaryPrefix + strings.Repeat(canaryBody, 3)[:CanaryBytes]' \
+  "canary   = \"$canary_literal\""
+expect_red_check 'breakage 50: the canary is committed as a literal' \
+  "$canary_as_literal" 'the canary  (never committed as a literal, anywhere)' --static-only
+
+# 34. The zizmor config baselines unpinned-uses — the trade made invisibly, in a
+#     file that looks like routine housekeeping. Every finding is still
+#     accounted for and the build is still green, which is exactly what makes it
+#     the failure mode worth a proof.
+zizmor_baseline="$(fresh_copy zizmor-baselines-unpinned)"
+edit "$zizmor_baseline/.github/zizmor.yml" \
+  '  self-repository:' \
+  '  unpinned-uses:
+    ignore:
+      - "**"
+  self-repository:'
+expect_red_check 'breakage 51: the zizmor config baselines unpinned-uses' \
+  "$zizmor_baseline" '.github/zizmor.yml  (unpinned-uses recorded, never baselined)' --static-only
 
 printf '\n'
 if [ "$failures" -ne 0 ]; then

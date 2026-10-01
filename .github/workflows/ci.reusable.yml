@@ -35,8 +35,18 @@
 #   - Action refs are floating major tags where the upstream publishes them and
 #     exact tags where it does not (astral-sh/*). Dependabot upgrades are
 #     one-line diffs; full-SHA pinning is a service repo's own choice.
+#     zizmor disagrees about all of this and says so on every run; the
+#     disagreement is recorded, not resolved, in DECISIONS.md under MD10.
+#   - Every `actions/checkout` sets `persist-credentials: false`. No job in this
+#     file pushes, so a token left on disk after a checkout is a credential that
+#     outlives the job for no reason, and every job here runs `upload-artifact`
+#     — which is the combination zizmor's `artipacked` audit exists to catch.
 #   - Every step that can run offline does. Nothing here reaches a cafaye
-#     service, so this workflow needs no secrets.
+#     service, so this workflow needs no secrets. The `secrets` job's scanner is
+#     a static binary that reads a repository and matches regexes: it makes no
+#     network call, which is why it is gitleaks and not trufflehog.
+#   - The `secrets` job is the only job here with no opt-in, on purpose. It is
+#     the one job that must not be something a repo has to remember to ask for.
 name: ci
 on:
   workflow_call:
@@ -191,6 +201,19 @@ on:
         required: false
         type: string
         default: 'false'
+      # The GitHub Actions security audit, opt-in for the reason its header
+      # gives: it reads the adopting repo's workflows, which kit did not write.
+      # A string for the same reason `telemetry` is one, and for the same trap.
+      zizmor:
+        description: >-
+          'Run the zizmor GitHub Actions security audit as well: "true" or
+          "false". Off by default so a repo adopts kit without inheriting a red
+          build for a finding in a workflow kit did not write. Turn it on once
+          your own workflows are clean; every finding but unpinned-uses is
+          fatal, and unpinned-uses is recorded, never baselined.'
+        required: false
+        type: string
+        default: 'false'
 permissions:
   contents: read
 concurrency:
@@ -263,6 +286,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - name: kit gate
         working-directory: ${{ inputs.working-dir }}
         # The gate bootstraps its own dependencies (PyYAML, yamllint, hadolint)
@@ -286,6 +311,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-go@v7
         with:
           go-version: ${{ fromJSON(inputs.versions).go || 'stable' }}
@@ -456,6 +483,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy, rustfmt
@@ -523,6 +552,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       # Reads .ruby-version/.tool-versions/mise.toml from working-dir when the
       # repo pins one, so the worktree and CI agree on the interpreter.
       - uses: ruby/setup-ruby@v1
@@ -672,6 +703,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: erlef/setup-beam@v1
         with:
           elixir-version: ${{ fromJSON(inputs.versions).elixir || '1.18' }}
@@ -737,6 +770,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: astral-sh/setup-uv@v10.2.0
         with:
           working-directory: ${{ inputs.working-dir }}
@@ -813,6 +848,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: actions/setup-node@v7
         with:
           node-version: ${{ fromJSON(inputs.versions).node || '22' }}
@@ -982,6 +1019,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: ${{ fromJSON(inputs.versions).bun || '1.3.12' }}
@@ -1077,6 +1116,8 @@ jobs:
           - rust
     steps:
       - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
       # The toolchain comes from the matrix, so a bun-only repo does not install
       # an entire Go toolchain to run one test file. Each entry is the setup
       # action the language's own job uses, deliberately the same action and the
@@ -1138,3 +1179,114 @@ jobs:
               rustc --test --edition 2021 -o "$RUNNER_TEMP/kit-telemetry" "$dir/traceparent.rs"
               "$RUNNER_TEMP/kit-telemetry" ;;
           esac
+
+  # ------------------------------------------------------------------ secrets
+  # The one job here with no opt-in, and the only one a repository cannot
+  # choose to not run.
+  #
+  # WHY NO OPT-IN
+  #   Every other job in this file is gated because a new job that can go red
+  #   must not turn thirteen green repositories red on the day it lands — the
+  #   repo has to ask for it by name. A secret scanner is the exception, and
+  #   the exception is the ruling (DECISIONS.md, MD10): a secret scanner that
+  #   only warns is a report. An opt-in control is not a control.
+  #
+  #   The cost of that choice is real and is written down rather than
+  #   discovered: a repository that adopts kit and has a secret anywhere in its
+  #   history gets a red build on its first run. That red build is the scanner
+  #   working. What to do about it is in README.md — rotate first, then
+  #   allowlist with a reason if it was a false positive. Do not reach for
+  #   `continue-on-error`, which is the only setting on this job that would
+  #   make it a report instead of a gate, and which tests/validate.sh fails on.
+  #
+  # WHY THIS RUNS ON `pull_request` AND NEVER `pull_request_target`
+  #   `pull_request_target` runs in the context of the BASE repository with the
+  #   repository's secrets and a writable token, executing code proposed by a
+  #   FORK. Any job under that trigger is a credential-theft primitive waiting
+  #   for a reason. The scanner is the job that most obviously invites "let me
+  #   just pull the base branch in so the scan sees the real history" — and that
+  #   edit is how a secret scanner becomes the way secrets are taken. So the
+  #   reusable workflow declares no dangerous trigger at all, and
+  #   tests/validate.sh fails if the string ever appears.
+  #
+  # WHY fetch-depth: 0
+  #   The default checkout is a shallow clone: one commit. A shallow scan cannot
+  #   see a secret that was committed and deleted, which is the finding that
+  #   matters most — it is on every fork, and it is in the packfile of anyone
+  #   who cloned. Full history is the requirement; the default is not.
+  secrets:
+    name: secrets
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          # Full history. See above: a shallow scan is a diff scan with extra
+          # steps, and a diff scan cannot see a deleted secret.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: install gitleaks (pinned release, sha256-verified)
+        # kit's own bootstrap, not a third-party action. Two reasons, and both
+        # of them are properties this repository already holds hadolint to: the
+        # version and the hash are one edit in a file we ship, and the scan
+        # cannot be quietly swapped for another scanner by a dependency bump.
+        run: |
+          set -euo pipefail
+          . "${GITHUB_ACTION_PATH}/tests/bootstrap.sh"
+          kit_bootstrap_binary gitleaks \
+            "https://github.com/gitleaks/gitleaks/releases/download/v${KIT_GITLEAKS_VERSION}" \
+            "$KIT_GITLEAKS_SHA256S" "$GITHUB_ACTION_PATH" \
+            "gitleaks_${KIT_GITLEAKS_VERSION}_@ros@_@arch@.tar.gz" gitleaks
+          echo "GITLEAKS=$BIN" >> "$GITHUB_ENV"
+      - name: gitleaks (full history, redacted)
+        # kit's own script, so this invocation and `bash tests/validate.sh` on a
+        # laptop are the same scan. --redact is inside that script and cannot be
+        # turned off from here: a CI log is a place secrets go to be read, and
+        # the scanner finding a secret must never be why the secret is printed.
+        #
+        # The runner does have network access — GitHub-hosted runners always do
+        # and there is no per-step way to remove it. What is offline is the
+        # scan: gitleaks is a static binary that reads a repository and matches
+        # regexes. That is the whole reason it is gitleaks and not trufflehog,
+        # which would use this network access to verify a live credential
+        # against its issuer — a scanner that can reach the internet is a
+        # scanner that can be made to exfiltrate.
+        run: bash "${GITHUB_ACTION_PATH}/tests/gitleaks_gate.sh" "$GITHUB_WORKSPACE" "$GITLEAKS"
+
+  # ------------------------------------------------------------------ zizmor
+  # GitHub Actions' own security audit, run on the adopting repository's own
+  # workflows. It is a separate job rather than a step in `secrets` because they
+  # answer different questions: gitleaks looks at content, zizmor looks at the
+  # workflow's own shape — who can write, what is pinned, what persists a
+  # credential.
+  #
+  # It ships with the same opt-out as `secrets` and for a different reason. The
+  # audit's output depends entirely on the adopting repository's workflows,
+  # which kit does not control and did not write, so making it fatal on day one
+  # would mean a repo inherits a red build for a finding kit introduced. A repo
+  # that wants it now asks for it; every repo gets it the moment this stops
+  # being true, because the input is already here and the default only ever
+  # moves down.
+  #
+  # `unpinned-uses` is reported and does not fail the job. That is not a
+  # baseline: the finding is counted and printed on every run, and the decision
+  # it is waiting on is written down in DECISIONS.md under MD10 with all three
+  # options costed. Every other audit is fatal.
+  zizmor:
+    name: zizmor
+    if: ${{ inputs.zizmor == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: install zizmor (pinned)
+        # From PyPI, not a release archive: zizmor publishes no checksums file,
+        # so pinning its archives would mean pinning hashes we computed
+        # ourselves, which is a weaker claim than hadolint's and gitleaks'.
+        # The version is exact because an audit whose findings change when the
+        # tool is upgraded is an audit nobody can reason about.
+        run: |
+          set -euo pipefail
+          python3 -m pip install --quiet --disable-pip-version-check 'zizmor==1.30.1'
+      - name: zizmor (unpinned-uses recorded, everything else fatal)
+        run: bash "${GITHUB_ACTION_PATH}/tests/zizmor_gate.sh" "$GITHUB_WORKSPACE" "$(command -v zizmor)"
