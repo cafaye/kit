@@ -8389,10 +8389,25 @@ PY
   #
   # BOUNDED, and this is the phase that most needs it. Every recipe builds a
   # fresh throwaway copy of the tree and runs the whole static gate inside it, so
-  # the self-test is _n_ gates in sequence: 67 on this branch, and the number
+  # the self-test is _n_ gates in sequence: 77 on this branch, and the number
   # grows with every check this repository adds. On a quiet box it is the
   # longest phase in the run by a wide margin, and it is the one that grows
   # silently — nothing in it announces that the gate just got slower.
+  #
+  # The count in the LABEL above is computed from the recipes, so the number in
+  # this comment is the one place it can go stale, and it did: it read 67 for
+  # three packets. Corrected here rather than left, because a comment claiming a
+  # count is a claim, and this repository's rule about `DECISIONS.md` — that a
+  # reference to something that does not exist is worse than no reference — is the
+  # same rule one layer down.
+  #
+  # AND A BOUND IS NOT A RESULT ABOUT THE BREAKAGES IT DID NOT REACH. Measured on
+  # kit-22: this tier BOUNDed at breakage 56 of 77, so 21 recipes never ran, and
+  # the run still exited 0. That is the correct behaviour — a bound is neither a
+  # pass nor a skip, and it is reported — but it means a green gate is not
+  # evidence about the unreached recipes. Running them by hand is how kit-22 found
+  # breakage 72 green on a check that could not see its own defect. See
+  # AGENTS.md, "a BOUND self_test is a gate to run by hand".
   #
   # 5400s is measured, not chosen. The uninterrupted run recorded in
   # REPORT-kit-13.md §5.2 took ~44 minutes end to end, of which the self-test
