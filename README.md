@@ -102,12 +102,15 @@ the entry; deleting the entry to shrink the file is a hard failure of its own.
 | `lint/hadolint.yaml` | hadolint config, with the one ignored rule (DL3008) argued rather than assumed. | Any repo that ships a Dockerfile |
 | `lint/drift-allowlist` | Known, owned service configs that disagree with kit's: reason, owner, since, until. An entry that expires, duplicates, or stops describing a real difference is a failure. | kit's gate only |
 | `templates/bin-prime/<lang>.sh` | The worktree primer: one script per language, exit 0 only when the tree is genuinely ready. | Every service, as `bin/prime` |
-| `templates/bin/dev.sh` | The local developer loop: bring the stack up, wait for health, migrate, seed an admin, print the URLs. Idempotent, fails loudly. | Every service, as `bin/dev` |
-| `templates/compose/docker-compose.yml` | Postgres, NATS+JetStream, Redis, the OTel collector, and the four LGTM backing services. Every port parameterized inside kit's claimed `15000-15999` block, every image pinned, every service healthchecked and memory-bounded. | Every service, as `docker-compose.yml` |
-| `templates/compose/otel-collector.yml` | The collector: OTLP + container-stderr receivers, the redaction allowlist **derived from core's schemas**, the `spanmetrics` connector, and fan-out to Tempo/Loki/Mimir. Every endpoint a `${env:}`. | Every service, as `otel-collector.yml` |
-| `templates/compose/{tempo,loki,mimir}/` | Vendor **configuration** for the three stores: retention, limits, paths. Read-only mounts over stock images. | Every service, beside its compose file |
-| `templates/compose/grafana/provisioning/` | Datasources, the dashboard provider, the fleet error dashboard and the alert rules — all files, working on first load. Nothing to click together by hand. | Every service, beside its compose file |
-| `templates/compose/.env.example` | Every `${KIT_*}` the stack interpolates, each with a default. | Every service, as `.env.example` |
+| `templates/bin/dev.sh` | The local developer loop: **fetch** the stack from a pinned kit ref, bring it up, wait for health, migrate, seed an admin, print the URLs. Idempotent, fails loudly, works offline. | Every service, as `bin/dev` |
+| `templates/compose/docker-compose.yml` | Postgres, NATS+JetStream, Redis, the OTel collector, and the four LGTM backing services. Every port parameterized inside kit's claimed `15000-15999` block, every image pinned, every service healthchecked and memory-bounded. | **Fetched** by `bin/dev` — never copied |
+| `templates/compose/otel-collector.yml` | The collector: OTLP + container-stderr receivers, the redaction allowlist **derived from core's schemas**, the `spanmetrics` connector, and fan-out to Tempo/Loki/Mimir. Every endpoint a `${env:}`. | **Fetched** — never copied |
+| `templates/compose/{tempo,loki,mimir}/` | Vendor **configuration** for the three stores: retention, limits, paths. Read-only mounts over stock images. | **Fetched** — never copied |
+| `templates/compose/grafana/provisioning/` | Datasources, the dashboard provider, the fleet error dashboard and the alert rules — all files, working on first load. Nothing to click together by hand. | **Fetched** — never copied |
+| `templates/compose/.env.example` | Every `${KIT_*}` the stack interpolates, each with a default. **Fetched, not copied** — `bin/dev` writes it into `.env` on first run. | `bin/dev`, on first run |
+| `tests/fetch_test.sh` | Executes the fetch against a local bare remote: a pin resolves and the bytes are identical, a branch is refused **before any network call**, and offline mode is real in all four of its states. | kit |
+| `tests/stack_live_test.sh` | Brings the **fetched** stack up, sends real OTLP, and reads a trace out of Tempo, a metric out of Mimir, and no canary into either. | kit |
+| `tests/fleet_check.py` | Reads the **other** repositories: a stale copy of the stack, a weakened redaction boundary, a collector config nothing starts, a published port on a service kit already ships, an unpinned ref. Under the **adoption ceiling**: a `FAIL` inside a repository that has a `kit.ref`, a named `WARN` inside one that has not. | kit, over the sibling checkouts |
 | `tests/canary_test.sh` | Plants a canary in ten leak shapes against a real collector and asserts it reaches no exporter. | kit |
 | `tests/no_telemetry_in_readiness.sh` | Kills the collector and proves a service still starts, still serves and still reports healthy. | kit |
 | `templates/otel/<lang>/` | W3C traceparent: a stdlib codec, an executed conformance suite, an SDK snippet, and a README. | Every service, per language |
@@ -305,28 +308,205 @@ services that make a developer's traces, metrics and errors visible: **Grafana,
 Loki, Tempo and Mimir**. One stack, one set of credentials, one command, for
 every service.
 
-```sh
-cp <kit>/templates/compose/docker-compose.yml ./docker-compose.yml
-cp <kit>/templates/compose/otel-collector.yml  ./otel-collector.yml
-cp -R <kit>/templates/compose/tempo  ./tempo
-cp -R <kit>/templates/compose/loki   ./loki
-cp -R <kit>/templates/compose/mimir  ./mimir
-cp -R <kit>/templates/compose/grafana ./grafana
-cp <kit>/templates/compose/.env.example        ./.env
-cp <kit>/templates/bin/dev.sh                  ./bin/dev && chmod +x bin/dev
+**You do not copy any of it.** There is no `docker-compose.yml` of kit's in your
+repository, no `otel-collector.yml`, no `tempo/`, no `loki/`, no `mimir/`, no
+`grafana/`, and no `.env.example`. `bin/dev` fetches all of it from a **pinned**
+ref and runs it beside the one compose file you do have:
 
-bin/dev            # up, wait for health, migrate, seed, print URLs
+```sh
+cp <kit>/templates/bin/dev.sh ./bin/dev && chmod +x bin/dev
+git -C <kit> rev-parse HEAD > kit.ref      # the pin — see below
+
+bin/dev            # fetch kit, compose up --wait, migrate, seed, print URLs
+bin/dev stack      # resolve the pin and show what the two files merged into
+bin/dev pin v0.4.0 # move the pin DELIBERATELY; prints the stack diff first
 bin/dev status     # what is running
-bin/dev logs nats  # tail one service
+bin/dev logs tempo # tail one service
 bin/dev down       # stop, keep the data
 bin/dev nuke       # stop and DELETE the data
 ```
 
-It is a **template with placeholders**, not a fixed stack. Every published port
-is `${KIT_*:default}` inside kit's claimed block, every image is pinned to an
-exact tag, and every service has a healthcheck so `up --wait` can mean
-something. A service joins by adding a `depends_on` and copying the connection
-URLs into its own `.env`.
+Everything the stack needs comes from the fetch: `templates/compose/otel-collector.yml`,
+and the vendor **configuration** for the three stores — `templates/compose/tempo`,
+`templates/compose/loki`, `templates/compose/mimir` — plus
+`templates/compose/grafana/provisioning`, which is where the datasources, the
+fleet error dashboard and the alert rules live as files. None of it is copied, so
+none of it can be a stale copy.
+
+The command that actually runs is:
+
+```sh
+docker compose --project-directory . \
+  -f <fetched>/templates/compose/docker-compose.yml \
+  -f ./docker-compose.yml up -d --wait
+```
+
+A compose file cannot be `uses:`-ed — GitHub resolves reusable *workflows* and
+nothing else — so `bin/dev` is the callable path, and the pin is what makes it
+one. See [`kit.ref`, the pin](#kitref-the-pin).
+
+### `kit.ref`, the pin
+
+One committed line at your repository root, holding the ref of kit you run: a
+**40-character commit sha**, or a **`v<MAJOR>.<MINOR>.<PATCH>` tag**. `bin/dev`
+refuses a branch — loudly, before any network call.
+
+```sh
+$ cat kit.ref
+# the stack this service runs; see bin/dev pin
+b25bdff23cec89697854b95ac03550baa81de9cc
+```
+
+**Why a pin, and why not `master`.** The ref decides which redaction allowlist,
+which port block and which Grafana dashboards your dev loop runs. On a branch
+those change between two runs of the same command, and a stack that changes under
+you between Monday and Tuesday is not a stack you reviewed.
+
+**Why a committed file and not a line in `.env`.** `.env` is git-ignored. A pin
+there exists on exactly one machine — the laptop of whoever ran `bin/dev pin`
+last — and on no CI runner and no teammate's checkout. `kit.ref` is in the diff,
+so the bump is reviewed like any other change to the dev loop, and
+`tests/fleet_check.py` reads it to decide whether your repository runs a pin at
+all.
+
+`KIT_STACK_REF` still works, **from the environment only**, as a one-run override
+for someone working on kit itself:
+
+```sh
+KIT_STACK_REF=$(git -C ../kit rev-parse HEAD) bin/dev up
+```
+
+### Offline
+
+`KIT_STACK_OFFLINE=1` uses only what is on the machine — `KIT_STACK_DIR`, the
+cache, or a copy you vendored at `.kit/stack` — and **fails loudly**, naming each,
+when none of them holds the pinned ref. It never falls back to an unversioned
+directory.
+
+A vendored copy must **say what it is**, and this is the part that is not
+optional:
+
+```sh
+git clone --depth 1 https://github.com/cafaye/kit.git .kit/stack
+git -C .kit/stack checkout "$(cat kit.ref)"
+git -C .kit/stack rev-parse HEAD > .kit/stack/.kit-stack-ref
+```
+
+A directory that merely *contains* `templates/compose/` is not a kit checkout at a
+known version. A mismatched record is refused, a missing one is refused, and only
+a matching one is used — because an offline loop that silently runs some other
+version is worse than one that refuses to start.
+
+## What stays in your service
+
+Your `docker-compose.yml` is the **second** `-f`, which makes it an **override**:
+what is in it wins, and everything you did not mention still comes from kit.
+
+**You may:** set `image:`; add keys to `environment:`; add a `depends_on`; declare
+your own services; change a published port **by changing the variable in `.env`**.
+
+**You may not:** touch `otel-collector` — not its `image:`, not its `command:`,
+and above all not the `volumes:` entry that mounts `otel-collector.yml`. That file
+carries the redaction allowlist, **derived from core's schemas**; a service that
+overrides the mount is shipping a telemetry boundary nobody derived, and prompt
+content leaves the process inside it. Nor may you override the four AGPL backends,
+or set `allow_all_keys`, or add an exporter, by any route.
+
+**The trap: `ports:` APPENDS, it does not replace.** A second file's `ports:`
+list is concatenated with the first's, so this:
+
+```yaml
+services:
+  postgres:
+    ports: ["15433:5432"]     # WRONG
+```
+
+publishes postgres on **15500 _and_ 15433**. Move the port in `.env`
+(`KIT_POSTGRES_PORT=15433`) and say nothing in the compose file. Measured, not
+assumed; the rule is in `templates/compose/docker-compose.yml`'s own header and
+the gate fails on a `ports:` entry in a service file.
+
+**Pointing at your own database** is one override, and it is the one override that
+is not your own service — `environment:` merges by key:
+
+```yaml
+services:
+  postgres:
+    environment:
+      POSTGRES_DB: yoursvc
+      POSTGRES_USER: yoursvc
+```
+
+Kit's healthcheck, volume, port and user survive; only the database name is
+yours. **Measured on `muse`, the largest adopter: 52 non-comment lines became 22,
+and the 538-line stack it used to half-copy is now fetched.**
+
+It is a **stack, fetched from a pinned ref**, not a template you copy. Every
+published port is `${KIT_*:default}` inside kit's claimed block, every image is
+pinned to an exact tag, and every service has a healthcheck so `up --wait` can
+mean something. A service joins by writing an **override** file — its own image,
+its own port, its own database name — which `bin/dev` merges with the fetched
+stack.
+
+### The gate on adoption, and the adoption ceiling
+
+`tests/fleet_check.py` reads the **sibling repositories**, not kit's own files,
+because the failure this packet exists to catch is in the callers and not in the
+callee. Four claims, one check each:
+
+| claim | the defect it catches |
+|---|---|
+| no stale copy | the service runs its own `postgres` rather than joining kit's |
+| no weakened boundary | the service re-points the collector's config mount — the redaction allowlist, derived from core |
+| no dead config | an `otel-collector.yml` that nothing mounts, so editing it changes nothing |
+| every ref pinned | a `kit.ref` holding a branch |
+
+**Measured against the current fleet: six repositories declare local
+infrastructure, 13 findings.** Five carry their own copy of the shared stack
+(billing, courier, darkroom, identity, muse), six have no `kit.ref` at all, and
+two publish a port on a service kit already ships. This is the same shape as D4:
+three repositories not spelling their gate the same way is invisible to any check
+that reads only one of them, so kit's gate reads all of them.
+
+#### The ceiling, and why it is not a softening
+
+| | a repository **with** a `kit.ref` | a repository **without** one |
+|---|---|---|
+| stale copy · weakened boundary · dead config · published port · bad pin | **FAIL** | **WARN**, naming the adoption path |
+
+Same four checks, same predicates, same messages. **The strictness moves to
+where adoption exists; it does not disappear.** The judgement is about **who owns
+the debt**, not about how bad it is: a repository that has adopted and still runs
+its own `postgres:17-alpine` has made a promise it is breaking, and one that has
+adopted nothing has not made a promise yet.
+
+All six repositories in scope are currently **warnings and no failures**, because
+not one of them has adopted. That is a deliberate, temporary, named state and it
+is a *wave*, not a discount: commit the one line and your own findings become
+failures, with no change to this repository and no re-review. Because the FAIL
+side is therefore unexercised by any real repository today, it is proved against
+a fixture instead — self-test breakages 59 and 60 run the identical mutation
+once unadopted (must stay green, must name the finding) and once adopted (must
+go red).
+
+```sh
+git -C ../kit rev-parse HEAD > kit.ref    # the only thing that decides which kit you run
+```
+
+**A warning is a debt with a name.** A gate that has been red for thirteen
+findings no repository has agreed to fix stops being read within one release, and
+a gate nobody reads catches nothing — which is how the state this packet exists to
+remove survived a full round of CI the first time.
+
+The check is keyed on the **image**, not the service name, and reads the set of
+images out of kit's own compose file rather than a hand-kept list. Five of the six
+copies name their database `db` rather than `postgres`, so a name-keyed check would
+report the fleet clean while five copies of the platform stood right there — and a
+list that must be edited every time kit adds a service is a list that gets skipped.
+
+A clone of kit with no siblings **skips loudly**. "No fleet was found" is not "the
+fleet is clean", and a gate that reports the second when it means the first is a
+gate that gets muted.
 
 `bin/dev` is idempotent — run it twice and nothing changes — and it fails loudly
 rather than half-starting: if the stack does not become healthy it prints what is
@@ -705,9 +885,14 @@ chmod +x bin/prime bin/dev
 ```
 
 Set `SERVICE_NAME` (Go, Rust) or the `:app` release name (Elixir) to your real
-binary or application name. `bin/dev` needs `docker-compose.yml`,
-`otel-collector.yml` and `.env` beside it — see
-[the local stack](#the-local-stack--templatescompose).
+binary or application name. `bin/dev` needs no stack files beside it — it fetches
+them. Write the pin and commit it:
+
+```sh
+git -C <kit> rev-parse HEAD > kit.ref
+```
+
+See [the local stack](#the-local-stack--templatescompose).
 
 **4. Copy `templates/mise.toml` to `mise.toml`** and raise every placeholder to
 the version you actually deploy. kit's values are placeholders, not an org-wide
@@ -795,7 +980,8 @@ bash <kit>/tests/validate.sh
 - [ ] `docker/Dockerfile` copied, binary/application name set
 - [ ] `bin/prime` copied, `chmod +x`, green on a fresh clone
 - [ ] `bin/dev` copied, `chmod +x`, `bin/dev up` green on a fresh clone
-- [ ] `docker-compose.yml` + `otel-collector.yml` copied, ports parameterized
+- [ ] `kit.ref` written and committed: a 40-char sha or a `v<semver>` tag, never a branch
+- [ ] `docker-compose.yml` is an OVERRIDE: no `ports:`, no `otel-collector`, no vendor config tree
 - [ ] `mise.toml` copied, every placeholder raised to a shipped version
 - [ ] `AGENTS.md` copied and filled in
 - [ ] A coverage command exists and `COVERAGE_FAIL_UNDER` is above 0
@@ -1177,17 +1363,17 @@ output. A proof nobody can see is a proof nobody ran — the same argument the
 self_test phase makes, applied to the harness rather than to the gate.
 
 **self_test** — `tests/self_test.sh` breaks a throwaway copy of this tree
-**fifty-six** ways: fifty-five assert the gate goes red, and one (23b)
-asserts the gate stays **green** while naming the skip that replaced a red. A
-further **green control** (31b) asserts a service config that agrees with kit's
-is *not* a failure. Fourteen breakages are for the static checks; one is a
-semantic mutation of each of the six language implementations, so **every suite
-is proven able to fail** rather than assumed to. A skip fails the run — a
-self_test that skips half its proofs and exits 0 is the "0 passed, 14 ignored"
-shape that verifies nothing. Thirty-seven of the static ones go further and assert
-that one *named* check reported `FAIL`, so the check written for a given defect
-is proven still load-bearing rather than being one of fifty checks that could
-have gone red for an unrelated reason.
+**sixty-five** ways: sixty-three assert the gate goes red, and two assert it
+stays **green** while naming what they said — 23b a SKIP that replaced a red, and
+59 a FINDING that did not yet fail the build. A further **green control** (31b)
+asserts a service config that agrees with kit's is *not* a failure. Fourteen
+breakages are for the static checks; one is a semantic mutation of each of the
+six language implementations, so **every suite is proven able to fail** rather
+than assumed to. A skip fails the run — a self_test that skips half its proofs and
+exits 0 is the "0 passed, 14 ignored" shape that verifies nothing. Forty-five of
+the static ones go further and assert that one *named* check reported `FAIL`, so
+the check written for a given defect is proven still load-bearing rather than
+being one of fifty checks that could have gone red for an unrelated reason.
 
 Breakage 19 is the allowlist one: an entry naming a test that does not exist,
 well-formed in every other respect. It is the rule most able to be decorative —
@@ -1211,6 +1397,17 @@ Any `FAIL` exits 1. A `SKIP` is always reported in the summary, never hidden.
 PyYAML, yamllint, zizmor, hadolint and gitleaks are required and are
 **bootstrapped by the gate itself**; the seven language toolchains and
 `shellcheck` run when present.
+
+**Four counts, because they are four different claims.** `PASS` and `FAIL` are
+about the tree. `SKIP` is about the **environment** — no docker, no toolchain,
+nothing ran. **`BOUND` is about the run**: the tier started, this machine was too
+busy to finish it, and the claim it exists to prove is therefore *unexercised*.
+The four heavy tiers — three docker stacks, and the self-test, which is *n*
+whole gates in sequence — carry a time bound for exactly this reason. A gate
+SIGKILLed by the OOM killer reports nothing about the tiers it never reached, so
+its green is a claim about how far it got; a bound converts that into a verdict
+that is stated rather than a run that stops. The summary prints both how many
+tiers ran under a bound and how many reached one.
 
 ### What the gate lints the Dockerfiles with, and why
 

@@ -276,6 +276,97 @@ version_at_least() {
   return 0
 }
 
+
+# ---------------------------------------------------------------------------
+# bounded_check <label> <bound-seconds> <command...>
+# ---------------------------------------------------------------------------
+#
+# `check` with a CEILING on how long it may take, and — this is the part that
+# matters — a fourth, named outcome when the ceiling is reached.
+#
+# WHY IT EXISTS. The gate grew past what one process can finish on a loaded
+# box: three docker stacks brought up and torn down, and thirty-two throwaway
+# copies of a 193 KB script each running their own bootstrap. The previous full
+# run on this branch was SIGKILLed (exit 137 — the kernel's OOM killer, not a
+# test failure) partway through the observability collector tier, which means
+# the gate reported *nothing* about the tiers it had not reached. A gate that is
+# killed is a gate whose green is a claim about however far it got.
+#
+# `timeout N` alone would fix the symptom and hide the disease in a new place:
+# a timed-out `check` prints FAIL with a two-word diagnostic that names neither
+# the tier nor the bound, and the next reader files it under "flaky". So the
+# bound is a verdict of its own — `BOUND` — carrying the tier, the bound and the
+# tail of what it had printed. It is counted separately in the summary, because
+# a bound that is reported as a PASS is exactly the silent skip the gate's own
+# rules forbid, and one reported as a FAIL is indistinguishable from a defect
+# in the tree.
+#
+# WHY IT IS NOT A SKIP. Nothing about a timed-out tier is unknown: we know it
+# did not finish, and the claim it exists to prove is therefore unexercised. A
+# SKIP is for a check that CANNOT run (no docker, no toolchain) and says so
+# about the environment. A bound is this machine being too busy, which is a
+# fact about the run and not about the tree — and it is the reason the gate
+# carries a bound at all rather than being allowed to be killed.
+#
+# `timeout` IS NOT PORTABLE and pretending otherwise would be the same class of
+# defect as the port rules this packet writes about: GNU coreutils ships it as
+# `timeout`, macOS has no `/usr/bin/timeout` at all, and Homebrew's coreutils
+# installs `gtimeout`. So it is RESOLVED, and a machine with neither runs the
+# tier unbounded and says so in the summary — a bound that silently did not
+# apply is worse than no bound, because the reader is told a ceiling exists.
+bounded_ran=0
+# Tiers that actually REACHED their bound. A separate counter from `bounded_ran`
+# on purpose: the summary line has to say "N tiers ran under a bound, M hit it",
+# and one counter cannot state both. An earlier version incremented one variable
+# in both places and printed "4 tier(s) hit their time bound" for a run in which
+# exactly one did — a summary that overstates a machine problem by 4x is the
+# fastest way to make a reader ignore the line entirely.
+bounded_hit=0
+_timeout_bin() {
+  for candidate in timeout gtimeout; do
+    if have "$candidate"; then
+      printf '%s' "$candidate"
+      return 0
+    fi
+  done
+  return 1
+}
+
+bounded_check() {
+  local label="$1" bound="$2"
+  shift 2
+  local runner out ec=0
+  if runner="$(_timeout_bin)"; then
+    bounded_ran=$((bounded_ran + 1))
+    # `--kill-after` so a tier that ignores SIGTERM is still ended: without it
+    # the bound is only a request, and the whole point is that the run ENDS.
+    out="$("$runner" --kill-after=30s "$bound" "$@" 2>&1)" || ec=$?
+  else
+    out="$("$@" 2>&1)" || ec=$?
+  fi
+  if [ "$ec" -eq 0 ]; then
+    report PASS "$label"
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out" | sed 's/^/       /'
+    fi
+  elif [ "$ec" -eq 124 ]; then
+    # 124 is `timeout`'s own code for "the bound was reached", and it is the
+    # only status here that means the command's verdict is unknown.
+    bounded_hit=$((bounded_hit + 1))
+    printf '%-4s %s\n' BOUND "$label"
+    printf '       exceeded its %ss bound on this machine. The tier did not finish, so\n' "$bound"
+    printf '       the claim it exists to prove is UNEXERCISED — this is not a defect in\n'
+    printf '       the tree, and it is not a pass. Re-run on a quieter box; every tier is\n'
+    printf '       bounded, so a run that reaches the end has exercised all of them.\n'
+    if [ -n "$out" ]; then
+      printf '%s\n' "$out" | tail -12 | sed 's/^/       /'
+    fi
+  else
+    report FAIL "$label"
+    printf '%s\n' "$out" | sed 's/^/       /'
+  fi
+}
+
 # ===========================================================================
 # phase: static
 # ===========================================================================
@@ -2658,12 +2749,25 @@ PY
   # is where the trap bites; a stub `docker` on PATH keeps the test hermetic and
   # fast, because what is under test is the shell, not compose.
   dev_escape_hatch_check() {
-    local stub sandbox out ec=0
+    local stub sandbox out ec=0 kitcheck
     stub="$TMP/dev-hatch-stub"
     sandbox="$TMP/dev-hatch"
-    rm -rf "$stub" "$sandbox"
-    mkdir -p "$stub" "$sandbox/bin" "$sandbox/grafana" "$sandbox/tempo" \
-      "$sandbox/loki" "$sandbox/mimir"
+    # The stub KIT TREE, as a separate directory. The sandbox below is a service
+    # repository, and after this packet a service repository holds NONE of the
+    # stack: no docker-compose.yml of kit's, no otel-collector.yml, no vendor
+    # config directories. Everything `bin/dev` mounts comes from the tree it
+    # fetches, so the fixture has to have one — pointed at with `KIT_STACK_DIR`,
+    # which is a checkout a person named rather than one that was fetched.
+    kitcheck="$TMP/dev-hatch-kit"
+    rm -rf "$stub" "$sandbox" "$kitcheck"
+    mkdir -p "$stub" "$sandbox/bin"
+    mkdir -p "$kitcheck/templates/compose" "$kitcheck/templates/compose/tempo" \
+      "$kitcheck/templates/compose/loki" "$kitcheck/templates/compose/mimir" \
+      "$kitcheck/templates/compose/grafana/provisioning"
+    : >"$kitcheck/templates/compose/docker-compose.yml"
+    : >"$kitcheck/templates/compose/otel-collector.yml"
+    : >"$kitcheck/templates/compose/.env.example"
+    printf '%s\n' "0000000000000000000000000000000000000000" >"$sandbox/kit.ref"
     cat >"$stub/docker" <<'STUB'
 #!/usr/bin/env bash
 # Reports readiness so `bin/dev up` believes the stack came up, and does
@@ -2677,24 +2781,33 @@ esac
 exit 0
 STUB
     chmod +x "$stub/docker"
-    # A compose file and the vendor config trees, so `require_files` passes and
-    # the run reaches `up`, which is where the trap fires. They are empty files
-    # on purpose: nothing here parses them.
-    : >"$sandbox/docker-compose.yml"
-    : >"$sandbox/otel-collector.yml"
-    : >"$sandbox/.env.example"
+    # The sandbox is a service repository and NOTHING ELSE: no compose file of
+    # kit's, no collector config, no `.env`. That is the shape this packet leaves
+    # behind, and the fixture has to be the shape or the check proves a world
+    # that no longer exists — the first version of this sandbox carried five
+    # empty files that `require_files` demanded, and the moment `require_files`
+    # went away the fixture stopped reaching `up` at all.
+    #
+    # `KIT_STACK_DIR` is how the escape hatch is exercised without a network: it
+    # is a checkout a person named on this run, which is source 1 of the four in
+    # `resolve_stack` and the only one that skips git entirely.
     cp "$ROOT/templates/bin/dev.sh" "$sandbox/bin/dev"
 
     # `KIT_DEV_PROFILES=''` and not `KIT_DEV_PROFILES=`: shellcheck reads the
     # latter as a typo, and it is right to.
-    out="$(cd "$sandbox" && KIT_DEV_PROFILES='' PATH="$stub:$PATH" \
-      bash ./bin/dev up 2>&1)" || ec=$?
+    out="$(cd "$sandbox" && KIT_DEV_PROFILES='' KIT_STACK_DIR="$kitcheck" \
+      PATH="$stub:$PATH" bash ./bin/dev up 2>&1)" || ec=$?
     case "$out" in
       *"unbound variable"*)
         echo "the documented escape hatch KIT_DEV_PROFILES= is broken:"
         printf '%s\n' "$out" | head -3
         return 1
         ;;
+      # Both halves are asserted, and the second is not decoration. Reaching the
+      # migration step proves the profile expansion survived; that the run got
+      # all the way there on a sandbox with NO `.env` and no stack of its own
+      # proves the fetch path does not require either. A fixture that wrote a
+      # `.env` would pass the first and silently not be testing the second.
       *"no migration command found"*) return 0 ;;
       *)
         echo "bin/dev with KIT_DEV_PROFILES= exited $ec without reaching the"
@@ -2705,6 +2818,278 @@ STUB
     esac
   }
   check 'templates/bin/dev.sh  (KIT_DEV_PROFILES= escape hatch actually runs)' dev_escape_hatch_check
+
+  # -------------------------------------------------------------------------
+  # THE FLEET GATE, and it is RED on master. That is the point, and the shape is
+  # the same as D4: three repositories that do not spell the same gate the same
+  # way is invisible to any check that reads only one of them, so kit's gate
+  # reads the OTHER repositories rather than trusting that they adopted it.
+  #
+  # Four failure modes, one check each, in tests/fleet_check.py:
+  #   - a service carrying a copy of the shared infrastructure
+  #   - a service that weakened the redaction boundary
+  #   - an otel-collector.yml that exists but that nothing ever starts
+  #   - a pin that is unpinned, or points at a branch
+  #
+  # IT SKIPS LOUDLY WHEN THERE IS NO FLEET, and that is not a detail. A clone of
+  # kit on CI has no siblings, and "no fleet was found" is not "the fleet is
+  # clean" — the same `unknown` vs `current` confusion tests/staleness.py exists
+  # to avoid. A gate that reports the second when it means the first is a gate
+  # that gets muted, and this one is going to be red a lot on purpose.
+  #
+  # `KIT_FLEET` is the seam, and it exists so self_test.sh can point the check at
+  # a FIXTURE fleet. Without it every breakage below would depend on the real
+  # fleet being present and dirty, which is a proof that passes when the fleet is
+  # absent — the exact shape this repository keeps warning about.
+  #
+  # The SKIP decision is `fleet_check.py`'s, not this file's, and the reason is a
+  # disagreement that was real. The first version guarded the call with its own
+  # "are there any sibling entries?" test — `ls -A ..` minus kit's own worktrees.
+  # A self-test's throwaway directory HAS sibling entries (one per breakage) and
+  # none of them is a repository, so the guard said "there is a fleet", ran the
+  # check, and the check exited 2 with "no cafaye repositories". The self-test's
+  # CONTROL would have gone red, which D13 treats as blocking the packet, for a
+  # reason that has nothing to do with the packet.
+  #
+  # So there is exactly one predicate for "is there a fleet", it lives beside the
+  # code that knows what a repository is, and it answers with a machine-readable
+  # marker. `check` cannot express three outcomes, which is why this is written
+  # out rather than delegated: a SKIP is not a PASS that happened quietly.
+  #
+  # THE ADOPTION CEILING, and it is the fourth outcome this block has to express.
+  # `fleet_check.py` answers three questions and this file must not collapse
+  # them: is there a fleet (SKIP), is any ADOPTING repository defective (FAIL),
+  # and is any UNADOPTED repository carrying debt (PASS, with the debt printed).
+  # The three outcomes are read off the exit code plus the `CEILING fleet:` line
+  # the check always prints, rather than from a fourth flag, because a fourth
+  # flag is a fourth thing to keep in step with the check that emits it.
+  #
+  # WHY A PASS CAN CARRY FINDINGS, and why this is not the softening the packet
+  # refuses. The strictness has not moved anywhere weaker; it has moved to WHERE
+  # ADOPTION EXISTS. The same four predicates, the same messages, the same
+  # severity — and the moment a repository commits `git -C ../kit rev-parse HEAD
+  # > kit.ref`, every finding inside it becomes a FAIL with no discretion and no
+  # re-review. A gate that stays red for thirteen findings no repository has
+  # agreed to fix is a gate whose red stops being read, and a gate nobody reads
+  # catches nothing. This is core-16's shape for a missing OpenAPI document, and
+  # it is a WAVE, not a discount: each repository's adoption converts its own
+  # named debt into a failure.
+  #
+  # The count is printed because a ceiling with no number on it cannot be
+  # argued about: "PASS" and "PASS with 13 named warnings across 6 repositories"
+  # are different statements, and only the second is true.
+  section 'static: the fleet adopts the stack rather than copying it'
+  fleet_out='' fleet_ec=0
+  fleet_out="$("$PY" "$ROOT/tests/fleet_check.py" --kit "$ROOT" \
+    --repos-dir "${KIT_FLEET:-$ROOT/..}" --no-fleet 2>&1)" || fleet_ec=$?
+  case "$fleet_out" in
+    *FLEET-ABSENT:*)
+      report SKIP 'fleet adoption (no cafaye repository on this machine — set KIT_FLEET=<dir>)'
+      ;;
+    *)
+      if [ "$fleet_ec" -eq 0 ]; then
+        if printf '%s\n' "$fleet_out" | grep -q '^WARN fleet: '; then
+          fleet_debt=$(printf '%s\n' "$fleet_out" | sed -n 's/^WARN fleet: //p')
+          report PASS "fleet  (adopting repositories clean; $fleet_debt — adoption debt, non-fatal until each repository writes kit.ref)"
+        else
+          report PASS 'fleet  (no stale copy, no weakened boundary, no dead config, every ref pinned)'
+        fi
+        printf '%s\n' "$fleet_out" | sed 's/^/       /'
+      else
+        report FAIL 'fleet  (no stale copy, no weakened boundary, no dead config, every ref pinned)'
+        printf '%s\n' "$fleet_out" | sed 's/^/       /'
+      fi
+      ;;
+  esac
+
+  # -------------------------------------------------------------------------
+  # THE COLLECTOR CONFIG IS MOUNTED FROM THE TREE `bin/dev` FETCHED, and this is
+  # the check for a defect that ONLY RUNNING THE STACK could find.
+  #
+  # `templates/compose/otel-collector.yml` carries the redaction allowlist. Once
+  # the file is no longer copied into the service, the compose file must mount it
+  # from `${KIT_COMPOSE_DIR:-.}`, and `bin/dev` must set that variable to the
+  # FETCHED tree. Get either half wrong and nothing above notices: the compose
+  # file parses, `docker compose config` renders the same project either way, and
+  # every static check in this file stays green — because the value of the
+  # variable is not a property of the YAML.
+  #
+  # What it actually does when it is wrong: the mount resolves to a path that does
+  # not exist, and Docker's answer to a missing bind source is to CREATE A
+  # DIRECTORY. The collector then exits naming a file type:
+  #
+  #   failed to read configFile /etc/tempo/tempo.yaml: is a directory
+  #
+  # which says nothing about the thing that is wrong, and arrives four containers
+  # after a stack that was supposed to come up. `tests/stack_live_test.sh` is what
+  # found it, by bringing the fetched stack up and reading the collector's own
+  # mount back with `docker inspect`. This check is the static half of the same
+  # property, so the defect cannot be re-introduced between one live run and the
+  # next.
+  #
+  # It asserts BOTH halves. Checking the compose file alone would pass on a
+  # `bin/dev` that stopped exporting `KIT_COMPOSE_DIR`; checking `bin/dev` alone
+  # would pass on a compose file that stopped using the variable. The defect is
+  # in their AGREEMENT, so the check is over their agreement.
+  stack_mount_check() {
+    "$PY" - "$ROOT" <<'PY'
+import re
+import sys
+
+root = sys.argv[1]
+compose = open(f"{root}/templates/compose/docker-compose.yml", encoding="utf-8").read()
+dev = open(f"{root}/templates/bin/dev.sh", encoding="utf-8").read()
+
+problems = []
+
+# 1. Every vendor config kit hands out is mounted through the variable, and none
+#    of them through a bare `./`. A bare `./` was correct when the file sat in the
+#    service and is wrong now that it does not, and nothing else in the tree would
+#    notice the difference.
+VENDOR_MOUNTS = {
+    "otel-collector.yml": "/etc/otel/otel-collector.yml",
+    "tempo/tempo.yaml": "/etc/tempo/tempo.yaml",
+    "loki/loki-config.yaml": "/etc/loki/loki-config.yaml",
+    "mimir/mimir.yaml": "/etc/mimir/mimir.yaml",
+    "grafana/provisioning": "/etc/grafana/provisioning",
+}
+for source, destination in VENDOR_MOUNTS.items():
+    mounted = [ln for ln in compose.splitlines()
+               if source in ln and destination in ln]
+    if not mounted:
+        problems.append(
+            f"docker-compose.yml does not mount {source} into {destination} at all"
+        )
+        continue
+    if not any("${KIT_COMPOSE_DIR:-.}" in ln for ln in mounted):
+        problems.append(
+            f"docker-compose.yml mounts {source} without ${KIT_COMPOSE_DIR:-.}. "
+            f"That path is relative to wherever compose runs, and `bin/dev` runs it "
+            f"from the service root - where this file no longer is. Docker creates a "
+            f"DIRECTORY at a missing bind source and the collector exits naming a "
+            f"file type instead of the mount that is wrong."
+        )
+
+# 2. `bin/dev` sets it, to the FETCHED compose directory and not the kit root.
+#    The kit root resolves every mount to `<kit>/grafana/provisioning`, which does
+#    not exist - the same failure, one directory up.
+if "KIT_COMPOSE_DIR=" not in dev:
+    problems.append(
+        "bin/dev never sets KIT_COMPOSE_DIR, so every vendor config mount falls "
+        "back to `.` and resolves against the service root"
+    )
+else:
+    exports = re.findall(
+        r"(?:export\s+)?KIT_COMPOSE_DIR=(?:\"([^\"]*)\"|'([^']*)'|([^\s#]*))", dev
+    )
+    values = [next(g for g in m if g) for m in exports if any(m)]
+    if not values:
+        problems.append("bin/dev mentions KIT_COMPOSE_DIR but never assigns it")
+    else:
+        bad = [v for v in values if "templates/compose" not in v]
+        if bad:
+            problems.append(
+                f"bin/dev assigns KIT_COMPOSE_DIR={bad[0]!r}, which is not the "
+                f"tree's templates/compose directory. Naming it after the thing it "
+                f"points at rather than after the repository it came from is what "
+                f"keeps the hand-copied case and the fetched case the same path with "
+                f"a different prefix, rather than two different shapes."
+            )
+
+# 3. The two files must agree on the DEFAULT too. `.` in the compose file means
+#    "the directory holding this file", which is right for a hand-copied stack and
+#    is the value `bin/dev` overrides. If the default were ever changed to the kit
+#    root, the hand-copied case would silently break instead of the fetched one.
+if "${KIT_COMPOSE_DIR:-.}" not in compose:
+    problems.append(
+        "docker-compose.yml no longer documents the `.` default for "
+        "KIT_COMPOSE_DIR, so the hand-copied stack has no path left to fall back to"
+    )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check 'templates/compose/ + bin/dev  (every vendor config mounts from the fetched tree)' \
+    stack_mount_check
+
+  # -------------------------------------------------------------------------
+  # THE PIN IS `kit.ref`, AND THREE FILES AGREE ON THAT SPELLING.
+  #
+  # `bin/dev` reads the pin, `tests/fleet_check.py` audits it, and
+  # `templates/compose/.env.example` documents where it is NOT. Three files, one
+  # fact, and the failure mode if they disagree is invisible: the fleet gate
+  # reports "kit.ref: ABSENT" on a repository whose `bin/dev` reads `.env`, and
+  # reads it as a broken repository rather than as two kit files that stopped
+  # agreeing — which is what it is, and which only kit can fix.
+  #
+  # This is the same SHAPE as the `callable path` check further down, and it is
+  # here for the same reason: a documented string that stops being true while
+  # every behavioural check stays green. `tests/fetch_test.sh` proves `bin/dev`
+  # honours the pin; this proves `bin/dev` and the gate are talking about the same
+  # one, which no execution of either can show.
+  pin_contract_check() {
+    "$PY" - "$ROOT" <<'PY'
+import re
+import sys
+
+root = sys.argv[1]
+dev = open(f"{root}/templates/bin/dev.sh", encoding="utf-8").read()
+fleet = open(f"{root}/tests/fleet_check.py", encoding="utf-8").read()
+example = open(f"{root}/templates/compose/.env.example", encoding="utf-8").read()
+
+problems = []
+
+# 1. `bin/dev` must actually read a file for the pin, and it must be named the
+#    same way `fleet_check.py` names it.
+assigned = re.search(r'^REF_FILE="([^"]+)"', dev, re.M)
+if not assigned:
+    problems.append(
+        "bin/dev has no REF_FILE assignment, so there is no committed pin file and "
+        "the gate's 'kit.ref: ABSENT' finding would be about a file bin/dev never "
+        "reads"
+    )
+else:
+    ref_file = assigned.group(1)
+    if "kit.ref" not in fleet:
+        problems.append(
+            f"bin/dev reads the pin from {ref_file!r} and fleet_check.py does not "
+            f"mention it, so the fleet gate audits a file nothing reads"
+        )
+    if ref_file not in dev:
+        problems.append(f"REF_FILE is {ref_file!r} but bin/dev never opens it")
+
+# 2. `.env.example` must NOT carry the pin. This is the assertion with teeth: the
+#    file becomes `.env`, `.env` is git-ignored, and a pin there exists on one
+#    machine and on no CI runner. Shipping a `KIT_STACK_REF=` line in the template
+#    is how that state gets reintroduced - and it would look like the pin is
+#    configured, which is worse than its absence.
+for line in example.splitlines():
+    m = re.match(r"^([A-Z_][A-Z0-9_]*)=", line)
+    if m and m.group(1) == "KIT_STACK_REF":
+        problems.append(
+            ".env.example sets KIT_STACK_REF. `.env` is git-ignored, so a pin there "
+            "exists on one machine and on no CI runner; the pin is `kit.ref`, "
+            "committed. Remove the line."
+        )
+        break
+
+# 3. `.env.example` must still TELL a developer where the pin lives. Removing the
+#    line without documenting the alternative leaves the ref undiscoverable, and
+#    the first `bin/dev` on a fresh clone fails with a message about a file
+#    nothing mentions.
+if "kit.ref" not in example:
+    problems.append(
+        ".env.example never mentions kit.ref, so a developer whose `.env` has no "
+        "pin is never told which committed file is supposed to hold one"
+    )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check 'templates/bin/dev.sh + .env.example  (the pin is kit.ref, and the gate reads the same file)' \
+    pin_contract_check
   # ------------------------------------------------------------------ core
   # The fan-out standard: vendir templates, the shared Renovate policy, and the
   # two runnable pieces (the change classifier and the staleness reporter).
@@ -5081,6 +5466,12 @@ for path in (
     # it is not.
     "tests/artifacts.json",
     "templates/parity-allowlist",
+    # The three the fetched-stack packet added. A README that documents the stack
+    # without documenting how it is OBTAINED describes a copy, and this packet's
+    # whole claim is that the copy is gone.
+    "tests/fetch_test.sh",
+    "tests/stack_live_test.sh",
+    "tests/fleet_check.py",
 ):
     if path not in readme:
         problems.append(f"README.md never mentions {path}")
@@ -5099,6 +5490,28 @@ for phrase, why in (
 ):
     if phrase.lower() not in readme.lower():
         problems.append(f"README.md does not state {why} (looked for {phrase!r})")
+
+# `kit.ref` IS NAME-ONLY, deliberately, and it is the one entry in the list above
+# that cannot also be an existence check. kit is the repository being pinned, so
+# it has no `kit.ref` of its own — requiring one would make this repository fail a
+# check about the repositories that consume it, which is the confusion the whole
+# split between "kit's own artifacts" and "the fleet" exists to prevent.
+#
+# It is read by two programs — `bin/dev` at run time and `tests/fleet_check.py`
+# at gate time — so a README that lists it in a table of files without saying what
+# it is has documented a file, not a contract.
+if not re.search(r"`?kit\.ref`?", readme):
+    problems.append(
+        "README.md never names kit.ref, so a reader cannot find where the pin "
+        "lives — and the pin is the one thing in this packet that decides which "
+        "bytes of kit a developer's machine runs."
+    )
+if not re.search(r"(?i)pin", readme):
+    problems.append(
+        "README.md never uses the word `pin`, so kit.ref reads as a filename "
+        "rather than as the thing it is. A reader who does not know it is a pin "
+        "will edit it to `master`."
+    )
 
 # The escape hatch, and the ports. A self-hoster reads the README and not the
 # code, so the variable name has to be in the README and so does the block.
@@ -6527,19 +6940,40 @@ if [ "$RUN_OBSERVABILITY" -eq 1 ]; then
   # Not skippable by preference. A dev machine with no docker gets a reported
   # SKIP, because the alternative — running the suite and reporting PASS while
   # the security claim went unexercised — is the shape of a proof nobody ran.
+  #
+  # BOUNDED, each tier with its own. Three docker stacks, eight containers apiece,
+  # brought up and torn down in sequence, on a machine that may also be running
+  # five other workers' gates. This is the tier the previous full run was
+  # SIGKILLed inside, and a kill costs the reader every tier after it — so each
+  # of these three carries a bound generous enough for a loaded box and a verdict
+  # of its own if it is reached.
+  #
+  # The numbers are ~3x the quiet-machine durations recorded in REPORT-kit-13.md
+  # §7, not a guess: a bound set at the observed quiet duration is a bound that
+  # fires on any contention at all, and a bound that fires is a tier that proved
+  # nothing.
   if ! have docker; then
     report SKIP 'observability proofs (docker not installed)'
   elif ! docker info >/dev/null 2>&1; then
     report SKIP 'observability proofs (docker daemon not reachable)'
   else
-    check 'tests/canary_test.sh  (a canary secret reaches no exporter)' \
-      bash "$ROOT/tests/canary_test.sh"
-    check 'tests/no_telemetry_in_readiness.sh  (collector killed, service still serves)' \
-      bash "$ROOT/tests/no_telemetry_in_readiness.sh"
+    bounded_check 'tests/canary_test.sh  (a canary secret reaches no exporter)' \
+      900 bash "$ROOT/tests/canary_test.sh"
+    bounded_check 'tests/no_telemetry_in_readiness.sh  (collector killed, service still serves)' \
+      900 bash "$ROOT/tests/no_telemetry_in_readiness.sh"
+    # THE STACK, RUN. Every claim in this file about the observability platform
+    # being usable is a claim about YAML until this one runs: that the FETCHED
+    # stack comes up healthy, that a trace arrives in Tempo, that a metric
+    # arrives in Mimir, and that a canary planted in ten attributes reaches
+    # neither. `docker compose config` proved a stack that could not start, twice,
+    # in this repository's own history — once because the collector's environment
+    # block was missing and once because Mimir's healthcheck named a directory.
+    bounded_check 'tests/stack_live_test.sh  (the fetched stack runs; a trace and a metric land)' \
+      900 bash "$ROOT/tests/stack_live_test.sh"
   fi
 fi
-# phase: classifier + staleness — the two runnable pieces, executed
 # ===========================================================================
+# phase: classifier + staleness — the two runnable pieces, executed
 #
 # Separate from `static` and run unconditionally, because both are the property
 # rather than the shape: classify_test asserts that the classifier FAILS on an
@@ -6556,6 +6990,20 @@ fi
   # skip silently drop the fail-closed proof. A gate that skips is not green.
 check 'tests/classify_test.sh  (19 cases, incl. the fail-closed property)' \
   bash "$ROOT/tests/classify_test.sh"
+
+# The fetch is a claim about a REAL SUBPROCESS talking to a REAL REMOTE, and it is
+# the only proof that `bin/dev` can obtain the stack it runs at all. A check that
+# parsed bin/dev would pass on a script that fetches nothing, which is why this is
+# executed and why its remote is a local bare repository rather than github.com: a
+# gate that goes red when the network is down is a gate people learn to re-run
+# with --no-observability, and then it is not a gate.
+#
+# Deliberately OUTSIDE the `RUN_STATIC` guard, for the reason the classifier and
+# the staleness reporter are: these are the PROPERTY rather than the shape, and a
+# gate that skips is not green.
+section 'fetch: the pinned kit ref resolves, and a moving one is refused'
+check 'tests/fetch_test.sh  (a pin fetches, a branch is refused, offline is real)' \
+  bash "$ROOT/tests/fetch_test.sh"
 
 section 'staleness: the fleet reporter tells the states apart'
 # The case count is READ OUT OF THE RUN rather than counted in the source, and
@@ -6631,27 +7079,21 @@ if [ "$RUN_SELF_TEST" -eq 1 ]; then
   # a hardcoded number is exactly the kind of thing that goes stale quietly when
   # the next packet adds a check. The wording follows from the counts so the two
   # cannot disagree.
+  # Three counts, because the helpers no longer agree on what they expect.
+  # `expect_skip_check` (breakage 23b) asserts the gate stays GREEN while naming
+  # a SKIP, and `expect_green_check` (breakage 59) asserts it stays green while
+  # naming a FINDING — kit-13's adoption ceiling, the other side of the same
+  # claim. Conflating either with the red-expecting helpers would either claim
+  # sixty-five reds when there are sixty-three, or drop a green-expecting proof
+  # from the label entirely, and a proof the summary does not count is a proof
+  # nobody runs.
   #
-  # Two numbers, not one, because breakage 23b asserts something the other
-  # fifty-five do not: that a check can report SKIP and still be load-bearing.
-  # Counting only reds would have made "56 breakages, 56 reds" a false summary
-  # of fifty-five red-assertions plus one green one — the same claim, wearing a
-  # number, that nobody would have checked.
-  #
-  # `expect_green` is deliberately NOT in the pattern. kit-12's breakage 31b is a
-  # CONTROL rather than a breakage: it asserts that a service config agreeing with
-  # kit's is not a failure, which is a claim about what must NOT go red. Counting
-  # it as a breakage would put a number on a control, and the header/recipe check
-  # below would then demand a numbered header entry for a recipe the header
-  # deliberately describes in prose.
-  #
-  # Both patterns anchor on the BREAKAGE LABEL, not on the helper name. An
-  # earlier version anchored on `^expect_` and counted 28 over 23 recipes: the
-  # four helper *definitions* are `expect_red() {` and match a bare `^expect_`
-  # exactly as well as a call does. Counting the labels cannot hit that, because
-  # a function definition never carries one — and a count that over-reports is
-  # worse than none, since it is indistinguishable from a correct one.
-  _st_breakages=$(grep -cE '^ *expect_(red(_check|_lang|_script)?|skip_check) +.breakage +[0-9]+[a-z]*:' "$ROOT/tests/self_test.sh" || true)
+  # The `green_check`/`skip_check` arms on the first pattern and their absence
+  # on the second are the load-bearing asymmetry: `breakages` is every recipe,
+  # `reds` is only the ones that must fail. Both read the same file, so neither
+  # can go stale, and both are anchored on the BREAKAGE LABEL so a helper
+  # *definition* can never be counted as a call.
+  _st_breakages=$(grep -cE '^ *expect_(red(_check|_lang|_script)?|green_check|skip_check) +.breakage +[0-9]+[a-z]*:' "$ROOT/tests/self_test.sh" || true)
   _st_reds=$(grep -cE '^ *expect_red(_check|_lang|_script)? +.breakage +[0-9]+[a-z]*:' "$ROOT/tests/self_test.sh" || true)
 
   # The header is a promise about what the file proves, and a promise nobody
@@ -6709,27 +7151,12 @@ carried = set(
         # and breakage 4's single; matching one of them would have reported a
         # disagreement that does not exist, and the fix belongs in the pattern
         # rather than in rewriting a working recipe to suit a new check.
-        # All FOUR helpers, or the check reports a header/recipe disagreement
+        # All FIVE helpers, or the check reports a header/recipe disagreement
         # that does not exist: breakages 21 and 22 are `expect_red_script`, and
         # a pattern missing `_script` calls them undocumented. Same omission as
         # the `_st_breakages` count above — one bug, two symptoms, because the
         # helper list was written down twice.
-        #
-        # `^ *` and not `^`, and this is the third time this pattern has needed
-        # it. Breakages 23 and 23b sit inside a `command -v ruby` guard because
-        # their fixture is a stub `ruby`, so their calls are INDENTED — and a
-        # column-0 pattern reported two documented breakages as carrying no
-        # recipe. The check was right about the disagreement and wrong about the
-        # cause: the recipes exist, at column 2. A pattern tight enough to
-        # reject a real recipe is not a stricter check, it is a broken one, and
-        # the failure it produces looks exactly like missing documentation.
-        #
-        # `[ \t]*`, not `\s*`: under re.M `\s` matches a newline, so `\s*` could
-        # span from the end of one line onto the next and match a `breakage 23:`
-        # label belonging to a call that is not a recipe at all. One permissive
-        # character here would trade a false negative for a false positive on the
-        # very check that exists to catch drift.
-        r"""^[ \t]*expect_(?:red(?:_check|_lang|_script)?|skip_check) ['"]breakage\s+(\d+[a-z]?):""",
+        r"""^[ \t]*expect_(?:red(?:_check|_lang|_script)?|green_check|skip_check) ['"]breakage\s+(\d+[a-z]?):""",
         src,
         re.M,
     )
@@ -6784,19 +7211,59 @@ PY
   check 'tests/self_test.sh  (every documented breakage has a recipe, and vice versa)' \
     self_test_claims
 
-  if check "tests/self_test.sh  ($_st_breakages breakages, $_st_reds reds, $((_st_breakages - _st_reds)) skip-proofs)" \
-    bash "$ROOT/tests/self_test.sh"; then
-    :
-  fi
+  # The label carries both numbers and, deliberately, does not sum them into
+  # "N breakages, N reds" the way it did while every recipe was red-expecting.
+  # Sixty-five breakages of which sixty-three must go red and two must stay green
+  # — 23b naming a SKIP, 59 naming a FINDING — is a *stronger* suite than
+  # sixty-five that must all go red, and a label that flattened the two would hide
+  # the only facts that distinguish them.
+  #
+  # BOUNDED, and this is the phase that most needs it. Every recipe builds a
+  # fresh throwaway copy of the tree and runs the whole static gate inside it, so
+  # the self-test is _n_ gates in sequence: 65 on this branch, and the number
+  # grows with every check this repository adds. On a quiet box it is the
+  # longest phase in the run by a wide margin, and it is the one that grows
+  # silently — nothing in it announces that the gate just got slower.
+  #
+  # 5400s is measured, not chosen. The uninterrupted run recorded in
+  # REPORT-kit-13.md §5.2 took ~44 minutes end to end, of which the self-test
+  # phase was the majority; 5400 leaves room for a box three times busier than
+  # this one without being a number so large it never binds. A bound that never
+  # binds is the correct answer here — the point is that the run REACHES THE END
+  # and says so, not that it fails sooner. A tier that hits its bound is reported
+  # as a BOUND, which is neither a pass nor a skip, so a bound cannot buy a green
+  # this tree did not earn.
+  bounded_check "tests/self_test.sh  ($_st_breakages breakages: $_st_reds red, $((_st_breakages - _st_reds)) green-expecting — the ceiling has both sides proved)" \
+    5400 bash "$ROOT/tests/self_test.sh"
 fi
 
 # ---------------------------------------------------------------------------
 
 printf '\n'
+# FOUR COUNTS, and the reason there are four is the reason this summary exists
+# at all. `PASS` and `FAIL` are verdicts about the tree. `SKIP` is a verdict
+# about the ENVIRONMENT: the check could not run here. `BOUND` is a verdict
+# about the RUN: the check started, this machine was too busy to finish it, and
+# the claim it exists to prove is therefore unexercised.
+#
+# Collapsing BOUND into FAIL would report a loaded box as a defect in the tree,
+# and collapsing it into PASS would be a lie with a green word on it. Either way
+# the reader loses the one thing they need: which failures to go and fix, and
+# which to go and re-run. The count is printed whenever it is non-zero, exactly
+# like the skip count, so a run that hit a bound cannot end quietly.
 if [ "$fails" -ne 0 ]; then
   echo "FAIL: $fails check(s) failed."
   [ "$skips" -eq 0 ] || echo "note: $skips check(s) skipped (reported above)."
+  [ "$bounded_hit" -eq 0 ] || echo "note: $bounded_hit tier(s) hit their time bound — the proof was unexercised, not passed (reported above)."
   exit 1
 fi
 echo "PASS: every check passed."
 [ "$skips" -eq 0 ] || echo "note: $skips check(s) skipped — reported above, never hidden."
+[ "$bounded_hit" -eq 0 ] || echo "note: $bounded_hit tier(s) hit their time bound — reported above, never hidden."
+# And the bound itself, on the runs where it did NOT bind, because a ceiling the
+# reader has never been told about is a ceiling they cannot rely on. Only
+# printed when a bound was actually applied, so a machine with no `timeout` at
+# all is not told about bounds it never had.
+if [ "$bounded_ran" -gt 0 ]; then
+  echo "note: $bounded_ran tier(s) ran under a time bound; none was reached."
+fi

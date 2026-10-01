@@ -54,6 +54,37 @@ Run these; do not improvise equivalents.
   the identifier needed to find the failing row, not just a message.
 - Money is integer minor units. Time is UTC. IDs are opaque strings.
 
+## The local stack
+
+**You do not copy kit's stack.** There is no `docker-compose.yml` of kit's in this
+repository, no `otel-collector.yml`, and no `tempo/`, `loki/`, `mimir/` or
+`grafana/`. `bin/dev` fetches all of it from a **pinned** ref and runs it beside
+your own `docker-compose.yml`, which is an **override** — the second `-f`, so what
+is in it wins and everything you did not mention still comes from kit.
+
+- **`kit.ref`, one committed line at the repository root, is the pin.** A
+  40-character commit sha, or a `v<MAJOR>.<MINOR>.<PATCH>` tag. **Never a branch**,
+  and never a variable in `.env`: `.env` is git-ignored, so a pin there exists on
+  one machine and on no CI runner. `bin/dev` refuses a branch loudly, before any
+  network call. `bin/dev pin <ref>` moves it deliberately and prints the stack diff
+  first.
+- **Your `docker-compose.yml` may** set `image:`, add keys to `environment:`, add
+  a `depends_on`, declare your own services, and change a published port **by
+  changing the variable in `.env`**.
+- **Your `docker-compose.yml` may not** touch `otel-collector` — not its `image:`,
+  not its `command:`, and above all not the `volumes:` entry that mounts
+  `otel-collector.yml`. That file carries the redaction allowlist, and it is
+  **derived from core's schemas**; owning it means shipping a telemetry boundary
+  nobody derived, and prompt content leaves the process inside it. Nor may you
+  override the four AGPL backends, set `allow_all_keys`, or add an exporter.
+- **A `ports:` entry for a service kit ships is a bug, and a quiet one.** Compose
+  **appends** a second file's `ports:` list rather than replacing it, so writing
+  one publishes postgres on kit's port *and* on yours. Move the port in `.env`.
+  This is measured, not folklore, and kit's gate fails on it.
+- **Pointing at your own database is an override, not a second container:**
+  `services.postgres.environment.POSTGRES_DB`. `environment:` merges by key, so
+  kit's healthcheck, volume and port survive.
+
 ## Observability
 
 On by default. Not opt-in, and not something a developer turns on to see traces

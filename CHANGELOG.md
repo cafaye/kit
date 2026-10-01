@@ -134,6 +134,77 @@ it without a copy (see kit-12 below).
 
 ### Added
 
+- **kit-13 — the observability stack gets a live path, and a gate that says which
+  repositories are not on it.** `templates/compose/` shipped a complete local
+  observability platform and **no service used it**: no repository had an
+  `otel-collector.yml`, six carried a bespoke 52–158 line
+  `docker-compose.yml` whose only infrastructure was a Postgres, and **none**
+  adopted `bin/dev`. The stack was built, gated, and running nowhere.
+
+  - **`bin/dev` fetches the stack from a PINNED kit ref** and runs it beside the
+    service's own `docker-compose.yml`, which is an override. A compose file
+    cannot be `uses:`-ed — GitHub resolves reusable *workflows* and nothing else —
+    so `bin/dev` is the callable path and the pin is what makes it one.
+    `git init` + `fetch --depth 1` rather than `clone --branch`, because
+    `--branch` cannot take a commit sha and so cannot express the stricter of the
+    two pin forms.
+
+  - **The pin is `kit.ref`, a committed one-liner — and it was `.env` first.**
+    `.env` is git-ignored, so a pin there exists on exactly one machine and on no
+    CI runner or teammate's checkout, which turns "one command, always current"
+    into "one command, whatever this checkout last fetched". `bin/dev pin <ref>`
+    moves it deliberately and prints the stack diff first. A 40-char sha or a
+    `v<semver>` tag; a branch is refused **before any network call**, because by
+    the time a fetch has returned it has already changed under you.
+
+  - **`KIT_STACK_OFFLINE=1` is a real mode.** It uses only `KIT_STACK_DIR`, the
+    cache, or a copy vendored at `.kit/stack` — and fails loudly, naming each,
+    when none holds the pin. A cached or vendored tree must RECORD its ref in
+    `.kit-stack-ref`; a directory that merely contains `templates/compose/` is
+    refused, because accepting one silently is how an offline loop stops matching
+    what the team runs.
+
+  - **`tests/fetch_test.sh`** — 14 assertions, executed. A pinned ref resolves and
+    the fetched bytes are byte-identical to the tree; a branch, a short sha and
+    an empty pin are each refused with a message that says why; offline runs from
+    a cache with the remote deleted from disk, fails loudly with a cold one, and
+    accepts or refuses a vendored copy by whether it declares the pin. The remote
+    is a local `file://` bare repository built from this tree, so the suite needs
+    no network.
+
+  - **`tests/stack_live_test.sh`** — 15 assertions, executed, and the reason the
+    packet is not "a compose file that parses". It brings the **fetched** stack up
+    (all eight containers healthy), sends real OTLP, and reads a trace out of
+    Tempo and a metric out of Mimir — including the `spanmetrics` connector's
+    `cafaye_duration_count`, which is what the fleet dashboard is built on. The
+    canary reaches no exporter, asserted as an absence against a search that first
+    proved the data is there. The collector's config is checked by
+    `docker inspect .Mounts`: the daemon's own record of the bind, not the host's
+    idea of it and not the container's (the image is distroless).
+
+  - **`tests/fleet_check.py`, wired into the gate as `fleet`.** Four failure
+    modes, one check each: a service carrying a copy of the shared stack, a
+    service that re-points the collector's config mount (the redaction allowlist,
+    derived from core's schemas), an `otel-collector.yml` nothing ever mounts, and
+    a pin that is a branch. It reads the **sibling repositories**, not kit's own
+    files, because the defect is in the callers — the same shape as D4.
+    **It is red against the current fleet and that is the deliverable**: five
+    repositories carry their own copy of the shared stack, six have no pin, and
+    two publish a port on a service kit already ships. The predicate is the
+    image, not the service name, and the image set is read out of kit's own
+    compose file rather than a hand-kept list — three of the five copies name
+    their database `db` rather than `postgres`, so a name-keyed check would report
+    the fleet clean while five copies stood right there.
+
+  - **Nine breakages (52–60), eight asserting the NAMED check and one asserting
+    the gate stays green while naming its finding.** The fleet ones run against a
+    **fixture fleet** rather than the real one — which is what makes the
+    assertion mean anything when the real fleet is red by design. Breakage 58
+    covers the `ports:` append rule and carries **no `image:`**, so it fires the
+    port rule alone: a breakage that reddened two rules at once would not say
+    which of them is load-bearing. 59 and 60 are the adoption ceiling's two
+    sides and are described below.
+
 - **kit-14 — the staleness reporter, pointed at `templates/`, and the word
   `absent`.**
   kit already had a change classifier and a staleness reporter for `core/`, and
@@ -2540,6 +2611,32 @@ a
 t
 e
 .
+### Changed
+
+- **`templates/compose/docker-compose.yml` — the vendor config mounts are anchored
+  to `${KIT_COMPOSE_DIR:-.}`.** The file is no longer copied into the service, so
+  a bare `./` resolves against the service, where `otel-collector.yml` no longer
+  is; and Docker's answer to a missing bind source is to **create a directory**, so
+  all four backends died with `read /etc/tempo/tempo.yaml: is a directory` —
+  naming a file type rather than the thing that is wrong. `docker compose config`
+  renders the same project either way, and every static check was green. The
+  default `.` is the directory holding this file, so a hand-copied stack is
+  unchanged; `bin/dev` sets the variable to the fetched tree.
+
+- **`templates/compose/docker-compose.yml` — Grafana no longer downloads a plugin
+  on first boot** (`GF_INSTALL_PLUGINS_PREINSTALL_DISABLED=true`). Grafana 11.3
+  preinstalls `grafana-lokiexplore-app` and holds the sqlite lock its own
+  migrations want, so a cold start took anywhere from 26s to over **180s** to
+  answer `/api/health` — a network call in a dev loop, and one that made the stack
+  unstartable for an air-gapped developer. Nothing kit ships uses that plugin:
+  both dashboards read Loki through the provisioned datasource and the alert rules
+  are PromQL. It is *configuration*, not a modification — the AGPL condition is
+  about not building a `grafana/*` image. **The Grafana healthcheck budget was
+  left at its shipped value**: the wrong fix, raising the retries, would have hidden
+  the network dependency and left the loop unusable offline. With the cause
+  removed, Grafana answers at ~26s against a 65s budget and the whole stack is up
+  in 76s.
+
 ### Fixed
 
 - **`expect_red_check` reported a successful match as a failure, once the output

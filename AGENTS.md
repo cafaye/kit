@@ -223,18 +223,20 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   is the one that tells a working config from a valid one, and — unlike every
   other phase — it is **fatal on a skip**, because the claim under test is "kit's
   configs work" and a run in which no linter executed has not tested it.
-- **self_test** — fifty-six breakages of a throwaway copy. Fifty-five assert
-  the gate goes red; one (23b) asserts the gate stays green while naming a skip,
-  because a check that turns a red into an honest skip is load-bearing precisely
-  by not going red. One further GREEN control (31b) asserts a service config
-  that AGREES with kit's does not fail, because a check satisfied by banning the
-  file would train every service to delete one. Six are a semantic mutation of one
-  language each, so **every suite is proven able to fail** rather than assumed
-  to. Thirty-seven assert that one *named* check reported `FAIL`, so a check
-  written for a specific defect is proven still load-bearing. Two assert that a
-  *proof* goes red: one inverts the classifier's fail-closed property, and one
-  makes the staleness reporter call an undeclared pin `current`. A property
-  nobody has tried to break is a property nobody has tested.
+- **self_test** — sixty-five breakages of a throwaway copy. Sixty-three assert
+  the gate goes red; two assert it stays **green** while naming what it said —
+  23b a SKIP, because a check that turns a red into an honest skip is
+  load-bearing precisely by not going red, and 59 a FINDING, because kit-13's
+  adoption ceiling is only a ceiling if its unadopted side is proved green too.
+  One further GREEN control (31b) asserts a service config that AGREES with
+  kit's does not fail, because a check satisfied by banning the file would train
+  every service to delete one. Six are a semantic mutation of one language each,
+  so **every suite is proven able to fail** rather than assumed to. Forty-five
+  assert that one *named* check reported `FAIL`, so a check written for a specific
+  defect is proven still load-bearing. Two assert that a *proof* goes red: one
+  inverts the classifier's fail-closed property, and one makes the staleness
+  reporter call an undeclared pin `current`. A property nobody has tried to break
+  is a property nobody has tested.
 - **A toolchain's floor is checked against the floor the ARTIFACT declares.**
   `KitOtel::RUBY_FLOOR` says what `templates/otel/ruby` needs and the gate reads
   that constant rather than restating the number. Below the floor is a loud,
@@ -309,6 +311,20 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   A required check whose tool path is hardcoded to a directory the resolver may
   have skipped is a gate that fails on arrival; that is a bug this file has
   already had once.
+- **Four counts, because they are four different claims.** `PASS` and `FAIL`
+  are verdicts about the tree. `SKIP` is a verdict about the **environment** —
+  no docker, no toolchain, nothing ran. `BOUND` is a verdict about the **run** —
+  the tier started, this machine was too busy to finish it, and the claim it
+  exists to prove is therefore unexercised. The heavy tiers (three docker stacks,
+  and the self-test, which is *n* whole gates in sequence) carry a time bound for
+  exactly this reason: a gate SIGKILLed by the OOM killer reports nothing about
+  the tiers it never reached, so its green is a claim about how far it got. A
+  bound that is reported as a PASS is the silent skip this file forbids; a bound
+  reported as a FAIL is indistinguishable from a defect in the tree. It is its
+  own verdict, and the summary prints both the number that ran under a bound and
+  the number that reached one. `timeout` is **resolved**, not assumed — GNU
+  coreutils calls it `timeout`, macOS has no `/usr/bin/timeout`, Homebrew's
+  installs `gtimeout`.
 - **A skip is a gap, and the summary line is how you find it.** The seven
   Dockerfiles sat behind `SKIP ... (no parser for this file type)` for the whole
   life of kit-02, and the only reason anyone knew is that the summary printed
@@ -331,7 +347,7 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   rubocop ran on kit's own Ruby with kit's own config. That is the only way an
   obsolete key surfaces before six repos inherit it.
 - The suite must be able to fail: `self_test` breaks a throwaway copy of the
-  tree fifty-six ways and asserts the run goes red. If you change the suite,
+  tree sixty-five ways and asserts the run goes red. If you change the suite,
   keep that true.
 
 ## The classifier fails closed, and that is a rule about code
@@ -438,6 +454,44 @@ repository does not have, which left the repository that defines the standard
 structurally excluded from using it. If you add a job for a new option, the
 `ci_check` block in `tests/validate.sh` must know about it in the same commit:
 an `option` with no `job` is a green build that ran nothing.
+
+## The stack is FETCHED, and the pin is the only thing that decides what it is
+
+`templates/compose/` is not copied into a service. `bin/dev` fetches it from the
+ref named in the service's committed **`kit.ref`** and runs it beside the service's
+own `docker-compose.yml`, which is an **override**. A compose file cannot be
+`uses:`-ed, so `bin/dev` is the callable path and the pin is what makes it one.
+
+Three rules follow, and each is a thing that has to be true rather than a thing
+that is usually true:
+
+- **A pin is a 40-character commit sha or a `v<semver>` tag.** Never a branch.
+  The ref decides which redaction allowlist, port block and dashboards a
+  developer's loop runs, and on a branch those change between two runs of the
+  same command.
+- **The pin is `kit.ref`, not `.env`.** `.env` is git-ignored, so a pin there
+  exists on one machine and on no CI runner — which turns "one command, always
+  current" into "one command, whatever this checkout last fetched".
+- **`tests/fleet_check.py` reads the CALLERS, not this repository.** A defect in
+  the standard is invisible to a gate that only reads the standard, which is the
+  same argument as D4. As measured: six repositories declare local
+  infrastructure, **five** carry their own copy of the shared stack (billing,
+  courier, darkroom, identity, muse), **all six** have no `kit.ref`, and **two**
+  publish a port on a service kit already ships — 13 findings, and the gate names
+  every one of them. **All six are currently WARNINGS and none is a FAIL**, because
+  the ceiling keys on adoption and not one of them has adopted. That is the state
+  to beat, and it is a state the gate is now *about to be able to leave*: the
+  first repository to commit `kit.ref` finds its own two or three findings are
+  failures, with no change to this repository.
+
+  Do not soften the checks to make this repository green. Do not raise the
+  ceiling either — a repository that HAS adopted is judged strictly, and
+  `breakage 60` in `self_test.sh` is the recipe that would go red if that ever
+  stopped being true. Report the findings; name the repositories.
+
+`README.md` carries the override rules, and one of them is a trap worth knowing
+before you write a service compose file: **a second file's `ports:` list is
+appended, not substituted.** Move a port in `.env`; never in the override.
 
 ## Rules
 
