@@ -2794,6 +2794,60 @@ if not os.path.isfile(contract_path):
     )
 contract = json.load(open(contract_path, encoding="utf-8"))
 
+
+def strip_comments(src, lang):
+    """`src` with its COMMENTS removed, per language.
+
+    Exists because a required setting can be named in prose and not set in code,
+    and a substring test cannot tell the two apart. Measured: the go snippet's
+    header comment reads "1. application_name — THE ONE THAT IS NOT OPTIONAL",
+    so deleting the one line that sets it left the contract satisfied and
+    self-test breakage 72 green.
+
+    The rules, and the reasoning behind each:
+
+      * go / elixir / node / rust  — `//` to end of line. Elixir is the awkward
+        one: a `#` starts a comment there too, and `#{}` is interpolation, so a
+        `#` is only a comment when it is NOT inside `{}`.
+      * python                     — `#` to end of line.
+      * ruby (a `.yml`)            — `#` to end of line. The ruby snippet is
+        DATA, so this strips YAML comments; it is not ERB, because the file holds
+        `<%= ENV.fetch(…) %>` as a plain scalar.
+
+    String literals are NOT tracked, and that is the conservative choice in the
+    right direction: a comment marker inside a string is left in place, so the
+    code that follows it is still scanned and a real setting is still found. The
+    failure this could cause is a false NEGATIVE — a setting missed because a
+    `#` in a string opened a comment that ran to end of line — and every one of
+    the six snippets' settings is on its own line above such a marker, so it
+    survives. The opposite error, eating code that carries a setting, would make
+    this check red on a correct tree.
+    """
+    out = []
+    for line in src.splitlines():
+        marker = None
+        if lang in ("go", "node", "rust"):
+            marker = "//"
+        elif lang in ("python", "ruby"):
+            marker = "#"
+        elif lang == "elixir":
+            # `#` but not `#{…}`: interpolation is code and can hold a setting.
+            i = line.find("#")
+            if i != -1 and not (i + 1 < len(line) and line[i + 1] == "{"):
+                marker = "#"
+        if marker is None:
+            out.append(line)
+            continue
+        i = line.find(marker)
+        if i == -1:
+            out.append(line)
+        else:
+            # Keep the indentation so a reader of the finding can see where the
+            # line was; only the comment text goes.
+            out.append(line[:i].rstrip())
+    return "\n".join(out)
+
+
 required = contract.get("requiredSettings") or []
 pool = contract.get("boundedPool") or {}
 pool_tokens = pool.get("tokens") or []
@@ -2823,10 +2877,32 @@ for entry in languages:
         problems.append(f"{lang}: {rel} does not exist")
         continue
     body = open(path, encoding="utf-8").read()
+    # THE CODE, NOT THE PROSE. Measured, and it is the rule AGENTS.md states
+    # about `-count=1`: a check that a comment can satisfy is not a check.
+    #
+    # `application_name` appears in the go snippet's header comment — "1.
+    # application_name — THE ONE THAT IS NOT OPTIONAL" — so deleting the only
+    # line that ACTUALLY SETS it left the substring in the file and this check
+    # reported the contract satisfied. Self-test breakage 72 exists to catch
+    # precisely that, and it was green: the mutation it performs is the one this
+    # check could not see.
+    #
+    # So the required-setting test reads code with the comments removed. It is a
+    # per-language stripper rather than one regex because a line comment is `//`
+    # in four of the six languages, `#` in two, and a YAML or a doc comment is not
+    # a line comment at all — a stripper that got this wrong would either eat real
+    # code (a `#` inside a string) or leave the comment in.
+    #
+    # The stripper is deliberately CONSERVATIVE: it removes a comment it can
+    # recognise and leaves anything ambiguous alone, because a false NEGATIVE
+    # here (comment retained, check still satisfied) is the bug being fixed,
+    # while a false positive (code removed, a real setting reported absent) would
+    # be a red on a correct tree — and both directions are proven below.
+    code = strip_comments(body, entry.get("lang", ""))
 
     for setting in required:
         key = setting.get("key", "?")
-        if key not in body:
+        if key not in code:
             problems.append(
                 f"database/{lang}: does not set {key}. {setting.get('why', '')} "
                 f"The contract is templates/database/contract.json and this file "
@@ -2835,7 +2911,7 @@ for entry in languages:
                 f"cluster."
             )
 
-    if not any(t in body for t in pool_tokens):
+    if not any(t in code for t in pool_tokens):
         problems.append(
             f"database/{lang}: no bounded pool setting. Expected one of "
             f"{pool_tokens}. {pool.get('why', '')}"
@@ -2845,7 +2921,7 @@ for entry in languages:
     # the directory: a single check over the directory would be satisfied by four
     # clean files beside one that carries the flag.
     for bad in forbidden:
-        if bad in body:
+        if bad in code:
             problems.append(
                 f"database/{lang}: contains {bad!r}, which is a pooler "
                 f"workaround. kit runs NO pooler — see "

@@ -91,8 +91,8 @@
 
   "boundedPool": {
     "why": "This service's share of the cluster's connection budget, expressed as a cap inside the process. It is the INNER of two caps: the cluster's per-role `ALTER ROLE … CONNECTION LIMIT` is the outer one, and the two must agree in the direction that is safe — an inner cap larger than the outer one does not give the service more connections, it gives it errors.",
-    "tokens": ["pool_max_conns", ":pool_size", "MAX_CONNS", "pool:", "max:"],
-    "tokensWhy": "One token per language's own spelling, because the check is over GENERATED OUTPUT and each driver names this differently. A single canonical token would have meant rewriting each snippet to carry a token its driver does not use, which is decoration rather than a contract."
+    "tokens": ["pool_max_conns", "pool_size", "MAX_CONNS", "pool:", "max:"],
+    "tokensWhy": "One token per language's own spelling, because the check is over GENERATED OUTPUT and each driver names this differently. A single canonical token would have meant rewriting each snippet to carry a token its driver does not use, which is decoration rather than a contract. `pool_size` carries NO leading colon because the check now strips comments before looking: the Elixir snippet's real setting is `pool_size: @pool_size,` and the `:pool_size` spelling existed only in its prose, so the token was being satisfied by a comment and reported the bounded pool as absent once the comments went."
   },
 
   "languages": [

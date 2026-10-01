@@ -15,6 +15,29 @@ it without a copy (see kit-12 below).
 
 ### Fixed
 
+- **the connection-contract check was satisfied by a comment.** It tested
+  `if key not in body` over the whole snippet, and the go snippet's header says
+  "1. `application_name` — THE ONE THAT IS NOT OPTIONAL". So deleting the single
+  line that *sets* it left the substring in the file and the contract reported
+  satisfied — and **self-test breakage 72, which performs exactly that deletion,
+  was green.** This is the rule AGENTS.md already states about `-count=1` ("a
+  check that a comment can satisfy is not a check") arriving in a new place, and
+  the only reason it is written down here is that the self-test could not see it:
+  the mutation was real, the recipe ran, and the check agreed with the tree.
+
+  All three of the check's tests now read code with the comments stripped, per
+  language — `//` for go/node/rust, `#` for python, and for elixir a `#` that is
+  **not** `#{`, because interpolation is code and can carry a setting. The
+  stripper does not track string literals, which is deliberate and conservative:
+  a comment marker inside a string leaves its line scanned rather than eating the
+  code after it, so the failure this can cause is a missed setting, never a
+  setting wrongly reported absent.
+
+  Fixing it also corrected `contract.json`'s bounded-pool token: it listed
+  `:pool_size`, a spelling that existed only in the Elixir snippet's *prose*,
+  while the code says `pool_size: @pool_size`. Once the comments stopped
+  counting, the token read as absent and named a real defect in the token list.
+
 - **`self_test.sh` classified a caught defect as a machine failure, on a large
   gate report.** The `env_skips` branch added in `1d98e42` tested for a finding
   with `printf '%s\n' "$out" | grep -qE '^(FAIL|SKIP)'` — while the verdict three

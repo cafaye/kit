@@ -2863,6 +2863,20 @@ base72="$(fresh_copy kit-72)"
 # key, so a check that greps for `application_name` would be satisfied by the
 # exact defect — a service whose queries cannot be attributed to it, which is the
 # bug the setting exists to prevent.
+#
+# AND THIS RECIPE WAS GREEN ON A CHECK THAT COULD NOT SEE IT, which is the
+# second half and the reason it is worth the paragraph above. The go snippet's
+# header comment reads "1. application_name — THE ONE THAT IS NOT OPTIONAL", so
+# after the line above was deleted the substring was still in the file — in a
+# COMMENT — and the contract check reported the contract satisfied. The recipe
+# ran, the mutation was real, and the check agreed with the tree.
+#
+# The rule is the one AGENTS.md states about `-count=1` — a check a comment can
+# satisfy is not a check — and the check now strips comments per language before
+# looking for a required setting. The two things this recipe proves are
+# different and both matter: the SETTING is required (it is), and the check reads
+# code rather than prose (it now does). A recipe that passed for the first reason
+# would have been green either way.
 edit "$base72/templates/database/go/database.go.snippet" \
   '	cfg.ConnConfig.RuntimeParams["application_name"] = serviceName
 ' ''
