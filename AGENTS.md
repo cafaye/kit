@@ -287,6 +287,23 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   six that needs this: the other five refuse an old toolchain themselves, at
   build time, with a message naming their own requirement. Ruby 2.6 is the only
   one that loads the template happily and raises on first use.
+- **`self_test` hits its 90-minute bound on a busy box, and a `BOUND` tier is
+  not evidence about the breakages it never reached.** This repository's machine
+  runs several kit gates at once, and the self-test is *n* whole gates in
+  sequence, so it is the phase that binds first. Measured on kit-22: the full
+  gate **exited 0** while `self_test` reported `BOUND` at breakage **56 of 77** —
+  so 57-77 were never executed, and a green gate says nothing whatever about
+  them.
+  - The `BOUND` verdict is what made that legible, and it is why the bound is not
+    a failure: the point of the run is to reach the end and say so, and a bound
+    reported as a pass would be the silent skip this file forbids. It bought
+    nothing here, and the summary line is how a reader finds it.
+  - **So a `BOUND` self_test is a gate to run BY HAND, not a gate to report.**
+    Take the recipes that were not reached, apply each one's own mutation to a
+    throwaway copy, and run the static gate in it. On kit-22 that is how
+    breakage 72 was found to be green on a check that could not see the defect
+    it was written to catch — the `BOUND` did not hide a failure, it created the
+    gap where one was found.
 - **A green control that two different checks could satisfy proves neither.**
   This is the `reportUnusedDisableDirectives` rule's other half, and breakage 75
   exists because it was violated by kit's own self-test. The rule above is about
