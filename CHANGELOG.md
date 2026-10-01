@@ -21,10 +21,12 @@ it without a copy (see kit-12 below).
 
   kit does not ship a deployment tool or a backup tool. `kamal` and
   `kamal-backup` are both, both are installed wherever cafaye deploys, and
-  kit-20 demonstrated the cost of the alternative by building one: about 1,850
-  lines across `templates/backup/`, `templates/bin/backup.sh`,
-  `docker/Dockerfile.backup` and `tests/backup_test.sh`, reimplementing a command
-  surface that already existed. Every one of those files is **removed**, and
+  kit-20 demonstrated the cost of the alternative by building one: **3,012 lines
+  across seven files** — the four in `templates/backup/`, plus
+  `templates/bin/backup.sh`, `docker/Dockerfile.backup` and
+  `tests/backup_test.sh` — reimplementing a command surface that already
+  existed. 1,411 of those were shipped code and configuration. Every one of those
+  files is **removed**, and
   `tests/validate.sh` asserts their absence — "we removed it" has no mechanical
   form until something checks, and self_test breakage 64 resurrects one file to
   prove that check is load-bearing.

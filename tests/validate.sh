@@ -181,8 +181,18 @@ SKIP_EXIT=78
 check() { # check <label> <command...>
   local label="$1" out status
   shift
-  out="$("$@" 2>&1)"
-  status=$?
+  # The command substitution is the CONDITION of an `if`, not a statement of its
+  # own, and that is load-bearing rather than stylistic. Under `set -e` (line
+  # 49) a bare `out="$(cmd)"` that fails takes the SHELL down with it: verified
+  # with a three-line reproduction, which exits 3 and never reaches the line
+  # after. Capturing the status first and branching on it afterwards looks
+  # equivalent and is not — it turns every FAIL into a truncated run whose last
+  # line is a check, which is precisely the shape a reader has to guess at.
+  if out="$("$@" 2>&1)"; then
+    status=0
+  else
+    status=$?
+  fi
   if [ "$status" -eq 0 ]; then
     report PASS "$label"
     # A check that reports WHICH SPEC it verified is a different statement from

@@ -22,7 +22,7 @@ configuration that a third-party tool reads.
 
 kit-20 built a custom backup distribution — `templates/backup/` (a compose file,
 a job script, a crontab), `templates/bin/backup.sh` (a hand-written restic
-wrapper) and `docker/Dockerfile.backup` — about 1,850 lines that reimplemented
+wrapper) and `docker/Dockerfile.backup` — 3,012 lines that reimplemented
 the command surface `kamal-backup` already provides. It worked, and it was
 wrong, because it was a second implementation of something that exists:
 

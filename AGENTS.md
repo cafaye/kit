@@ -461,7 +461,7 @@ an `option` with no `job` is a green build that ran nothing.
 `drill.sh`, and a README. kit does not ship a deployment tool or a backup tool,
 because `kamal` and `kamal-backup` are both, they are both installed wherever
 cafaye deploys, and kit-20 proved the cost of the alternative by building
-`templates/backup/` and `templates/bin/backup.sh` — about 1,850 lines
+`templates/backup/` and `templates/bin/backup.sh` — about 3,012 lines
 reimplementing a command surface that already existed. **All of it is gone**, and
 `tests/validate.sh` asserts its absence, because "we removed it" has no
 mechanical form until something checks.

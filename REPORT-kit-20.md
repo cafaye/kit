@@ -3,7 +3,8 @@
 ## What this packet was
 
 Briefed as "add database backups to kit". Built as asked: a custom backup
-distribution wrapping restic directly, about 1,850 lines across five files.
+distribution wrapping restic directly, 3,012 lines across seven files — 1,411 of them shipped code and
+configuration, 1,231 the test, 370 the README.
 Then the product owner reversed the central assumption: **use Kamal and
 kamal-backup the way anymark does; stop maintaining a second implementation of
 something that already exists.**
@@ -33,7 +34,7 @@ The four properties worth keeping, quoted from what was there:
 | `trap drill_cleanup EXIT INT TERM` + `drop database if exists "$scratch" with (force)` | **KEPT** in `drill.sh` — the gem does not drop the scratch database at all (below) |
 | "no `docker system prune`, no `docker volume prune`, no unprefixed `docker rm`" (`templates/deploy/README.md:177-191`) | **untouched** — belongs to the deploy distribution, which this packet did not remove |
 
-An interim commit would have preserved ~1,850 lines of code whose entire purpose
+An interim commit would have preserved 3,012 lines of code whose entire purpose
 was to be deleted. What it would genuinely have preserved is the *record* above,
 which is this section. That is the honest accounting: a process mistake, a small
 net loss of verbatim comments, and no loss of decision.
@@ -178,6 +179,51 @@ restore is reported as a successful drill.**
 `DO $$ … RAISE EXCEPTION` block under `ON_ERROR_STOP=1`, so `count(*) = 0`
 becomes a non-zero psql exit. No default table list: a drill with no `--table` is
 a usage error, not a drill that quietly passes.
+
+**Measured against a real `postgres:17-alpine`**, not asserted. The generated
+check, run with `--table users --table documents`:
+
+| state of the restored scratch database | the generated check | the published `SELECT count(*)` check |
+|---|---|---|
+| both tables empty | **exit 3**, `table users is empty` | **exit 0** — prints `0` |
+| `users` has rows, `documents` empty | **exit 3**, `table documents is empty` | — |
+| both have rows | **exit 0** | exit 0 |
+
+Two things this establishes. The assertion **fails** on empty content, which the
+`count(*)` form does not; and it names **which** table is empty, so a drill over
+three tables reports the one that broke rather than only that something did.
+
+The scratch-database refusal is proved separately by `tests/kamal_test.sh`, which
+exercises five production-looking names and one legitimate default.
+
+
+## What I deliberately did NOT do
+
+- **`tests/artifacts.json` was not extended to cover `templates/kamal/`.** The
+  `--scope templates` staleness reporter measures files listed in that table
+  against a service's tree, so today it cannot tell you that your
+  `config/deploy.yml` has drifted from kit's. Adding four artefacts would make
+  every one of the 9 repositories in the parity-allowlist report `absent` —
+  **36 new permanent findings for a standard that zero services have adopted**,
+  and `templates/parity-allowlist`'s own hygiene rule makes an unpinned absence a
+  failure. That is precisely the "a permanently-reported gap nobody ever fixes"
+  pattern `AGENTS.md` gives as the reason the *skip* exists. The right moment is
+  the first service that commits `config/deploy.yml`, and it is a one-line
+  change to a table when that happens.
+- **`templates/deploy/` and `templates/bin/deploy.sh` were not removed.** See
+  above — evidence, and a live proof that would go with them.
+- **`DECISIONS.md` was not created**, even though `AGENTS.md:21` lists it and two
+  files link to it. Inventing the file *and* deciding what belongs in it is a
+  separate call, and this packet already had one too many.
+- **`tests/deploy_test.sh` was not wired into the gate.** It needs docker, and
+  the observability phase already brings up eight containers a tier. It is
+  present, named in the README, and run by the reader — the same treatment
+  `templates/kamal/drill.sh` would get if it needed a live database, which it
+  does not for the parts the gate asserts.
+- **No `minimum:` was moved.** Every count in this packet is derived
+  (`grep -c` over the recipe invocations, in both `validate.sh` and
+  `self_test.sh`), so there was nothing to re-measure. The new counts are
+  reported below with the command that produced each.
 
 ## Things found wrong in code I did not write
 

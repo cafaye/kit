@@ -333,6 +333,13 @@ admin -c "CREATE DATABASE \"${SCRATCH}\"" >/dev/null ||
 # THE DRILL ITSELF, which is entirely kamal-backup's.
 # --------------------------------------------------------------------------
 KAMAL="$(kamal_cmd)"
+# `--files` is deliberately NOT passed. kamal-backup defaults it to
+# `/restore/files`, and `perform_file_restore` returns nil immediately when the
+# config declares no `paths:` (app.rb:460-461) — which is the shape
+# config/kamal-backup.yml.erb ships, because object storage is already remote and
+# there is nothing local to snapshot. A service that DOES configure `paths:` adds
+# `--files <target>` here; without one, passing it would ask the gem to restore a
+# file snapshot that was never taken.
 set -- drill production ${SNAPSHOT:-latest} \
   --database "$SCRATCH" \
   --check "$CHECK_COMMAND" \
