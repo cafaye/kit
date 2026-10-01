@@ -11,6 +11,76 @@ semver contract — it is consumed by *calling*
 
 ## Unreleased
 
+### Fixed
+
+- **kit-17 — `templates/otel/ruby` had no interpreter floor, so the gate blamed
+  the template for the interpreter it picked.** `FAIL templates/otel/ruby (ruby
+  test suite)` on every gate run on macOS, minitest `.EE.......E..` — three of
+  thirteen tests erroring, all three the same `NoMethodError: undefined method
+  'filter_map'`, called from `usable_tracestate_entries`.
+
+  **The template was right and the runner was wrong.** `filter_map` arrived in
+  ruby 2.7; kit's own pin is 3.4 (`templates/mise.toml`, `lint/rubocop.yml`'s
+  `TargetRubyVersion`), and the macOS system interpreter at `/usr/bin/ruby` is
+  2.6.10. Every method *definition* in the file parses fine on 2.6, so 2.6 loads
+  `traceparent.rb` without complaint and only raises on the first tracestate
+  entry — which reads exactly like a bug in trace propagation, and was
+  measured as one for three packets' worth of gate runs before anyone read a
+  version number. (kit-14 attributed it pre-existing and reproduced it on a
+  clean clone of master; this entry is the fix, not the attribution.) The other
+  five templates are unaffected: go, node and rustc all *refuse* an old
+  toolchain at build time with a message naming their own requirement. Ruby is
+  the only one of the six that can fail silently.
+
+  - **`KitOtel::RUBY_FLOOR = '2.7'`, in the file.** Not a sentence in the header,
+    because the failure it prevents does not look like a version problem. 2.7 is
+    `filter_map` and nothing else — everything else in the file and its suite is
+    2.4 or older (`casecmp?` 2.4, `allbits?` 2.5, `&.` 2.3) — so it is the
+    file's real requirement rather than a guess, and well below the 3.4 kit hands
+    a service.
+  - **The gate reads that constant** (`ruby_floor()`) instead of keeping its own
+    copy of the number. A version restated in the runner is a second place for it
+    to rot, and asking the artifact is the same reason the classifier's tier
+    lives in `rules.json` and nowhere else.
+  - **A below-floor interpreter is a loud, counted `SKIP`, not a `FAIL`.** The
+    template is correct and the interpreter is too old; reporting that red would
+    keep three landed-or-landing packets blocked by a red naming a file none of
+    them touched. Reporting it `PASS` would be worse — a pass on the strength of
+    thirteen tests that never ran. An unreadable floor is still a `FAIL`: that one
+    *is* a template defect.
+  - **`version_at_least()` — a hand-rolled version comparison.** Not `sort -V`,
+    which is a GNU coreutils extension older BSD sort lacks; a floor comparison
+    that degrades to a *string* compare on the sort macOS ships reads `2.10` <
+    `2.9`. An unparseable field refuses rather than assuming the version is new
+    enough — fail-closed, like `tests/classify.py`.
+  - **Two new self-test breakages, 23 and 23b, both on a stub `ruby` that
+    reports 2.6.10 and refuses the suite.** 23 deletes the floor guard and
+    asserts the suite goes red *under its own label*; 23b keeps the guard and
+    asserts the gate stays **green** while naming the skip. 23b needed a fourth
+    helper, `expect_skip_check`: "the gate went red" cannot express a check that
+    is load-bearing precisely by not going red, and "the gate went green" is
+    satisfied just as well by a check that was deleted entirely.
+  - **Two counting bugs found on the way, both the same shape.** The breakage
+    counts in `self_test.sh` and `validate.sh` anchored on `^expect_`, which also
+    matches the four helper *definitions* — `expect_red() {` looks exactly like a
+    call to a name-only pattern — so both printed **28 over 23 recipes**. And the
+    header/recipe check anchored on `^expect_` too, so the indented calls in
+    breakages 23/23b (inside a `command -v ruby` guard) were reported as two
+    documented breakages carrying no recipe: the check was right about the
+    disagreement and wrong about the cause. All three now anchor on the breakage
+    *label*, which a function definition cannot carry. `[ \t]*` rather than `\s*`
+    in the header check, because under `re.M` `\s` matches a newline and `\s*`
+    could span onto the next line and match a label that is not a recipe at all.
+  - `self_test.sh` is now **25 breakages — 24 that assert the gate goes red, and
+    one (23b) that asserts a green gate with a named skip.** The summary line
+    says which is which rather than claiming all 25 "went red", because that
+    would be a false statement about a proof that passed.
+
+  Gate on this branch: **143 pass, 0 fail, 2 skip** (both the pre-existing
+  `node --check cannot read TypeScript` skips for `templates/tier/{node,bun}`,
+  which are a parser gap in a packet that owns it, not this one). All six
+  traceparent suites green, `canary_test.sh` green against a real collector.
+
 ### Added
 
 - **kit-07 — the declared tier, and the allowlist that is supposed to shrink.**

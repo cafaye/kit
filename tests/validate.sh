@@ -173,6 +173,60 @@ section() { printf '\n-- %s\n' "$1"; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# The ruby interpreter floor, read FROM THE TEMPLATE it applies to.
+#
+# `templates/otel/ruby` calls `Enumerable#filter_map`, which arrived in ruby 2.7.
+# The macOS system interpreter at /usr/bin/ruby is 2.6, so a gate that runs the
+# suite on whatever `ruby` happens to be first on PATH gets three
+# NoMethodErrors and reports them as `FAIL templates/otel/ruby` — blaming the
+# template for an interpreter it chose. That is not a cosmetic mislabel: the red
+# it printed was attributed to three unrelated packets, and none of them could
+# fix it, because none of them touched the template either.
+#
+# The floor comes from `KitOtel::RUBY_FLOOR` rather than a literal here. A
+# version restated in the runner is a second place for it to rot, and the artifact
+# is the thing that actually knows. Reading it also means the file and the gate
+# cannot disagree about what the file needs — the same reason the classifier's
+# tier lives in rules.json and nowhere else.
+#
+# Empty output means the template could not be loaded far enough to be asked, and
+# the caller treats that as a template defect rather than an absent interpreter.
+ruby_floor() {
+  ruby -e 'require ARGV[0]; print KitOtel::RUBY_FLOOR' \
+    "$ROOT/templates/otel/ruby/traceparent.rb" 2>/dev/null
+}
+
+# Is dotted version $1 at least dotted version $2?
+#
+# Hand-rolled rather than `sort -V`, and that choice is load-bearing rather than
+# fussy: `-V` is a GNU coreutils extension that older BSD sort does not have,
+# and a gate whose floor comparison degrades to a *string* compare on the sort
+# shipped with macOS is a gate that reads "2.10" < "2.9" on one machine and not
+# on another. Two of the six toolchains here are only ever run by developers, so
+# "worked on my sort" is not a portability story.
+#
+# Refuses on an unparseable field instead of assuming the version is new enough:
+# fail-closed is the whole lesson of this repo's classifier, and it applies to a
+# shell comparison just as much.
+version_at_least() {
+  local have_v="$1" want_v="$2" i a b
+  for i in 1 2 3; do
+    a="$(printf '%s' "$have_v" | cut -d. -f"$i")"; a="${a:-0}"
+    b="$(printf '%s' "$want_v" | cut -d. -f"$i")"; b="${b:-0}"
+    case "$a$b" in
+      '' | *[!0-9]*) return 1 ;;
+    esac
+    if [ "$a" -eq "$b" ]; then
+      continue
+    fi
+    if [ "$a" -gt "$b" ]; then
+      return 0
+    fi
+    return 1
+  done
+  return 0
+}
+
 # ===========================================================================
 # phase: static
 # ===========================================================================
@@ -3783,6 +3837,7 @@ if [ "$RUN_TELEMETRY" -eq 1 ]; then
   run_ruby() {
     ruby "$ROOT/templates/otel/ruby/test_traceparent.rb"
   }
+
   run_elixir() {
     # -r the module first: mix is not involved, so ExUnit.start() lives in the
     # test file and there is no mix.exs to grow.
@@ -3824,6 +3879,48 @@ if [ "$RUN_TELEMETRY" -eq 1 ]; then
     if ! have "$tool"; then
       report SKIP "templates/otel/$lang  ($tool not installed)"
       continue
+    fi
+    # ruby only, because ruby is the only one of the six that can fail
+    # *silently*: the other five refuse on their own — an old go, an old node
+    # or an old rustc fails at build time with a message naming its own
+    # requirement — whereas ruby 2.6 loads this template happily and then dies
+    # on the first method call, which reads as a behavioural failure. A floor
+    # check for a toolchain that already refuses would be a second place to be
+    # wrong.
+    if [ "$lang" = ruby ]; then
+      ruby_seen="$(ruby -e 'print RUBY_VERSION' 2>/dev/null || true)"
+      ruby_need="$(ruby_floor || true)"
+      if [ -z "$ruby_need" ]; then
+        # The template could not be loaded far enough to be asked. That is a
+        # defect in the artifact, not an absent interpreter, so it is a FAIL.
+        report FAIL "templates/otel/$lang  ($tool test suite)"
+        printf '%s\n' \
+          "       Could not read KitOtel::RUBY_FLOOR from" \
+          "       templates/otel/ruby/traceparent.rb, so the interpreter floor" \
+          "       is unknown and the suite cannot be run knowingly. This is a" \
+          "       template defect: the constant is how the gate asks the" \
+          "       template what interpreter it needs."
+        continue
+      fi
+      if ! version_at_least "$ruby_seen" "$ruby_need"; then
+        # A SKIP, not a FAIL, and the distinction is the whole point of this
+        # check. The template is correct; the interpreter is too old to run it.
+        # Reporting that as a FAIL would keep three landed-or-landing packets
+        # blocked by a red that names a file none of them touched. Reporting it
+        # as a PASS would be worse — it would claim the suite passed having
+        # never run a single test. So: a loud, counted SKIP that names both
+        # versions and the one command that fixes it, which is exactly the
+        # treatment every other absent toolchain in this file already gets.
+        report SKIP "templates/otel/$lang  (ruby $ruby_seen is below the template's $ruby_need floor)"
+        printf '%s\n' \
+          "       templates/otel/ruby declares KitOtel::RUBY_FLOOR = $ruby_need and the" \
+          "       ruby first on PATH is $ruby_seen, so the suite did NOT run. On a" \
+          "       conforming interpreter it is green; this is a toolchain fact wearing" \
+          "       a template's clothes, not a finding about trace propagation." \
+          "       Fix: put a pinned ruby first on PATH — mise exec -- bash tests/validate.sh," \
+          "       or any PATH whose ruby is >= $ruby_need. kit's own pin is templates/mise.toml (3.4)."
+        continue
+      fi
     fi
     check "templates/otel/$lang  ($tool test suite)" "run_$lang"
   done
@@ -3879,13 +3976,27 @@ check 'tests/staleness_test.sh  (12 cases, incl. the red proof)' \
 
 if [ "$RUN_SELF_TEST" -eq 1 ]; then
   section 'self_test: this gate is able to fail'
-  # The number in this label is COUNTED from self_test.sh's recipes rather than
-  # written down. Every breakage calls exactly one of the three red-expecting
+  # The numbers in this label are COUNTED from self_test.sh's recipes rather than
+  # written down. Every breakage calls exactly one of the four red-expecting
   # helpers, so counting those calls is the breakage count by construction — and
   # a hardcoded number is exactly the kind of thing that goes stale quietly when
-  # the next packet adds a check. The wording follows from the count so the two
+  # the next packet adds a check. The wording follows from the counts so the two
   # cannot disagree.
-  _st_breakages=$(grep -cE '^expect_red(_check|_lang|_script)? ' "$ROOT/tests/self_test.sh" || true)
+  #
+  # Two numbers, not one, because breakage 23b asserts something the other
+  # twenty-three do not: that a check can report SKIP and still be load-bearing.
+  # Counting only reds would have made "24 breakages, 24 reds" a false summary
+  # of twenty-four red-assertions plus one green one — the same claim, wearing a
+  # number, that nobody would have checked.
+  #
+  # Both patterns anchor on the BREAKAGE LABEL, not on the helper name. An
+  # earlier version anchored on `^expect_` and counted 28 over 23 recipes: the
+  # four helper *definitions* are `expect_red() {` and match a bare `^expect_`
+  # exactly as well as a call does. Counting the labels cannot hit that, because
+  # a function definition never carries one — and a count that over-reports is
+  # worse than none, since it is indistinguishable from a correct one.
+  _st_breakages=$(grep -cE '^ *expect_(red(_check|_lang|_script)?|skip_check) +.breakage +[0-9]+[a-z]*:' "$ROOT/tests/self_test.sh" || true)
+  _st_reds=$(grep -cE '^ *expect_red(_check|_lang|_script)? +.breakage +[0-9]+[a-z]*:' "$ROOT/tests/self_test.sh" || true)
 
   # The header is a promise about what the file proves, and a promise nobody
   # reads is decoration. Compare the breakage numbers the header NAMES against
@@ -3947,7 +4058,22 @@ carried = set(
         # a pattern missing `_script` calls them undocumented. Same omission as
         # the `_st_breakages` count above — one bug, two symptoms, because the
         # helper list was written down twice.
-        r"""^expect_red(?:_check|_lang|_script)? ['"]breakage\s+(\d+[a-z]?):""",
+        #
+        # `^ *` and not `^`, and this is the third time this pattern has needed
+        # it. Breakages 23 and 23b sit inside a `command -v ruby` guard because
+        # their fixture is a stub `ruby`, so their calls are INDENTED — and a
+        # column-0 pattern reported two documented breakages as carrying no
+        # recipe. The check was right about the disagreement and wrong about the
+        # cause: the recipes exist, at column 2. A pattern tight enough to
+        # reject a real recipe is not a stricter check, it is a broken one, and
+        # the failure it produces looks exactly like missing documentation.
+        #
+        # `[ \t]*`, not `\s*`: under re.M `\s` matches a newline, so `\s*` could
+        # span from the end of one line onto the next and match a `breakage 23:`
+        # label belonging to a call that is not a recipe at all. One permissive
+        # character here would trade a false negative for a false positive on the
+        # very check that exists to catch drift.
+        r"""^[ \t]*expect_(?:red(?:_check|_lang|_script)?|skip_check) ['"]breakage\s+(\d+[a-z]?):""",
         src,
         re.M,
     )
@@ -3971,7 +4097,7 @@ PY
   check 'tests/self_test.sh  (every documented breakage has a recipe, and vice versa)' \
     self_test_claims
 
-  if check "tests/self_test.sh  ($_st_breakages breakages, $_st_breakages reds)" \
+  if check "tests/self_test.sh  ($_st_breakages breakages, $_st_reds reds, $((_st_breakages - _st_reds)) skip-proofs)" \
     bash "$ROOT/tests/self_test.sh"; then
     :
   fi

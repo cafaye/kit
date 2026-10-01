@@ -705,19 +705,27 @@ no `npm ci`, no `cargo fetch`. If these ever need the network, a template has
 grown a dependency and kit has stopped being config-only.
 
 **self_test** — `tests/self_test.sh` breaks a throwaway copy of this tree
-**twenty** ways and asserts the gate goes red each time. Fourteen breakages are
-for the static checks; one is a semantic mutation of each of the six language
-implementations, so **every suite is proven able to fail** rather than assumed
-to. A skip fails the run — a self_test that skips half its proofs and exits 0 is
-the "0 passed, 14 ignored" shape that verifies nothing. Seven of the static
-ones go further and assert that one *named* check reported `FAIL`, so the check
-written for a given defect is proven still load-bearing rather than being one
-of fifty checks that could have gone red for an unrelated reason.
+**twenty-five** ways: twenty-four assert the gate goes red, and one (23b)
+asserts the gate stays **green** while naming the skip that replaced a red.
+Fourteen breakages are for the static checks; one is a semantic mutation of each
+of the six language implementations, so **every suite is proven able to fail**
+rather than assumed to. A skip fails the run — a self_test that skips half its
+proofs and exits 0 is the "0 passed, 14 ignored" shape that verifies nothing.
+Eight of the static ones go further and assert that one *named* check reported
+`FAIL`, so the check written for a given defect is proven still load-bearing
+rather than being one of fifty checks that could have gone red for an unrelated
+reason.
 
 Breakage 19 is the allowlist one: an entry naming a test that does not exist,
 well-formed in every other respect. It is the rule most able to be decorative —
 a hygiene rule in a data file is exactly the shape of a check nobody has ever
 seen fail.
+
+Breakage 23b is the other end of that problem. A check that converts a red into a
+skip can be load-bearing precisely by *not* going red, so "the gate went red"
+cannot express it and "the gate went green" is satisfied just as well by a check
+that was deleted outright. It asserts both halves: exit 0, *and* the named skip
+in the output.
 
 Any `FAIL` exits 1. A `SKIP` is always reported in the summary, never hidden.
 PyYAML, yamllint and hadolint are required and are **bootstrapped by the gate

@@ -11,7 +11,7 @@
 #   *different* check, so a passing self_test means the checks are independent
 #   and not one lucky assertion standing in for all of them.
 #
-# THE TWENTY-THREE BREAKAGES   (20 from the tier work, 21 from the
+# THE TWENTY-FIVE BREAKAGES   (20 from the tier work, 21 from the
 #                               fan-out work, 18 of them shared)
 #   1. delete a language template   -> the artifact-presence check goes red
 #   2. add a collector exporter    -> the privacy check goes red
@@ -61,6 +61,14 @@
 #   22. report an undeclared core pin as `current` -> staleness_test.sh goes red.
 #         Two real repositories are in that state today, which is what makes the
 #         difference between `undeclared` and `current` load-bearing.
+#   23. delete the interpreter floor from validate.sh -> with a stub ruby older
+#         than KitOtel::RUBY_FLOOR on PATH, the ruby suite goes red under its
+#         own label. This is the red that three landed-or-landing packets were
+#         blocked by, reproduced on purpose.
+#  23b. the floor INTACT, same old stub -> the gate stays GREEN and names the
+#         skip. The one breakage here that asserts a check while the gate is
+#         green: a floor that turns a red into a silent pass is worse than no
+#         floor, and only this direction can tell the two apart.
 #
 #   These are numbered 20-22 rather than 19-21 because 19 is the allowlist
 #   breakage above, from the tier work. Both packets numbered their first entry
@@ -203,6 +211,36 @@ expect_red_script() {
     failures=$((failures + 1))
   else
     printf 'PASS self_test: %s — the proof went red\n' "$label"
+  fi
+}
+
+# expect_skip_check <label> <dir> <check-label> <validate.sh args...>
+#
+# The other direction, and it exists because 23b asserts something no other
+# helper can. `expect_red*` proves a check CATCHES a defect; this proves a check
+# can be load-bearing while the gate stays green — which is the interpreter
+# floor's whole job. The floor turns a red gate into a skip; "the gate went
+# red" says nothing about whether it did, and "the gate went green" is
+# satisfied just as well by a check that was deleted entirely.
+#
+# So this asserts BOTH halves of the honest-reporting claim: the gate exited 0,
+# and the named check is what said so. A gate that passed by running nothing and
+# mentioning nothing fails here; a gate that failed fails here too.
+expect_skip_check() {
+  local label="$1" dir="$2" want="$3"
+  shift 3
+  local out ec=0
+  out=$(cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" 2>&1) || ec=$?
+  if [ "$ec" -ne 0 ]; then
+    printf 'FAIL self_test: %s — the gate exited %s, so the skip was not clean\n' "$label" "$ec"
+    printf '%s\n' "$out" | grep '^FAIL' | sed 's/^/       /'
+    failures=$((failures + 1))
+  elif printf '%s\n' "$out" | grep -qF "SKIP $want"; then
+    printf 'PASS self_test: %s — reported as `%s`\n' "$label" "$want"
+  else
+    printf 'FAIL self_test: %s — the gate stayed green but never said `%s`\n' "$label" "$want"
+    printf '%s\n' "$out" | grep '^SKIP' | sed 's/^/       /'
+    failures=$((failures + 1))
   fi
 }
 
@@ -655,6 +693,78 @@ edit "$twentytwo/tests/staleness.py" '    return UNDECLARED' '    return CURRENT
 expect_red_script 'breakage 22: the staleness reporter calls an undeclared pin current' \
   "$twentytwo" tests/staleness_test.sh
 
+# 23 and 23b. The interpreter floor, in both directions, and they share one
+# fixture: a stub `ruby` that lies about its version.
+#
+# The stub is the smallest thing that reproduces the real failure. On macOS the
+# gate's `ruby` can resolve to /usr/bin/ruby 2.6, which loads
+# templates/otel/ruby/traceparent.rb without complaint — every constant and
+# method definition parses fine — and then raises NoMethodError on
+# `filter_map` at the first tracestate entry. So the *only* honest way to
+# reproduce it is a stub that reports 2.6 and refuses the suite. It delegates
+# everything else to the real interpreter, because the version probe has to keep
+# working: a stub that could not be asked its version would fail the gate in
+# the wrong place, and a self_test whose recipe fails for the wrong reason is a
+# recipe that stopped testing what it names.
+if command -v ruby >/dev/null 2>&1; then
+  twentythree="$WORK/old-ruby"
+  mkdir -p "$twentythree/stub"
+  real_ruby="$(command -v ruby)"
+  cat >"$twentythree/stub/ruby" <<STUB
+#!/bin/sh
+# Reports a ruby older than any cafaye service pins, then refuses to run
+# anything. Everything else — `ruby -c`, the RUBY_VERSION probe — is delegated,
+# so the only behaviour this fixture changes is "can the suite run here".
+case "\$*" in
+  *RUBY_VERSION*) printf '2.6.10'; exit 0 ;;
+esac
+case "\$*" in
+  *test_traceparent.rb*) echo 'undefined method \`filter_map' >&2; exit 1 ;;
+esac
+exec "$real_ruby" "\$@"
+STUB
+  chmod +x "$twentythree/stub/ruby"
+
+  # PATH is exported rather than prefixed onto the call: `PATH=… expect_red_check`
+  # puts something other than `expect_red_check` first, so the count in
+  # tests/validate.sh — anchored on `expect_` at the start of a line — would
+  # miss this recipe and the summary would report fewer breakages than the file
+  # carries. The same reasoning is why both counts allow indentation: the recipe
+  # sits inside the `command -v ruby` guard.
+  twentythree_old_path="$PATH"
+  PATH="$twentythree/stub:$PATH"
+  export PATH
+
+  # 23. The floor is defined and never consulted. Removing the guard is the
+  #     whole breakage: with the stub on PATH the suite goes red, and it goes
+  #     red under the SAME label a genuine template defect uses — which is
+  #     precisely why the guard had to exist. Asserted by name, because "the
+  #     gate went red" would be satisfied by the unrelated checks in the same
+  #     run and would prove nothing about this one.
+  twentythree_a="$(fresh_copy old-ruby-no-floor)"
+  edit "$twentythree_a/tests/validate.sh" \
+    'if [ "$lang" = ruby ]; then' \
+    'if false; then'
+  expect_red_check 'breakage 23: the interpreter floor is defined but never consulted' \
+    "$twentythree_a" 'templates/otel/ruby  (ruby test suite)' --language=ruby --no-self-test
+
+  # 23b. The floor consulted and reported as a skip. Same fixture, guard intact.
+  #      This is the assertion that a green gate can still be an honest one: the
+  #      suite is NOT run, and the gate says so by name rather than passing on
+  #      the strength of thirteen tests it never executed.
+  twentythree_b="$(fresh_copy old-ruby-floor-honest)"
+  expect_skip_check 'breakage 23b: an interpreter below the floor is a named skip, not a silent pass' \
+    "$twentythree_b" "templates/otel/ruby  (ruby 2.6.10 is below the template's 2.7 floor)" \
+    --language=ruby --no-self-test
+
+  PATH="$twentythree_old_path"
+  export PATH
+else
+  printf 'SKIP self_test: breakage 23: the interpreter floor is defined but never consulted — ruby not installed\n'
+  printf 'SKIP self_test: breakage 23b: an interpreter below the floor is a named skip, not a silent pass — ruby not installed\n'
+  skips=$((skips + 2))
+fi
+
 printf '\n'
 if [ "$failures" -ne 0 ]; then
   echo "FAIL: self_test — $failures breakage(s) the gate did not catch."
@@ -670,5 +780,17 @@ fi
 # way a hardcoded "all N breakages" does — and the header's list is checked
 # against it by `tests/validate.sh`, so a breakage added without a header entry
 # (or a header entry with no recipe) is a red gate rather than a doc that lies.
-counted=$(grep -cE '^expect_red(_check|_lang|_script)? ' "$0" || true)
-echo "PASS: self_test — all $counted breakages went red, and the unbroken tree is green."
+#   Anchored on the breakage LABEL, and identical to the `_st_breakages` /
+#   `_st_reds` patterns in tests/validate.sh. Both used to anchor on `^expect_`,
+#   which also matched the four helper *definitions* — `expect_red() {` looks
+#   exactly like a call to a name-only pattern — so this printed 28 over 23
+#   recipes for a run. Two files printing two different counts of the same file,
+#   side by side, is the defect this repo keeps refusing to ship; the fix is to
+#   count something that cannot be a definition.
+#
+#   Only the reds are counted as reds, and the skip-proofs are named
+#   separately. Breakage 23b asserts a green gate on purpose, and a summary
+#   claiming it "went red" would be a false statement about a proof that passed.
+counted=$(grep -cE '^ *expect_red(_check|_lang|_script)? +.breakage +[0-9]+[a-z]*:' "$0" || true)
+total=$(grep -cE '^ *expect_(red(_check|_lang|_script)?|skip_check) +.breakage +[0-9]+[a-z]*:' "$0" || true)
+echo "PASS: self_test — all $total breakages hold ($counted assert red, $((total - counted)) assert a green gate with a named skip), and the unbroken tree is green."
