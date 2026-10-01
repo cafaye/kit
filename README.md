@@ -127,6 +127,7 @@ the entry; deleting the entry to shrink the file is a hard failure of its own.
 | `tests/validate.sh` | kit's own suite — the gate. | kit |
 | `tests/gitleaks_gate.sh` | The one secret scan. Run by the `secrets` job **and** by the gate. | Every service, copied verbatim |
 | `tests/zizmor_gate.sh` | The one zizmor split: `unpinned-uses` recorded, every other audit fatal. | Every service, copied verbatim |
+| `LICENSE` | **kit's own grant: MIT.** The whole grant — kit has no package manifest, so there is no metadata field that could disagree with the file. A gate check reads it *and* every root manifest that can carry a licence field, because a licence is only unambiguous when exactly one place can declare one. | Anyone reading or vendoring kit |
 
 ## Secrets — two scanners, two questions
 
@@ -593,6 +594,18 @@ Grafana. If you believe a change to one of these is necessary, that is a
 Every image is pinned to an exact tag. `latest` for a log store means a
 self-hoster's upgrade path is whatever happened to be cached when their disk
 filled.
+
+### kit's own licence
+
+**kit itself is MIT.** See [LICENSE](LICENSE), which is the whole grant: kit is
+configuration and documentation, has no package manifest in any ecosystem, and
+therefore has no metadata field that could disagree with the file.
+
+That is a different question from the AGPL paragraph above, and keeping them
+apart is the point. The four backing services are third-party software we
+*consume*, unmodified, under their own terms. kit is cafaye's own work and is
+granted MIT. A service adopting kit adopts the conventions under MIT and pulls
+the four backends under AGPL-3.0, and neither obligation runs toward the other.
 
 ### Telemetry is never in a readiness path
 
@@ -1363,14 +1376,14 @@ output. A proof nobody can see is a proof nobody ran — the same argument the
 self_test phase makes, applied to the harness rather than to the gate.
 
 **self_test** — `tests/self_test.sh` breaks a throwaway copy of this tree
-**sixty-five** ways: sixty-three assert the gate goes red, and two assert it
+**sixty-seven** ways: sixty-five assert the gate goes red, and two assert it
 stays **green** while naming what they said — 23b a SKIP that replaced a red, and
 59 a FINDING that did not yet fail the build. A further **green control** (31b)
 asserts a service config that agrees with kit's is *not* a failure. Fourteen
 breakages are for the static checks; one is a semantic mutation of each of the
 six language implementations, so **every suite is proven able to fail** rather
 than assumed to. A skip fails the run — a self_test that skips half its proofs and
-exits 0 is the "0 passed, 14 ignored" shape that verifies nothing. Forty-five of
+exits 0 is the "0 passed, 14 ignored" shape that verifies nothing. Forty-seven of
 the static ones go further and assert that one *named* check reported `FAIL`, so
 the check written for a given defect is proven still load-bearing rather than
 being one of fifty checks that could have gone red for an unrelated reason.
@@ -1393,6 +1406,27 @@ correct step, and a proof pattern carrying escape tolerance (D13, core
 `c63af27`). They mutate a *synthetic fleet* built in the work directory, since
 kit is one repository and the fleet is fifteen — which also makes the control
 this file's positive case for the check.
+
+Breakages 61-62 are the licence, in the two ways a grant stops being
+unambiguous: `LICENSE` deleted, and a root manifest declaring a licence the file
+contradicts. The second is the one that makes the check a check — see
+[`## License`](#license).
+
+One defect in this harness was found by that packet rather than by a reader.
+`expect_green_check` asserted on the gate's output with `printf … | grep -qF`,
+which reads a **match** as a non-match once the output overflows the 64K pipe
+buffer: `grep -q` closes the pipe at the first match, `printf` dies of SIGPIPE,
+and `set -o pipefail` promotes that 141 to the pipeline's status. It had been
+latent because no check had printed enough to get there, and it reported
+breakage 59 — the adoption ceiling — red when that proof had in fact passed.
+`expect_red_check` had already been repaired for the identical bug and said so
+in a long comment **in the same file**, which is the shape worth naming: three
+correct explanations of a defect do not stop the fourth copy of it. All three
+assertion helpers now match the captured variable through one `contains`
+helper. The alternative fix — making the new check quieter — was worse twice
+over: it contradicts `check`'s documented behaviour, and the threshold it hides
+behind is a property of the pipe buffer, so it moves with the machine.
+
 Any `FAIL` exits 1. A `SKIP` is always reported in the summary, never hidden.
 PyYAML, yamllint, zizmor, hadolint and gitleaks are required and are
 **bootstrapped by the gate itself**; the seven language toolchains and
@@ -1449,3 +1483,26 @@ we create one."* The official `oven/bun:1.3.12-slim` image ships `bun` at uid
 1000 (verified against the running container), and the `useradd` that note
 described was never in the file — so the note described a different Dockerfile
 than the one being read.
+
+## License
+
+MIT. See [LICENSE](LICENSE).
+
+kit is configuration and documentation — no runtime code, no library, nothing
+imported by anything — so the `LICENSE` file is the entire grant. There is no
+`Cargo.toml`, `package.json`, `pyproject.toml` or gemspec here, and therefore no
+metadata field that could disagree with the file. That is the same shape as Go
+modules and the reason the file is the grant there too.
+
+That last sentence is a **claim about the tree**, so a check holds it: the gate
+reads the grant by MIT's own sentences rather than by the string `MIT`, and then
+inspects every manifest at the repository root that can carry a licence field,
+failing on any that declares something else. A licence is only unambiguous when
+exactly one place in a repository can declare one — a `package.json` appears, it
+carries `"license": "AGPL-3.0-only"` copied out of a service, and now a
+compliance tool and a reader are reading different files. The check does **not**
+ban the manifest; it requires it to agree, which is the difference between a rule
+and a ratchet.
+
+See [kit's own licence](#kits-own-licence) for why this is a separate question
+from the AGPL-3.0 backends kit ships unmodified.

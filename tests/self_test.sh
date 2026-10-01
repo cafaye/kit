@@ -11,12 +11,13 @@
 #   *different* check, so a passing self_test means the checks are independent
 #   and not one lucky assertion standing in for all of them.
 #
-# THE SIXTY-FIVE BREAKAGES, and one GREEN control   (20 from the tier work, 21
+# THE SIXTY-SEVEN BREAKAGES, and one GREEN control (20 from the tier work, 21
 #                               from the fan-out work, 24-26 from the fleet gate,
 #                               27-32c from the lint work, 33-40 from the
 #                               staleness/parity work, 41-51 from the secrets
-#                               work, 52-60 from the fetched-stack work; 18
-#                               shared before the lint packet)
+#                               work, 52-60 from the fetched-stack work, 61-62
+#                               from the licence; 18 shared before the lint
+#                               packet)
 #   1. delete a language template   -> the artifact-presence check goes red
 #   2. add a collector exporter    -> the privacy check goes red
 #   2b. DELETE the tempo exporter   -> the same check goes red from the other
@@ -240,22 +241,40 @@
 #           change that hardened the unadopted side fails 59, and there is no
 #           third state in which both pass and the checks are weaker.
 #
+# 61-62. THE LICENCE, in the two ways the grant stops being unambiguous. A
+#         licence is only unambiguous when exactly ONE place in a repository can
+#         declare one.
+#           61. `LICENSE` DELETED -> the licence check goes red. cafaye's
+#               decision is MIT across the fleet, and a repository with no grant
+#               is not permissive: it is all rights reserved, the default
+#               copyright position when nothing is granted. The README kept
+#               saying MIT the whole time, which is exactly why this needed a
+#               check — the documentation was true and the repository was not.
+#           62. a root `package.json` declaring `AGPL-3.0-only` -> the same check
+#               goes red, with `LICENSE` and the README both still saying MIT.
+#               This is the direction nobody looks at, and it is the one that
+#               makes the check real: a check asserting only that `LICENSE`
+#               exists is satisfied by a repository that has acquired a THIRD
+#               statement about its own grant, which a compliance tool reads.
+#
 #   33-40 continue that numbering above, and the reason the copy-is-gone case
 #   gets TWO breakages and not one is that
 #   "report absent as current" and "grade by resemblance" are opposite mistakes
 #   that a single mutation cannot both produce: one removes a finding, the
 #   other invents one, and a gate that can only do one of them is half a gate.
 #
-#   Forty-five of them (7-12, 19, 20, 24-32c, 33-35, 38, 40-60) additionally
+#   Forty-seven of them (7-12, 19, 20, 24-32c, 33-35, 38, 40-62) additionally
 #         assert WHICH check went red. Every other breakage only proves the gate
 #         can fail; those prove the check written for that defect is still
 #         load-bearing, which is a different claim and the one that decays
 #         silently. 21, 22, 36 and 37 assert the same thing about the two scripts
 #         that are themselves proofs, 39 asserts it about the WORDING — a red that
 #         blames the reporter when the fixture is at fault is a red that sends
-#         the next reader to the wrong file — and 52-55 and 58-60 assert it over
-#         a FIXTURE fleet rather than over the tree; see `fixture_fleet` below
-#         for why that helper exists at all.
+#         the next reader to the wrong file — 52-55 and 58-60 assert it over
+#         a FIXTURE fleet rather than over the tree (see `fixture_fleet` below
+#         for why that helper exists at all), and 61-62 assert it over the
+#         licence, where the named check is the only thing distinguishing
+#         "the grant is gone" from "something else went red".
 #
 #   And one GREEN control, which is a claim the numbered breakages cannot make.
 #         31b asserts the gate is green on a copy whose service config MATCHES
@@ -411,7 +430,12 @@ fresh_copy() {
   # a real coupling between the harness and the tree, and it is better than the
   # alternative: a check that silently cannot run in a copy is a proof that
   # proves nothing while reporting something.
-  for entry in .gitleaks.toml .github AGENTS.md README.md CHANGELOG.md core docker lint templates tests; do
+  # `LICENSE` is here for the same reason, and its absence is a false GREEN:
+  # `license_check` reads the file to assert the MIT grant, so a copy without it
+  # fails that check on every breakage — and the two green-expecting proofs
+  # (23b, 59) would then be red for a reason that has nothing to do with the
+  # defect under test, which is the failure mode this list exists to prevent.
+  for entry in .gitleaks.toml .github AGENTS.md README.md CHANGELOG.md LICENSE core docker lint templates tests; do
     [ -e "$ROOT/$entry" ] && cp -R "$ROOT/$entry" "$dst/"
   done
   # KIT_GITLEAKS, unlike the other two, must ALSO be resolved before the first
@@ -437,6 +461,22 @@ fresh_copy() {
   # any breakage under test.
   chmod +x "$dst"/tests/*.sh 2>/dev/null || true
   printf '%s' "$dst"
+}
+
+# contains <haystack> <needle> — is `needle` present in `haystack`?
+#
+# A shell `case`, not `printf … | grep -qF`. See `expect_green_check` for the
+# measurement and the 64K pipe-buffer threshold; the short version is that
+# `grep -q` closes the pipe at the first match, `printf` dies of SIGPIPE, and
+# `set -o pipefail` turns that 141 into the pipeline's exit status — so a proof
+# of the form `! printf … | grep -qF x` reads a MATCH as a non-match once the
+# output is large enough. Every such assertion in this file goes through here,
+# which is also why the two helpers cannot disagree about how to read the output.
+contains() {
+  case "$1" in
+    *"$2"*) return 0 ;;
+    *) return 1 ;;
+  esac
 }
 
 # edit <file> <old> <new> — a textual breakage that FAILS LOUDLY if the source
@@ -520,21 +560,20 @@ expect_red_check() {
   # Measured, not reasoned about: 2000 lines of output still returns 0 and 5000
   # returns 141, on the same match and the same grep. The threshold is a property
   # of the pipe buffer, so it would move with the machine — which is why the fix
-  # is to stop piping rather than to bound the output.
-  case "$out" in
-    *"FAIL $want"*)
-      printf 'PASS self_test: %s — caught by `%s`\n' "$label" "$want"
-      ;;
-    *)
-      if [ "$ec" -eq 0 ]; then
-        printf 'FAIL self_test: %s — the gate stayed GREEN\n' "$label"
-      else
-        printf 'FAIL self_test: %s — the gate went red, but NOT via `%s`\n' "$label" "$want"
-        printf '%s\n' "$out" | grep '^FAIL' | sed 's/^/       /'
-      fi
-      failures=$((failures + 1))
-      ;;
-  esac
+  # is to stop piping rather than to bound the output. It now goes through the
+  # same `contains` helper as `expect_green_check` and `expect_skip_check`, so
+  # the three cannot drift apart on the one thing they all have to get right.
+  if contains "$out" "FAIL $want"; then
+    printf 'PASS self_test: %s — caught by `%s`\n' "$label" "$want"
+  else
+    if [ "$ec" -eq 0 ]; then
+      printf 'FAIL self_test: %s — the gate stayed GREEN\n' "$label"
+    else
+      printf 'FAIL self_test: %s — the gate went red, but NOT via `%s`\n' "$label" "$want"
+      printf '%s\n' "$out" | grep '^FAIL' | sed 's/^/       /'
+    fi
+    failures=$((failures + 1))
+  fi
 }
 
 # expect_green_check <label> <dir> <check-label> <needle> <validate.sh args...>
@@ -552,6 +591,33 @@ expect_red_check() {
 # about, and (2) alone would be satisfied by a check that printed the word
 # somewhere. Together they are the claim: *this* check passed, and it passed
 # while telling you about this specific thing.
+#
+# BOTH halves match the VARIABLE with a shell pattern, and never with
+# `printf … | grep -qF`. That is the same rule `expect_red_check` already follows
+# for the reason documented at length there: `grep -q` exits at the FIRST match
+# and closes the pipe, `printf` takes SIGPIPE and dies 141, `set -o pipefail`
+# promotes that 141 to the pipeline's status, and `!` then reads a match as a
+# NON-match.
+#
+# It is not theoretical HERE either, and this helper had the defect that
+# `expect_red_check` had already been repaired for. Breakage 59 asserted the
+# adoption ceiling stayed green and named its finding, and it began failing the
+# moment kit's gate output crossed the 64K pipe buffer — which is exactly what
+# `license_check` printing its measurement on PASS did, correctly, as
+# `check`'s own contract requires of a check that reports WHICH SPEC it verified.
+# So the gate grew, the harness read the growth as a defect in the ceiling, and
+# reported a proof red that had in fact passed:
+#
+#     FAIL self_test: breakage 59: … the gate stayed GREEN but
+#       `fleet  (adopting repositories clean;` did not report PASS
+#     tests/self_test.sh: line 589: printf: write error: Broken pipe
+#
+# The two possible fixes were to stop the check printing, or to stop the harness
+# piping. Stopping the check printing was the wrong one twice over: it would
+# contradict `check`'s documented behaviour, and the threshold it hides behind
+# is a property of the pipe buffer, so it would move with the machine and the
+# bug would come back as a flake on somebody else's packet. The output was
+# already captured in a variable; there is no reason to pipe at all.
 expect_green_check() {
   local label="$1" dir="$2" want="$3" needle="$4"
   shift 4
@@ -562,12 +628,12 @@ expect_green_check() {
       "$label" "$ec"
     printf '%s\n' "$out" | grep -E '^(FAIL|  -|       )' | tail -20 | sed 's/^/       /'
     failures=$((failures + 1))
-  elif ! printf '%s\n' "$out" | grep -qF "PASS $want"; then
+  elif ! contains "$out" "PASS $want"; then
     printf 'FAIL self_test: %s — the gate stayed GREEN but `%s` did not report PASS\n' \
       "$label" "$want"
     printf '%s\n' "$out" | grep -E '^(FAIL|SKIP)' | tail -20 | sed 's/^/       /'
     failures=$((failures + 1))
-  elif ! printf '%s\n' "$out" | grep -qF "$needle"; then
+  elif ! contains "$out" "$needle"; then
     # The dangerous one. A green run that said nothing is a check that ran
     # nothing, and it is exactly what a deleted ceiling looks like from here.
     printf 'FAIL self_test: %s — GREEN, but the finding was never named (no %q)\n' \
@@ -625,6 +691,10 @@ expect_red_script() {
 # So this asserts BOTH halves of the honest-reporting claim: the gate exited 0,
 # and the named check is what said so. A gate that passed by running nothing and
 # mentioning nothing fails here; a gate that failed fails here too.
+#
+# `contains`, for the reason given at `expect_green_check`: the output is already
+# in a variable, and piping it into `grep -q` makes the answer depend on how much
+# of it there is.
 expect_skip_check() {
   local label="$1" dir="$2" want="$3"
   shift 3
@@ -634,7 +704,7 @@ expect_skip_check() {
     printf 'FAIL self_test: %s — the gate exited %s, so the skip was not clean\n' "$label" "$ec"
     printf '%s\n' "$out" | grep '^FAIL' | sed 's/^/       /'
     failures=$((failures + 1))
-  elif printf '%s\n' "$out" | grep -qF "SKIP $want"; then
+  elif contains "$out" "SKIP $want"; then
     printf 'PASS self_test: %s — reported as `%s`\n' "$label" "$want"
   else
     printf 'FAIL self_test: %s — the gate stayed green but never said `%s`\n' "$label" "$want"
@@ -2292,6 +2362,46 @@ edit "$zizmor_baseline/.github/zizmor.yml" \
   self-repository:'
 expect_red_check 'breakage 51: the zizmor config baselines unpinned-uses' \
   "$zizmor_baseline" '.github/zizmor.yml  (unpinned-uses recorded, never baselined)' --static-only
+
+# 61-62. THE LICENCE, in the two ways the grant stops being unambiguous.
+#
+# A licence is only unambiguous when there is exactly ONE place in a repository
+# that can declare one. Both breakages are the same property failing from
+# opposite sides, and one of them is not a file being edited at all:
+#
+#   61. `LICENSE` DELETED. The direction everybody can see, and the one this
+#       check exists for: cafaye's decision is MIT across the fleet, and a
+#       repository with no grant is not permissive — it is all rights reserved,
+#       which is the default copyright position when nothing is granted. The
+#       README kept saying MIT the whole time, which is exactly why it needed a
+#       check: the documentation was true and the repository was not.
+#   62. a root `package.json` declaring `AGPL-3.0-only`. The direction nobody
+#       looks at, and the reason the check inspects manifests rather than merely
+#       the file's existence. The grant is still MIT in `LICENSE` and still MIT
+#       in the README; the repository has acquired a THIRD statement, a
+#       compliance tool reads it, and a reader has no way to tell which one is
+#       authoritative.
+#
+# 62 is the one that decides whether this is a real check. A check that only
+# asserts `LICENSE` exists is satisfied by a repository that has drifted into
+# saying two different things, which is the more likely failure — a manifest is
+# easy to add and nobody thinks of it as a licence decision.
+license_missing="$(fresh_copy licence-missing)"
+rm -f "$license_missing/LICENSE"
+expect_red_check 'breakage 61: LICENSE deleted — a repository with no grant is not permissive' \
+  "$license_missing" 'LICENSE  (MIT, and nothing in the tree can disagree with it)' --static-only
+
+# ASSEMBLED, not committed, and the reason is the same one as breakages 24, 25
+# and 33: this file is scanned. A literal `package.json` with a licence field is
+# harmless to the scanner, but the habit is the rule — a probe written out is a
+# probe committed, and the breakage would then be "caught by the wrong thing".
+# Written with printf rather than a heredoc so the fixture carries no manifest of
+# its own for a later recipe to trip over.
+license_conflict="$(fresh_copy licence-conflict)"
+printf '%s\n' '{' '  "name": "kit",' '  "private": true,' '  "license": "AGPL-3.0-only"' '}' \
+  > "$license_conflict/package.json"
+expect_red_check 'breakage 62: a root manifest declares a licence the LICENSE file contradicts' \
+  "$license_conflict" 'LICENSE  (MIT, and nothing in the tree can disagree with it)' --static-only
 
 
 # 52-60. THE FLEET GATE, one breakage per failure mode. Four, because the claim

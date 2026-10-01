@@ -17,6 +17,7 @@
 ```
 kit/
 ├── README.md                             # what kit is, how a repo adopts it
+├── LICENSE                               # MIT. The whole grant, and nothing can disagree
 ├── .gitleaks.toml                        # the allowlist, and nothing else
 ├── DECISIONS.md                          # the trades this repo has NOT made
 ├── .github/
@@ -223,7 +224,7 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   is the one that tells a working config from a valid one, and — unlike every
   other phase — it is **fatal on a skip**, because the claim under test is "kit's
   configs work" and a run in which no linter executed has not tested it.
-- **self_test** — sixty-five breakages of a throwaway copy. Sixty-three assert
+- **self_test** — sixty-seven breakages of a throwaway copy. Sixty-five assert
   the gate goes red; two assert it stays **green** while naming what it said —
   23b a SKIP, because a check that turns a red into an honest skip is
   load-bearing precisely by not going red, and 59 a FINDING, because kit-13's
@@ -231,7 +232,7 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   One further GREEN control (31b) asserts a service config that AGREES with
   kit's does not fail, because a check satisfied by banning the file would train
   every service to delete one. Six are a semantic mutation of one language each,
-  so **every suite is proven able to fail** rather than assumed to. Forty-five
+  so **every suite is proven able to fail** rather than assumed to. Forty-seven
   assert that one *named* check reported `FAIL`, so a check written for a specific
   defect is proven still load-bearing. Two assert that a *proof* goes red: one
   inverts the classifier's fail-closed property, and one makes the staleness
@@ -333,6 +334,20 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   ignored. If you add a file type, add the parser in the same commit.
 - When adding an artifact, add the check that would catch its absence. A
   validator nobody extends is a validator that quietly rots.
+- **Assert the AGREEMENT, not the presence of a file, and never read the gate's
+  output through a pipe.** Both halves are the same lesson from two directions.
+  A file existing does not mean it agrees with the other four places that state
+  the same fact — a licence, a port range, a tier, an allowlist — so a check
+  that only asks "is it there" is satisfied by exactly the state where the
+  repository has started contradicting itself. And when the harness asserts on
+  gate output, match the captured variable with a shell `case`; `printf … |
+  grep -q` reads a **match** as a non-match once the output overflows the 64K
+  pipe buffer, because `grep -q` closes the pipe, `printf` dies of SIGPIPE, and
+  `set -o pipefail` promotes 141 to the pipeline's status. That one cost kit-19 a
+  false red on breakage 59 after three correct copies of the defect were already
+  documented in the very file that contained them; it is now a `contains` helper
+  all three assertion helpers share, because the failure is a property of how the
+  harness READS output and has nothing to do with which check it is reading.
 - **Parse what you hand out.** A file a service copies has to parse in its own
   language, and the extension kit gives it must not stop you checking. This is
   not hypothetical: `rack_middleware.rb.snippet` shipped with
@@ -347,7 +362,7 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   rubocop ran on kit's own Ruby with kit's own config. That is the only way an
   obsolete key surfaces before six repos inherit it.
 - The suite must be able to fail: `self_test` breaks a throwaway copy of the
-  tree sixty-five ways and asserts the run goes red. If you change the suite,
+  tree sixty-seven ways and asserts the run goes red. If you change the suite,
   keep that true.
 
 ## The classifier fails closed, and that is a rule about code
@@ -578,6 +593,15 @@ appended, not substituted.** Move a port in `.env`; never in the override.
 - **Pins are placeholders.** `templates/mise.toml` and the Dockerfiles carry
   placeholder versions on purpose. A service raises them in its own repo; kit
   does not become an org-wide lockfile.
+- **The licence is MIT, and it lives in exactly one place.** `LICENSE` is the
+  grant, and `license_check` asserts it *and* walks every root manifest that can
+  carry a licence field. It does not ban those manifests — it requires them to
+  agree, because a check satisfied by "kit has no `package.json`" would be
+  satisfied by deleting one and would be a `FAIL` the day kit legitimately grew
+  one. A licence is only unambiguous when exactly one place in a repository can
+  declare it; a manifest copied out of a service is how that stops being true,
+  and it looks like a build decision rather than a legal one. `templates/` is
+  out of scope by design — a licence in a template is that template's business.
 - **No `latest`.** Every base image and action ref is pinned or floating-major
   deliberately, never `latest`.
 
