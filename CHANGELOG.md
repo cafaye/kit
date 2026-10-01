@@ -13,6 +13,62 @@ it without a copy (see kit-12 below).
 
 ## Unreleased
 
+### Fixed — the postgres accessory no longer publishes its port on every interface
+
+- **`templates/kamal/deploy.yml.erb` — one line deleted, and what replaces it is a
+  comment that says why.** The postgres accessory carried `port: 5432`, which is
+  valid YAML and which `kamal config` accepts and exits 0 — the two strongest false
+  greens available. Kamal expands it (`Configuration::Accessory#port` returns
+  `"#{port}:#{port}"` when the value carries no colon) and hands it to
+  `docker run --publish` (`Commands::Accessory#publish_args`), and Docker's
+  `--publish HOST:CONTAINER` with no host address binds `0.0.0.0` and `::`.
+
+  **Measured, on a real Kamal 2.12.0 boot, not inferred:** a boot with the line
+  present fails with
+  `Bind for 0.0.0.0:5432 failed: port is already allocated`
+  when something else holds 5432 — which is Docker naming the bind it is about to
+  make. On a VPS where 5432 is free it succeeds, and the database is on every
+  interface the host has. kit does not ship a firewall, and the only thing between
+  that and the internet is one the operator wrote.
+
+- **The loopback alternative is not the fix, and the comment says so, because it
+  is the obvious answer and it does not work.** `port: "127.0.0.1:5432:5432"`
+  really does bind only that host — measured, `docker ps` shows
+  `127.0.0.1:5432->5432/tcp` and nothing on `::`. But the application is not on
+  the host's loopback: it is a container on the `kamal` Docker network, where
+  `127.0.0.1` is its own. Measured, from a container on that network:
+  `pg_isready -h 127.0.0.1 -p 5432` gets **no response**, while
+  `pg_isready -h <service>-postgres -p 5432` **answers**. So the loopback bind
+  reduces the exposure, does not make the application work, and the only thing it
+  buys is a `psql` on the box itself.
+
+- **What the application uses instead, measured rather than argued.** Kamal boots
+  the accessory with `--network kamal` and `--name <service_name>`, Docker's
+  embedded DNS resolves that name, and the app reaches the database at
+  `<service>-postgres:5432`. Measured from **inside a deployed app container**
+  with this template and no `port:` line: `pg_isready -h <service>-postgres -p
+  5432` → `accepting connections`, and `docker ps` for the accessory shows
+  `5432/tcp` with no host binding at all.
+
+  **`DATABASE_URL` must therefore name the container, not the server.** That is
+  the one migration this costs, and it is a one-line change per service in a file
+  that is already a secret and already per-service. The fleet's own probe URLs
+  already use the container-name form, which is independent evidence that
+  name-based access is the intended shape.
+
+- **`tests/kamal_test.sh` — two new cases, and one of them is a control.** The
+  first asserts that the **resolved** accessories block (read back from the real
+  `kamal config`, not grepped out of the template) carries no `port:`. The second
+  plants the line it forbids and asserts the same check catches it, because a grep
+  that finds nothing because it read nothing is the failure mode a negative test
+  has by construction.
+
+  Both were needed more than expected. The first version of the block-extraction
+  was `sed -n '/^:accessories:/,/^[^-:]/p'`, which stops on `  postgres:` the
+  very next line — `p` is neither `-` nor `:` — so it read a two-line document and
+  the case passed for the wrong reason; the control caught it, which is what a
+  control is for.
+
 ### Added — Kamal deploy and backup configuration, and the custom toolchain removed
 
 - **`templates/kamal/` — the deploy and backup configuration a service copies,
