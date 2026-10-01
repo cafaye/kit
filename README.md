@@ -888,14 +888,21 @@ no `npm ci`, no `cargo fetch`. If these ever need the network, a template has
 grown a dependency and kit has stopped being config-only.
 
 **self_test** — `tests/self_test.sh` breaks a throwaway copy of this tree
-**twenty** ways and asserts the gate goes red each time. Fourteen breakages are
-for the static checks; one is a semantic mutation of each of the six language
-implementations, so **every suite is proven able to fail** rather than assumed
-to. A skip fails the run — a self_test that skips half its proofs and exits 0 is
-the "0 passed, 14 ignored" shape that verifies nothing. Seven of the static
-ones go further and assert that one *named* check reported `FAIL`, so the check
-written for a given defect is proven still load-bearing rather than being one
-of fifty checks that could have gone red for an unrelated reason.
+**thirty-two** ways: **thirty-one assert the gate goes red, and one asserts it
+stays green while still naming the finding** — the adoption ceiling's other side,
+and the only proof that a ceiling is a ceiling rather than a deleted check. One
+is a semantic mutation of each of the six language implementations, so **every
+suite is proven able to fail** rather than assumed to. A skip fails the run — a
+self_test that skips half its proofs and exits 0 is the "0 passed, 14 ignored"
+shape that verifies nothing. Sixteen go further and assert that one *named*
+check reported `FAIL`, so the check written for a given defect is proven still
+load-bearing rather than being one of fifty checks that could have gone red for
+an unrelated reason; two assert that a *proof* went red.
+
+The count is **counted from the recipes**, not written down, and `validate.sh`
+compares the header's list against the recipes — so a breakage added without a
+header entry, or a header entry with no recipe, is a red gate rather than
+documentation that quietly lies.
 
 Breakage 19 is the allowlist one: an entry naming a test that does not exist,
 well-formed in every other respect. It is the rule most able to be decorative —
@@ -905,6 +912,17 @@ seen fail.
 Any `FAIL` exits 1. A `SKIP` is always reported in the summary, never hidden.
 PyYAML, yamllint and hadolint are required and are **bootstrapped by the gate
 itself**; the six language toolchains and `shellcheck` run when present.
+
+**Four counts, because they are four different claims.** `PASS` and `FAIL` are
+about the tree. `SKIP` is about the **environment** — no docker, no toolchain,
+nothing ran. **`BOUND` is about the run**: the tier started, this machine was too
+busy to finish it, and the claim it exists to prove is therefore *unexercised*.
+The four heavy tiers — three docker stacks, and the self-test, which is *n*
+whole gates in sequence — carry a time bound for exactly this reason. A gate
+SIGKILLed by the OOM killer reports nothing about the tiers it never reached, so
+its green is a claim about how far it got; a bound converts that into a verdict
+that is stated rather than a run that stops. The summary prints both how many
+tiers ran under a bound and how many reached one.
 
 ### What the gate lints the Dockerfiles with, and why
 

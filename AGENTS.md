@@ -157,7 +157,7 @@ Three phases, and all three must pass:
   finding**, which is the adoption ceiling's other side and the only proof that
   a ceiling is a ceiling rather than a deletion. Six of them are a semantic
   mutation of one language each, so **every suite is proven able to fail** rather
-  than assumed to. Fifteen assert
+  than assumed to. Sixteen assert
   that one *named* check reported `FAIL`, so a check written for a specific
   defect is proven still load-bearing. Two assert that a *proof* goes red: one
   inverts the classifier's fail-closed property, and one makes the staleness

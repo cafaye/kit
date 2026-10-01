@@ -79,6 +79,15 @@
 #               authoritative, every edit to it changes nothing, and a
 #               developer has no way to find out.
 #           26. a `kit.ref` holding `master` -> the pin check goes red.
+#   27-29. the override rules, each against the named check.
+#           27. a vendor config mount that stopped resolving from the fetched
+#               tree. Found by RUNNING the stack; `docker compose config`
+#               renders the same project and every other check stays green.
+#           28. the pin moved back into `.env`, where it is git-ignored and so
+#               exists on exactly one machine.
+#           29. a service publishes a port on a service kit already ships. The
+#               merge appends rather than substitutes, so nothing errors and the
+#               port the developer meant to move is still bound.
 #   30-31. THE ADOPTION CEILING, both sides of it, because a ceiling that only has
 #         one side proved is not a ceiling — it is a deleted check.
 #           30. the SAME stale copy in a repository with NO `kit.ref` -> the gate
@@ -94,23 +103,14 @@
 #           fixture, so a change that softened the adopted side fails 31 and a
 #           change that hardened the unadopted side fails 30, and there is no
 #           third state in which both pass and the checks are weaker.
-#   27-29. the override rules, each against the named check.
-#           27. a vendor config mount that stopped resolving from the fetched
-#               tree. Found by RUNNING the stack; `docker compose config`
-#               renders the same project and every other check stays green.
-#           28. the pin moved back into `.env`, where it is git-ignored and so
-#               exists on exactly one machine.
-#           29. a service publishes a port on a service kit already ships. The
-#               merge appends rather than substitutes, so nothing errors and the
-#               port the developer meant to move is still bound.
 #
-#   Fifteen of them (7-12, 19, 20, 23-29) additionally assert WHICH check
+#   Sixteen of them (7-12, 19, 20, 23-29, 31) additionally assert WHICH check
 #         went red. Every other breakage only proves the gate can fail; those
 #         prove the check written for that defect is still load-bearing, which is
 #         a different claim and the one that decays silently. 21 and 22 assert
 #         the same thing about the two scripts that are themselves proofs, and
-#         23-26 assert it over a fixture fleet rather than over the tree — see
-#         `break_fleet` below for why that helper exists at all.
+#         23-26 and 29-31 assert it over a fixture fleet rather than over the
+#         tree — see `fixture_fleet` below for why that helper exists at all.
 #
 set -euo pipefail
 

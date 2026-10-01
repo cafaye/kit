@@ -728,7 +728,8 @@ def main(argv: list) -> int:
     # when they are scanning for what went wrong.
     print(
         "CEILING fleet: a finding inside a repository that has a kit.ref is a FAIL; "
-        "inside one that has not adopted, it is the WARN below. The four checks are "
+        "inside one that has not adopted, it is a named WARN and the run stays green. "
+        "The four checks are "
         "identical either way — the strictness MOVES to where adoption exists, it "
         "does not disappear. A warning is a debt with a name, and the adoption wave "
         "turns them into failures one repository at a time.",

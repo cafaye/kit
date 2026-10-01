@@ -533,7 +533,7 @@ is indistinguishable, from the outside, from not having one.
 
 `tests/self_test.sh` breaks a throwaway copy once per check and asserts it goes
 red. **Thirty-two breakages: thirty-one red, one green-expecting.**
-**Fifteen assert the NAMED check**, because "the gate went red" is a weak claim
+**Sixteen assert the NAMED check**, because "the gate went red" is a weak claim
 when a hundred checks can make it red.
 
 **One does not assert red at all**, and that is the load-bearing one for this

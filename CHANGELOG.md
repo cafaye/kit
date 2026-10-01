@@ -149,9 +149,9 @@ semver contract — it is consumed by *calling*
   asserted with a literal substring of the finding rather than the word `WARN`,
   so a gate that printed `WARN` and nothing else cannot satisfy it. 31 is that
   identical mutation with `kit.ref` committed: the gate goes **red** on the
-  identical finding. Now **31 breakages in all — 30 red, 1 green-expecting**,
-  15 of them name-specific — and the summary line counts the two separately
-  rather than summing them, because "31 breakages, 31 reds" would hide the only
+  identical finding. Now **32 breakages in all — 31 red, 1 green-expecting**,
+  **16 of them name-specific** — and the summary line counts the two separately
+  rather than summing them, because "32 breakages, 32 reds" would hide the only
   fact that distinguishes them.
 
   One mutation, factored into `break_stale_copy`, shared by all three recipes:
