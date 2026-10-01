@@ -181,6 +181,40 @@ TPL_NA = "n/a"
 # which cells are a problem.
 NEEDS_PIN = (TPL_DIVERGED, TPL_ABSENT, TPL_UNKNOWN)
 
+
+def needs_a_pin(row: dict) -> bool:
+    """Does this row require a reason in the parity allowlist?
+
+    The rule is the default one — `diverged`, `absent` and `unknown` all need a
+    pin, `current` does not — with ONE exemption, and the exemption is narrower
+    than it looks.
+
+    `artifacts.json` has documented an `optional` field since kit-14: "true when
+    kit genuinely does not expect universal adoption. Such an artefact is
+    reported but does not, by itself, make a service look broken." Nothing
+    implemented it, because no artefact in the table used it — a property stated
+    in one file and asserted in zero places, which is the exact shape this
+    repository's own rules call out. kit-21 added the first `optional`
+    artefacts (the per-language connection contract) and the reporter turned
+    every one of them into an unpinned finding for every service in the fleet,
+    which is the opposite of what the field says.
+
+    It exempts `absent` and ONLY `absent`, and the narrowness is the point:
+
+      * `diverged` — the service HAS the artefact and it is not kit's bytes. A
+        field about adoption expectation says nothing about a copy that has
+        drifted, and that is the state this whole mechanism exists to catch.
+      * `unknown` — the reporter could not measure it. `unknown` inherits the
+        fail-closed rule above rather than copying it: an unmeasured optional
+        artefact is still an unmeasured one.
+
+    So an optional artefact is reported in the table and contributes no finding.
+    It is visible and it is not a pin.
+    """
+    if row.get("optional") and row["state"] == TPL_ABSENT:
+        return False
+    return row["state"] in NEEDS_PIN
+
 # Where a pin can hide, in preference order. Lockfile first: it is the form the
 # migration moves toward, and a repository that has both is mid-migration and
 # its two pins should agree (see `pins_disagree`).
@@ -537,6 +571,10 @@ def collect_cell(repo_name: str, repo_dir: str, artefact: dict, kit_dir: str,
         "pin": None,
         "source": None,
         "dest": dest,
+        # Carried onto the row so `needs_a_pin` can act on it without reaching
+        # back into the table. See that function for why only `absent` is
+        # exempted.
+        "optional": bool(artefact.get("optional")),
     }
 
     # The one artefact a service does not copy. A caller is a reference, and
@@ -727,7 +765,7 @@ def collect_cell(repo_name: str, repo_dir: str, artefact: dict, kit_dir: str,
 
 
     index = {(r["repo"], r["artefact"]): r for r in rows}
-    unpinned = [r for r in rows if r["state"] in NEEDS_PIN and not r.get("pin")]
+    unpinned = [r for r in rows if needs_a_pin(r) and not r.get("pin")]
     dead = [
         dict(pin, state=(index.get(key) or {}).get("state", "unmeasured"))
         for key, pin in pins.items()
@@ -769,8 +807,15 @@ def render_template_table(rows: list[dict], findings: list[dict], kit_head: str,
             cell += f"  ({row['note']})"
         if row.get("pin"):
             cell += f"  PINNED: {pin_text(row['pin'])}"
-        elif row["state"] in NEEDS_PIN:
+        elif needs_a_pin(row):
             cell += "  UNPINNED"
+        elif row.get("optional"):
+            # Reported and not a pin. The marker is on the row rather than
+            # implied by the absence of UNPINNED, because "absent, and nothing
+            # needs saying" and "absent, and kit does not expect this service to
+            # have adopted it yet" are different statements and a reader should
+            # not have to know which one they are looking at.
+            cell += "  (optional — kit does not yet expect this service to hold it)"
         out.append(cell)
 
     out.append("")
@@ -1169,7 +1214,7 @@ def run_templates_scope(args: argparse.Namespace) -> int:
 
     index = {(r["repo"], r["artefact"]): r for r in rows}
     measured = {r["repo"] for r in rows}
-    unpinned = [r for r in rows if r["state"] in NEEDS_PIN and not r.get("pin")]
+    unpinned = [r for r in rows if needs_a_pin(r) and not r.get("pin")]
     mismatched = [r for r in rows if r.get("pin_mismatch")]
     dead: list[dict] = []
 

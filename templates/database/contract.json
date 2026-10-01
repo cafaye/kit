@@ -1,0 +1,139 @@
+{
+  "_about": [
+    "THE CONNECTION CONTRACT, in the form the gate can read.",
+    "",
+    "Read by tests/validate.sh's `database contract` check. One file, because",
+    "the alternative is six snippets that each restate what the settings are and",
+    "a seventh place — a README paragraph — that says what they mean, and the",
+    "three disagree the moment a fourth language is added. This file is the one",
+    "that is checked; README.md is the one that is read.",
+    "",
+    "WHAT THIS FILE IS FOR",
+    "",
+    "  Every generated per-language config must CARRY the required settings and",
+    "  must NOT carry the pooler workarounds. Both directions are asserted, per",
+    "  language, against the file named below. The second half is the half that",
+    "  matters most: a service carrying `prepare: :unnamed` looks correct and is",
+    "  wrong, because kit runs no pooler and that flag trades real performance",
+    "  for compatibility with a component that is not in the path.",
+    "",
+    "  A comment saying 'remember to set prepare: :unnamed' is not a contract.",
+    "  A comment saying 'do NOT set prepare: :unnamed, and here is why' plus a",
+    "  check that fails the build when it appears IS one.",
+    "",
+    "WHAT IS NOT IN HERE, AND WHY",
+    "",
+    "  The VALUES. Timeouts and pool sizes are decisions a service makes in its",
+    "  own repository, and kit's own rule is that pins are placeholders. What is",
+    "  fixed here is the SETTING NAMES and the requirement to carry them — the",
+    "  names are what a service and kit must agree on, and the numbers are what",
+    "  the service tunes.",
+    "",
+    "  The pooler choice itself, beyond its name. The argument is in README.md",
+    "  and the measurements are in DECISIONS.md, because an argument in a JSON",
+    "  file is an argument nobody reads and a check that only checks a string."
+  ],
+
+  "pooler": {
+    "decision": "none",
+    "summary": "One cluster, direct connections, a stated connection budget, and per-role blast-radius limits. No transaction-mode pooler.",
+    "forbidden": [
+      "prepare: :unnamed",
+      "prepare: :unnamed,",
+      "default_query_exec_mode",
+      "simple_protocol",
+      "QueryExecModeSimpleProtocol",
+      "QueryExecModeCacheDescribe",
+      "track_extra_parameters",
+      "server_reset_query",
+      "max_prepared_statements"
+    ],
+    "forbiddenWhy": [
+      "These are the settings a service adds to SURVIVE a pooler, and kit runs",
+      "no pooler. Each one is a real setting with a real purpose; none of them has",
+      "a purpose here.",
+      "",
+      "They are forbidden rather than merely discouraged because their cost is",
+      "invisible: `prepare: :unnamed` and `default_query_exec_mode=",
+      "simple_protocol` both disable named prepared statements, which makes every",
+      "execution re-parse and re-plan. A service carrying one of them is SLOWER",
+      "and looks fine, and the only way to notice is to look for the flag.",
+      "",
+      "A check that lists them is also the cheapest possible tripwire for the",
+      "real failure: somebody reading a blog post, or a copied `docker-compose.yml`",
+      "from a company that does run PgBouncer, adding a pooler workaround to a",
+      "generated config in a fleet that has no pooler. The diff is one line and",
+      "the flag is in this file.",
+      "",
+      "`track_extra_parameters`, `server_reset_query` and `max_prepared_statements`",
+      "are in the list because they are pgbouncer.ini KEYWORDS: a service carrying",
+      "one of them has, in effect, configured a pooler it does not have."
+    ]
+  },
+
+  "requiredSettings": [
+    {
+      "key": "application_name",
+      "why": "THE ONE THAT IS NOT OPTIONAL. Nine services share one pg_stat_activity, and without an application_name a query in it cannot be attributed to any of them. It is also what a slow-query log, a pg_stat_statements breakdown, and an operator asking whose query is this all read.",
+      "servedBy": "the service name, which is also its database name and its role name"
+    },
+    {
+      "key": "statement_timeout",
+      "why": "One service's runaway query occupies shared resources until it finishes. On its own machine that is its own outage; on a shared cluster it is everybody's. The cluster sets this per role as a backstop, so a service that omits it is still bounded — this is the first line, not the only one.",
+      "servedBy": "KIT_POSTGRES_STATEMENT_TIMEOUT_MS in the cluster, as the backstop"
+    },
+    {
+      "key": "idle_in_transaction_session_timeout",
+      "why": "THE SHARED-CLUSTER KILLER. One forgotten BEGIN holds a snapshot open, which blocks VACUUM and grows every table on the box. With one database per machine that is one service's problem; with one cluster it is nine services' problem, and it is silent until the disk fills.",
+      "servedBy": "KIT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS in the cluster, as the backstop"
+    }
+  ],
+
+  "boundedPool": {
+    "why": "This service's share of the cluster's connection budget, expressed as a cap inside the process. It is the INNER of two caps: the cluster's per-role `ALTER ROLE … CONNECTION LIMIT` is the outer one, and the two must agree in the direction that is safe — an inner cap larger than the outer one does not give the service more connections, it gives it errors.",
+    "tokens": ["pool_max_conns", ":pool_size", "MAX_CONNS", "pool:", "max:"],
+    "tokensWhy": "One token per language's own spelling, because the check is over GENERATED OUTPUT and each driver names this differently. A single canonical token would have meant rewriting each snippet to carry a token its driver does not use, which is decoration rather than a contract."
+  },
+
+  "languages": [
+    {
+      "lang": "go",
+      "snippet": "templates/database/go/database.go.snippet",
+      "copiesTo": "internal/db/db.go",
+      "parser": "gofmt"
+    },
+    {
+      "lang": "elixir",
+      "snippet": "templates/database/elixir/repo.exs.snippet",
+      "copiesTo": "lib/<app>/database.ex",
+      "parser": "elixir"
+    },
+    {
+      "lang": "python",
+      "snippet": "templates/database/python/database.py.snippet",
+      "copiesTo": "db.py",
+      "parser": "python"
+    },
+    {
+      "lang": "ruby",
+      "snippet": "templates/database/ruby/database.yml.snippet",
+      "copiesTo": "config/database.yml",
+      "parser": "yaml",
+      "parserWhy": "The one language whose connection config is DATA rather than code, so `yaml.safe_load` is its parser — and it is not an ERB template, because a file with `<%= ENV.fetch(...) %>` in it is not YAML and the parse check would fail on every run. Substitute the URL at read time."
+    },
+    {
+      "lang": "node",
+      "snippet": "templates/database/node/database.ts.snippet",
+      "copiesTo": "src/db.ts",
+      "parser": "node",
+      "alsoFor": "bun",
+      "alsoForWhy": "bun runs the same node-postgres driver, so it ships THIS file rather than a second one. A near-identical bun.ts would be two files to keep in step for no difference in behaviour."
+    },
+    {
+      "lang": "rust",
+      "snippet": "templates/database/rust/database.rs.snippet",
+      "copiesTo": "src/db.rs",
+      "parser": "rustc"
+    }
+  ]
+}

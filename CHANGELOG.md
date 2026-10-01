@@ -13,7 +13,145 @@ it without a copy (see kit-12 below).
 
 ## Unreleased
 
-### Fixed
+### Added
+
+- **one Postgres cluster, one database and one role per service, and the database
+  is the isolation boundary.** Nine services, one cluster, no pooler. A service
+  adds its own name to `KIT_POSTGRES_DATABASES` and gets a role, a database and a
+  refused-at-the-door boundary — there is no second container, no second port and
+  no second volume, which is the entire point of sharing a cluster.
+
+  `templates/compose/postgres/initdb/10-cluster.sh` provisions one non-superuser
+  role and one owned database per name, then applies the boundary by **sweeping
+  `REVOKE ALL ON DATABASE … FROM PUBLIC` over every non-template database** in
+  the cluster rather than over a list of the ones it created. Measured, and this
+  is the load-bearing part: with the revoke, `psql -U courier -d billing` answers
+  `FATAL: permission denied for database "billing"` / `DETAIL: User does not have
+  CONNECT privilege` before a query is parsed; without it, the connection
+  **succeeds** and only the `SELECT` on billing's table is refused — by the
+  accident that nobody granted it. A cluster provisioned without the revoke has,
+  by Postgres's default, no isolation at all, and fails open silently.
+
+- **`tests/isolation_test.sh` — the proof, not the claim.** Brings the *shipped*
+  stack up through compose, creates two service databases and two service roles,
+  and asserts service A cannot reach service B's, printing the refused query and
+  the server's answer. Four assertions: A reaches its own; A is refused B's; B is
+  refused A's (one lucky direction is not isolation); and a **control cluster of
+  the same shape with the revoke removed must let A in**.
+
+  The control is the assertion that makes the rest mean anything, and it is
+  there because of the rule this repository already applies to allowlists and
+  proofs: an assertion that cannot be shown to fail is not known to be
+  load-bearing. Without it, a check asserting "A cannot SELECT from B's rows"
+  would pass on a cluster with no isolation at all. Wired into the gate's
+  observability phase with its own `BOUND` bound (1800s — three container
+  lifecycles and two initdb runs), and a loud SKIP when docker is absent.
+
+- **`templates/database/` — the connection contract, published and consumed.** The
+  topology is only finished if a service's config actually works against it, so
+  the four settings that only matter on a shared cluster are generated per
+  language rather than described in a comment:
+
+  | setting | what it prevents on one cluster |
+  |---|---|
+  | `application_name` | an unattributable query — nine services in one `pg_stat_activity` and no way to say whose |
+  | `statement_timeout` | one service's runaway query occupying shared resources |
+  | `idle_in_transaction_session_timeout` | one forgotten `BEGIN` blocking `VACUUM` cluster-wide |
+  | a bounded pool | one service taking the connections the other eight need |
+
+  Six languages (go, elixir, python, ruby, node — also bun — and rust), each
+  parsed by **its own parser** in the gate, and each required to carry the
+  contract by `templates/database/contract.json` rather than by a grep repeated
+  six times. The cluster sets the two timeouts **per role** as a backstop, so a
+  service that forgets them is bounded rather than unbounded.
+
+- **the pooler decision, as a check rather than a paragraph.** kit runs **no
+  PgBouncer**: direct connections, `max_connections` raised to 200, a per-role
+  `CONNECTION LIMIT`, and per-role timeouts. The argument is in
+  `templates/database/README.md` and the measurements in `DECISIONS.md` (MD21); the
+  deciding sentence is from PgBouncer's own configuration documentation, which
+  describes `RECONNECT` on its admin console as the remedy for
+  `ERROR: cached plan must not change result type` after a DDL migration — a
+  manual operator step after every schema change in nine repositories.
+
+  The pooler workarounds are **forbidden** in `contract.json` and the gate fails
+  the build if one appears in any generated config. A service carrying
+  `prepare: :unnamed` on a fleet with no pooler is slower and looks entirely
+  correct, so nothing else would ever find it.
+
+- **`DECISIONS.md` — the file seven places referenced and that did not exist.**
+  `AGENTS.md` (twice), `README.md` (twice, one of them a markdown link),
+  `.github/zizmor.yml`, `ci.reusable.yml` (three times) and three of the gate's
+  own scripts all pointed at it. A reference to a decision document that is not
+  there tells the reader the trade was made and then leaves them with nothing to
+  read — worse than not claiming it, because the absence looks like they have not
+  looked hard enough. It now exists, with MD10, MD12, MD13 and the four MD21
+  entries this packet decided, and a check asserts it is present, records real
+  entries, and that every reference to it resolves.
+
+### Changed
+
+- **the cluster image is `postgres:17` (Debian), not `postgres:17-alpine`.**
+  pglayers publishes each extension as a glibc-linked layer built from the PGDG
+  Debian packages, and alpine is musl. Measured, on the alpine base: the image
+  **builds cleanly** and then `CREATE EXTENSION vector` reports the extension is
+  not available, with `ldd` showing `Error loading shared library
+  ld-linux-*.so.1`. Two independent failures — the loader cannot resolve a glibc
+  binary, and alpine's PostgreSQL looks under
+  `/usr/local/share/postgresql/extension` while pglayers writes to
+  `/usr/share/postgresql/17/extension`. On `postgres:17` the same layer answers a
+  real query. An image that claims pgvector and does not have it is worse than one
+  that is visibly missing it.
+
+  The layer is composed rather than pulled: `pglayers-full` would be one line
+  instead of four, but it *replaces* the official `postgres` image with a
+  community build for every service permanently, and loads 80+ extensions and a
+  raised `max_worker_processes` onto the cluster whether or not any is used.
+  Trade recorded as MD21b, including that pglayers is a community project and
+  **not** a PostgreSQL one — it layers onto the official images, which is a
+  weaker claim.
+
+- **extensions are a cluster decision, created by the admin role.** A service role
+  cannot `CREATE EXTENSION`: pgvector's control file is not marked `trusted`, so
+  a non-superuser is refused with `HINT: Must be superuser to create this
+  extension`. Verified against pglayers' layer *and* upstream pgvector v0.8.6,
+  whose `vector.control` is byte-identical — this is pgvector's own
+  classification, not something the packaging drops. The `SET ROLE` design that
+  looked right could not work, and the measurement is why.
+
+- **`lint/hadolint.yaml` ignores DL3067 as well as DL3008.** The cluster image is
+  `COPY --from=<layer> / /`, which is pglayers' whole mechanism and has no
+  narrower form on PG17. The rule's rationale — an accidental whole-filesystem
+  copy pastes in unreviewed files — is answered by pinning a specific published
+  version of one extension rather than by the rule.
+
+- **`templates/compose/.env.example` said `KIT_POSTGRES_TAG=16.6-alpine` while
+  `docker-compose.yml` defaulted to `17-alpine`, and `.env.example` WINS** —
+  `bin/dev` copies it to `.env` on first run, so every developer's stack ran 16.6
+  while the compose file, this README and the CHANGELOG all said 17. Commit
+  `48689e6` fixed the compose default and left the file that overrides it alone,
+  which is the more dangerous half of that fix: it made the repository agree with
+  itself and the developer's machine disagree with both.
+
+  Now asserted in **both directions** — a tag in `.env.example` that is not the
+  compose default fails, and a compose default that is not that tag fails. A
+  check that only asked "is `KIT_POSTGRES_TAG` in `.env.example`" would be
+  satisfied by the broken state, because the broken state has it. The check also
+  refuses an alpine variant, with the reason. self_test breakage 68 is the shipped
+  defect and breakage 69 is the alpine regression.
+
+- **`artifacts.json` documented an `optional` field that no code implemented.**
+  "Such an artefact is reported but does not, by itself, make a service look
+  broken" — a property stated in the table's own `_about` and asserted in zero
+  places, because no artefact in the table used it. kit-21 added the first
+  optional artefacts and the reporter turned every one into an unpinned finding
+  for every service in the fleet, which is the opposite of what the field says.
+  `staleness.py` now implements it, and the exemption is **`absent` only**: a
+  `diverged` optional artefact is a copy that has drifted and still needs a pin,
+  and an `unknown` one is an unmeasured artefact and inherits the fail-closed
+  rule rather than copying it.
+
+### Fixed (previously open in this release)
 
 - **a gate that exited non-zero reporting NO finding was reported as "the gate
   went red, but NOT via `<the named check>`", which blames a check for a machine

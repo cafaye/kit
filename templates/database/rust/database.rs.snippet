@@ -1,0 +1,154 @@
+// kit template — the connection contract for a shared Postgres cluster.
+//
+//   cargo add tokio-postgres --features with-serde_json-1
+//
+// FOUR SETTINGS, and each exists because nine services share one Postgres. On a
+// database per machine you would need none of them.
+//
+//   1. application_name  — THE ONE THAT IS NOT OPTIONAL. `pg_stat_activity` shows
+//      nine services' queries in one list and cannot attribute any of them
+//      without it. tokio-postgres has a first-class builder method for it.
+//   2. statement_timeout — one service's runaway query occupies shared resources
+//      until it finishes. The cluster sets this per role as a backstop too.
+//   3. idle_in_transaction_session_timeout — THE SHARED-CLUSTER KILLER. A
+//      forgotten BEGIN holds a snapshot open, blocks VACUUM and grows every table
+//      on the box.
+//   4. a bounded pool    — this service's share of the cluster's budget.
+//
+// Copy into your db module and change SERVICE_NAME.
+
+use std::time::Duration;
+
+use tokio_postgres::NoTls;
+
+/// MUST equal your database and role name: one service, one database, one role,
+/// one name, so a query on the cluster is attributable from the query alone.
+pub const SERVICE_NAME: &str = "courier";
+
+// These are the values the cluster's per-role settings apply as a backstop
+// (KIT_POSTGRES_STATEMENT_TIMEOUT_MS, KIT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS),
+// so a service that forgets them is still bounded rather than unbounded.
+pub const STATEMENT_TIMEOUT_MS: u64 = 15_000;
+pub const IDLE_IN_TRANSACTION_TIMEOUT_MS: u64 = 30_000;
+
+// This service's SHARE of the cluster's connection budget. The cluster caps each
+// role at 10 with `ALTER ROLE … CONNECTION LIMIT`; MAX_CONNS is the cap inside
+// this process. The two must agree in the direction that is safe — a pool larger
+// than the role limit does not give you more connections, it gives you errors.
+pub const MAX_CONNS: usize = 10;
+
+/// The connection string, or a refusal.
+///
+/// `Result`, not `String`, because an empty connection string in tokio-postgres
+/// is not a connection error at construction: it is a runtime failure in whatever
+/// request happens to reach the pool first. Refusing here turns a missing
+/// configuration into a startup failure that names the variable.
+pub fn connection_string() -> Result<String, String> {
+    match std::env::var("DATABASE_URL") {
+        Ok(url) if !url.is_empty() => Ok(url),
+        _ => Err(
+            "DATABASE_URL is not set. The shared cluster holds one database and \
+             one role per service, named after the service; this process will \
+             not guess either."
+                .to_string(),
+        ),
+    }
+}
+
+/// The `PgConnectOptions` for this service. This is the whole contract.
+///
+/// Every one of these is a BUILDER METHOD rather than a field in the URL, and
+/// that is the point worth carrying to the other four languages: the timeout
+/// settings are startup-packet parameters, so setting them through tokio-postgres
+/// makes it impossible to forget them on a connection this process did not
+/// open. A pool that grows behind you cannot acquire a backend that skipped the
+/// configuration — which is the failure a `?options=` in a DSN invites, because
+/// the DSN is a string somebody can rewrite and nothing checks it.
+pub fn connect_options() -> Result<tokio_postgres::Config, String> {
+    let url = connection_string()?;
+    let config = url
+        .parse::<tokio_postgres::Config>()
+        .map_err(|e| format!("DATABASE_URL is not a valid connection URL: {e}"))?;
+
+    Ok(config
+        // (1) The attribution every shared cluster depends on.
+        .application_name(SERVICE_NAME)
+        // (2) and (3). tokio-postgres takes these as `Duration`s and formats
+        // them the way Postgres expects (milliseconds), which is why the
+        // constants above are milliseconds rather than a formatted string.
+        .statement_timeout(Duration::from_millis(STATEMENT_TIMEOUT_MS))
+        .idle_in_transaction_session_timeout(Duration::from_millis(
+            IDLE_IN_TRANSACTION_TIMEOUT_MS,
+        ))
+        // `connect_timeout` bounds the cost of a dead host. Below the cluster's
+        // statement_timeout on purpose, so a caller finds out while its own
+        // timeout still has somewhere to go.
+        .connect_timeout(Duration::from_secs(5)))
+}
+
+/// One connection. Callers that need a pool wrap this in deadpool or bb8 and
+/// configure it with `MAX_CONNS` — which is the same number, for the same
+/// reason: the cluster's per-role `CONNECTION LIMIT` is the outer cap and this
+/// is the inner one.
+pub async fn connect() -> Result<tokio_postgres::Client, String> {
+    let (client, connection) = tokio_postgres::connect(&connect_options()?, NoTls)
+        .await
+        .map_err(|e| format!("database: connect: {e}"))?;
+
+    // The connection future must be driven or the client is inert. `tokio::spawn`
+    // is the whole of this, and it is worth stating because the alternative —
+    // awaiting it — deadlocks at the first query.
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("[db] connection task ended: {e}");
+        }
+    });
+
+    Ok(client)
+}
+
+/// Fail at BOOT rather than on the first request that needs the database.
+///
+/// A service whose /up is green while its database is unreachable gets traffic
+/// it cannot serve, and the readiness probe is the only cheap place to catch it.
+pub async fn ping(client: &tokio_postgres::Client) -> Result<(), String> {
+    client
+        .simple_query("select 1")
+        .await
+        .map(|_| ())
+        .map_err(|e| format!("database: ping: {e}"))
+}
+
+// ---------------------------------------------------------------------------
+// WHAT IS NOT HERE, AND WHY — read this before "fixing" this file.
+//
+//   There is NO pooler compatibility setting in this file, and that omission is
+//   the load-bearing one. The usual workaround for a transaction-mode connection
+//   pooler is to stop using named prepared statements — in tokio-postgres, by
+//   moving query execution off its default prepared path. kit runs NO pooler, so
+//   there is nothing to be compatible with, and making that change here would
+//   re-parse and re-plan every query for a component that is not in the path.
+//
+//   The argument for running no pooler at all is in
+//   templates/database/README.md and DECISIONS.md (MD21), and the sentence that
+//   decides it is from PgBouncer's own configuration documentation: the remedy
+//   for `ERROR: cached plan must not change result type` after a DDL migration is
+//   `RECONNECT` on its admin console — a manual operator step after every schema
+//   change in nine repositories.
+//
+//   So tokio-postgres's default prepared-statement behaviour stays exactly as it
+//   is. `templates/database/contract.json` lists the pooler settings that are
+//   FORBIDDEN in generated config, and `tests/validate.sh` fails the build when
+//   one appears.
+//
+//   (This comment deliberately does not spell those settings out. The first
+//   version of it quoted them, and the check that forbids them flagged its own
+//   explanation — which is the failure mode AGENTS.md records about
+//   `gate_declaration_check`: a check that fires on correct work teaches the
+//   reader to ignore it. The names belong in the contract file, where a program
+//   reads them.)
+//
+//   If a pooler IS ever adopted, this file and templates/database/contract.json
+//   change together, and that is a DECISIONS.md entry rather than a one-line
+//   edit in nine repositories.
+// ---------------------------------------------------------------------------

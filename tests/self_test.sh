@@ -11,14 +11,30 @@
 #   *different* check, so a passing self_test means the checks are independent
 #   and not one lucky assertion standing in for all of them.
 #
-# THE SIXTY-SEVEN BREAKAGES, and one GREEN control (20 from the tier work, 21
+# THE SEVENTY-FOUR BREAKAGES, and one GREEN control (20 from the tier work, 21
 #                               from the fan-out work, 24-26 from the fleet gate,
 #                               27-32c from the lint work, 33-40 from the
 #                               staleness/parity work, 41-51 from the secrets
 #                               work, 52-60 from the fetched-stack work, 61-62
-#                               from the licence; 18 shared before the lint
-#                               packet)
+#                               from the licence, 68-74 from the shared-cluster
+#                               work; 18 shared before the lint packet)
 #   1. delete a language template   -> the artifact-presence check goes red
+#   68. .env.example's Postgres tag disagrees with compose's default -> the
+#        agreement check goes red. This is the defect that SHIPPED: the stack
+#        ran 16.6 on every developer's machine while the compose file, the
+#        README and the CHANGELOG all said 17, and commit 48689e6 fixed the
+#        compose file and left the file that overrides it alone.
+#   69. the tag is switched back to an alpine variant -> red, because pgvector
+#        is a glibc-linked layer and does not load on musl.
+#   70. the init script is never mounted -> red. Nothing reports a cluster with
+#        one database and no per-service roles except this.
+#   71. the connection budget set below what the topology needs -> red.
+#   72. a generated config stops setting `application_name` -> red.
+#   73. a generated config carries a POOLER WORKAROUND -> red. The invisible
+#        one: `prepare: :unnamed` on a fleet with no pooler is slower and looks
+#        correct, so this list is the only way anyone finds out.
+#   74. `DECISIONS.md` deleted -> red. Seven places reference it; it did not
+#        exist until this packet, so nothing had ever checked.
 #   2. add a collector exporter    -> the privacy check goes red
 #   2b. DELETE the tempo exporter   -> the same check goes red from the other
 #        side. A set difference only catches the extra; this catches the
@@ -2667,6 +2683,86 @@ expect_red_check 'breakage 60: the same copy in an ADOPTING service is a hard FA
 # and a breakage the counter cannot see is a breakage the header is not proved
 # against.
 unset KIT_FLEET
+
+# ---------------------------------------------------------------------------
+# 68-74: the one-cluster topology and the connection contract.
+#
+# Seven checks, seven breakages, and every one of them is a check that could
+# pass while the thing it is about is broken:
+#
+#   68  the Postgres tag disagrees between .env.example and compose — THE
+#       defect that shipped (16.6-alpine against a 17-alpine default) and that
+#       48689e6 fixed in the compose file only.
+#   69  the tag is switched back to alpine — which builds cleanly and cannot
+#       create an extension.
+#   70  the init script is not mounted, so no service gets a database.
+#   71  the budget is set below what the declared topology needs.
+#   72  a generated config drops `application_name`.
+#   73  a generated config carries a POOLER WORKAROUND — the invisible one, and
+#       the reason the forbidden list exists.
+#   74  DECISIONS.md is deleted — the file seven places reference and that did
+#       not exist until this packet.
+#
+# 73 is the one worth the most: nothing about it looks wrong. A service carrying
+# `prepare: :unnamed` on a fleet with no pooler is slower and correct-looking,
+# and the ONLY way anyone finds out is a check that looks for it.
+# ---------------------------------------------------------------------------
+
+base68="$(fresh_copy kit-68)"
+edit "$base68/templates/compose/.env.example" \
+  'KIT_POSTGRES_TAG=17' 'KIT_POSTGRES_TAG=16.6-alpine'
+expect_red_check 'breakage 68: the Postgres tag in .env.example disagrees with compose' \
+  "$base68" 'postgres tag  (.env.example and compose agree' --static-only
+
+base69="$(fresh_copy kit-69)"
+edit "$base69/templates/compose/.env.example" \
+  'KIT_POSTGRES_TAG=17' 'KIT_POSTGRES_TAG=17-alpine'
+edit "$base69/templates/compose/docker-compose.yml" \
+  'POSTGRES_TAG: ${KIT_POSTGRES_TAG:-17}' \
+  'POSTGRES_TAG: ${KIT_POSTGRES_TAG:-17-alpine}'
+expect_red_check 'breakage 69: the cluster is pinned back to an alpine variant' \
+  "$base69" 'postgres tag  (.env.example and compose agree' --static-only
+
+base70="$(fresh_copy kit-70)"
+edit "$base70/templates/compose/docker-compose.yml" \
+  '      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
+' ''
+expect_red_check 'breakage 70: the init script is never mounted, so no service gets a database' \
+  "$base70" 'the cluster  (one database + role per service' --static-only
+
+base71="$(fresh_copy kit-71)"
+edit "$base71/templates/compose/.env.example" \
+  'KIT_POSTGRES_MAX_CONNECTIONS=200' 'KIT_POSTGRES_MAX_CONNECTIONS=12'
+expect_red_check 'breakage 71: the connection budget is below what the topology needs' \
+  "$base71" 'the connection budget  (max_connections covers' --static-only
+
+# The two halves of the connection contract, and they are broken in opposite
+# directions on purpose: 72 removes something the service NEEDS, 73 adds
+# something it must not carry. A check that only did one of them would be
+# satisfied by a config that has the wrong settings in place of the right ones.
+base72="$(fresh_copy kit-72)"
+# The whole assignment goes, not its value: an EMPTY value still contains the
+# key, so a check that greps for `application_name` would be satisfied by the
+# exact defect — a service whose queries cannot be attributed to it, which is the
+# bug the setting exists to prevent.
+edit "$base72/templates/database/go/database.go.snippet" \
+  '	cfg.ConnConfig.RuntimeParams["application_name"] = serviceName
+' ''
+expect_red_check 'breakage 72: a generated config does not set application_name' \
+  "$base72" 'templates/database/*  (the contract, in the generated output' --static-only
+
+base73="$(fresh_copy kit-73)"
+edit "$base73/templates/database/elixir/repo.exs.snippet" \
+  '        application_name: @service_name,' \
+  '        application_name: @service_name,
+      prepare: :unnamed,'
+expect_red_check 'breakage 73: a generated config carries a POOLER WORKAROUND' \
+  "$base73" 'templates/database/*  (the contract, in the generated output' --static-only
+
+base74="$(fresh_copy kit-74)"
+rm -f "$base74/DECISIONS.md"
+expect_red_check 'breakage 74: DECISIONS.md deleted — seven places reference it' \
+  "$base74" 'DECISIONS.md  (exists, records trades' --static-only
 
 printf '\n'
 # TWO skip kinds, counted apart, because they are two different problems and one

@@ -1,0 +1,128 @@
+// kit template — the connection contract for a shared Postgres cluster.
+//
+//   npm add pg@8.13.1
+//
+// FOUR SETTINGS, and each exists because nine services share one Postgres. On a
+// database per machine you would need none of them.
+//
+//   1. application_name  — THE ONE THAT IS NOT OPTIONAL. `pg_stat_activity` shows
+//      nine services' queries in one list and cannot attribute any of them
+//      without it. node-postgres passes it through in the startup packet.
+//
+//   2. statement_timeout — one service's runaway query occupies shared resources
+//      until it finishes. The cluster sets this per role as a backstop too.
+//
+//   3. idle_in_transaction_session_timeout — THE SHARED-CLUSTER KILLER. A
+//      forgotten BEGIN holds a snapshot open, blocks VACUUM and grows every table
+//      on the box.
+//
+//   4. max / poolSize    — this service's share of the cluster's connection
+//      budget.
+//
+// // bun add pg@8.13.1 — bun uses THIS file. Same driver, same contract.
+//
+// Copy into your db module and change SERVICE_NAME.
+
+import { Pool, type PoolConfig } from 'pg';
+
+// MUST equal your database and role name: one service, one database, one role,
+// one name, so a query on the cluster is attributable from the query alone.
+export const SERVICE_NAME = 'courier';
+
+// These are the values the cluster's per-role settings apply as a backstop
+// (KIT_POSTGRES_STATEMENT_TIMEOUT_MS, KIT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS),
+// so a service that forgets them is still bounded rather than unbounded.
+export const STATEMENT_TIMEOUT_MS = 15_000;
+export const IDLE_IN_TRANSACTION_TIMEOUT_MS = 30_000;
+
+// This service's SHARE of the cluster's connection budget. The cluster caps each
+// role at 10 with `ALTER ROLE … CONNECTION LIMIT`; `max` is the cap inside this
+// process. The two must agree in the direction that is safe — a pool larger than
+// the role limit does not give you more connections, it gives you errors.
+export const MAX_CONNS = 10;
+
+/**
+ * The pool configuration. This is the whole contract.
+ *
+ * `application_name` and `statement_timeout` are node-postgres connection
+ * parameters, sent in the startup packet rather than applied with a `SET` after
+ * connecting. That distinction is the reason they live here: a `pool.on('connect')`
+ * handler that runs `SET` has to fire for every new backend, and the one path
+ * that forgets is the path that only runs when the pool has grown — which is
+ * exactly when a service under load already has a problem.
+ */
+export function poolConfig(): PoolConfig {
+  const connectionString = process.env.DATABASE_URL;
+  if (!connectionString) {
+    throw new Error(
+      'DATABASE_URL is not set. The shared cluster holds one database and one role per service, ' +
+        'named after the service; this process will not guess either.',
+    );
+  }
+  return {
+    connectionString,
+    application_name: SERVICE_NAME,
+    statement_timeout: STATEMENT_TIMEOUT_MS,
+    idle_in_transaction_session_timeout: IDLE_IN_TRANSACTION_TIMEOUT_MS,
+    max: MAX_CONNS,
+    // No eager warm-up. `min` is left at 0 so importing this module to read
+    // configuration does not take MAX_CONNS connections out of a
+    // 200-connection cluster before the service has served a request.
+    //
+    // `connectionTimeoutMillis` bounds the connect, and is deliberately below
+    // the cluster's statement_timeout so a caller finds out about a dead host
+    // while its own timeout still has somewhere to go.
+    connectionTimeoutMillis: 5_000,
+    // `idleTimeoutMillis` is how long an UNUSED connection is kept. Left
+    // generous on purpose: this is a pool against one long-lived cluster, not a
+    // fleet of short-lived replicas, so an aggressive idle timeout buys nothing
+    // and costs a handshake on the next request.
+    idleTimeoutMillis: 30_000,
+  };
+}
+
+export function pool(): Pool {
+  const created = new Pool(poolConfig());
+  // A pool-level error handler is mandatory rather than good manners: an
+  // EventEmitter with no 'error' listener THROWS, and node-postgres emits here
+  // for a backend the cluster dropped. Without this line the process dies on the
+  // first idle timeout that races a restart of the cluster.
+  created.on('error', (err: Error) => {
+    console.error(`[db] idle client error: ${err.message}`);
+  });
+  return created;
+}
+
+// ---------------------------------------------------------------------------
+// WHAT IS NOT HERE, AND WHY — read this before "fixing" this file.
+//
+//   There is NO pooler compatibility setting in this file, and that omission is
+//   the load-bearing one. The usual workaround for a transaction-mode connection
+//   pooler is to stop naming prepared statements, or to route every query through
+//   the simple protocol. kit runs NO pooler, so there is nothing to be
+//   compatible with, and either change would make this service re-parse and
+//   re-plan every query for a component that is not in the path.
+//
+//   The argument for running no pooler at all is in
+//   templates/database/README.md and DECISIONS.md (MD21), and the sentence that
+//   decides it is from PgBouncer's own configuration documentation: the remedy
+//   for `ERROR: cached plan must not change result type` after a DDL migration is
+//   `RECONNECT` on its admin console — a manual operator step after every schema
+//   change in nine repositories.
+//
+//   So node-postgres's default named-statement behaviour stays exactly as it is.
+//   `templates/database/contract.json` lists the pooler settings that are
+//   FORBIDDEN in generated config, and `tests/validate.sh` fails the build when
+//   one appears.
+//
+//   (This comment deliberately does not spell those settings out. The first
+//   version of it quoted them, and the check that forbids them flagged its own
+//   explanation — which is the failure mode AGENTS.md records about
+//   `gate_declaration_check`: a check that fires on correct work teaches the
+//   reader to ignore it. The names belong in the contract file, where a program
+//   reads them.)
+//
+//   If a pooler IS ever adopted, this file and templates/database/contract.json
+//   change together, and that is a DECISIONS.md entry rather than a one-line
+//   edit in nine repositories.
+// ---------------------------------------------------------------------------

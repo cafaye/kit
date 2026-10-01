@@ -18,8 +18,8 @@
 kit/
 ├── README.md                             # what kit is, how a repo adopts it
 ├── LICENSE                               # MIT. The whole grant, and nothing can disagree
-├── .gitleaks.toml                        # the allowlist, and nothing else
 ├── DECISIONS.md                          # the trades this repo has NOT made
+├── .gitleaks.toml                        # the allowlist, and nothing else
 ├── .github/
 │   ├── workflows/
 │   │   ├── ci.reusable.yml               # the workflow six repos call
@@ -44,6 +44,7 @@ kit/
     ├── validate.sh                       # THE gate
     ├── self_test.sh                      # proves the gate can go red
     ├── lint_test.sh                      # the linters RUN, against fixtures
+    ├── isolation_test.sh                 # the cluster, RUN; A cannot reach B's database
     ├── gitleaks_gate.sh                  # the one secret scan, for CI and here
     ├── zizmor_gate.sh                    # the one zizmor split, ditto
     ├── bootstrap.sh                      # the gate installs its own tools
@@ -52,7 +53,22 @@ kit/
     ├── core_fanout_check.py              # structural checks on core/vendir, core/renovate
     ├── gate_declaration_check.py         # no adopter carries a D12/D13 workaround
     └── self_test.sh                      # every check, broken once, asserted red
-```
+
+templates/ holds everything a service adopts, and it is split by **how a thing
+reaches a service**, not by subject:
+
+- `templates/compose/` — **FETCHED**, never copied. One file for every service,
+  pinned by `kit.ref`.
+- `templates/bin/`, `templates/otel/`, `templates/tier/`,
+  `templates/secrets/`, `templates/database/` — **COPIED** into the service, per
+  language.
+- `templates/compose/postgres/` — the cluster image and its init script, and the
+  only place a database, a role or an extension is created.
+
+**One cluster, one database per service, one role per service.** The DATABASE is
+the isolation boundary rather than the machine, and there is **no pooler** — see
+`templates/database/README.md` for the argument and `DECISIONS.md` (MD21) for the
+measurements behind it.
 
 Flat on purpose. `grep -r` finds everything; there is no plugin system to
 learn.
@@ -224,7 +240,7 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   is the one that tells a working config from a valid one, and — unlike every
   other phase — it is **fatal on a skip**, because the claim under test is "kit's
   configs work" and a run in which no linter executed has not tested it.
-- **self_test** — sixty-seven breakages of a throwaway copy. Sixty-five assert
+- **self_test** — seventy-four breakages of a throwaway copy. Seventy-two assert
   the gate goes red; two assert it stays **green** while naming what it said —
   23b a SKIP, because a check that turns a red into an honest skip is
   load-bearing precisely by not going red, and 59 a FINDING, because kit-13's
@@ -232,12 +248,16 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   One further GREEN control (31b) asserts a service config that AGREES with
   kit's does not fail, because a check satisfied by banning the file would train
   every service to delete one. Six are a semantic mutation of one language each,
-  so **every suite is proven able to fail** rather than assumed to. Forty-seven
+  so **every suite is proven able to fail** rather than assumed to. Fifty-four
   assert that one *named* check reported `FAIL`, so a check written for a specific
   defect is proven still load-bearing. Two assert that a *proof* goes red: one
   inverts the classifier's fail-closed property, and one makes the staleness
   reporter call an undeclared pin `current`. A property nobody has tried to break
   is a property nobody has tested.
+  Seven are the shared-cluster work (68-74), and **73 is the one worth the
+  most**: a generated config carrying `prepare: :unnamed` on a fleet with no
+  pooler is slower and looks entirely correct, so the forbidden-list check is the
+  only thing that will ever find it.
 - **A toolchain's floor is checked against the floor the ARTIFACT declares.**
   `KitOtel::RUBY_FLOOR` says what `templates/otel/ruby` needs and the gate reads
   that constant rather than restating the number. Below the floor is a loud,
@@ -371,7 +391,7 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   rubocop ran on kit's own Ruby with kit's own config. That is the only way an
   obsolete key surfaces before six repos inherit it.
 - The suite must be able to fail: `self_test` breaks a throwaway copy of the
-  tree sixty-seven ways and asserts the run goes red. If you change the suite,
+  tree seventy-four ways and asserts the run goes red. If you change the suite,
   keep that true.
 
 ## The classifier fails closed, and that is a rule about code
@@ -447,6 +467,65 @@ The count is printed on PASS and it is a measurement, not a ledger to shrink.
 It is currently **80**, which is a bad number, and the way to move it is to
 re-copy an artefact and delete the entry — never to delete an entry, which the
 dead-entry rule turns red.
+
+## One cluster, and the database is the boundary
+
+**Nine services, ONE Postgres, one database and one role per service.** Isolation
+between services is the database, not the machine. There is **no pooler**.
+
+Four rules, and each one is load-bearing:
+
+- **The `REVOKE` is the boundary, not the table grants.** Postgres grants
+  `CONNECT` on every database to `PUBLIC` by default, so a cluster provisioned
+  without `REVOKE ALL ON DATABASE … FROM PUBLIC` has, by default, **no
+  isolation at all** — it fails open and silently. Measured both ways: with the
+  revoke, `FATAL: permission denied for database "billing"` before a query is
+  parsed; without it, the connection succeeds and only the `SELECT` on the other
+  service's table is refused, by the accident that nobody granted it. A check
+  asserting "A cannot SELECT from B's rows" would therefore pass on a cluster
+  with no isolation whatsoever, which is why `tests/isolation_test.sh`'s fourth
+  assertion builds a **control** cluster without the revoke and requires it to
+  let A in.
+- **The boundary is applied by SWEEP, not by a list.** The init script revokes
+  `PUBLIC`'s `CONNECT` on *every* non-template database in the cluster, so the
+  invariant holds by construction. An earlier version enumerated the databases it
+  knew about and printed "PUBLIC holds CONNECT on none of them" while the stock
+  `postgres` database still granted it — a closing sentence that was wrong, and
+  worse than no closing sentence because it is the one a reader trusts.
+- **An init script that cannot apply the boundary does not start.** `ON_ERROR_STOP`
+  is on every call and there is no `if` around any of it. `set -e` does not reach
+  inside a command substitution used as an `if` condition, and a load-bearing
+  statement whose failure is ignored is how a cluster comes up holding two of nine
+  databases and reports itself healthy.
+- **PG15 is the floor**, because PG15 removed the default `CREATE` grant on the
+  `public` schema and that change is what makes database-per-service a boundary
+  rather than a naming convention.
+
+**Extensions are a cluster decision.** They live in the image (pglayers) and are
+created by the **admin role** into every declared database. A service role cannot
+create one: pgvector's control file is not `trusted`, so `CREATE EXTENSION` by a
+non-superuser is refused. That is pgvector's own classification — pglayers'
+`vector.control` is byte-identical to upstream's — and it is the right shape
+anyway, since an extension's binaries are available to every service on the
+cluster whether or not anybody creates one.
+
+**`postgres:17-alpine` cannot carry pgvector.** pglayers publishes glibc-linked
+layers and alpine is musl, so the image builds and then fails to create the
+extension. The cluster base is `postgres:17` (Debian); the measurement is in
+`templates/compose/postgres/Dockerfile` and the trade is MD21b.
+
+**The four settings every service's config carries**, and none would be needed
+with one database per service: `application_name` (the only way to attribute a
+query on a shared cluster), `statement_timeout`, `idle_in_transaction_session_timeout`
+(the shared-cluster killer), and a bounded pool. The cluster sets the middle two
+**per role** as a backstop, so a service that forgets is bounded rather than
+unbounded.
+
+**The pooler decision is a CHECK, not a paragraph.** The pooler workarounds are
+forbidden in `templates/database/contract.json` and the gate fails the build if
+one appears in any generated config. A service carrying `prepare: :unnamed` on a
+fleet with no pooler is slower and looks entirely correct, so nothing else would
+ever find it.
 
 ## Adding a language
 
