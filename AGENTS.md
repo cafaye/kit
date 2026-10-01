@@ -479,6 +479,98 @@ structurally excluded from using it. If you add a job for a new option, the
 `ci_check` block in `tests/validate.sh` must know about it in the same commit:
 an `option` with no `job` is a green build that ran nothing.
 
+## Deploy and backup are Kamal's, and kit generates the CONFIG
+
+`templates/kamal/` is four files: `deploy.yml.erb`, `kamal-backup.yml.erb`, a
+`drill.sh`, and a README. kit does not ship a deployment tool or a backup tool,
+because `kamal` and `kamal-backup` are both, they are both installed wherever
+cafaye deploys, and kit-20 proved the cost of the alternative by building
+`templates/backup/` and `templates/bin/backup.sh` — about 3,012 lines
+reimplementing a command surface that already existed. **All of it is gone**, and
+`tests/validate.sh` asserts its absence, because "we removed it" has no
+mechanical form until something checks.
+
+Four things about this arrangement are load-bearing, and each is a check rather
+than a comment.
+
+- **The two config files are ONE contract, so the gate EXECUTES them.**
+  `kamal-backup validate` builds the backup accessory's environment from
+  `config/deploy.yml` and resolves every `{ secret: NAME }` in
+  `config/kamal-backup.yml` out of it. A secret named in one file and missing
+  from the other is a valid YAML file that fails validation, and **neither file
+  is internally inconsistent** — so no per-file parse can see it, and
+  `tests/kamal_test.sh` runs the real `kamal` and the real `kamal-backup` to
+  find it. This is the one place kit hands out YAML a **third-party binary** has
+  to accept, and it is why the check exists at all: three real defects in these
+  templates' own first draft — a doubled registry host, a missing
+  `builder.arch`, and a cross-file secret — were all invisible to a parse and all
+  caught by the binaries within one run each. `self_test` breakages 61, 62 and 65
+  are those three, inverted.
+- **A missing required variable FAILS THE RENDER, by name.** `<%= ENV['X'] %>`
+  with `X` unset renders an empty string, which YAML reads as a null list item
+  and which surfaces three layers away as a deploy that cannot find a host. The
+  templates `raise` and name the variable.
+- **A TAG in the body of an ERB block closes the block early.** Not a kit rule:
+  an observation that cost a run. A comment inside `<% … %>` that spells out an
+  ERB tag in full is compiled as code, the block ends, and the file fails with
+  "undefined local variable or method `service'" pointing at a variable defined
+  two lines above. Nothing in the template may contain a literal ERB tag, even in
+  a comment.
+- **Retention is WRITTEN OUT, not inherited.** kamal-backup 0.5.2's defaults
+  happen to be exactly the five numbers `templates/kamal/kamal-backup.yml.erb`
+  states, so omitting the block would work today. A retention policy that lives
+  in a dependency's defaults is a policy that changes on a version bump, and the
+  diff at that moment is about the gem rather than about the thing that decides
+  how far back a restore can reach.
+
+**Ruby is the OPERATOR's tool, not the service's, and the difference is a
+boundary rather than a caveat.** The service image contains no Ruby. The backup
+accessory **ships its own** — it is an ordinary container, which is why the
+`backup` block in `deploy.yml.erb` is a normal accessory. `kamal` itself is a
+Ruby gem and always has been; an operator deploying with Kamal has Ruby, and that
+is not a requirement kit adds. A service that wants backups and no local gem
+still gets backups, because the accessory's scheduler loop is what takes
+snapshots; what it loses is `restore local` and `drill local`, not the backups.
+`templates/kamal/README.md` states all of it, and the ERB costs nothing extra
+because Kamal evaluates `config/deploy.yml` through `ERB#result` itself.
+
+**`drill.sh` exists for the two things kamal-backup does not do**, both found by
+reading the gem rather than by using it. `restore_to_scratch`
+(`databases/base.rb:52-55`) validates and restores and does **not drop the
+scratch database** — the only `DROP SCHEMA` in the gem runs against the *live*
+database — so cleanup is an operator's job, and a step remembered after a failure
+is a step that does not happen after a failure. And the gem decides the drill
+passed by the **exit status** of `--check` (`app.rb:307-325`), which makes a
+`psql -tAc "SELECT count(*) FROM t"` useless as a check: it exits 0 for zero
+rows, so a restore of an empty database is reported as a successful drill. So the
+wrapper drops the scratch database on **every** exit path with `WITH (FORCE)`,
+and generates a `DO $$ … RAISE EXCEPTION` block under `ON_ERROR_STOP=1` so an
+empty table becomes a non-zero exit. There is no default table list: a drill with
+no `--table` is a usage error rather than a drill that quietly passes.
+
+**R2 has no object versioning and no Object Lock**, so a deleted object there is
+gone. That is not a kit rule, it is a property of the store — read out of
+Cloudflare's own compatibility table, where those four APIs are listed as not
+implemented. **An operator who deletes a snapshot from the console has destroyed
+it and nothing here can bring it back**; the mitigation is bucket access control,
+and `templates/kamal/README.md` says so rather than implying the mechanism
+prevents it.
+
+**The custom deploy distribution is still here, and the overlap with Kamal is
+real.** `templates/bin/deploy.sh` is 1,067 lines implementing `up`, `verify`,
+`rollback`, `status` and `down` — all five of which are Kamal commands, and
+`templates/deploy/README.md:5-8` says in its own first line that the thing is
+**not a remote deployment**: no TLS, no reverse proxy, no multi-host, no
+zero-downtime. What it does that Kamal does not is deliver secrets into a tmpfs
+over stdin so no credential is ever in `Config.Env`, and redact output **by
+shape** — a JWT, an AWS key, a PEM header — which kamal-backup's `Redactor` does
+not (it knows env values whose *key* looks secret, and URL credentials, and
+nothing else). Removing the distribution would also delete
+`tests/deploy_test.sh`, which is where kit-16's live proof that the redactor
+catches a JWT by shape lives, and which `.gitleaks.toml`'s only allowlist entry
+is scoped to. That is a larger decision than this packet, it is recorded in
+`REPORT-kit-20.md` §"not removed", and it is not resolved here.
+
 ## The stack is FETCHED, and the pin is the only thing that decides what it is
 
 `templates/compose/` is not copied into a service. `bin/dev` fetches it from the

@@ -240,6 +240,41 @@
 #           fixture, so a change that softened the adopted side fails 60 and a
 #           change that hardened the unadopted side fails 59, and there is no
 #           third state in which both pass and the checks are weaker.
+# 61-65. THE KAMAL CONFIG, which is the one place kit generates YAML that a
+#         THIRD-PARTY BINARY has to accept. Everything else kit hands out is
+#         read by the service's own toolchain; this is read by `kamal` and
+#         `kamal-backup`, so a template can be valid YAML, parse cleanly, and
+#         still be a config neither tool will take.
+#           61. the generated deploy.yml made INVALID for kamal -> the
+#                kamal_test check goes red. `builder.arch` is the mutation
+#                because it is a real one: removing it is valid YAML, and kamal
+#                refuses the file outright ("Builder arch not set").
+#           62. the image name given the registry host it already has ->
+#                kamal_test goes red. The sharpest of the five, and the one no
+#                parse check could ever have caught: `image: ghcr.io/org/repo`
+#                with `registry.server: ghcr.io` resolves to
+#                `ghcr.io/ghcr.io/org/repo`. Both files are valid, `kamal
+#                config` exits 0, and the deploy fails at the push.
+#           63. one kamal/ artifact DELETED -> the presence check goes red.
+#                Half a set is worse than none, and here the two configs are one
+#                contract rather than two files.
+#           64. the superseded custom backup toolchain RESTORED -> the
+#                must-be-gone check goes red. The only breakage here that is
+#                about something being PRESENT, and it exists because "we
+#                removed it" is a claim with no mechanical form until something
+#                asserts the absence.
+#           65. the drill's refusal of a production-looking scratch name WEAKENED
+#                -> kamal_test goes red. The safety property, mutated the way a
+#                well-meaning commit would mutate it: the `*prod*` pattern
+#                narrowed so the common names still match and the awkward one
+#                does not.
+#
+#   ...and one GREEN control for the Kamal work, 61b: an UNMODIFIED tree's
+#        generated config must PASS kamal and kamal-backup. Every other recipe
+#        here proves a check can go red; this proves the thing they are all
+#        measured against actually works, which is the half that decays without
+#        a symptom. It is written as prose rather than numbered because
+#        `self_test_claims` counts only the red-expecting helpers.
 #
 # 61-62. THE LICENCE, in the two ways the grant stops being unambiguous. A
 #         licence is only unambiguous when exactly ONE place in a repository can
@@ -711,6 +746,30 @@ expect_red_script() {
     fi
   else
     printf 'PASS self_test: %s — the proof went red\n' "$label"
+  fi
+}
+
+# expect_green_script <label> <dir> <script> [script args...]
+#
+# The green direction for a PROOF rather than for the gate, and it is here for
+# exactly one recipe (61b) because the other three that use it would be measuring
+# themselves against nothing.
+#
+# Deliberately NOT matched by the `self_test_claims` pattern in validate.sh, so
+# `61b` is a control rather than a numbered breakage — the same choice 31b made,
+# and for the same reason: the header counts red-expecting recipes, and a green
+# control listed among them would make the header claim a breakage that nothing
+# breaks. It is written in the header as prose instead.
+expect_green_script() {
+  local label="$1" dir="$2" script="$3"
+  shift 3
+  local out
+  if out=$(cd "$dir" && KIT_PYTHON="$PY" bash "$script" "$@" 2>&1); then
+    printf 'PASS self_test: %s — the proof is green\n' "$label"
+  else
+    printf 'FAIL self_test: %s — the proof went RED on an unbroken tree\n' "$label"
+    printf '%s\n' "$out" | grep -E '^(FAIL|SKIP)' | sed 's/^/       /'
+    failures=$((failures + 1))
   fi
 }
 
@@ -2667,6 +2726,95 @@ expect_red_check 'breakage 60: the same copy in an ADOPTING service is a hard FA
 # and a breakage the counter cannot see is a breakage the header is not proved
 # against.
 unset KIT_FLEET
+
+# ---------------------------------------------------------------------------
+# 61-65. THE KAMAL CONFIG, and the green control 61b.
+#
+# Every recipe below mutates `templates/kamal/` and asserts a NAMED check goes
+# red, because "the gate went red" is a weak claim when forty other checks could
+# have gone red instead.
+#
+# The green control is not optional here in the way it is elsewhere. Breakages
+# 61, 62 and 65 all work by making `tests/kamal_test.sh` fail; if the UNMODIFIED
+# tree's generated config did not satisfy the real binaries, every one of those
+# three would pass for the wrong reason — the check would be reporting "this
+# template is broken" when what it reports is "every template is broken". So 61b
+# runs the same script on the same binaries and asserts it is green, and it runs
+# FIRST, so a red in 61-65 reads as what it is rather than as an environment
+# problem.
+# ---------------------------------------------------------------------------
+KAMALCHECK='kamal_test'
+
+if command -v kamal >/dev/null 2>&1 && command -v kamal-backup >/dev/null 2>&1; then
+  sixtyoneb="$(fresh_copy kamal-green-control)"
+  expect_green_script 'breakage 61b: the UNMODIFIED generated config satisfies kamal and kamal-backup' \
+    "$sixtyoneb" tests/kamal_test.sh
+
+  # 61. `builder.arch` deleted. Valid YAML; kamal refuses the file outright
+  # ("Builder arch not set"), so this is the case where a parse check is not
+  # merely weaker than the real one but points at a file the real one rejects.
+  sixtyone="$(fresh_copy kamal-no-builder-arch)"
+  edit "$sixtyone/templates/kamal/deploy.yml.erb" \
+    'builder:
+  arch: arm64' 'builder:'
+  expect_red_check 'breakage 61: the generated deploy.yml is invalid for kamal' \
+    "$sixtyone" "$KAMALCHECK" --static-only
+
+  # 62. The doubled registry host. BOTH files are valid YAML and `kamal config`
+  # exits 0 — the config resolves to `ghcr.io/ghcr.io/org/repo`, and the failure
+  # is a push that cannot authenticate against a host that does not exist. This
+  # is the breakage that justifies running the binaries at all: it is invisible
+  # to every check that parses.
+  sixtytwo="$(fresh_copy kamal-double-registry)"
+  edit "$sixtytwo/templates/kamal/deploy.yml.erb" \
+    'image: <%= org %>/<%= repo %>' 'image: <%= registry %>/<%= org %>/<%= repo %>'
+  expect_red_check 'breakage 62: the image name carries the registry host twice' \
+    "$sixtytwo" "$KAMALCHECK" --static-only
+
+  # 63. One artifact of the set deleted. `deploy.yml` and `kamal-backup.yml` are
+  # ONE contract — every `{ secret: NAME }` in the second must appear in the
+  # backup accessory's `env.secret` in the first — so half a set is a config that
+  # is internally valid and jointly wrong.
+  sixtythree="$(fresh_copy kamal-half-a-set)"
+  rm -f "$sixtythree/templates/kamal/kamal-backup.yml.erb"
+  expect_red_check 'breakage 63: one half of the kamal config set is deleted' \
+    "$sixtythree" 'templates/kamal/  (4 artifacts present, the set is whole)' --static-only
+
+  # 64. The superseded custom backup toolchain RESTORED. The only breakage here
+  # about something being PRESENT rather than absent, and it exists because "we
+  # removed it" has no mechanical form until something asserts the absence —
+  # which is the whole argument for a check on a path nobody should ever
+  # reference again. The recipe writes a single file, not the 1,850 lines: the
+  # check is `[ -e ... ]`, so one path is enough to make it red, and a recipe
+  # that recreated the tree would only be testing its own ability to copy files.
+  sixtyfour="$(fresh_copy kamal-backup-returns)"
+  mkdir -p "$sixtyfour/templates/backup"
+  printf '# resurrected by self_test breakage 64\n' >"$sixtyfour/templates/backup/job.sh"
+  expect_red_check 'breakage 64: the superseded custom backup toolchain is BACK' \
+    "$sixtyfour" 'the superseded custom backup toolchain' --static-only
+
+  # 65. The drill's refusal narrowed. The mutation is the one a well-meaning
+  # commit makes: `*prod*` becomes `*production*`, so every name containing the
+  # word still matches and the abbreviated spellings stop being caught. Nothing
+  # about the code reads as a weakening — it reads as tidying a glob.
+  #
+  # And the drill is the safety property the whole backup path rests on: it
+  # restores into a scratch database and DROPS it, so a scratch name that looks
+  # like production is a production database that gets dropped.
+  sixtyfive="$(fresh_copy kamal-drill-refusal-narrowed)"
+  edit "$sixtyfive/templates/kamal/drill.sh" \
+    '*prod* | *PROD* | *live* | *LIVE*)' '*production* | *PROD* | *live* | *LIVE*)'
+  expect_red_check 'breakage 65: the drill stops refusing a production-looking scratch name' \
+    "$sixtyfive" "$KAMALCHECK" --static-only
+else
+  # SKIPPED, and loudly, because a skipped proof is not a proof. The recipes above
+  # are the only place kit asserts that its generated config is ACCEPTED by the
+  # real binaries, so on a machine without them this file's claim about the Kamal
+  # templates is simply unexercised — and the summary line is how that stays
+  # visible rather than becoming a silent gap.
+  printf 'SKIP self_test: breakages 61-65 — kamal or kamal-backup is not installed\n'
+  skips=$((skips + 1))
+fi
 
 printf '\n'
 # TWO skip kinds, counted apart, because they are two different problems and one

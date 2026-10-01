@@ -174,10 +174,26 @@ report() {
   esac
 }
 
+# The exit status a `check`ed command returns to say "the tool is not installed"
+# rather than "the tree is wrong". See `check`.
+SKIP_EXIT=78
+
 check() { # check <label> <command...>
-  local label="$1" out
+  local label="$1" out status
   shift
+  # The command substitution is the CONDITION of an `if`, not a statement of its
+  # own, and that is load-bearing rather than stylistic. Under `set -e` (line
+  # 49) a bare `out="$(cmd)"` that fails takes the SHELL down with it: verified
+  # with a three-line reproduction, which exits 3 and never reaches the line
+  # after. Capturing the status first and branching on it afterwards looks
+  # equivalent and is not — it turns every FAIL into a truncated run whose last
+  # line is a check, which is precisely the shape a reader has to guess at.
   if out="$("$@" 2>&1)"; then
+    status=0
+  else
+    status=$?
+  fi
+  if [ "$status" -eq 0 ]; then
     report PASS "$label"
     # A check that reports WHICH SPEC it verified is a different statement from
     # one that only reports that it passed. core_check prints the resolved core
@@ -188,6 +204,19 @@ check() { # check <label> <command...>
     if [ -n "$out" ]; then
       printf '%s\n' "$out" | sed 's/^/       /'
     fi
+  elif [ "$status" -eq "$SKIP_EXIT" ]; then
+    # A MISSING TOOL IS NOT A DEFECT IN THE TREE. `check` reports every non-zero
+    # as FAIL, which is right for a required tool and wrong for an optional one:
+    # a gate that reports FAIL because a developer's machine has no `kamal`
+    # installed is blaming the tree for the machine, and the reader learns to
+    # ignore red lines.
+    #
+    # 78 is sysexits.h EX_CONFIG. It is used instead of a sentinel string
+    # because a string sentinel collides with a command that legitimately prints
+    # the word "skip", and because a command's exit status is the one thing
+    # `check` already has without having to parse its output.
+    report SKIP "$label"
+    [ -z "$out" ] || printf '%s\n' "$out" | sed 's/^/       /'
   else
     report FAIL "$label"
     printf '%s\n' "$out" | sed 's/^/       /'
@@ -372,6 +401,49 @@ bounded_check() {
 # ===========================================================================
 
 if [ "$RUN_STATIC" -eq 1 ]; then
+  # erb_yaml_ok <file> — a Kamal config TEMPLATE renders, and the result is YAML.
+  #
+  # Two properties, in this order, and the order matters. Rendering first means a
+  # template that does not render fails HERE rather than being reported as a YAML
+  # error several lines away from the ERB that caused it — the failure this
+  # repository keeps rediscovering, and the one that cost a run when a comment
+  # inside the ERB block contained a literal tag, closed the block early, and
+  # produced "undefined local variable or method `service'" pointing at a
+  # variable defined two lines above.
+  #
+  # The variable set is the OPERATOR's, not kit's, and it is deliberately the
+  # non-secret half only. `service` is set to the same placeholder `erl -n` uses
+  # everywhere else in this file, so a template that grew a dependency on a value
+  # kit does not have would fail here rather than in a customer's shell.
+  #
+  # `erb` is resolved rather than assumed, for the reason `timeout` is: this gate
+  # runs on machines kit does not own, and a check that fails because a tool is
+  # missing is a check that fails for a reason that has nothing to do with the
+  # tree. A missing `erb` SKIPs; it never FAILs.
+  erb_yaml_ok() {
+    local f="$1" rendered
+    have ruby || return 78
+    # The render is Ruby's own `ERB#result`, which is the call Kamal's
+    # configuration loader makes — not `erb -x` piped back through a second
+    # parse, which was the first version here and which parsed the template
+    # twice to learn the same thing.
+    #
+    # The environment is the operator's non-secret half, exported for the child
+    # and NOT left behind: `KIT_SERVICE` is a name, never a credential, and a
+    # value that outlived the check would be a value the next check inherited.
+    if ! rendered="$(KIT_SERVICE=kitprobe KIT_REGISTRY_ORG=kitprobe \
+      KIT_REPO=kitprobe KIT_WEB_HOST=198.51.100.7 \
+      KIT_APP_DOMAIN=kitprobe.invalid \
+      ruby -rerb -e '
+        puts ERB.new(File.read(ARGV[0]), trim_mode: "-").result
+      ' "$f" 2>&1)"; then
+      printf '%s\n' "$rendered" >&2
+      return 1
+    fi
+    printf '%s' "$rendered" | "$PY" -c 'import sys, yaml; yaml.safe_load(sys.stdin.read())'
+  }
+
+
   # Dockerfile rules hadolint does not cover. Defined here rather than inline so
   # the section above reads as a list of assertions.
   docker_rules() {
@@ -500,8 +572,23 @@ PY
 
   section 'static: every artifact parses'
 
+  # `templates/kamal/*.yml.erb` is in this list, and its ABSENCE from the plain
+  # `*.yml` arm is the interesting part. These templates are not YAML: they are
+  # ERB that produces YAML, so `yaml.safe_load` on the file itself would be
+  # checking the wrong thing — a template's own validity is a property of the
+  # text after rendering.
+  #
+  # So the two `.erb` files are rendered with the operator's non-secret
+  # variables and the RESULT is parsed, by a case below. `drill.sh` is named
+  # rather than globbed as `templates/kamal/*`, because the `*)` arm reports an
+  # unrecognised type as a SKIP and `README.md` would put a permanent
+  # "no parser for this file type" line in every run — and a permanently
+  # reported skip is a gap nobody fixes, which is the whole point of the skip
+  # existing. Naming them explicitly also means a NEW file dropped into
+  # `templates/kamal/` is unparsed rather than mis-parsed: the safe direction.
   for f in "$ROOT"/.github/workflows/* "$ROOT"/lint/* "$ROOT"/docker/* \
     "$ROOT"/templates/bin-prime/* "$ROOT"/templates/compose/* \
+    "$ROOT"/templates/kamal/drill.sh \
     "$ROOT"/templates/bin/* "$ROOT"/templates/tier/*/* "$ROOT"/tests/*.sh; do
     [ -f "$f" ] || continue
     path="${f#"$ROOT"/}"
@@ -605,6 +692,28 @@ PY
           "[ \"\$(grep -cE '^[[:space:]]*[^#[:space:]]' '$f')\" \
              -eq \"\$(grep -c '^diverged ' '$f')\" ]"
         ;;
+      # A Kamal config TEMPLATE, which is ERB that produces YAML.
+      #
+      # `yaml.safe_load` on the file itself would be checking the wrong artifact:
+      # what a service ends up with is the RENDERED text, and a template's
+      # failure modes live in the gap between the two. Rendering first and
+      # parsing the result is the check that can fail.
+      #
+      # The renderer is the SAME one kamal uses, and that is the point rather
+      # than a convenience. Kamal's own configuration loader calls
+      # `ERB.new(...).result`, so rendering with the stock `erb` and then handing
+      # the output to `kamal config` in tests/kamal_test.sh walks the same path an
+      # operator walks. A bespoke renderer would be a second parser to keep
+      # correct, and this repository has already refused that twice.
+      #
+      # The values supplied here are the non-secret ones a real operator sets.
+      # Deliberately NOT supplied: any secret. If a future edit interpolated a
+      # credential into the rendered output this check would still pass — the
+      # assertion that it does not is in tests/kamal_test.sh, which runs the real
+      # binary and greps its real output for the real values.
+      "$ROOT"/templates/kamal/deploy.yml.erb | "$ROOT"/templates/kamal/kamal-backup.yml.erb)
+        check "$path  (renders, and the rendered YAML parses)" erb_yaml_ok "$f"
+        ;;
       "$ROOT"/templates/tier/go/*.go)
         # gofmt is run over the whole tree's Go templates in the telemetry phase
         # below, so it is deliberately not reported twice here. `go build` would
@@ -646,7 +755,12 @@ PY
   # executed, and it says so at the top. A check that required it to be
   # executable would be asking a file to claim a contract it does not have.
   section 'static: handed-out scripts are executable'
+  # `templates/kamal/drill.sh` is in this list because it is a script kit HANDS
+  # OUT: an operator runs it, exactly as they run entrypoint.sh. A non-executable
+  # drill.sh is a drill nobody can start, and the message is "permission denied"
+  # without saying which file.
   for f in "$ROOT"/templates/bin-prime/* "$ROOT"/templates/bin/* \
+    "$ROOT"/templates/kamal/drill.sh \
     "$ROOT/$GITLEAKS_GATE" "$ROOT/tests/zizmor_gate.sh"; do
     [ -f "$f" ] || continue
     path="${f#"$ROOT"/}"
@@ -665,7 +779,8 @@ PY
   # directive, which is why this paragraph is worded the way it is.)
   if have shellcheck; then
     section 'static: shellcheck -S warning'
-    for f in "$ROOT"/templates/bin-prime/* "$ROOT"/templates/bin/* "$ROOT"/tests/*.sh; do
+    for f in "$ROOT"/templates/bin-prime/* "$ROOT"/templates/bin/* \
+      "$ROOT"/templates/kamal/*.sh "$ROOT"/tests/*.sh; do
       [ -f "$f" ] || continue
       path="${f#"$ROOT"/}"
       # SC2317 (unreachable command) is excluded deliberately: the `check`
@@ -737,6 +852,78 @@ OTEL
   # can be run on it. This is the equivalent.
   check 'templates/otel/rust/traceparent.rs  (carries its own suite)' bash -c \
     "grep -qE '#\[test\]' '$ROOT/templates/otel/rust/traceparent.rs'"
+
+  # -------------------------------------------------------------------------
+  section 'static: templates/kamal — every artifact is present'
+  #
+  # The Kamal configuration is a SET for the same reason the backup distribution
+  # was, and the failure is the same shape: `config/deploy.yml` and
+  # `config/kamal-backup.yml` are ONE contract (every `{ secret: NAME }` in the
+  # second must appear in the backup accessory's `env.secret` list in the first,
+  # or `kamal-backup validate` rejects the pair), so a service holding one
+  # without the other has a config that is internally valid and jointly wrong.
+  #
+  # `drill.sh` is in the list because it is a script kit HANDS OUT, run by the
+  # operator — so it is also in the executable and shellcheck lists above.
+  #
+  # `README.md` is not decoration: it is the file that answers the Ruby question
+  # (does a service need Ruby to deploy?) and records what was removed and why.
+  if otel_required \
+    'templates/kamal/README.md' \
+    'templates/kamal/deploy.yml.erb' \
+    'templates/kamal/kamal-backup.yml.erb' \
+    'templates/kamal/drill.sh'; then
+    report PASS 'templates/kamal/  (4 artifacts present, the set is whole)'
+  else
+    report FAIL 'templates/kamal/  (4 artifacts present, the set is whole)'
+  fi
+
+  # The superseded custom backup toolchain must be GONE, and this is the check
+  # that goes red if it ever comes back.
+  #
+  # It is not a deprecation warning. kit-20 built `templates/backup/` (a compose
+  # file, a job script, a crontab), `templates/bin/backup.sh` (a hand-written
+  # restic wrapper) and `docker/Dockerfile.backup` — roughly 1,850 lines
+  # reimplementing kamal-backup's command surface. Keeping them "just in case"
+  # is the failure this repository names explicitly: an unreferenced backup path
+  # is a second thing to keep correct forever, and it would be a second set of
+  # retention numbers and a second redaction boundary that nobody reviews.
+  #
+  # The property worth having is therefore NEGATIVE — a path that must not be
+  # reachable — and a negative needs its own check or it is only a convention.
+  if [ -e "$ROOT/templates/backup" ] || [ -e "$ROOT/templates/bin/backup.sh" ] ||
+    [ -e "$ROOT/docker/Dockerfile.backup" ] || [ -e "$ROOT/tests/backup_test.sh" ]; then
+    report FAIL 'the superseded custom backup toolchain  (it must be gone — kamal-backup is the standard)'
+  else
+    report PASS 'the superseded custom backup toolchain  (it must be gone — kamal-backup is the standard)'
+  fi
+
+  # The generated config is EXECUTED, not parsed. `yaml.safe_load` on either
+  # file would say they are YAML and nothing about whether Kamal can use them,
+  # and the three defects this replaces were all invisible to a parse: a
+  # doubled registry host, a missing `builder.arch`, and a secret named in one
+  # file and not the other. `tests/kamal_test.sh` runs the real binaries.
+  #
+  # It SKIPS, loudly and counted, when kamal/kamal-backup are not installed —
+  # they are the OPERATOR's tools, not kit's dependency, so a machine without
+  # Ruby is a normal machine and the gate must not demand one. A skip in the
+  # telemetry or lint phases is fatal; here it is not, for that reason, and the
+  # summary line is how the gap stays visible.
+  if have kamal && have kamal-backup && have ruby; then
+    if bash "$ROOT/tests/kamal_test.sh" >"$TMP/kamal_test.log" 2>&1; then
+      # The script's own last line is its count, and that count is the point:
+      # a reader who wants to know how much of the claim was exercised should not
+      # have to open a second file. The leading `PASS: ` is stripped because
+      # `report` prints its own verdict, and "PASS PASS:" is the kind of small
+      # wrongness that trains a reader to skim past a line that matters.
+      report PASS "$(sed 's/^PASS: //' "$TMP/kamal_test.log" | tail -1)"
+    else
+      report FAIL 'kamal_test  (the generated config is accepted by the real binaries)'
+      sed 's/^/       /' "$TMP/kamal_test.log" | tail -20
+    fi
+  else
+    report SKIP 'kamal + kamal-backup + ruby not installed  (the generated config was validated by nothing)'
+  fi
 
   # A snippet that names no version is a snippet nobody can install: the reader
   # copies a floating major, gets three minors of drift, and files a bug
