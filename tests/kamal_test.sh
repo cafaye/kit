@@ -302,6 +302,103 @@ for pair in "keep_last: 7" "keep_daily: 7" "keep_weekly: 4" "keep_monthly: 6" "k
 done
 
 # ---------------------------------------------------------------------------
+# 4b. NO ACCESSORY PUBLISHES ITS PORT, and the assertion is on the RESOLVED
+#     document rather than on the template.
+#
+# `port: 5432` on the postgres accessory is valid YAML, and `kamal config` accepts
+# it and exits 0 — the two strongest false greens available. Kamal expands it to
+# "5432:5432" and hands it to `docker run --publish`, and Docker binds 0.0.0.0
+# and :: when no host address is given, so the database lands on every interface
+# the host has. Measured: a boot with the line fails with `Bind for 0.0.0.0:5432
+# failed` when something else holds 5432, which is Docker naming the bind.
+#
+# Neither the loopback alternative nor a firewall is the fix, and the loopback one
+# does not even work for the application: a container on the `kamal` network has
+# its own 127.0.0.1, so `port: "127.0.0.1:5432:5432"` makes the database
+# unreachable FROM THE APP while reducing its exposure. The app reaches the
+# accessory by container name over that network, with nothing published.
+#
+# This is the case for which this test file's whole argument applies. A per-file
+# grep for "port:" would pass on a template that publishes postgres and fail on one
+# that publishes a port the service needs, and it would say nothing about what
+# kamal RESOLVES. So it reads the resolved document, the way the retention
+# assertions above read the template, and the two are different claims about
+# different files on purpose.
+# ---------------------------------------------------------------------------
+resolved="$svc/config/deploy.yml"
+if [ -d "$svc" ] && [ -f "$resolved" ]; then
+  # accessories_block is a FUNCTION rather than a sed range inline, and the reason
+  # is measured: `sed -n '/^:accessories:/,/^[^-:]/p'` — the obvious spelling —
+  # stops on `  postgres:` the very next line, because `p` is neither `-` nor `:`.
+  # The block it returned was two lines long, so the case below passed on a
+  # document it had barely read and the planted-port control failed with an
+  # apparently empty block. `^[^ ]` is a column-0 key, which is what ends a block.
+  accessories_block() {
+    # `seen` is load-bearing and the second version of this line got it wrong: the
+    # "am I at a top-level key" test matches `:accessories:` ITSELF, because `:`
+    # is not a space, so without it the block is the start line and nothing else.
+    # The end condition is therefore a top-level key that is not the start.
+    awk '/^:accessories:/{p=1} p && seen && /^[^ ]/{exit} p{print; seen=1}' "$1"
+  }
+
+  # The specific property: the RESOLVED accessories block, not the source. Reading
+  # the source would be the false green this file exists to refuse.
+  published="$(cd "$svc" && with_secrets "$KAMAL" config --version latest 2>/dev/null |
+    accessories_block /dev/stdin | grep -cE '^[[:space:]]+(port:|:port):' || true)"
+  if [ "$published" -eq 0 ]; then
+    ok 'kamal config  (no accessory publishes a port on the host)'
+  else
+    no 'kamal config  (no accessory publishes a port on the host)' \
+      "the resolved accessories block has ${published} port line(s). A `port:` on an accessory becomes
+       docker run --publish, which binds 0.0.0.0 and :: when it names no host address, so the
+       database is on every interface the host has. Delete the line: the app reaches the accessory by
+       container name on the kamal network, and nothing needs it published."
+  fi
+
+  # The positive control for the check above, because a grep that finds nothing
+  # because it read nothing is the failure mode a negative test has by
+  # construction. This plants the line it forbids and asserts the same check
+  # catches it — against the real binary, so the control and the case are the
+  # same measurement.
+  planted="$WORK/planted-port"
+  cp -R "$svc" "$planted"
+  # Line-based, and deliberately not a search for a substring. The first version
+  # of this planted on `    image: postgres:17-alpine\n    host: ` and that string
+  # also occurs INSIDE the comment explaining why there is no port line — so the
+  # `port: 5432` landed in the middle of a paragraph, the rendered YAML became a
+  # syntax error, and the control failed with an empty resolved block. A control
+  # that plants into a comment is a control that tests nothing.
+  python3 - "$planted/config/deploy.yml" <<'PY'
+import re, sys
+p = sys.argv[1]
+lines = open(p).read().split("\n")
+for i, line in enumerate(lines):
+    # The accessory's own `host:`, not the one in the `ssh:` block above it and
+    # not the one inside a comment.
+    if re.fullmatch(r"    host: \S+", line) and any("postgres:17-alpine" in x for x in lines[max(0, i - 5):i]):
+        lines.insert(i + 1, "    port: 5432")
+        break
+else:
+    raise SystemExit("no accessory host line to plant after")
+open(p, "w").write("\n".join(lines))
+PY
+  planted_out="$(cd "$planted" && with_secrets "$KAMAL" config --version latest 2>&1)"
+  if printf '%s' "$planted_out" | accessories_block /dev/stdin | grep -qE '^[[:space:]]+port: 5432$'; then
+    ok 'kamal config  (a planted accessory `port:` reaches the resolved document — the check above can see it)'
+  else
+    # The message is single-quoted throughout: a backtick inside double quotes is
+    # a command substitution, and a `port:` in backticks is a shell trying to run
+    # a command named `port` — which is exactly what the first run of this case
+    # did, printing "port:: command not found" and failing for a reason that had
+    # nothing to do with the case.
+    no 'kamal config  (a planted accessory port line reaches the resolved document — the check above can see it)' \
+      'planted a "port: 5432" line and the resolved accessories block did not carry it, so the
+       check above would pass for the wrong reason. Resolved block:' \
+      "$(printf '%s' "$planted_out" | accessories_block /dev/stdin)"
+  fi
+fi
+
+# ---------------------------------------------------------------------------
 # 5. The drill refuses a production-looking scratch database, and builds a
 #    content assertion rather than a row report.
 #

@@ -165,7 +165,49 @@ accessories:
   postgres:
     image: postgres:17-alpine
     host: <%= web_host %>
-    port: 5432
+    # NO `port:` LINE, AND ITS ABSENCE IS THE POINT. This is not an omission to
+    # be tidied up later and not a placeholder for a firewall rule somewhere
+    # else — the database has to be unreachable from outside this host, and the
+    # only thing that guarantees it is not publishing at all.
+    #
+    # WHAT A `port:` LINE DOES. Kamal's Configuration::Accessory#port returns the
+    # value as a string, expanded to "N:N" when it carries no colon, and
+    # Commands::Accessory#publish_args hands it to `docker run` as `--publish`.
+    # Docker's `--publish HOST:CONTAINER` with no host address binds 0.0.0.0 and
+    # ::. Measured, not inferred: a boot with `port: 5432` on this template fails
+    # with `Bind for 0.0.0.0:5432 failed: port is already allocated` when
+    # something else holds 5432 — which is Docker naming the bind it is about to
+    # make. On a VPS where 5432 is free it succeeds, and the database is on every
+    # interface the host has, and the firewall is the only thing between it and
+    # the internet. This template does not ship a firewall.
+    #
+    # WHY LOOPBACK IS NOT THE ANSWER, because it is the obvious one and it does
+    # not work. `port: "127.0.0.1:5432:5432"` really does bind only this host —
+    # measured, `docker ps` shows `127.0.0.1:5432->5432/tcp` and nothing on ::.
+    # But the application is not on this host's loopback: it is a container on the
+    # `kamal` Docker network, where `127.0.0.1` is its own. Measured, from a
+    # container on that network: `pg_isready -h 127.0.0.1 -p 5432` gets no
+    # response while `pg_isready -h <service>-postgres -p 5432` answers. So a
+    # loopback bind reduces the exposure and does not make the application work,
+    # and the only thing it buys is a `psql` run on the box itself.
+    #
+    # WHAT THE APPLICATION USES INSTEAD. Kamal boots the accessory with
+    # `--network kamal` and `--name <service_name>`, Docker's embedded DNS
+    # resolves that name on the network, and the app reaches the database at
+    # `<service>-postgres:5432`. Measured from INSIDE a deployed app container
+    # with this template and no `port:`: `pg_isready -h <service>-postgres -p 5432`
+    # -> `accepting connections`, and `docker ps` for the accessory shows `5432/tcp`
+    # with no host binding at all.
+    #
+    # SO `DATABASE_URL` MUST NAME THE CONTAINER, not the server. It is a
+    # `<service>-postgres` hostname, which is what the fleet's own probe URLs
+    # already use. A service whose DATABASE_URL points at a host address breaks
+    # here, and that is the one migration this change costs: a one-line change per
+    # service, in a file that is already a secret and already per-service.
+    #
+    # If you genuinely need a psql on the box, do not publish a port for it:
+    # `kamal accessory exec postgres psql` runs inside the container, which is
+    # what templates/kamal/drill.sh does.
     volumes:
       - <%= service %>_postgres:/var/lib/postgresql
     env:
