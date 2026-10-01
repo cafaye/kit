@@ -88,15 +88,19 @@ semver contract — it is consumed by *calling*
   named debt into a failure with no re-review, which is what makes this a wave
   rather than a discount.
 
-  The judgement is about **who owns the debt**, not about how bad it is:
-  `identity` has adopted and still runs its own `postgres:17-alpine` — a defect
-  in an adopting repository, and a failure. `billing` has adopted nothing and
-  runs the same image, which is the cost of a fleet that has not taken up the
-  standard. A gate that stays red for thirteen findings no repository has agreed
-  to fix is a gate whose red stops being read within one release, and a gate
-  nobody reads catches nothing. The ceiling is printed by the check, carried in
-  the gate's own summary line, and argued in `REPORT-kit-13.md`; a ceiling that
-  exists only in an exit code is a ceiling nobody knows is there.
+  The judgement is about **who owns the debt**, not about how bad it is: a
+  repository that has adopted and still runs its own `postgres:17-alpine` has
+  made a promise it is breaking, and one that has adopted nothing has not made a
+  promise yet. A gate that stays red for thirteen findings no repository has
+  agreed to fix is a gate whose red stops being read within one release, and a
+  gate nobody reads catches nothing. The ceiling is printed by the check, carried
+  in the gate's own summary line, and argued in `REPORT-kit-13.md`; a ceiling
+  that exists only in an exit code is a ceiling nobody knows is there.
+
+  **No repository in the fleet has adopted yet**, so the FAIL side is exercised
+  by none of them and is proved against a fixture instead: breakages 30 and 31
+  run the same mutation once unadopted and once adopted. The ceiling's current
+  measured state is **13 warnings, 0 failures, 6 repositories**.
 
   Adoption is read from `read_kit_ref` — the same function every finding message
   already assumes — and only `absent` counts as unadopted. An empty,

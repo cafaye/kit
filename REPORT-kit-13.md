@@ -21,12 +21,31 @@ Nothing, for about a release. Then it decays, and the decay is silent:
 - A gate that cannot go green is a gate people learn to re-run without reading,
   which is precisely how the state this packet exists to remove survived a full
   round of CI the first time.
-- The 13 findings are true and they are **nobody's agreed work**. `identity` has
-  adopted and still runs its own `postgres:17-alpine` — that is a defect in a
-  repository that accepted the standard. `billing` has adopted nothing and runs
-  the same image — that is the cost of a fleet that has not taken it up.
+- The 13 findings are true and they are **nobody's agreed work**. A repository
+  that has adopted and still runs its own `postgres:17-alpine` has made a promise
+  it is breaking. A repository that has adopted nothing and runs the same image
+  has not made a promise yet — and the useful thing the gate can do about that is
+  name what it would have to do, which is why each warning carries the adoption
+  path.
 
 So the two are separated by **who owns the debt**, not by how bad it is.
+
+**A correction worth stating, because I wrote the first version of this the other
+way round.** I first wrote the argument with `identity` as the adopting
+repository and `billing` as the unadopted one, as though `identity` had already
+taken the standard. **It has not — no repository in this fleet has a `kit.ref` at
+all**, as the table two sections below records. The illustration was doing real
+work in the argument and it was fiction, and a fictional example inside a
+reasoning chain is the kind of thing a reader cannot check and therefore believes.
+The hypothetical is now phrased as one, in all three places that state it
+(`fleet_check.py`'s docstring, `README.md`, `CHANGELOG.md`).
+
+That correction has a consequence I would rather state than leave implied: with
+no repository adopting, **the FAIL half of the ceiling is currently exercised by
+no real repository**. It is proved against a fixture instead, by breakages 30 and
+31 — the same mutation, unadopted and adopted — because a ceiling whose strict
+side is untested until the day somebody adopts is a ceiling that gets discovered
+to be broken on the day somebody adopts.
 
 ### The ceiling
 

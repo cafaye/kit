@@ -264,15 +264,18 @@ that reads only one of them, so kit's gate reads all of them.
 
 Same four checks, same predicates, same messages. **The strictness moves to
 where adoption exists; it does not disappear.** The judgement is about **who owns
-the debt**, not about how bad it is — `identity` has adopted and still runs its
-own `postgres:17-alpine`, which is a defect in an adopting repository and fails;
-`billing` has adopted nothing and runs the same image, which is the cost of a
-fleet that has not taken up the standard.
+the debt**, not about how bad it is: a repository that has adopted and still runs
+its own `postgres:17-alpine` has made a promise it is breaking, and one that has
+adopted nothing has not made a promise yet.
 
 All six repositories in scope are currently **warnings and no failures**, because
 not one of them has adopted. That is a deliberate, temporary, named state and it
 is a *wave*, not a discount: commit the one line and your own findings become
-failures, with no change to this repository and no re-review.
+failures, with no change to this repository and no re-review. Because the FAIL
+side is therefore unexercised by any real repository today, it is proved against
+a fixture instead — self-test breakages 30 and 31 run the identical mutation
+once unadopted (must stay green, must name the finding) and once adopted (must
+go red).
 
 ```sh
 git -C ../kit rev-parse HEAD > kit.ref    # the only thing that decides which kit you run

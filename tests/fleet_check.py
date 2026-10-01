@@ -72,14 +72,23 @@ THE ADOPTION CEILING, and why it is not a weakening
     the adoption path. A finding inside a repository that HAS a `kit.ref` is a
     FAIL, every time, with no discretion.
 
-    The judgement is about WHO OWNS THE DEBT, not about how bad it is. All four
-    findings are equally true of an unadopted repository; what differs is whether
+    The judgement is about WHO OWNS THE DEBT, not about how bad it is. Every
+    finding is equally true of an unadopted repository; what differs is whether
     that repository has already accepted the standard and is therefore already
-    accountable to it. `identity` has adopted and still runs its own
-    `postgres:17-alpine` — that is a defect in an adopting repository and it
-    fails. `billing` has adopted nothing and runs the same image — that is the
-    cost of a fleet that has not taken up the standard, and it is reported by
-    name so the adoption wave can retire it.
+    accountable to it. A repository that has adopted and still runs its own
+    `postgres:17-alpine` has made a promise it is breaking, and that is a FAIL.
+    A repository that has adopted nothing and runs the same image has not made a
+    promise yet, and the useful thing the gate can do is name what it would have
+    to do — which is what the adoption path printed with each warning is.
+
+    MEASURED TODAY, and stated because it is the honest state of both halves:
+    no repository in this fleet has a `kit.ref`, so the WARN side is exercised by
+    all six and the FAIL side by none of them. That leaves the FAIL side a claim
+    about the future, which is not good enough on its own — so
+    `tests/self_test.sh` breakages 30 and 31 run the SAME mutation twice, once
+    unadopted (must stay green and name the finding) and once adopted (must go
+    red), and the FAIL side is proved against a fixture today rather than trusted
+    to hold until somebody adopts.
 
     The strictness MOVES rather than disappearing. Nothing about the four checks
     changes: the same predicate, the same message, the same severity the moment
