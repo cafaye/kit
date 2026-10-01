@@ -5536,6 +5536,179 @@ PY
   }
   check 'README.md  (documents every new template)' readme_check
 
+  # kit's own licence, and the one property about it that can rot.
+  #
+  # WHY THIS EXISTS. kit carried no `LICENSE` at all while the rest of the fleet
+  # was being given one, and the state that produces is not "unlicensed" — it is
+  # "all rights reserved", because that is the default copyright position when a
+  # public repository grants nothing. cafaye's decision is MIT everywhere, and a
+  # decision that is written down on a website and absent from the repository is
+  # a decision a buyer's own legal review cannot see.
+  #
+  # The interesting half is not the file. It is that a licence is only
+  # unambiguous when there is exactly ONE place in a repository that can declare
+  # one, and that place is easy to lose: a `package.json` appears, it carries
+  # `"license": "AGPL-3.0-only"` copied out of a service, and now the repository
+  # says MIT in one file and AGPL in another. Both are true statements about
+  # different fields, and the reader has no way to tell which one a licence
+  # compliance tool reads.
+  #
+  # So this asserts the AGREEMENT, not the presence of a file:
+  #
+  #   1. `LICENSE` exists and grants MIT, recognised by the grant's own words
+  #      rather than by the string "MIT" — a file saying "MIT" and granting
+  #      something else passes every check that looks for the word, and this is
+  #      the check that looks for the words.
+  #   2. it names a copyright holder, because MIT's attribution obligation is
+  #      that notice travelling with the software, and a grant with no holder is
+  #      a grant nobody can attribute.
+  #   3. README says MIT and links the file. A grant nobody reads is not
+  #      published, and the two licence questions in kit's README are separate
+  #      on purpose (MIT for kit, AGPL-3.0 for the four backends it ships
+  #      unmodified) — so the check asserts against kit's OWN paragraph and
+  #      leaves the AGPL one alone, since conflating the two is the mistake the
+  #      README's structure exists to prevent.
+  #   4. every root manifest that CAN carry a licence field declares MIT.
+  #
+  # Point 4 is deliberately a check for AGREEMENT and not a ban on the file. The
+  # same reasoning as breakage 31b: a check satisfied by "kit has no
+  # package.json" would train the next contributor to delete a manifest rather
+  # than to fix its licence field, and would be a FAIL the day kit legitimately
+  # grew one. Today it finds zero manifests and prints that count, because "0
+  # manifests, none of which can disagree" is a measurement and silence is not.
+  license_check() {
+    "$PY" - "$ROOT" <<'PY'
+import glob
+import os
+import re
+import sys
+
+root = sys.argv[1]
+problems = []
+
+# (1) and (2): the grant itself.
+path = os.path.join(root, "LICENSE")
+if not os.path.isfile(path):
+    problems.append(
+        "LICENSE does not exist. cafaye's decision is MIT across the fleet, and a "
+        "repository with no grant is not permissive — it is all rights reserved, "
+        "which is the default copyright position when nothing is granted. The "
+        "grant is one file and it is the whole grant"
+    )
+else:
+    text = open(path, encoding="utf-8").read()
+    # The grant's own sentences, not the identifier. `MIT` as a bare string is
+    # also how a summary, a badge line, or a note about some OTHER repository's
+    # licence is spelled, and matching it would pass on all three.
+    for phrase, why in (
+        (
+            "Permission is hereby granted, free of charge",
+            "the permission grant is MIT's first sentence and the thing being granted",
+        ),
+        (
+            'THE SOFTWARE IS PROVIDED "AS IS"',
+            "MIT's warranty disclaimer. Its ABSENCE is how you tell a copied "
+            "identifier from a real grant, and a grant without it is a different "
+            "licence",
+        ),
+    ):
+        if phrase not in text:
+            problems.append(
+                f"LICENSE does not contain {phrase!r} — {why}. If kit is not MIT, "
+                f"say so in README.md instead of leaving the two files to disagree"
+            )
+    if not re.search(r"^Copyright \(c\) \d{4} \S.*$", text, re.M):
+        problems.append(
+            "LICENSE names no copyright holder. MIT's attribution obligation is "
+            "that notice travelling with the software, and a grant with no holder "
+            "is a grant nobody can attribute"
+        )
+
+# (3): the README, against kit's OWN paragraph.
+readme = open(os.path.join(root, "README.md"), encoding="utf-8").read()
+# The `## License` section, not the whole file: the AGPL paragraph above names a
+# licence that is NOT kit's, and a substring search over the document is
+# satisfied by that one — which is the exact conflation the section split exists
+# to prevent.
+section = re.split(r"^## ", readme, flags=re.M)
+own = next((s for s in section if s.startswith("License")), "")
+if not own:
+    problems.append(
+        "README.md has no `## License` section. A grant nobody reads is not "
+        "published, and this is the section a reader is looking for"
+    )
+else:
+    if not re.search(r"\bMIT\b", own):
+        problems.append("README.md's License section does not state MIT")
+    if not re.search(r"\]\(LICENSE\)", own):
+        problems.append(
+            "README.md's License section does not link to the LICENSE file, so a "
+            "reader has to go looking for it"
+        )
+# The separation itself, which is a claim rather than a file.
+if not re.search(r"AGPL", own):
+    problems.append(
+        "README.md's License section does not name AGPL anywhere. kit shipping "
+        "AGPL-3.0 backends unmodified and kit itself being MIT are two different "
+        "questions, and the section that answers the second has to say why the "
+        "first does not change the answer"
+    )
+
+# (4): anything in the tree root that can carry a licence field.
+# Deliberately ROOT-ONLY and deliberately not a ban. `templates/` holds
+# manifests for other people — `go.mod` files, a service's package.json — and a
+# licence declared in a template is that template's business. What cannot be
+# allowed is a licence declared about KIT, and only the root can be about kit.
+FIELDS = {
+    "package.json": r'"license"\s*:\s*"([^"]*)"',
+    "Cargo.toml": r'^\s*license\s*=\s*"([^"]*)"',
+    "pyproject.toml": r'^\s*license\s*=\s*(?:\{[^}]*text\s*=\s*)?"([^"]*)"',
+    "composer.json": r'"license"\s*:\s*"([^"]*)"',
+    "setup.cfg": r"^license\s*=\s*(\S+)",
+    "bower.json": r'"license"\s*:\s*"([^"]*)"',
+}
+found = 0
+for name, pattern in FIELDS.items():
+    for full in sorted(glob.glob(os.path.join(root, name))):
+        found += 1
+        body = open(full, encoding="utf-8").read()
+        m = re.search(pattern, body, re.M)
+        if not m:
+            # No field is not a disagreement: the LICENSE file still governs, and
+            # the check above already asserted it says MIT.
+            continue
+        declared = m.group(1)
+        if "MIT" not in declared:
+            problems.append(
+                f"{name} declares license {declared!r} while LICENSE grants MIT. A "
+                f"licence compliance tool reads the manifest, a reader reads the "
+                f"file, and the repository now says two different things about the "
+                f"same grant"
+            )
+for full in sorted(glob.glob(os.path.join(root, "*.gemspec"))):
+    found += 1
+    m = re.search(r"\.license\s*=\s*[\"']([^\"']+)[\"']", open(full, encoding="utf-8").read())
+    if m and "MIT" not in m.group(1):
+        problems.append(
+            f"{os.path.basename(full)} declares license {m.group(1)!r} while LICENSE "
+            f"grants MIT — same disagreement, same reason"
+        )
+
+if problems:
+    sys.exit("; ".join(problems))
+
+# Printed on PASS, because "no manifest could disagree" and "nobody looked" are
+# the same output otherwise.
+print(
+    "LICENSE grants MIT and names cafaye; README states it and links the file; "
+    f"{found} root manifest(s) inspected, none declaring a licence other than MIT "
+    f"(kit has {'none' if found == 0 else str(found)}, so the file is the only "
+    "place a grant can be declared)"
+)
+PY
+  }
+  check 'LICENSE  (MIT, and nothing in the tree can disagree with it)' license_check
+
   # The README's own examples must call the workflow the README says it does.
   #
   # Every yaml block in the README that contains `uses: cafaye/kit/` is a
@@ -7084,7 +7257,7 @@ if [ "$RUN_SELF_TEST" -eq 1 ]; then
   # a SKIP, and `expect_green_check` (breakage 59) asserts it stays green while
   # naming a FINDING — kit-13's adoption ceiling, the other side of the same
   # claim. Conflating either with the red-expecting helpers would either claim
-  # sixty-five reds when there are sixty-three, or drop a green-expecting proof
+  # sixty-seven reds when there are sixty-five, or drop a green-expecting proof
   # from the label entirely, and a proof the summary does not count is a proof
   # nobody runs.
   #
@@ -7213,14 +7386,16 @@ PY
 
   # The label carries both numbers and, deliberately, does not sum them into
   # "N breakages, N reds" the way it did while every recipe was red-expecting.
-  # Sixty-five breakages of which sixty-three must go red and two must stay green
+  # Sixty-seven breakages of which sixty-five must go red and two must stay green
   # — 23b naming a SKIP, 59 naming a FINDING — is a *stronger* suite than
-  # sixty-five that must all go red, and a label that flattened the two would hide
-  # the only facts that distinguish them.
+  # sixty-seven that must all go red, and a label that flattened the two would hide
+  # the only facts that distinguish them. The NUMBERS in this label are counted from
+  # the recipes; the numbers in these comments are written down, which is why they
+  # are the ones that go stale.
   #
   # BOUNDED, and this is the phase that most needs it. Every recipe builds a
   # fresh throwaway copy of the tree and runs the whole static gate inside it, so
-  # the self-test is _n_ gates in sequence: 65 on this branch, and the number
+  # the self-test is _n_ gates in sequence: 67 on this branch, and the number
   # grows with every check this repository adds. On a quiet box it is the
   # longest phase in the run by a wide margin, and it is the one that grows
   # silently — nothing in it announces that the gate just got slower.

@@ -15,6 +15,32 @@ it without a copy (see kit-12 below).
 
 ### Fixed
 
+- **`expect_green_check` read a MATCH as a non-match once the gate's output was
+  large enough, so breakage 59 reported the adoption ceiling red when it had
+  passed.** `printf '%s\n' "$out" | grep -qF` is the SIGPIPE defect
+  `expect_red_check` was already repaired for and recorded at length: `grep -q`
+  exits at the first match and closes the pipe, `printf` dies 141, `set -o
+  pipefail` promotes that to the pipeline's status, and `!` inverts a success into
+  a failure. It was latent because the gate's output had never crossed the 64K
+  pipe buffer; kit-19's `license_check` printing its measurement on PASS — which
+  is what `check`'s own contract asks of a check reporting which spec it
+  verified — was the crossing point.
+
+  Reproduced outside the suite to establish the mechanism rather than the
+  coincidence: at 5000 lines `grep -qF` returns 141 and the shell `case` returns
+  0 on the same input and the same match. The failing run printed the diagnosis
+  itself — `printf: write error: Broken pipe` — inside a phase whose output nobody
+  reads on a green run.
+
+  **The fix is a `contains` helper** (a shell `case`, no pipe) used by
+  `expect_red_check`, `expect_green_check` and `expect_skip_check`. Three correct
+  copies were the wrong shape: the failure is a property of how the harness READS
+  output and has nothing to do with which check it is reading. Stopping the new
+  check printing was the alternative and it was worse twice over — it contradicts
+  `check`'s documented behaviour, and the threshold it hides behind is a property
+  of the pipe buffer, so it moves with the machine and returns as a flake on
+  somebody else's packet. No recipe, threshold or pin changed.
+
 - **`templates/compose/docker-compose.yml` defaulted to postgres 16.6 while the
   rest of the fleet floated at 17.** `postgres:${KIT_POSTGRES_TAG:-16.6-alpine}`
   meant a developer running `bin/dev` with nothing configured got postgres 16.6
@@ -153,6 +179,57 @@ it without a copy (see kit-12 below).
     running its own config, which is the copy this packet exists to end.
 
 ### Added
+
+- **kit-19 — kit carries a licence, and a check that keeps it unambiguous.**
+  cafaye's decision is MIT across the fleet, and `kit` had no `LICENSE` at all.
+  That is not "unlicensed, therefore free": it is **all rights reserved**, the
+  default copyright position when a public repository grants nothing, and it is
+  the state `docs`' `licensing.md` names `kit` in. The grant is now the MIT text
+  in `LICENSE`, and the README says so in two places — a `### kit's own licence`
+  paragraph next to the AGPL one, and a `## License` section a reader looking for
+  a licence actually finds.
+
+  - **The check is for AGREEMENT, not for the file's existence, and that is the
+    half that matters.** A licence is only unambiguous when exactly one place in
+    a repository can declare one. `license_check` asserts the grant by MIT's own
+    sentences rather than by the string `MIT` — the identifier is also how a
+    badge line, a summary, or a note about some *other* repository's licence is
+    spelled, and matching it passes on all three — asserts a copyright holder
+    exists, asserts the README states MIT and links the file *in its own section*
+    rather than anywhere in the document (the AGPL paragraph names a licence that
+    is not kit's, so a whole-file substring search is satisfied by the exact
+    conflation the section split exists to prevent), and then walks every root
+    manifest that can carry a licence field and fails on any that is not MIT.
+
+  - **It checks agreement, and does not ban the manifest.** A check satisfied by
+    "kit has no `package.json`" would be satisfied by deleting one, and would be
+    a `FAIL` the day kit legitimately grew one — the same shape as breakage
+    31b's control. `templates/` is untouched by design: a licence in a template is
+    that template's business, and only the root can be about kit.
+
+  - **Two breakages, `61` and `62`, and 62 is the one that makes it real.** 61
+    deletes `LICENSE`, which is the direction everybody can see. 62 writes a root
+    `package.json` declaring `AGPL-3.0-only` while `LICENSE` and the README both
+    still say MIT: the repository has acquired a third statement about its own
+    grant, a compliance tool reads the manifest, and a reader has no way to tell
+    which is authoritative. A check asserting only that `LICENSE` exists is
+    satisfied by exactly that state, and a manifest is easy to add without
+    anybody thinking of it as a licence decision. 62's fixture is **assembled**
+    with `printf`, not written out — the same rule as breakages 24, 25 and 33,
+    because a probe written out is a probe committed.
+
+  - **`fresh_copy` now copies `LICENSE`.** Without it the new check fails on
+    every throwaway copy for a reason that has nothing to do with the defect
+    under test, and the two green-expecting proofs (23b, 59) go red for that
+    reason. A check that cannot run in a copy is a proof that proves nothing
+    while reporting something.
+
+  - **Two counts moved, both in prose rather than in code.** The self-test is
+    now 67 breakages, 65 of which must go red, and 47 assert the *named* check.
+    `self_test.sh`'s header is checked against the recipes by
+    `self_test_claims`, so the header could not simply be left at sixty-five; the
+    README and `AGENTS.md` prose is not mechanically checked, which is why it is
+    worth saying the numbers were updated in all three places deliberately.
 
 - **kit-13 — the observability stack gets a live path, and a gate that says which
   repositories are not on it.** `templates/compose/` shipped a complete local
