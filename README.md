@@ -21,12 +21,13 @@ build lands in kit once, and reaches the next service in a pull request.
 | Path | What it is | Who uses it |
 |------|-----------|-------------|
 | `.github/workflows/ci.reusable.yml` | One reusable GitHub Actions workflow. Input `language` picks one of seven jobs — install, lint, test, coverage gate. Opt-in `telemetry` input adds the traceparent conformance job; opt-in `required-tier` demands a tier by gate-variable name. No job builds or pushes an image. | Every service, via a 6-line `.github/workflows/ci.yml` |
-| `lint/yamllint.yml` | YAML style, with the three rules Actions forces us to retune. | Any repo that lints its own YAML; kit's gate uses it on itself |
-| `lint/golangci.yml` | golangci-lint v2, correctness linters on, `errcheck` excluded only for `Close`/`Flush`. | Go services |
-| `lint/rubocop.yml` | RuboCop, `NewCops: enable`, Metrics left on. | Ruby services |
-| `lint/eslint.config.mjs` | ESLint 9 flat config, type-checked rules on. | Node/TypeScript/Bun services |
+| `lint/yamllint.yml` | YAML style, with the three rules Actions forces us to retune. Read at run time via `yamllint -c`, never copied. | Any repo that lints its own YAML; kit's gate uses it on itself |
+| `lint/golangci.yml` | golangci-lint v2, correctness linters on, `errcheck` excluded only for `Close`/`Flush`. Read at run time via `--config`, never copied. | Go services |
+| `lint/rubocop.yml` | RuboCop, `NewCops: enable`, Metrics left on. Read at run time via `--config`, never copied. | Ruby services |
+| `lint/eslint.config.mjs` | ESLint 9 flat config, type-checked rules on. Read at run time via `--config`, and it must be checked out INSIDE the repo — see below. | Node/TypeScript/Bun services |
 | `docker/Dockerfile.<lang>` | Seven multi-stage templates. `go` and `rust` finish on distroless; the rest finish on `*-slim`. All run non-root. Linted by `hadolint -c lint/hadolint.yaml`, plus a non-root/no-`:latest`/no-`ADD` check the linter does not cover. | Every service |
 | `lint/hadolint.yaml` | hadolint config, with the one ignored rule (DL3008) argued rather than assumed. | Any repo that ships a Dockerfile |
+| `lint/drift-allowlist` | Known, owned service configs that disagree with kit's: reason, owner, since, until. An entry that expires, duplicates, or stops describing a real difference is a failure. | kit's gate only |
 | `templates/bin-prime/<lang>.sh` | The worktree primer: one script per language, exit 0 only when the tree is genuinely ready. | Every service, as `bin/prime` |
 | `templates/bin/dev.sh` | The local developer loop: bring the stack up, wait for health, migrate, seed an admin, print the URLs. Idempotent, fails loudly. | Every service, as `bin/dev` |
 | `templates/compose/docker-compose.yml` | Postgres, NATS+JetStream, Redis, the OTel collector, and the four LGTM backing services. Every port parameterized inside kit's claimed `15000-15999` block, every image pinned, every service healthchecked and memory-bounded. | Every service, as `docker-compose.yml` |
@@ -471,15 +472,11 @@ runs your repository's own `tests/validate.sh` and **fails if it is missing** �
 a config gate with no gate in it is the same defect as a coverage threshold left
 at `0`.
 
-**2. Copy the linter config** that matches your language into the repo root, so
-the config is part of the code review that changes the code:
-
-```sh
-cp <kit>/lint/golangci.yml  .golangci.yml     # go
-cp <kit>/lint/rubocop.yml    .rubocop.yml      # ruby
-cp <kit>/lint/eslint.config.mjs eslint.config.mjs   # node / typescript / bun
-cp <kit>/lint/yamllint.yml   .yamllint.yml     # any repo with YAML
-```
+**2. Lint config: nothing to copy.** There is no step 2 any more, and its
+absence is the point — see [Where the lint configs run](#where-the-lint-configs-run)
+for the measured reason and the mechanism per linter. The short version: the
+reusable workflow checks `lint/` out of kit at run time and passes `--config` at
+it, so a service inherits kit's policy with no file in its tree and no action.
 
 **3. Copy the Dockerfile and the two scripts.** Rename the Dockerfile to
 `docker/Dockerfile`, the primer to `bin/prime`, and the dev loop to `bin/dev`:
@@ -563,7 +560,9 @@ bash <kit>/tests/validate.sh
 
 - [ ] `.github/workflows/ci.yml` calls `cafaye/kit/.github/workflows/ci.reusable.yml@master`
 - [ ] `working-dir` points at the dir holding the manifest
-- [ ] Linter config copied to the repo root, unmodified
+- [ ] Nothing copied from `lint/` — the workflow passes kit's config at run time.
+      If your repo carries a `.golangci.yml`, it must AGREE with kit's; see
+      [Where the lint configs run](#where-the-lint-configs-run)
 - [ ] `docker/Dockerfile` copied, binary/application name set
 - [ ] `bin/prime` copied, `chmod +x`, green on a fresh clone
 - [ ] `bin/dev` copied, `chmod +x`, `bin/dev up` green on a fresh clone
@@ -577,6 +576,174 @@ bash <kit>/tests/validate.sh
 - [ ] No `actions/cache` step caches a test report
 - [ ] `CHANGELOG.md` has an entry
 - [ ] The workflow is green on the adoption PR
+
+## Where the lint configs run
+
+`lint/` is 249 lines of golangci, rubocop, eslint, yamllint and hadolint
+configuration, and until now it was distributed by `cp`. **No service in the fleet
+had ever copied it** — the one repository that carries its own golangci config
+wrote that file itself, for its own reason, and the difference matters (it is
+recorded in `lint/drift-allowlist`). The three mechanisms kit ships are not
+equivalent, and the adoption numbers say so:
+
+| mechanism | live? | adoption |
+|---|---|---|
+| `uses: cafaye/kit/...@master` | **yes** — fetched at run time | **11/11** repos that call it |
+| `cp <kit>/lint/golangci.yml ./` | **no** — a snapshot | **1/11** — and that one is `identity`, which added its own in the meantime |
+| `cp <kit>/templates/... ./` | no | 1/11 (`bin/dev`), 0/11 (observability) |
+
+Counted, not estimated: a non-worktree directory beside this one that contains a
+workflow with a `uses: cafaye/kit/.github/workflows/ci.reusable.yml` line. The
+eleven are `billing caf core courier darkroom docs guard identity kit muse
+parlor`, and `kit` is in the list because it calls its own workflow — the
+repository that defines the standard should be the first repository held to it,
+and excluding it would make the denominator flattering rather than true.
+
+Adoption correlates **inversely** with how much a file does. The small
+self-contained artifacts are universal; the large behavioural ones are used by
+nobody. The reason is structural, and it is the whole argument for this section:
+a `uses:` is live — change kit and every service gets it with no action — while a
+copied config has no propagation at all, so it rots silently.
+
+So the configs now run from kit, in the step that already ran them.
+
+### The mechanism per linter, measured
+
+Every row below was **run**, not read from documentation. The fixture for each is
+in `tests/lint_test.sh`, which builds a throwaway service containing a violation
+only that linter would catch, runs the same command the workflow runs, and asserts
+the linter rejects it — plus a control that must answer differently.
+
+| linter | mechanism | measured, and the part that matters |
+|---|---|---|
+| **golangci-lint** | `--config=<repo>/.kit/lint/golangci.yml` | With no config present it does **not** fail and does **not** run nothing: it falls back to its own five-linter default set (`errcheck govet ineffassign staticcheck unused`) and **exits 0 on a file kit's config rejects**. `GOLANGCI_LINT_CONFIG` is **not** read by v2 — set it, and the run proceeds on that same default set (measured on 2.6.2). |
+| **RuboCop** | `--config=<repo>/.kit/lint/rubocop.yml` | Same shape. Measured: a 13-line method is **green** under kit (`Max: 15`) and **red** on RuboCop's defaults (`Max: 10`), so the flag is what makes the two differ. |
+| **ESLint** | `--config=<repo>/.kit/lint/eslint.config.mjs` | Works, and **only because kit is checked out inside the repo**. Node resolves an ESM import from the *config file's* directory upward; a config sitting beside the repository finds no `@eslint/js` and the run dies with `ERR_MODULE_NOT_FOUND` — a red build that has linted nothing. |
+| **yamllint** | `yamllint -c <repo>/.kit/lint/yamllint.yml --strict` | The one that behaves the way the other three are assumed to. `--strict` is load-bearing: both of kit's retuned rules are warnings by default, so without it `yamllint -c kit's` and plain `yamllint` agree on the exit code and disagree on everything a human reads. |
+
+**`--config` wins over a local config, in both linters that have one.** This is
+measured, and it corrected a claim this repository made before it ran anything:
+`golangci-lint run -v` prints exactly one `[config_reader] Used config file`, and
+with `--config` it names kit's — a repo-root `.golangci.yml` that disables
+`misspell` does not survive it. RuboCop agrees (a local `.rubocop.yml` with
+`Max: 40` loses to `--config` on a 17-line method). Discovery is the *fallback*,
+not the override.
+
+That matters for what a stale copy actually does, and the honest answer is
+narrower than "it hijacks your build". It does not. What it does is **split the
+policy**: kit's CI reads kit's file, and every other invocation in that repository
+— a developer's `golangci-lint run`, an editor, a `make lint` — reads the local
+one. Two policies in one repository, one of them enforced nowhere it is written
+down. And the copy becomes live again the moment the `--config` flag goes missing,
+silently, because a copy is always weaker than the thing it was copied from.
+
+### What could not be done, and the cost
+
+**ESLint cannot be configured from a URL at all.** Not "we chose not to": the
+mechanism does not exist. `import()` of an `https:` URL raises
+`ERR_UNSUPPORTED_ESM_URL_SCHEME` — the default ESM loader supports `file` and
+`data` only — and the flag that once allowed it, `--experimental-network-imports`,
+is **removed in Node 22** (`bad option`). So there is no remote-config path to
+weigh, and a flat config must exist as a real file on disk.
+
+**RuboCop does have one, and it works.** A three-line `.rubocop.yml` that says
+`inherit_from: [https://raw.githubusercontent.com/cafaye/kit/master/lint/rubocop.yml]`
+is genuinely applied — measured, a 17-line method is reported as
+`[17/15]` — and it *propagates*, so it does not rot the way a copy does. A bad URL
+fails loudly (exit 2, `404 "Not Found" while downloading remote config file`)
+rather than falling back to defaults, which is the right direction.
+
+It is **not** what the workflow uses, and the reason is worth stating: it needs
+the network on every lint run, it re-downloads a config that is a versioned
+artifact in a repository we control, and it puts a per-service file back — the
+shape this section exists to remove. `--config` against a checkout is
+deterministic, offline, and versioned with the workflow that uses it. The remote
+form is recorded here as the honest alternative for a repo that cannot take a
+checkout.
+
+### The deviation seam
+
+One input, and it is deliberately narrow:
+
+```yaml
+    with:
+      language: go
+      lint-args: "-E gosec"      # appended AFTER kit's own flags
+```
+
+- It comes **last**, so a service can add flags and cannot remove the `--config`
+  that precedes it. Anything here is an addition to kit's invocation, not a
+  replacement of it.
+- It is a **string, not a path**, so there is no service-side config file for a
+  linter to read and therefore none to rot. A seam that reintroduces the file
+  reinstates the failure this section exists to end.
+- It **may not change which config is read, what is linted, or whether a
+  finding fails the build.** That is the whole policy in one sentence, and it is
+  enforced by the `lint-args guard` step that runs before every linter, in the
+  **workflow** rather than in kit's gate — because `lint-args` is the caller's
+  value and kit has never got it.
+
+  The guard refuses 15 flags, each read out of the linter's own `--help` on the
+  version kit pins:
+
+  | refuses | why |
+  |---|---|
+  | `--config`, `-c`, `--no-config`, `--no-config-lookup`, `--force-default-config` | which config is read — the last three are golangci-lint's, ESLint's and RuboCop's separate ways of saying "ignore the config you were given" |
+  | `--new`, `--new-from-rev`, `--new-from-patch`, `--new-from-merge-base` | what is linted — a diff rather than the tree, so a red file outside the patch is green |
+  | `--issues-exit-code`, `--fail-level` | whether a finding fails the build — `--issues-exit-code=0` is a linter that cannot fail |
+  | `--quiet`, `--no-error-on-unmatched-pattern` | ESLint's way of reporting less; `--quiet` means *errors only*, which is looser, not stricter |
+  | `--auto-gen-config`, `--regenerate-todo` | both **write a config file into the tree** — a linter that generates its own config is the copy mechanism arriving through the back door, and it would be a copy nobody reviews |
+
+  `lint_args_seam_check` in `tests/validate.sh` asserts the guard is present in
+  all three lint jobs, that the three copies are byte-identical, that the guard
+  runs **before** the linter (a guard after it is decoration), that the linter
+  actually receives `$KIT_LINT_ARGS`, and that the refused-token list is the one
+  written there. Without that last one, deleting `--no-config` from the guard
+  would widen the seam for the whole fleet and leave the workflow looking exactly
+  as it did — so three self-test breakages cover it (deleted, shortened, moved).
+- If a flag is wanted often enough to be common, it belongs in `lint/` and every
+  service gets it for free.
+
+A repo that wants a stricter *rule* rather than a stricter *flag* has no seam, and
+that is the intended pressure: the rule belongs in kit, where nine services get
+it and one written-down entry in `lint/drift-allowlist` is replaced by a change
+everyone receives.
+
+### The gate that catches a service drifting back
+
+`lint drift` in `tests/validate.sh` reads **both** files and reports the
+**difference**, linter by linter, rather than demanding the file be absent. A
+service whose `.golangci.yml` agrees with kit's passes; one that disagrees is told
+exactly which linters it dropped or added.
+
+Banning the file was the first version and it is worse than the drift it prevents.
+A config that matches kit's has reached the same policy by another route, and
+failing it teaches the lesson that kit's config is a thing you get shouted at for
+having — which is how a standard stops being adopted. `tests/self_test.sh`
+breakage 31b asserts that agreeing copy **passes**, so the check cannot be
+satisfied by simply deleting it.
+
+A difference you cannot delete yet goes in `lint/drift-allowlist` with a reason,
+an owner, `since` and `until`. Four rules, and the fourth is the one that earns
+the other three:
+
+1. reason, owner, `since` and `until` are all required;
+2. an **expired** entry fails on the day it expires;
+3. a duplicate `(repo, path, key)` fails — one of the two is dead;
+4. **an entry that no longer describes a real difference fails.**
+
+Rule 4 is modelled on ESLint's `reportUnusedDisableDirectives`. Without it an
+allowlist is a ratchet that only turns one way: the repository gets fixed, the
+entry stays, and within two quarters the file lists every repository the fleet has
+ever had. One entry is live today — `identity`, whose `.golangci.yml` enables no
+linter at all and exists only to exclude one generated file.
+
+Rule 4 is scoped to repositories the run actually looked at, and that scoping is
+the correctness of the rule rather than a softening of it: an entry naming a
+repository that is not in this checkout's fleet is reported as **unverified**,
+never as a pass and never as a failure. A copy of kit checked out on its own has
+no fleet beside it, and a rule that reported every entry as unused there would be
+red on a correct tree.
 
 ## Test tiers — `templates/tier/`
 
@@ -694,9 +861,8 @@ we wrote them down to be:
 - `.yml` / `.yaml` → `python` `yaml.safe_load`
 - **every** `.yml` / `.yaml` in the tree → `yamllint -c lint/yamllint.yml`,
   enumerated by `git ls-files` rather than a hand-kept list. Required, not
-  optional: a repo that copies `lint/yamllint.yml` lints its own CI against it
-  on day one, so a YAML that breaks the config greets the first adopter with a
-  failure nobody authored
+  optional: kit lints its own YAML on day one, so a YAML that breaks the config
+  greets the first adopter with a failure nobody authored
 - `.mjs` → `node --check`
 - `templates/tier/<lang>/*` → parsed in **their own language**, because they are
   files a service copies: `rustc --test` (Rust, and `--list` proves the
@@ -745,16 +911,17 @@ no `npm ci`, no `cargo fetch`. If these ever need the network, a template has
 grown a dependency and kit has stopped being config-only.
 
 **self_test** — `tests/self_test.sh` breaks a throwaway copy of this tree
-**twenty-eight** ways: twenty-seven assert the gate goes red, and one (23b)
-asserts the gate stays **green** while naming the skip that replaced a red.
-Fourteen breakages are for the static checks; one is a semantic mutation of each
-of the six language implementations, so **every suite is proven able to fail**
-rather than assumed to. A skip fails the run — a self_test that skips half its
-proofs and exits 0 is the "0 passed, 14 ignored" shape that verifies nothing.
-Eleven of the static ones go further and assert that one *named* check reported
-`FAIL`, so the check written for a given defect is proven still load-bearing
-rather than being one of fifty checks that could have gone red for an unrelated
-reason.
+**thirty-seven** ways: thirty-six assert the gate goes red, and one (23b)
+asserts the gate stays **green** while naming the skip that replaced a red. A
+further **green control** (31b) asserts a service config that agrees with kit's
+is *not* a failure. Fourteen breakages are for the static checks; one is a
+semantic mutation of each of the six language implementations, so **every suite
+is proven able to fail** rather than assumed to. A skip fails the run — a
+self_test that skips half its proofs and exits 0 is the "0 passed, 14 ignored"
+shape that verifies nothing. Seventeen of the static ones go further and assert
+that one *named* check reported `FAIL`, so the check written for a given defect
+is proven still load-bearing rather than being one of fifty checks that could
+have gone red for an unrelated reason.
 
 Breakage 19 is the allowlist one: an entry naming a test that does not exist,
 well-formed in every other respect. It is the rule most able to be decorative —

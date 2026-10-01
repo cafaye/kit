@@ -20,9 +20,10 @@ kit/
 ├── .github/workflows/
 │   ├── ci.reusable.yml                   # the workflow six repos call
 │   └── ci.yml                            # kit calling its own workflow
-├── lint/                                 # configs a service copies verbatim
+├── lint/                                 # configs services RUN, not copy
 │   ├── yamllint.yml  golangci.yml
 │   ├── rubocop.yml   eslint.config.mjs
+│   ├── drift-allowlist                   # owned service configs that differ
 │   └── hadolint.yaml                      # argues the one rule it ignores
 ├── docker/                               # Dockerfile.<lang> templates
 ├── core/                                 # the cafaye/core fan-out standard
@@ -43,6 +44,7 @@ kit/
 │   └── AGENTS.md                         # skeleton for a service repo
 └── tests/
     ├── validate.sh                       # THE gate
+    ├── lint_test.sh                      # the linters RUN, against fixtures
     ├── classify.py  rules.json           # the change classifier, failing closed
     ├── staleness.py                      # the fleet staleness reporter
     ├── core_fanout_check.py              # structural checks on core/vendir, core/renovate
@@ -107,7 +109,7 @@ That was the second time this bit. It used to exit 1 with `no python with
 PyYAML` because it preferred `.venv/bin/python`, fell back to `python3`, and
 `.venv` is gitignored, so **every fresh clone and every CI runner** hit it.
 
-Three phases, and all three must pass:
+Six phases, and all six must pass:
 
 - **static** — every artifact parses, and the strictness decisions are still
   what we wrote them down to be. A parse is the weakest check; the rest are
@@ -135,16 +137,26 @@ Three phases, and all three must pass:
   guard: a check that only parsed those two files would pass on a classifier
   that waves every change through. They stay runnable when static analysis is
   skipped, because a gate that skips is not green.
-- **self_test** — twenty-eight breakages of a throwaway copy. Twenty-seven assert
+- **lint** — the four linters are **executed** against a throwaway service built
+  to violate exactly one rule, with kit's config, and each is paired with a
+  control that must answer differently. `lint/` spent its whole life behind a
+  parse check: `yaml.safe_load` on `golangci.yml`, `node --check` on the eslint
+  config, and both green on files no linter had ever been pointed at. This phase
+  is the one that tells a working config from a valid one, and — unlike every
+  other phase — it is **fatal on a skip**, because the claim under test is "kit's
+  configs work" and a run in which no linter executed has not tested it.
+- **self_test** — thirty-seven breakages of a throwaway copy. Thirty-six assert
   the gate goes red; one (23b) asserts the gate stays green while naming a skip,
   because a check that turns a red into an honest skip is load-bearing precisely
-  by not going red. Six are a semantic mutation of one language each, so **every
-  suite is proven able to fail** rather than assumed to. Eleven assert that one
-  *named* check reported `FAIL`, so a check written for a specific defect is
-  proven still load-bearing. Two assert that a *proof* goes red: one inverts the
-  classifier's fail-closed property, and one makes the staleness reporter call an
-  undeclared pin `current`. A property nobody has tried to break is a property
-  nobody has tested.
+  by not going red. One further GREEN control (31b) asserts a service config
+  that AGREES with kit's does not fail, because a check satisfied by banning the
+  file would train every service to delete one. Six are a semantic mutation of one
+  language each, so **every suite is proven able to fail** rather than assumed
+  to. Seventeen assert that one *named* check reported `FAIL`, so a check written
+  for a specific defect is proven still load-bearing. Two assert that a *proof*
+  goes red: one inverts the classifier's fail-closed property, and one makes the
+  staleness reporter call an undeclared pin `current`. A property nobody has tried
+  to break is a property nobody has tested.
 - **A toolchain's floor is checked against the floor the ARTIFACT declares.**
   `KitOtel::RUBY_FLOOR` says what `templates/otel/ruby` needs and the gate reads
   that constant rather than restating the number. Below the floor is a loud,
@@ -183,6 +195,12 @@ Three phases, and all three must pass:
     whose branch still carried the retired workaround, and the gate went red on
     a tree with nothing wrong with it. A sweep that reaches further than it owns
     is worse than no sweep.
+- **The self-test's copies are the fleet.** `fresh_copy` gives every breakage its
+  own parent directory, because `lint_drift_check` finds a fleet by globbing
+  `$ROOT/..`. Copies sharing one directory would each see the other thirty-six
+  as their fleet, and a breakage could be "caught" by a defect it did not
+  introduce — a control that goes red for a reason another test created reads as
+  evidence and is worse than no control at all.
 - Tests are written **first** and watched fail before the artifacts exist. A
   config written from documentation instead of from the pinned image is a config
   that breaks on the first `bin/dev up`: Tempo, Loki and Mimir all reject keys
@@ -225,8 +243,8 @@ Three phases, and all three must pass:
   rubocop ran on kit's own Ruby with kit's own config. That is the only way an
   obsolete key surfaces before six repos inherit it.
 - The suite must be able to fail: `self_test` breaks a throwaway copy of the
-  tree nineteen ways and asserts the run goes red. If you change the suite, keep
-  that true.
+  tree thirty-seven ways and asserts the run goes red. If you change the suite,
+  keep that true.
 
 ## The classifier fails closed, and that is a rule about code
 
@@ -312,6 +330,18 @@ an `option` with no `job` is a green build that ran nothing.
   versions, thresholds, names — is an input or a build arg, never a copy of a
   file. Six repos each holding their own workflow is the drift this repo
   prevents.
+  - **And a seam is only as narrow as the control on it.** `lint-args` is the
+    worked example and the rule is general: the seam's limits are a list of
+    refused flags, and that list lives in the **workflow**, not here — because
+    the value is the caller's and kit has never got it. A control in
+    `tests/validate.sh` that asserted the seam would be asserting the input
+    exists and defaults to empty, and nothing about what a service puts in it.
+    The promise that kit's gate would catch a bad `lint-args` was written down
+    once, in a comment, and was **false**: the check did not exist. What kit's
+    gate can do is assert the guard is in every lint job, that the three copies
+    are byte-identical, that it runs BEFORE the linter, and that its token list
+    is the one written here — so shortening the seam is a red build rather than
+    a quiet widening of it.
 - **Boring beats clever.** No frameworks, no generators, no clever YAML. A
   file that needs a paragraph to explain is a file that will be misread.
 - **Strictness is documented.** Every config carries comments saying what is

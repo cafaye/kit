@@ -10,8 +10,9 @@
 #   bash tests/validate.sh --language=go       # one telemetry language (CI matrix)
 #   bash tests/validate.sh --no-self-test      # skip the "can this go red" proof
 #   bash tests/validate.sh --no-observability  # skip the two docker-requiring proofs
+#   bash tests/validate.sh --no-lint           # skip running the linters themselves
 #
-# Four phases, all of which must pass:
+# Six phases, all of which must pass:
 #   static         every artifact parses, and the strictness decisions are still
 #                  what we wrote them down to be (env-substituted endpoints, every
 #                  compose port parameterized, every placeholder documented, and
@@ -28,6 +29,11 @@
 #   self_test      breaks a throwaway copy of this tree once per kind of check
 #                  and asserts the gate goes red each time. A gate that cannot
 #                  fail is not a gate.
+#   lint           golangci-lint, RuboCop, ESLint and yamllint are RUN against
+#                  a fixture built to violate them, with kit's config, and each
+#                  is paired with a control that must answer differently. This
+#                  is the phase `lint/` never had: 249 lines of configuration
+#                  that parsed cleanly and had never been pointed at anything.
 #
 # One line per check: PASS, FAIL, or SKIP. Any FAIL exits 1. A SKIP is always
 # reported in the summary — never hidden.
@@ -68,6 +74,7 @@ RUN_STATIC=1
 RUN_TELEMETRY=1
 RUN_SELF_TEST=1
 RUN_OBSERVABILITY=1
+RUN_LINT=1
 LANGS=()
 
 while [ "$#" -gt 0 ]; do
@@ -76,14 +83,16 @@ while [ "$#" -gt 0 ]; do
       RUN_TELEMETRY=0
       RUN_SELF_TEST=0
       RUN_OBSERVABILITY=0
+      RUN_LINT=0
       ;;
     --no-self-test) RUN_SELF_TEST=0 ;;
     --no-observability) RUN_OBSERVABILITY=0 ;;
+    --no-lint) RUN_LINT=0 ;;
     --language=*)
       LANGS+=("${1#*=}")
       ;;
     -h | --help)
-      sed -n '2,26p' "$0"
+      sed -n '2,35p' "$0"
       exit 0
       ;;
     *)
@@ -432,6 +441,38 @@ PY
         else
           report SKIP "$path  (elixir not installed)"
         fi
+        ;;
+      # The lint drift allowlist, which has no extension because it is not
+      # meant to look like a config a linter would read — it is a list of
+      # PEOPLE, and naming it `.yml` would invite exactly the `cp` this packet
+      # exists to stop. It has no parser of its own; the drift check below IS
+      # its parser, and it reads it as text and reports a malformed line.
+      #
+      # Without this case the loop's `*)` branch printed
+      # `SKIP … (no parser for this file type)` for it, which is a claim that
+      # would have been false — the file is read on every run of this gate.
+      "$ROOT"/lint/drift-allowlist)
+        # Shape only, and deliberately NOT a second copy of the drift check's
+        # rules. Those four — reason, owner, dates, and an entry that no longer
+        # describes a real difference — all live in `lint_drift_check` below, and
+        # the last one can only be evaluated there because it needs the fleet.
+        # Duplicating any of them here would be a second, unchecked copy of a
+        # rule, which is the mistake this repository's classifier section
+        # documents at length.
+        #
+        # What is checked here is the one property that is cheap and that the
+        # drift check's own parser cannot report nicely: every content line
+        # begins an entry. A wrapped entry shows up as a line that does not, and
+        # the drift check would call it "malformed" without saying that the
+        # obvious cause is a wrapped line.
+        # Counted, both sides, and compared. The first version of this was a
+        # `!` on one end of a pipeline, which negates the LAST stage's status
+        # rather than the one the author is thinking about — so it passed on a
+        # file with a wrapped entry, which is the exact case it was written for.
+        # Two counts and an equality have no stage to get wrong.
+        check "$path  (every content line starts one entry)" bash -c \
+          "[ \"\$(grep -cE '^[[:space:]]*[^#[:space:]]' '$f')\" \
+             -eq \"\$(grep -c '^diverged ' '$f')\" ]"
         ;;
       "$ROOT"/templates/tier/go/*.go)
         # gofmt is run over the whole tree's Go templates in the telemetry phase
@@ -3146,6 +3187,951 @@ PY
   check "$WORKFLOW  (required-tier is declared, demanded by every language job, and identical)" \
     tier_demand_check
 
+  # -------------------------------------------------------------------------
+  # LINT RUNS FROM KIT, NOT FROM A COPY. Three claims, and they decay separately.
+  # -------------------------------------------------------------------------
+  #
+  # `lint/` shipped 249 lines of golangci/rubocop/eslint/yamllint/hadolint
+  # configuration and NOT ONE service in the fleet had ever copied it. Adoption
+  # correlated inversely with how much a file did: the small self-contained
+  # artifacts are universal, the large behavioural ones are at zero.
+  #
+  # The reason is structural, and it is worth stating because it is what this
+  # check defends. `uses: cafaye/kit/...@master` is LIVE — change kit and every
+  # service gets it with no action. A copied config has NO propagation at all:
+  # it rots silently, and the file nobody chose still runs while the file nobody
+  # copies just decays. The measured numbers are in README.md; the mechanism
+  # that ends the rot is putting the config where the step already is.
+  #
+  # This check reads the reusable workflow and asserts the three things that
+  # make the lint step a GATE rather than a report. Each has a self_test
+  # breakage, because a check with no counterexample is a claim in a comment.
+  lint_wiring_check() {
+    "$PY" - "$ROOT" "$WORKFLOW" <<'PY'
+import os
+import re
+import sys
+
+import yaml
+
+root, workflow_path = sys.argv[1], sys.argv[2]
+with open(workflow_path, encoding="utf-8") as fh:
+    doc = yaml.safe_load(fh)
+jobs = doc.get("jobs") or {}
+source = open(workflow_path, encoding="utf-8").read()
+
+problems = []
+
+
+def strip_shell_comments(src):
+    """`run:` bodies, with shell comments removed. See the identical helper in
+    the tier_demand check, and the reason it exists there: a check satisfied by
+    the sentence explaining a flag is not a check.
+
+    YAML comments are a second, separate problem here, and they are removed
+    FIRST: this file's own prose names every one of these flags while explaining
+    why each is load-bearing, so a naive substring test over the raw source is
+    satisfied by the documentation of the very step it is meant to police.
+    """
+    without_yaml = "\n".join(
+        ln for ln in src.splitlines() if not ln.lstrip().startswith("#")
+    )
+    out = []
+    for line in without_yaml.splitlines():
+        stripped = line.lstrip()
+        if stripped.startswith("#"):
+            continue
+        quote, cut = None, None
+        for i, ch in enumerate(line):
+            if quote:
+                if ch == quote:
+                    quote = None
+                continue
+            if ch in ("'", '"'):
+                quote = ch
+            elif ch == "#" and (i == 0 or line[i - 1] in " \t"):
+                cut = i
+                break
+        out.append(line if cut is None else line[:cut])
+    return "\n".join(out)
+
+
+def steps_of(lang):
+    return (jobs.get(lang) or {}).get("steps") or []
+
+
+def lint_step(lang):
+    """The step that runs the language's linter, or None.
+
+    Matched by NAME, not by scanning the job for a linter-shaped command: the
+    name is what a reviewer renames, and a check keyed on the thing being
+    checked cannot notice when the thing it names is gone.
+    """
+    for step in steps_of(lang):
+        if step.get("name") == "lint":
+            return step
+    return None
+
+
+# ---------------------------------------------------------------------------
+# 1. EVERY LANGUAGE JOB THAT LINTS, LINTS WITH KIT'S CONFIG.
+# ---------------------------------------------------------------------------
+#
+# The three languages, and the flag each one needs, are all different. That is
+# not a preference — each was measured on a fixture containing a violation only
+# that linter would catch, and the results are in tests/lint_test.sh. The
+# invariant is the SHAPE, and the shape is the thing that decays:
+#
+#     golangci-lint  `--config=<path>`   GOLANGCI_LINT_CONFIG is NOT read by
+#                                        v2 (measured: silently ignored, the
+#                                        run proceeds on the 5-linter default
+#                                        set, exit 0 on a file kit rejects).
+#     rubocop        `--config=<path>`   measured: a 13-line method is green
+#                                        under kit (Max 15) and red on RuboCop's
+#                                        default (Max 10).
+#     eslint         `--config=<path>`   and the path must be INSIDE the repo,
+#                                        because node resolves the config's own
+#                                        imports upward from the config file.
+#
+# `--config` is the only spelling all three accept, so it is what is asserted.
+# A per-language exception would be a second thing to keep in step, and the
+# measurement says there is nothing to gain by it.
+NEEDS_KIT_CONFIG = {
+    "go": ("golangci", "golangci-lint"),
+    "ruby": ("rubocop",),
+    "node": ("eslint",),
+}
+
+for lang, linters in NEEDS_KIT_CONFIG.items():
+    step = lint_step(lang)
+    if step is None:
+        problems.append(
+            f"job {lang} has no step named `lint`, so nothing checks that it "
+            f"still lints with kit's config. A renamed step is a lint step that "
+            f"stopped being policed, and this check is the only thing that would "
+            f"notice"
+        )
+        continue
+
+    # The run body, for `run:` steps, and the `with:` block, for action steps.
+    # Both are read, because the two mechanisms are different: the go job uses
+    # the golangci-lint ACTION (so the flag lives in `with:`) while ruby and
+    # node use `run:`. A check that only read `run:` would pass on a go job
+    # whose action had lost its args, and that job is the one whose default set
+    # is a plausible-looking five linters.
+    haystack = strip_shell_comments(step.get("run") or "")
+    with_block = step.get("with") or {}
+    haystack += "\n" + "\n".join(
+        f"{k}: {v}" for k, v in (with_block.items() if isinstance(with_block, dict) else [])
+    )
+
+    if not any(tool in haystack for tool in linters):
+        problems.append(
+            f"job {lang}: its `lint` step names none of {linters}, so it is not "
+            f"the linter kit configures. Every check in this file can be green "
+            f"while the step that was supposed to run the linter runs something "
+            f"else"
+        )
+        continue
+
+    if "--config" not in haystack:
+        problems.append(
+            f"job {lang}: its `lint` step does not pass `--config`. Measured: "
+            f"with no config in the repository, each of these linters falls back "
+            f"to its own DEFAULT policy rather than failing — golangci-lint to "
+            f"five linters, rubocop to MethodLength 10, eslint to no rules — so "
+            f"the step still runs, still passes, and is now on a policy nobody "
+            f"chose. This is the exact failure the check exists to end"
+        )
+
+    # The config has to be KIT's, and the only way to say that without a second
+    # copy of the path to rot is to require the path to go through the
+    # environment variable that names the checked-out kit. A path into the
+    # service's own tree is a copy, and a copy is the mechanism this packet
+    # replaces: it has no propagation, so it rots in silence.
+    #
+    # The variable is the seam, not a convenience: the three jobs spell the
+    # path differently (one interpolates `${{ github.workspace }}` and the env
+    # var, two use a shell `$VAR`), and requiring the variable rather than a
+    # literal is what lets them differ without the check having to know how.
+    if "KIT_LINT_DIR" not in haystack or "/lint/" not in haystack:
+        problems.append(
+            f"job {lang}: its `lint` step does not read the config out of the "
+            f"checked-out kit (`$KIT_LINT_DIR/lint/…`). A path inside the "
+            f"service's own tree is a copy, and a copy is the mechanism this "
+            f"packet replaces: it has no propagation, so it rots silently"
+        )
+
+# ---------------------------------------------------------------------------
+# 1b. THE KIT CHECKOUT THAT MAKES `$KIT_LINT_DIR` NAME SOMETHING.
+# ---------------------------------------------------------------------------
+#
+# The claim above is that each lint step reads its config out of a checked-out
+# kit. A step that references the variable perfectly well still reads nothing if
+# the checkout that fills it was deleted — and that is a one-line deletion in a
+# job with eight steps, it leaves the YAML valid, and every other check in this
+# file stays green. The lint step would then be a bare `eslint` with no config,
+# which is precisely the default-policy failure the check above is about.
+#
+# Asserted on the PARSED step rather than by grepping, so a `uses:` inside a
+# comment (this file has several, explaining exactly this mechanism) cannot
+# satisfy it. And `ref` is required to be the INPUT rather than a literal: a
+# checkout pinned to `master` in three places is three places to update, and a
+# ref that is not the input is a ref that disagrees with the caller's own pin
+# without anyone noticing.
+for lang in sorted(NEEDS_KIT_CONFIG):
+    steps = steps_of(lang)
+    kit_steps = [
+        s
+        for s in steps
+        if isinstance(s, dict)
+        and str(s.get("uses", "")).startswith("actions/checkout")
+        and (s.get("with") or {}).get("repository") == "cafaye/kit"
+    ]
+    if not kit_steps:
+        problems.append(
+            f"job {lang}: no step checks out cafaye/kit, so the path its `lint` "
+            f"step reads its config from does not exist. The lint step still runs, "
+            f"still passes, and is now on the linter's defaults — the exact "
+            f"failure this check exists to catch, reached by deleting one step"
+        )
+        continue
+    for step in kit_steps:
+        with_block = step.get("with") or {}
+        ref = str(with_block.get("ref", ""))
+        if "inputs.kit-lint-ref" not in ref:
+            problems.append(
+                f"job {lang}: its kit checkout pins `ref: {ref or '(none)'}`, not "
+                f"`inputs.kit-lint-ref`. A ref hardcoded here is a fourth place a "
+                f"pin lives, and it is the one place the caller cannot see"
+            )
+        # `persist-credentials: false` — the checkout leaves kit's token in a git
+        # config inside the tree the service's own later steps run in. Cheap to
+        # require and the cost of forgetting it is a credential outliving the
+        # step that fetched it.
+        if with_block.get("persist-credentials") is not False:
+            problems.append(
+                f"job {lang}: its kit checkout does not set `persist-credentials: "
+                f"false`, so kit's token is left in a git config inside the tree "
+                f"the service's later steps run in"
+            )
+
+# ---------------------------------------------------------------------------
+# 2. THE LINT STEPS ARE GATES, NOT REPORTS.
+# ---------------------------------------------------------------------------
+#
+# `continue-on-error: true` on a lint step is the single most likely way for
+# this whole packet to become decoration, and it is invisible: the step runs,
+# prints its findings, and the job is green. A linter that only warns is a
+# report. So the assertion is on the PARSED step, and it is a separate claim
+# from the one above — a step can pass kit's config perfectly and still be
+# advisory.
+#
+# `|| true` and `| head` in a run body are the same defect wearing shell
+# clothes, and both are caught by looking at the command rather than the
+# setting, because `set -euo pipefail` is already in force and a pipeline's
+# status is what decides.
+for lang in sorted(NEEDS_KIT_CONFIG):
+    step = lint_step(lang)
+    if not isinstance(step, dict):
+        continue
+    if step.get("continue-on-error") is True:
+        problems.append(
+            f"job {lang}: its `lint` step is `continue-on-error: true`. The step "
+            f"still runs and still prints its findings, and the job is green — a "
+            f"linter that only warns is a report. This is the breakage that "
+            f"matters most, which is why it is asserted on the parsed step rather "
+            f"than left to a reviewer"
+        )
+    body = strip_shell_comments(step.get("run") or "")
+    if re.search(r"\|\|\s*true\b", body):
+        problems.append(
+            f"job {lang}: its `lint` run body swallows the linter's exit status "
+            f"with `|| true`, which is continue-on-error in shell and reads as a "
+            f"deliberate choice to nobody"
+        )
+
+# ---------------------------------------------------------------------------
+# 3. KIT'S CONFIGS ARE STILL WHAT THEY WERE.
+# ---------------------------------------------------------------------------
+#
+# The workflow can point `--config` at `.kit/lint/golangci.yml` on every run and
+# the file can still have been emptied of every linter it enabled. Nothing
+# above notices: the step runs, the config parses, and the job is green on a
+# policy that is now five defaults. So the strictness decisions are asserted
+# ON THE FILES, by value.
+#
+# Read as YAML rather than grepped, so a linter name in a comment cannot satisfy
+# the check — the same rule AGENTS.md states for every other check here.
+REQUIRED_LINTERS = {
+    "golangci.yml": [
+        "bodyclose", "copyloopvar", "errorlint", "exhaustive",
+        "misspell", "noctx", "revive", "unconvert", "wastedassign",
+    ],
+}
+for filename, wanted in REQUIRED_LINTERS.items():
+    path = f"{root}/lint/{filename}"
+    if not os.path.isfile(path):
+        problems.append(f"lint/{filename} is missing")
+        continue
+    with open(path, encoding="utf-8") as fh:
+        cfg = yaml.safe_load(fh) or {}
+    enabled = ((cfg.get("linters") or {}).get("enable")) or []
+    missing = [name for name in wanted if name not in enabled]
+    if missing:
+        problems.append(
+            f"lint/{filename} no longer enables {missing}. The workflow points "
+            f"`--config` at this file on every run, so an emptied config is not a "
+            f"failed check — it is a green build on a policy nobody chose. The "
+            f"list is asserted BY VALUE because this is the file whose weakening "
+            f"is invisible from every other angle"
+        )
+
+# `formatters` is a separate key from `linters` in golangci-lint v2, and a
+# config that kept its linters and lost its formatters still parses. gofmt and
+# goimports are the formatting half of the Go strictness story and they live
+# there.
+with open(f"{root}/lint/golangci.yml", encoding="utf-8") as fh:
+    gcl = yaml.safe_load(fh) or {}
+formatters = ((gcl.get("formatters") or {}).get("enable")) or []
+for name in ("gofmt", "goimports"):
+    if name not in formatters:
+        problems.append(
+            f"lint/golangci.yml no longer enables the `{name}` formatter. "
+            f"`formatters` is a different key from `linters` in golangci-lint v2, "
+            f"so this one is lost without touching the linter list at all"
+        )
+
+if problems:
+    sys.exit("; ".join(problems))
+print(
+    "3 lint jobs pass --config at a checked-out kit; none is advisory; "
+    "the linter list is intact"
+)
+PY
+  }
+  section 'static: lint runs from kit, not from a copy'
+  check 'lint/ + the workflow  (every lint step is a gate on kit config)' \
+    lint_wiring_check
+
+  # -------------------------------------------------------------------------
+  # THE SEAM IS NARROW, AND "NARROW" IS A LIST SOMEONE CAN SHORTEN.
+  # -------------------------------------------------------------------------
+  #
+  # `lint-args` is the deviation seam, and the workflow says in three places
+  # what it may not be used for. A promise in a comment is not a control, and the
+  # first version of this file PROMISED a control that did not exist: the
+  # input's own comment said `lint_wiring_check` "fails on exactly that string",
+  # and `lint_wiring_check` had no such assertion anywhere in it.
+  #
+  # The reason is structural and it is worth stating, because it decides where
+  # the control lives: **`lint-args` is the CALLER's value.** kit's gate can see
+  # that the input exists, that it is a string, and that it defaults to empty. It
+  # cannot see what a service put in it, because kit has never got it. So the
+  # rule that makes the seam narrow has to run in the service — the
+  # `lint-args guard` step, which every lint job has.
+  #
+  # Which leaves exactly the failure this check exists for: three hand-maintained
+  # copies of a policy block, in a repository whose own rule is that duplicated
+  # policy blocks are only safe while something reads them. This asserts all
+  # three: that the guard is in each lint job, that the three bodies are
+  # byte-identical, that the guard runs BEFORE the linter (a guard after it is
+  # decoration — the lint has already had its chance), that the linter actually
+  # receives the variable (a guard over a value nothing passes on is a guard over
+  # nothing), and that the forbidden token list is the one written here.
+  #
+  # The last of those is the one that matters most. Without it, deleting
+  # `--no-config` from the guard's `case` list is a one-token edit that widens
+  # the seam for every service in the fleet and leaves the workflow looking
+  # exactly as it did before.
+  lint_args_seam_check() {
+    "$PY" - "$ROOT" "$WORKFLOW" <<'PY2'
+import re
+import sys
+
+import yaml
+
+root, workflow_path = sys.argv[1], sys.argv[2]
+with open(workflow_path, encoding="utf-8") as fh:
+    doc = yaml.safe_load(fh)
+source = open(workflow_path, encoding="utf-8").read()
+triggers = doc.get("on") or doc.get(True) or {}
+call = (triggers.get("workflow_call") or {}).get("inputs") or {}
+jobs = doc.get("jobs") or {}
+
+LINT_JOBS = ("go", "ruby", "node")
+
+# The forbidden tokens, held HERE as well as in the workflow. Every one was read
+# out of the linter's own `--help` on the version kit pins, not remembered:
+#
+#   which config is read   golangci-lint `--no-config`; eslint
+#                         `--no-config-lookup`; rubocop `--force-default-config`;
+#                         all three spell "use this config" differently
+#   what is linted         golangci-lint `--new*` — a diff, not the tree
+#   whether it fails       golangci-lint `--issues-exit-code` (`=0` cannot fail);
+#                         rubocop `--fail-level`; eslint `--quiet` (errors only,
+#                         which is looser, not stricter) and
+#                         `--no-error-on-unmatched-pattern`
+#   and two that WRITE A FILE, which is this packet's own reason to refuse them:
+#                         rubocop `--auto-gen-config`, `--regenerate-todo`
+FORBIDDEN = (
+    "--config",
+    "-c",
+    "--no-config",
+    "--no-config-lookup",
+    "--force-default-config",
+    "--issues-exit-code",
+    "--fail-level",
+    "--quiet",
+    "--no-error-on-unmatched-pattern",
+    "--auto-gen-config",
+    "--regenerate-todo",
+    "--new",
+    "--new-from-rev",
+    "--new-from-patch",
+    "--new-from-merge-base",
+)
+
+problems = []
+
+# ---------------------------------------------------------------- the input
+seam = call.get("lint-args")
+if not isinstance(seam, dict):
+    problems.append(
+        "no `lint-args` workflow_call input, so a service that needs a stricter "
+        "linter has no seam and will fork the workflow instead. Callers override, "
+        "they never fork"
+    )
+else:
+    if str(seam.get("type")) != "string":
+        problems.append(
+            "`lint-args` must be type: string — a list would be split by the "
+            "guard's own word-splitting rules and could smuggle a token past it"
+        )
+    if str(seam.get("default", "x")) != "":
+        problems.append(
+            f"`lint-args` defaults to {seam.get('default')!r}; it must default to "
+            f"the empty string, or every service adopts one team's deviation"
+        )
+    if "guard" not in (seam.get("description") or ""):
+        problems.append(
+            "the `lint-args` description does not point at the `lint-args guard` "
+            "step. The first version of this description promised an enforcement "
+            "in tests/validate.sh that did not exist, and a reader who believed it "
+            "would not go looking for the real one"
+        )
+
+# ------------------------------------------------------- the guard, per job
+bodies = {}
+for lang in LINT_JOBS:
+    steps = (jobs.get(lang) or {}).get("steps") or []
+    names = [s.get("name") for s in steps if isinstance(s, dict)]
+    if "lint-args guard" not in names:
+        problems.append(
+            f"job {lang} has no `lint-args guard` step. The seam's limits are then "
+            f"enforced nowhere: kit's gate cannot see the value (it is the "
+            f"caller's), so a `--no-config` in a caller would restore the "
+            f"linter's defaults and turn kit's policy into five of them"
+        )
+        continue
+    gi = names.index("lint-args guard")
+    li = names.index("lint") if "lint" in names else None
+    if li is not None and gi > li:
+        problems.append(
+            f"job {lang}: the `lint-args guard` runs AFTER the `lint` step, so the "
+            f"linter has already had its argument list and the guard is decoration"
+        )
+    body = next(s for s in steps if s.get("name") == "lint-args guard").get("run") or ""
+    bodies[lang] = body
+
+    # The tokens, read out of the GUARD'S OWN `case` list rather than the whole
+    # body: the guard's comment block names every forbidden flag while explaining
+    # why each is refused, so counting tokens in the body would be satisfied by
+    # the documentation of the very list it is meant to police.
+    m = re.search(r'case\s+"\$name"\s+in(.*?)\besac\b', body, re.S)
+    if not m:
+        problems.append(
+            f"job {lang}: its `lint-args guard` has no `case \"$name\" in ... esac` "
+            f"list, so it refuses nothing"
+        )
+    else:
+        listed = set(re.findall(r"--?[A-Za-z][A-Za-z0-9-]*", m.group(1)))
+        missing = [t for t in FORBIDDEN if t not in listed]
+        if missing:
+            problems.append(
+                f"job {lang}: the `lint-args guard` no longer refuses {missing}. The "
+                f"seam is documented as narrow and this is the list that makes it so; "
+                f"dropping a token widens the input for every service in the fleet and "
+                f"leaves the workflow looking exactly as it did before"
+            )
+
+    # And the guard has to be reading the variable the linter is given.
+    if "KIT_LINT_ARGS" not in body:
+        problems.append(
+            f"job {lang}: its `lint-args guard` does not read KIT_LINT_ARGS, so it "
+            f"guards a variable it was not given"
+        )
+    lint = next((s for s in steps if s.get("name") == "lint"), None)
+    if isinstance(lint, dict):
+        hay = (lint.get("run") or "") + "\n" + "\n".join(
+            f"{k}: {v}" for k, v in (lint.get("with") or {}).items()
+        )
+        if "KIT_LINT_ARGS" not in hay:
+            problems.append(
+                f"job {lang}: its `lint` step does not receive KIT_LINT_ARGS, so the "
+                f"seam is guarded and then discarded — a repo may set a stricter "
+                f"flag, be told it is not allowed to set it, and still get no effect"
+            )
+
+if len(set(bodies.values())) > 1 and len(bodies) == len(LINT_JOBS):
+    problems.append(
+        "the `lint-args guard` steps are not identical across the lint jobs. They "
+        "are duplicated because GitHub reusable workflows cannot share a step, and "
+        "three copies of a policy block that disagree is the drift this repository "
+        "exists to prevent"
+    )
+
+if problems:
+    sys.exit("; ".join(problems))
+print(
+    f"the seam is a string input defaulting to empty, guarded by an identical "
+    f"pre-lint step in all {len(LINT_JOBS)} lint jobs, refusing {len(FORBIDDEN)} "
+    f"flags; and the linter receives it"
+)
+PY2
+  }
+  check 'the seam  (narrow, guarded before the linter, and wired to it)' \
+    lint_args_seam_check
+
+  # -------------------------------------------------------------------------
+  # THE DRIFT CHECK. A service that carries a lint config INCONSISTENT with
+  # kit's is the failure this packet exists to end, and it is invisible from
+  # both sides: kit cannot see the service's tree, and the service's CI goes
+  # green the whole time.
+  #
+  # WHY IT IS NOT "THE FILE MUST NOT EXIST". That version is easier to write and
+  # it is wrong in a way that costs more than the drift it prevents. A service
+  # whose `.golangci.yml` is byte-identical to kit's has not drifted; it has
+  # arrived at the same policy by another route, and failing it teaches the
+  # lesson that kit's config is a thing you get shouted at for having. The
+  # check a moment later asserts exactly this, as breakage 27b's GREEN control.
+  #
+  # So this READS BOTH FILES and reports THE DIFFERENCE, linter by linter. A
+  # reader of the failure message learns which linters the service turned off
+  # and which it added, which is the only information anyone can act on. A check
+  # that only said "unexpected file" would send someone to `diff` by hand.
+  #
+  # SCOPE, and it is a real limitation rather than a convenient one: this reads
+  # the kit working tree plus whatever service checkouts are present beside it
+  # (`../<repo>`), which is how every other fleet-shaped check in this file
+  # works — `core_repo()` above is the same shape. With no sibling checkout the
+  # check SKIPS loudly and says which environment variable points at one. It is
+  # never silently green, because a drift check that could not have run and
+  # reported nothing is the same class of defect as a lint step that cannot fail.
+  # The fleet directories, one per line, that CALL the reusable workflow. A
+  # service repo is one that calls it: a repository that does not is not
+  # governed by kit's policy, and reporting drift in it would be noise that
+  # trains people to ignore this check.
+  #
+  # Resolved in the same way as `core_repo()` above, and for the same reason: a
+  # sibling checkout, or a loud skip. Never a silent pass.
+  fleet_repos() {
+    local base cand
+    for base in "$ROOT/.." "$ROOT/../.." "$ROOT/../../cafaye"; do
+      [ -d "$base" ] || continue
+      for cand in "$base"/*; do
+        [ -d "$cand/.github/workflows" ] || continue
+        if grep -ql 'uses: cafaye/kit/.github/workflows/ci.reusable.yml' \
+          "$cand"/.github/workflows/*.yml 2>/dev/null; then
+          printf '%s\n' "$cand"
+        fi
+      done
+      return 0
+    done
+    return 1
+  }
+
+  # The comparison itself, in Python, because comparing two YAML documents is
+  # not a thing shell does, and approximating it with grep is how a check ends
+  # up comparing the wrong lines.
+  lint_drift_check() {
+    local fleet
+    fleet="$(fleet_repos)"
+    if [ -z "$fleet" ]; then
+      # A SKIP and not a failure, and not a pass. The same call `core_check`
+      # above makes when core is absent, and for the same reason: a
+      # throwaway copy of kit — which is what `self_test.sh` runs the gate
+      # against, twenty-odd times — has no fleet beside it, and a check that
+      # cannot have run and reported nothing must not be indistinguishable from
+      # a check that passed.
+      return 2
+    fi
+    "$PY" - "$ROOT" $fleet "$ROOT/lint/drift-allowlist" <<'PY'
+import datetime
+import os
+import re
+import sys
+
+import yaml
+
+kit_root = sys.argv[1]
+allowlist_path = sys.argv[-1]
+fleet_roots = sorted({os.path.realpath(p) for p in sys.argv[2:-1]})
+
+
+def is_worktree(path):
+    """True when `path` is a git WORKTREE rather than its own repository.
+
+    Same rule and the same reasoning as `tests/staleness.py`: a worktree's
+    `.git` is a file, it shares the parent repository's history, and counting it
+    separately reports one repository's config twice. Here the cost is a
+    duplicated allowlist entry and a finding that looks like two, which is
+    exactly the sort of thing a reader learns to discount.
+    """
+    marker = os.path.join(path, ".git")
+    if not os.path.isfile(marker):
+        return False
+    try:
+        with open(marker, encoding="utf-8") as fh:
+            return fh.read(6).strip() == "gitdir"
+    except OSError:
+        return False
+
+
+# The service-side filenames this check READS. Two facts measured on
+# golangci-lint v2.6.2, and the first one corrected a claim this file made
+# before it was run:
+#
+#   1. DISCOVERY IS THE FALLBACK, NOT THE OVERRIDE. `golangci-lint run -v`
+#      prints `[config_reader] Used config file <path>`, and it is decisive: with
+#      `--config=<kit>` it names kit's file and nothing else, and without the
+#      flag it names the repo-root one. A repo-root `.golangci.yml` that
+#      disables `misspell` is INERT under `--config` — the misspelling is still
+#      reported. This file previously claimed the opposite, that discovery
+#      "beats every flag", and that claim was the whole justification for
+#      reporting drift. It was wrong.
+#   2. So a stale copy does NOT hijack kit's CI. What it does is split the
+#      policy: every OTHER golangci-lint invocation in that repository — a
+#      developer's `golangci-lint run`, an editor integration, a `make lint`, a
+#      pre-commit hook — reads the local file, while kit's CI reads kit's. Two
+#      policies in one repository, one of them enforced nowhere it is written
+#      down. And the copy becomes live again the moment the `--config` flag goes
+#      missing, which is breakage 25, and silently, because a copy is always
+#      weaker than the thing it was copied from.
+#
+# The check is therefore not "the file hijacks the build". It is "the file and
+# kit disagree, and only one of the two is what CI runs" — which is a real
+# finding, and an honest one.
+#
+# `eslint.config.mjs` is deliberately NOT here, and now for a measured reason
+# rather than a rhetorical one: ESLint's `--config` also wins outright, and a
+# service's own `eslint.config.mjs` is only read by something that points at it.
+# The two linters behave the same way, so the difference between listing it and
+# not listing it is intent, not mechanics: a repo's own ESLint config is a
+# legitimate thing to own, and this check is about copies of KIT's policy.
+SERVICE_CONFIGS = (".golangci.yml", ".golangci.yaml")
+
+
+def policy_of(doc):
+    """The comparable part of a golangci config: what it turns on and off.
+
+    Three keys, and the omissions are as deliberate as the inclusions.
+    Settings, exclusions and paths are NOT compared: a service excluding one
+    generated file is a narrow, legitimate, reviewable decision, and comparing
+    it would make this check fire on the one deviation the seam explicitly
+    permits. What is compared is the linter SET, because turning a linter off
+    wholesale is the drift, and it is the drift nobody can see from either side.
+    """
+    linters = (doc or {}).get("linters") or {}
+    return {
+        "enable": frozenset(linters.get("enable") or []),
+        "disable": frozenset(linters.get("disable") or []),
+        "formatters": frozenset(((doc or {}).get("formatters") or {}).get("enable") or []),
+    }
+
+
+def load(path):
+    with open(path, encoding="utf-8") as fh:
+        return yaml.safe_load(fh)
+
+
+kit_policy_path = f"{kit_root}/lint/golangci.yml"
+if not os.path.isfile(kit_policy_path):
+    sys.exit("lint/golangci.yml is missing, so there is no policy to compare against")
+kit_policy = policy_of(load(kit_policy_path))
+
+# --------------------------------------------------------------------------
+# the allowlist
+# --------------------------------------------------------------------------
+#
+# Two services in the fleet carry a `.golangci.yml` today, and this packet
+# cannot fix them — kit does not touch other repositories, and the fix for
+# each is a decision its own team makes. So the drift is REAL and RECORDED, with
+# an owner and an expiry, rather than being reported as a green pass or as a
+# permanently red gate.
+#
+# This is the same shape as `templates/tier/skip-allowlist` and for the same
+# reason. An allowlist nobody can expire is a comment; an allowlist that is only
+# ever added to is a ratchet pointing the wrong way. So:
+#
+#   1. every entry needs a reason, an owner, and both dates;
+#   2. an EXPIRED entry is a FAILURE on the day it expires;
+#   3. a duplicate (repo, path, key) is a FAILURE — one of the two is dead;
+#   4. AN ENTRY THAT NO LONGER DESCRIBES A REAL DIFFERENCE IS A FAILURE.
+#
+# Rule 4 is the one that earns the other three. Modelled on ESLint's
+# `reportUnusedDisableDirectives`, which reports a disable comment that no
+# longer suppresses anything: without it, a fixed repository stays listed, the
+# listing stops being read, and within two quarters the file contains every
+# repository in the fleet. The entry is how you find out first.
+LINE = re.compile(
+    r"^diverged\s+(?P<repo>\S+)\s+(?P<path>\S+)\s+(?P<key>\S+)"
+    r"(?P<fields>(?:\s+[a-z]+=(?:\"[^\"]*\"|\S+))*)\s*$"
+)
+FIELD = re.compile(r'([a-z]+)=("[^"]*"|\S+)')
+WHY = {
+    "reason": 'without one, "we will get to it" is the reason for everything',
+    "owner": "drift nobody owns is drift nobody will ever fix",
+    "since": "the ratchet needs the date the decision was taken",
+    "until": "an entry that cannot expire has stopped being a decision",
+}
+KEYS = ("enable", "disable", "formatters")
+
+allowed = {}
+today = datetime.date.today()
+if not os.path.isfile(allowlist_path):
+    sys.exit(
+        f"{allowlist_path} is missing. A drift check with nowhere to record a "
+        f"known divergence is a check that either reports the fleet as broken or "
+        f"has been taught to report nothing"
+    )
+
+for lineno, raw in enumerate(open(allowlist_path, encoding="utf-8").read().splitlines(), 1):
+    line = raw.strip()
+    if not line or line.startswith("#"):
+        continue
+    m = LINE.match(line)
+    if not m:
+        sys.exit(
+            f"lint/drift-allowlist:{lineno}: malformed entry. Expected "
+            f"'diverged <repo> <path> <enable|disable|formatters> "
+            f"reason=\"...\" owner=... since=YYYY-MM-DD until=YYYY-MM-DD' on ONE line"
+        )
+    fields = {k: v.strip('"') for k, v in FIELD.findall(m.group("fields"))}
+    for field in ("reason", "owner", "since", "until"):
+        if not fields.get(field):
+            sys.exit(f"lint/drift-allowlist:{lineno}: entry names no {field} — {WHY[field]}")
+    if m.group("key") not in KEYS:
+        sys.exit(
+            f"lint/drift-allowlist:{lineno}: key {m.group('key')!r} is not one of "
+            f"{list(KEYS)}. A key the comparison does not read is an entry that "
+            f"silently matches nothing"
+        )
+    for field in ("since", "until"):
+        try:
+            datetime.date.fromisoformat(fields[field])
+        except ValueError:
+            sys.exit(f"lint/drift-allowlist:{lineno}: {field}={fields[field]!r} is not an ISO date")
+    if datetime.date.fromisoformat(fields["until"]) < today:
+        sys.exit(
+            f"lint/drift-allowlist:{lineno}: EXPIRED on {fields['until']} (today is "
+            f"{today.isoformat()}). Delete the entry, or move the date and write a new "
+            f"reason — a date that rolls forward by itself is not a ratchet"
+        )
+    key = (m.group("repo"), m.group("path"), m.group("key"))
+    if key in allowed:
+        sys.exit(
+            f"lint/drift-allowlist:{lineno}: {key} is already listed on line "
+            f"{allowed[key]}. Two lines for one divergence means one of them is no "
+            f"longer being read"
+        )
+    allowed[key] = lineno
+
+# --------------------------------------------------------------------------
+# the comparison
+# --------------------------------------------------------------------------
+problems = []
+seen_repos = set()
+found = set()
+compared = 0
+
+for root in fleet_roots:
+    if is_worktree(root):
+        continue  # one repository, one entry — see the docstring
+    name = os.path.basename(root)
+    seen_repos.add(name)
+    for service_name in SERVICE_CONFIGS:
+        path = os.path.join(root, service_name)
+        if not os.path.isfile(path):
+            continue
+        compared += 1
+        try:
+            got = policy_of(load(path))
+        except Exception as exc:
+            problems.append(
+                f"{name}/{service_name} does not parse as YAML ({exc}), so nobody can "
+                f"say what policy it applies. An unreadable copy is the worst case of "
+                f"the thing this check is for: a service linted by a config nobody "
+                f"can read, in a build that stays green"
+            )
+            continue
+        for key in KEYS:
+            if kit_policy[key] == got[key]:
+                continue
+            found.add((name, service_name, key))
+            if (name, service_name, key) in allowed:
+                continue
+            missing = sorted(kit_policy[key] - got[key])
+            extra = sorted(got_policy for got_policy in (got[key] - kit_policy[key]))
+            what = []
+            if missing:
+                what.append(f"no longer enables {missing}")
+            if extra:
+                what.append(f"enables {extra}, which kit does not")
+            problems.append(
+                f"{name}/{service_name}: {key} INCONSISTENT with lint/golangci.yml — "
+                f"{'; '.join(what)}. Measured on golangci-lint v2.6.2: `--config` "
+                f"WINS, so this file is inert for kit's CI, and that is the reason "
+                f"this is a finding rather than a non-event. Two policies now govern "
+                f"one repository — kit's, which CI runs, and this one, which every "
+                f"other invocation reads (a developer's `golangci-lint run`, an "
+                f"editor, a `make lint`). And the split is silent in the direction "
+                f"that matters: the moment the workflow's `--config` is dropped, "
+                f"this weaker file governs the build and nothing says so. Either "
+                f"delete it and let kit's policy be the only one, or make the "
+                f"deviation deliberate and visible in the workflow's `lint-args` "
+                f"seam. To record a difference you cannot delete yet, add an entry "
+                f"to lint/drift-allowlist with a reason, an owner and an expiry"
+            )
+
+# "The fleet is not here" is checked BEFORE the unused-entry rule, and the order
+# is load-bearing. Both rules read the same missing information: with no sibling
+# checkouts there is no comparison, so every entry trivially describes no
+# difference. Reporting all of them as unused in that case is a false alarm that
+# says "delete these" about debt nobody has discharged, and it fires in exactly
+# the place it is most damaging — `tests/self_test.sh` runs the gate against a
+# throwaway copy of kit, which has no fleet beside it, so the control would be
+# red on a correct tree.
+#
+# The rule can only be evaluated when there was a fleet to evaluate it against.
+if not seen_repos:
+    sys.exit(
+        "no cafaye service checkout was found beside this one, so the drift check "
+        "had nothing to compare. A drift check that could not have run and reported "
+        "nothing is a check that will not be missed when it matters"
+    )
+
+# Rule 4. An entry that no longer describes a real difference is dead weight,
+# and dead weight in an allowlist is how an allowlist becomes a list of
+# everything.
+#
+# RULE 4 IS SCOPED TO THE REPOSITORIES THIS RUN ACTUALLY LOOKED AT, and that
+# scoping is the whole correctness of the rule rather than a softening of it.
+# "This entry no longer describes a difference" is a claim about a file, and the
+# only way to make it is to have read that file. A repository that is not in the
+# fleet beside this checkout has NOT been read, so nothing is known about it, and
+# reporting its entry as unused is a check inventing a finding out of its own
+# ignorance.
+#
+# It is not a theoretical concern. It fired the moment this file was finished:
+# `tests/self_test.sh` runs this gate against a throwaway COPY of kit, and a
+# copy's fleet is itself rather than the cafaye directory, so every entry in the
+# allowlist named a repository that was not present — and the gate went red on a
+# perfectly correct tree, telling the reader to delete debt that had not been
+# discharged. A rule that cries wolf in its own test suite is a rule people
+# learn to bypass with `--no-`, which is the failure this packet exists to end.
+#
+# The consequence is stated rather than hidden: a repository DELETED from the
+# fleet leaves an entry nothing can flag. That is a real limit and it is paid
+# for deliberately, because the alternative is a gate that is red whenever kit is
+# checked out on its own — which is every fresh clone and every CI runner. What
+# covers the deleted case is `tests/staleness.py`, which reports a repository
+# that calls kit and is not resolvable; this file covers the case where the
+# repository is HERE and no longer differs, and the two are not the same
+# question.
+# Whether this run can speak about a repository it did not see, and the answer
+# is not the same in the two situations kit runs in.
+#
+#   - A REAL checkout: the scan found the fleet, so a repository in the
+#     allowlist that the scan did NOT find is a repository that has been deleted,
+#     renamed, or renamed away. That is a finding, and it is the case rule 4
+#     exists for: the entry is dead weight and nobody will notice without it.
+#   - A COPY of kit, which is what `tests/self_test.sh` runs the gate against
+#     twenty-odd times: the only "fleet" beside it is itself, because a copy has
+#     no cafaye directory next to it. Nothing can be said about `identity` there,
+#     and reporting its entry as dead would be the check inventing a finding out
+#     of its own ignorance — red on a perfectly correct tree, telling the reader
+#     to delete debt that has not been discharged. It fired the moment this file
+#     was finished, on the gate's own test suite.
+#
+# So the two are told apart by asking whether the scan found anything other than
+# this checkout, which is a fact about the run rather than a flag someone can set
+# to make the check quiet.
+only_me = seen_repos <= {os.path.basename(os.path.realpath(kit_root))}
+unverified = 0
+for repo, path_name, key in sorted(set(allowed) - found):
+    if repo not in seen_repos and only_me:
+        # Counted and printed, never failed on. Silence would be the other
+        # mistake: a reader cannot tell "checked and clean" from "never looked".
+        unverified += 1
+        continue
+    if repo not in seen_repos:
+        problems.append(
+            f"lint/drift-allowlist:{allowed[(repo, path_name, key)]}: the entry "
+            f"names {repo}/{path_name} ({key}), and this run found no such "
+            f"repository in the fleet beside this checkout. Either that repository "
+            f"has been deleted or renamed — in which case the entry is dead weight "
+            f"and the file is one step from being a list of every repository the "
+            f"fleet has ever had — or the entry is a typo. Neither is a state you "
+            f"can leave it in"
+        )
+        continue
+    problems.append(
+        f"lint/drift-allowlist:{allowed[(repo, path_name, key)]}: the entry for "
+        f"{repo}/{path_name} ({key}) no longer describes a difference — the "
+        f"repository is here and no longer diverges, so either it adopted kit's "
+        f"policy or the file is wrong. Delete the entry, or this file becomes a "
+        f"list of every repository the fleet has ever had"
+    )
+
+if problems:
+    sys.exit("; ".join(problems))
+
+print(
+    f"{len(seen_repos)} service repo(s) compared against kit's golangci policy; "
+    f"{compared} carried their own config; {len(allowed)} divergence(s) recorded in "
+    f"lint/drift-allowlist, none expired, none unused"
+    + (
+        f"; {unverified} entr(y/ies) named a repository that is not in this "
+        f"checkout's fleet, so this run could not look and did NOT count them as "
+        f"clean (this is a copy of kit with no fleet beside it, not the fleet)"
+        if unverified
+        else ""
+    )
+)
+PY
+  }
+  # `check` cannot express "skip", so the exits are handled here: 2 is this
+  # check's own "there was nothing to compare" and reports a SKIP, which the
+  # summary counts. Anything else is a real finding.
+  #
+  # The output is printed on the passing path rather than swallowed, for the same
+  # reason `core_check`'s is: the count of repositories compared is what makes
+  # "it passed" mean something, and a green line that could equally have come
+  # from a check that examined nothing is the failure this whole file is about.
+  if _drift_out="$(lint_drift_check 2>&1)"; then
+    report PASS 'lint drift  (a service config is compared to kit, not merely forbidden)'
+    [ -n "$_drift_out" ] && printf '%s\n' "$_drift_out" | sed 's/^/       /'
+  else
+    case "$?" in
+      2) report SKIP 'lint drift  (no cafaye service checkout found beside this one)' ;;
+      *)
+        report FAIL 'lint drift  (a service config is compared to kit, not merely forbidden)'
+        printf '%s\n' "$_drift_out" | sed 's/^/       /'
+        ;;
+    esac
+  fi
+
   # (3) The skip allowlist and its four hygiene rules. This is the load-bearing
   #     check of the packet, and rule 4 is the sharpest property in the repo:
   #     AN ENTRY THAT MATCHES NOTHING IS A FAILURE.
@@ -4036,6 +5022,36 @@ check 'tests/staleness_test.sh  (12 cases, incl. the red proof)' \
   bash "$ROOT/tests/staleness_test.sh"
 
 # ===========================================================================
+# phase: lint — run the configs, do not parse them
+# ===========================================================================
+#
+# Deliberately NOT inside the `RUN_STATIC` guard, and that placement is the
+# point rather than an oversight. `lint/` spent its whole life behind a parse
+# check: `yaml.safe_load` on golangci.yml, `node --check` on eslint.config.mjs,
+# and both green on a file that no linter had ever been pointed at. Not one
+# service in the fleet had copied any of them.
+#
+# A phase that only parses cannot tell a config that works from a config that is
+# valid YAML, and the difference between those two is the difference between a
+# gate and a decoration. So this EXECUTES each linter against a fixture built to
+# contain a violation, and asserts the linter rejects it — and, for every one,
+# runs a control with the config REMOVED and asserts the control's answer
+# differs. A linter that rejects the fixture for a reason other than kit's
+# config cannot pass, which is what stops a broken fixture from proving a
+# working config.
+#
+# It also gates on its own toolchains, unlike every other phase: a skip here
+# means the claim "kit's lint configs work" went untested, and a claim nobody
+# ran is a rumour. See the script's own footer.
+section 'lint: kit configs, executed against fixtures that must fail them'
+if [ "$RUN_LINT" -eq 0 ]; then
+  report SKIP 'lint_test.sh  (--no-lint)'
+else
+  check 'tests/lint_test.sh  (every linter runs, and its control disagrees)' \
+    bash "$ROOT/tests/lint_test.sh"
+fi
+
+# ===========================================================================
 # phase: self_test — prove the gate can go red
 # ===========================================================================
 
@@ -4049,10 +5065,17 @@ if [ "$RUN_SELF_TEST" -eq 1 ]; then
   # cannot disagree.
   #
   # Two numbers, not one, because breakage 23b asserts something the other
-  # twenty-three do not: that a check can report SKIP and still be load-bearing.
-  # Counting only reds would have made "24 breakages, 24 reds" a false summary
-  # of twenty-four red-assertions plus one green one — the same claim, wearing a
+  # thirty-six do not: that a check can report SKIP and still be load-bearing.
+  # Counting only reds would have made "37 breakages, 37 reds" a false summary
+  # of thirty-six red-assertions plus one green one — the same claim, wearing a
   # number, that nobody would have checked.
+  #
+  # `expect_green` is deliberately NOT in the pattern. kit-12's breakage 31b is a
+  # CONTROL rather than a breakage: it asserts that a service config agreeing with
+  # kit's is not a failure, which is a claim about what must NOT go red. Counting
+  # it as a breakage would put a number on a control, and the header/recipe check
+  # below would then demand a numbered header entry for a recipe the header
+  # deliberately describes in prose.
   #
   # Both patterns anchor on the BREAKAGE LABEL, not on the helper name. An
   # earlier version anchored on `^expect_` and counted 28 over 23 recipes: the

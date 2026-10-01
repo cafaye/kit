@@ -56,6 +56,67 @@ on:
           - bun
           - rust
           - none
+      # The kit ref the LINT CONFIGS are read from, as opposed to the ref this
+      # workflow file itself was fetched at.
+      #
+      # These are two different things and the difference is the whole reason
+      # this input exists. `uses: cafaye/kit/.github/workflows/ci.reusable.yml@X`
+      # pins the WORKFLOW at X. GitHub does not hand a called workflow its own
+      # ref — `github.workflow_ref` inside a reusable workflow is the CALLER's
+      # workflow, and `GITHUB_ACTION_PATH` is documented as composite-action-only
+      # — so the configs have to be fetched by a name, and the name has to be an
+      # input. Defaulting it to `master` matches every caller in the fleet,
+      # which is written `uses: cafaye/kit/...@master`.
+      #
+      # Raise it to a SHA when you pin the `uses:` line to one. It is NOT a
+      # second, independent pin: a caller who pins the workflow to a SHA and
+      # leaves this at `master` gets that SHA's workflow with today's lint
+      # policy, which is a real and specific failure. Nothing detects it
+      # automatically, so it is documented here and in README.md rather than
+      # pretended to be automatic.
+      kit-lint-ref:
+        description: >-
+          Git ref to read kit's lint configs from, e.g. 'master' or a commit
+          SHA. Pin it to the SAME ref you pinned the `uses:` line to. Changing
+          it changes a service's lint policy without touching the service.
+        required: false
+        type: string
+        default: 'master'
+      # Extra arguments appended to the linter's own command line, after kit's.
+      #
+      # THIS IS THE DEVIATION SEAM, and its narrowness is the point:
+      #
+      #   - It comes LAST, so a service can add flags (`-E gosec`) and cannot
+      #     remove the `--config` that precedes it. Anything appended here is an
+      #     addition to kit's invocation, not a replacement of it.
+      #   - It is a string, not a path, so there is no service-side config file
+      #     for a linter to read and therefore none to rot. The failure this
+      #     packet ends is a file nobody propagates; a seam that reintroduces
+      #     the file reinstates the failure.
+      #   - It may not be used to turn kit's config off, to lint a diff instead
+      #     of the tree, or to stop a finding from failing the build. The
+      #     `lint-args guard` step in every lint job refuses those flags, and it
+      #     is in the WORKFLOW rather than in kit's gate because `lint-args` is
+      #     the caller's value and kit has never got it. The guard's token list
+      #     is asserted against a copy in `tests/validate.sh`, so shortening it is
+      #     a red build rather than a quiet widening of this input.
+      #
+      # What it is FOR: a repository that needs a stricter setting than the
+      # fleet's, and nothing else. If a flag is wanted often enough to be
+      # common, it belongs in lint/ and every service gets it for free.
+      lint-args:
+        description: >-
+          Extra arguments appended to the linter's command line, after kit's
+          own flags, for a service that needs a STRICTER setting than the
+          fleet's. May not change which config is read, what is linted, or
+          whether a finding fails the build: the `lint-args guard` step that
+          runs before every linter refuses those flags, and kit's gate fails
+          if that step is ever deleted, moved after the linter, or shortened.
+          A value here is a place a per-service lint policy can rot, so prefer
+          a change in kit, where every service gets it free.
+        required: false
+        type: string
+        default: ''
       # Descriptions are folded, not quoted: a long description that is reflowed
       # to fit line-length is unreadable, and Actions has no width limit on
       # `description`. Our own lint/yamllint.yml caps source lines at 120.
@@ -148,6 +209,20 @@ env:
   # that is a variable — and setting it here would export it to every step in
   # the job, including the ones that are not running the tier.
   REQUIRED_TIER: ${{ inputs.required-tier }}
+  # Where kit's own tree lands inside the service being built. `.kit` and NOT
+  # a path beside the repository, and the reason is measured rather than
+  # stylistic: ESLint's flat config is an ES module that does
+  # `import js from '@eslint/js'`, and node resolves that import from the
+  # CONFIG FILE's own directory upward. A config sitting beside the repository
+  # finds no `@eslint/js` and the run dies with ERR_MODULE_NOT_FOUND — a red
+  # build that has linted nothing. Inside the tree it walks up into the
+  # service's own node_modules and resolves. golangci-lint and rubocop accept
+  # the same path happily, so one location serves all three.
+  KIT_LINT_DIR: ${{ inputs.working-dir }}/.kit
+  # The linter's own extra arguments, from the seam. Empty by default, which is
+  # the fleet's current state: every service lints with kit's policy and
+  # nothing else.
+  KIT_LINT_ARGS: ${{ inputs.lint-args }}
 
 # ===========================================================================
 # THE `tier demand` STEP — one body, present in every language job, IDENTICAL
@@ -221,10 +296,97 @@ jobs:
       - name: build
         working-directory: ${{ inputs.working-dir }}
         run: go build ./...
+      # Kit's own tree, INSIDE the service, for the lint config below. Sparse,
+      # because the only thing read out of it is `lint/` and a full clone of
+      # kit on every Go push is a cost paid for files nobody opens.
+      #
+      # `persist-credentials: false` so kit's checkout leaves no token in a
+      # git config inside the tree a service's own later steps run in.
+      - name: kit (lint config)
+        uses: actions/checkout@v7
+        with:
+          repository: cafaye/kit
+          ref: ${{ inputs.kit-lint-ref }}
+          path: ${{ env.KIT_LINT_DIR }}
+          sparse-checkout: lint
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      # THE SEAM'S OWN GUARD, and it lives HERE rather than in kit's gate
+      # because of a fact about the input: `lint-args` is set by the CALLER, and
+      # kit never sees that value. A check in `tests/validate.sh` can assert the
+      # input exists, is a string and defaults to empty — all of which it does —
+      # and it can assert this step exists in three jobs and that the three
+      # copies are byte-identical. It cannot check the value, because kit has
+      # never got it. So the rule that makes the seam narrow has to run where
+      # the value is: in the service.
+      #
+      # WHAT IT REFUSES, and the one sentence that is the whole policy: the seam
+      # may make the lint STRICTER, and it may not change WHICH CONFIG IS READ,
+      # WHAT IS LINTED, or WHETHER A FINDING FAILS THE BUILD. Every token below
+      # is one of those three, and every one was read out of the linter's own
+      # `--help` rather than remembered:
+      #
+      #   which config   --config / -c (rubocop) / --no-config (golangci-lint)
+      #                  / --no-config-lookup (eslint) / --force-default-config
+      #   what is linted --new, --new-from-rev, --new-from-patch,
+      #                  --new-from-merge-base (a diff, not the tree)
+      #   does it fail   --issues-exit-code (golangci-lint; `=0` is a linter that
+      #                  cannot fail), --fail-level (rubocop), --quiet (eslint:
+      #                  "report errors only", which is looser, not stricter),
+      #                  --no-error-on-unmatched-pattern (an unmatched path is
+      #                  green, so a renamed file is silently unlinted)
+      #
+      # `--auto-gen-config` and `--regenerate-todo` are here for a different
+      # reason and it is the packet's own reason: both WRITE a config file into
+      # the tree. A linter that generates its own config is the copy mechanism
+      # arriving through the back door, and it would be a copy nobody reviews.
+      #
+      # The list is duplicated in `tests/validate.sh` and asserted against this
+      # one, so shortening it here is a red build rather than a quiet widening
+      # of the seam.
+      - name: lint-args guard
+        run: |
+          set -euo pipefail
+          # Empty is the fleet's state, and it is not a failure: every service
+          # lints with kit's policy and nothing else.
+          [ -n "${KIT_LINT_ARGS:-}" ] || exit 0
+          # Deliberate word splitting — the seam is a command line, and this is
+          # the list the shell will hand the linter. shellcheck disable=SC2086
+          # for exactly that one line.
+          # shellcheck disable=SC2086
+          for tok in $KIT_LINT_ARGS; do
+            # `--config=path` and `--config path` are the same request, so the
+            # value is stripped before the name is matched.
+            name="${tok%%=*}"
+            case "$name" in
+              --config|-c|--no-config|--no-config-lookup|--force-default-config|\
+              --issues-exit-code|--fail-level|--quiet|\
+              --no-error-on-unmatched-pattern|--auto-gen-config|--regenerate-todo|\
+              --new|--new-from-rev|--new-from-patch|--new-from-merge-base)
+                echo "::error::lint-args may not contain '$name'." >&2
+                echo "::error::The seam is for a STRICTER setting. '$name' changes" >&2
+                echo "::error::which config is read, what is linted, or whether a" >&2
+                echo "::error::finding fails the build — so a green build would stop" >&2
+                echo "::error::meaning what it says it means." >&2
+                echo "::error::If the fleet should have it, add it to kit/lint and" >&2
+                echo "::error::every service gets it free. See README.md," >&2
+                echo "::error::'The deviation seam'." >&2
+                exit 1
+                ;;
+            esac
+          done
       - name: lint
         uses: golangci/golangci-lint-action@v9
         with:
           working-directory: ${{ inputs.working-dir }}
+          # `--config` and not `GOLANGCI_LINT_CONFIG`: measured on
+          # golangci-lint v2.6.2, the environment variable is read by NOTHING —
+          # the run proceeds on the built-in default set and exits 0 on a file
+          # this config rejects. So the missing flag is not a slower lint, it
+          # is a different and much weaker policy that still goes green.
+          #
+          # `args` is space-split by the action, so the flag carries an `=`.
+          args: --config=${{ github.workspace }}/${{ env.KIT_LINT_DIR }}/lint/golangci.yml ${{ env.KIT_LINT_ARGS }}
       - name: test
         working-directory: ${{ inputs.working-dir }}
         run: |
@@ -370,9 +532,91 @@ jobs:
       - name: install
         working-directory: ${{ inputs.working-dir }}
         run: bundle install
+      # Kit's own tree, inside the service, for the lint config below. Same
+      # step, same reason, same shape as the go job's — three jobs cannot share
+      # a step in a reusable workflow, and `lint_wiring_check` is what keeps the
+      # three copies from drifting.
+      - name: kit (lint config)
+        uses: actions/checkout@v7
+        with:
+          repository: cafaye/kit
+          ref: ${{ inputs.kit-lint-ref }}
+          path: ${{ env.KIT_LINT_DIR }}
+          sparse-checkout: lint
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      # `--config` is load-bearing, and the measurement is in tests/lint_test.sh:
+      # with no config, RuboCop applies its own defaults and a 13-line method is
+      # RED under those defaults and GREEN under kit's (Max: 15). A repo whose
+      # lint step lost this flag goes from kit's policy to RuboCop's without
+      # failing anything.
+      # THE SEAM'S OWN GUARD, and it lives HERE rather than in kit's gate
+      # because of a fact about the input: `lint-args` is set by the CALLER, and
+      # kit never sees that value. A check in `tests/validate.sh` can assert the
+      # input exists, is a string and defaults to empty — all of which it does —
+      # and it can assert this step exists in three jobs and that the three
+      # copies are byte-identical. It cannot check the value, because kit has
+      # never got it. So the rule that makes the seam narrow has to run where
+      # the value is: in the service.
+      #
+      # WHAT IT REFUSES, and the one sentence that is the whole policy: the seam
+      # may make the lint STRICTER, and it may not change WHICH CONFIG IS READ,
+      # WHAT IS LINTED, or WHETHER A FINDING FAILS THE BUILD. Every token below
+      # is one of those three, and every one was read out of the linter's own
+      # `--help` rather than remembered:
+      #
+      #   which config   --config / -c (rubocop) / --no-config (golangci-lint)
+      #                  / --no-config-lookup (eslint) / --force-default-config
+      #   what is linted --new, --new-from-rev, --new-from-patch,
+      #                  --new-from-merge-base (a diff, not the tree)
+      #   does it fail   --issues-exit-code (golangci-lint; `=0` is a linter that
+      #                  cannot fail), --fail-level (rubocop), --quiet (eslint:
+      #                  "report errors only", which is looser, not stricter),
+      #                  --no-error-on-unmatched-pattern (an unmatched path is
+      #                  green, so a renamed file is silently unlinted)
+      #
+      # `--auto-gen-config` and `--regenerate-todo` are here for a different
+      # reason and it is the packet's own reason: both WRITE a config file into
+      # the tree. A linter that generates its own config is the copy mechanism
+      # arriving through the back door, and it would be a copy nobody reviews.
+      #
+      # The list is duplicated in `tests/validate.sh` and asserted against this
+      # one, so shortening it here is a red build rather than a quiet widening
+      # of the seam.
+      - name: lint-args guard
+        run: |
+          set -euo pipefail
+          # Empty is the fleet's state, and it is not a failure: every service
+          # lints with kit's policy and nothing else.
+          [ -n "${KIT_LINT_ARGS:-}" ] || exit 0
+          # Deliberate word splitting — the seam is a command line, and this is
+          # the list the shell will hand the linter. shellcheck disable=SC2086
+          # for exactly that one line.
+          # shellcheck disable=SC2086
+          for tok in $KIT_LINT_ARGS; do
+            # `--config=path` and `--config path` are the same request, so the
+            # value is stripped before the name is matched.
+            name="${tok%%=*}"
+            case "$name" in
+              --config|-c|--no-config|--no-config-lookup|--force-default-config|\
+              --issues-exit-code|--fail-level|--quiet|\
+              --no-error-on-unmatched-pattern|--auto-gen-config|--regenerate-todo|\
+              --new|--new-from-rev|--new-from-patch|--new-from-merge-base)
+                echo "::error::lint-args may not contain '$name'." >&2
+                echo "::error::The seam is for a STRICTER setting. '$name' changes" >&2
+                echo "::error::which config is read, what is linted, or whether a" >&2
+                echo "::error::finding fails the build — so a green build would stop" >&2
+                echo "::error::meaning what it says it means." >&2
+                echo "::error::If the fleet should have it, add it to kit/lint and" >&2
+                echo "::error::every service gets it free. See README.md," >&2
+                echo "::error::'The deviation seam'." >&2
+                exit 1
+                ;;
+            esac
+          done
       - name: lint
         working-directory: ${{ inputs.working-dir }}
-        run: bundle exec rubocop --parallel
+        run: bundle exec rubocop --parallel --config "$KIT_LINT_DIR/lint/rubocop.yml" ${{ env.KIT_LINT_ARGS }}
       - name: test
         working-directory: ${{ inputs.working-dir }}
         run: |
@@ -577,9 +821,104 @@ jobs:
       - name: install
         working-directory: ${{ inputs.working-dir }}
         run: npm ci
+      # Kit's own tree, inside the service, for the lint config below. Same
+      # step, same reason, same shape as the go and ruby jobs'.
+      #
+      # INSIDE the tree is not a preference here, it is the only thing that
+      # works: kit's flat config does `import js from '@eslint/js'`, node
+      # resolves that from the CONFIG FILE's directory upward, and a config
+      # beside the repository finds nothing and dies with ERR_MODULE_NOT_FOUND.
+      # Measured; see tests/lint_test.sh and README.md.
+      - name: kit (lint config)
+        uses: actions/checkout@v7
+        with:
+          repository: cafaye/kit
+          ref: ${{ inputs.kit-lint-ref }}
+          path: ${{ env.KIT_LINT_DIR }}
+          sparse-checkout: lint
+          sparse-checkout-cone-mode: false
+          persist-credentials: false
+      # ESLint run DIRECTLY, not `npm run lint`.
+      #
+      # `npm run lint` is not a linter: it is whatever script the repository
+      # happens to define, and a repository that defines none gets a confusing
+      # "Missing script" rather than a lint, while one that defines it is
+      # running its OWN config — which is the copy this packet exists to end.
+      # Naming the tool is what makes the policy kit's.
+      #
+      # `npx --no-install` and not bare `npx`: without it, a service that has
+      # not declared eslint gets a package FETCHED AND RUN at whatever version
+      # is current, which is a floating dependency in a build that is otherwise
+      # pinned. With it, a missing eslint is a build failure that says so.
+      #
+      # `.` rather than a path, so the service lints the same tree it tests.
+      # THE SEAM'S OWN GUARD, and it lives HERE rather than in kit's gate
+      # because of a fact about the input: `lint-args` is set by the CALLER, and
+      # kit never sees that value. A check in `tests/validate.sh` can assert the
+      # input exists, is a string and defaults to empty — all of which it does —
+      # and it can assert this step exists in three jobs and that the three
+      # copies are byte-identical. It cannot check the value, because kit has
+      # never got it. So the rule that makes the seam narrow has to run where
+      # the value is: in the service.
+      #
+      # WHAT IT REFUSES, and the one sentence that is the whole policy: the seam
+      # may make the lint STRICTER, and it may not change WHICH CONFIG IS READ,
+      # WHAT IS LINTED, or WHETHER A FINDING FAILS THE BUILD. Every token below
+      # is one of those three, and every one was read out of the linter's own
+      # `--help` rather than remembered:
+      #
+      #   which config   --config / -c (rubocop) / --no-config (golangci-lint)
+      #                  / --no-config-lookup (eslint) / --force-default-config
+      #   what is linted --new, --new-from-rev, --new-from-patch,
+      #                  --new-from-merge-base (a diff, not the tree)
+      #   does it fail   --issues-exit-code (golangci-lint; `=0` is a linter that
+      #                  cannot fail), --fail-level (rubocop), --quiet (eslint:
+      #                  "report errors only", which is looser, not stricter),
+      #                  --no-error-on-unmatched-pattern (an unmatched path is
+      #                  green, so a renamed file is silently unlinted)
+      #
+      # `--auto-gen-config` and `--regenerate-todo` are here for a different
+      # reason and it is the packet's own reason: both WRITE a config file into
+      # the tree. A linter that generates its own config is the copy mechanism
+      # arriving through the back door, and it would be a copy nobody reviews.
+      #
+      # The list is duplicated in `tests/validate.sh` and asserted against this
+      # one, so shortening it here is a red build rather than a quiet widening
+      # of the seam.
+      - name: lint-args guard
+        run: |
+          set -euo pipefail
+          # Empty is the fleet's state, and it is not a failure: every service
+          # lints with kit's policy and nothing else.
+          [ -n "${KIT_LINT_ARGS:-}" ] || exit 0
+          # Deliberate word splitting — the seam is a command line, and this is
+          # the list the shell will hand the linter. shellcheck disable=SC2086
+          # for exactly that one line.
+          # shellcheck disable=SC2086
+          for tok in $KIT_LINT_ARGS; do
+            # `--config=path` and `--config path` are the same request, so the
+            # value is stripped before the name is matched.
+            name="${tok%%=*}"
+            case "$name" in
+              --config|-c|--no-config|--no-config-lookup|--force-default-config|\
+              --issues-exit-code|--fail-level|--quiet|\
+              --no-error-on-unmatched-pattern|--auto-gen-config|--regenerate-todo|\
+              --new|--new-from-rev|--new-from-patch|--new-from-merge-base)
+                echo "::error::lint-args may not contain '$name'." >&2
+                echo "::error::The seam is for a STRICTER setting. '$name' changes" >&2
+                echo "::error::which config is read, what is linted, or whether a" >&2
+                echo "::error::finding fails the build — so a green build would stop" >&2
+                echo "::error::meaning what it says it means." >&2
+                echo "::error::If the fleet should have it, add it to kit/lint and" >&2
+                echo "::error::every service gets it free. See README.md," >&2
+                echo "::error::'The deviation seam'." >&2
+                exit 1
+                ;;
+            esac
+          done
       - name: lint
         working-directory: ${{ inputs.working-dir }}
-        run: npm run lint
+        run: npx --no-install eslint --config "$KIT_LINT_DIR/lint/eslint.config.mjs" . ${{ env.KIT_LINT_ARGS }}
       - name: test
         working-directory: ${{ inputs.working-dir }}
         run: |
