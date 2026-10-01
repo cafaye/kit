@@ -105,7 +105,7 @@ volumes:
 services:
   # ------------------------------------------------------------------ postgres
   postgres:
-    image: postgres:${KIT_POSTGRES_TAG:-16.6-alpine}
+    image: postgres:${KIT_POSTGRES_TAG:-17-alpine}
     environment:
       POSTGRES_USER: ${KIT_POSTGRES_USER:-cafaye}
       POSTGRES_PASSWORD: ${KIT_POSTGRES_PASSWORD:-cafaye}

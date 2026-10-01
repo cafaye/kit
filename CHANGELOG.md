@@ -13,6 +13,26 @@ semver contract — it is consumed by *calling*
 
 ### Fixed
 
+- **`templates/compose/docker-compose.yml` defaulted to postgres 16.6 while the
+  rest of the fleet floated at 17.** `postgres:${KIT_POSTGRES_TAG:-16.6-alpine}`
+  meant a developer running `bin/dev` with nothing configured got postgres 16.6
+  and a different database build from every CI runner in the fleet — which is the
+  drift `core`'s `compose.postgres-pin` rule exists to make visible, and which
+  it had recorded as a known exception since the rule landed.
+
+  Now `postgres:${KIT_POSTGRES_TAG:-17-alpine}`, so an unconfigured developer
+  gets the fleet's build. `core`'s recorded expectation in `tests/test_specs.py`
+  and the table in `docs/postgres-pin.md` moved in the same commit as this one,
+  because they are one claim stated twice.
+
+  One kit reference to the rule remains and is now recorded rather than fixed:
+  `templates/deploy/compose.deploy.yml` carries a `services.app.image` of
+  `${KIT_DEPLOY_IMAGE:?the deploy tool sets KIT_DEPLOY_IMAGE}`. It is not a
+  postgres image — it is a variable the deploy tool sets at run time — but it
+  sits in `services:`, so the rule reads it. It is left visible on purpose:
+  suppressing it would teach the rule to skip variables, and
+  `${KIT_POSTGRES_TAG:-default}` is exactly the form the rule exists to resolve.
+
 - **kit-17 — `templates/otel/ruby` had no interpreter floor, so the gate blamed
   the template for the interpreter it picked.** `FAIL templates/otel/ruby (ruby
   test suite)` on every gate run on macOS, minitest `.EE.......E..` — three of
