@@ -185,6 +185,48 @@ semver contract — it is consumed by *calling*
     the application, because a `POSTGRES_PASSWORD` in `environment:` is a
     password `docker inspect` prints.
 
+- **kit-15 — a check that fails when an adopting repository carries a workaround
+  for a fixed core defect.** `core`'s gate checker had two defects that forced
+  repositories which adopted `gate.yml` into local workarounds: **D12**
+  (`RUN_KEY` could not see a one-line `run:`, fixed in core `63fd319`) and
+  **D13** (a proof matched against bytes still carrying ANSI colour, fixed in
+  core `c63af27`). Both are fixed, and a workaround for a fixed defect is not
+  neutral — it is a second, local, unpolicied copy of a decision that now lives
+  in core, and it is the kind that rots. A `gate.yml` carrying a hand-rolled
+  escape-tolerant regex is now **weaker** than one without it: the escape runs
+  absorb characters a stricter pattern would have rejected.
+
+  - **`tests/gate_declaration_check.py`** — sweeps the adopting repositories for
+    three shapes, each of which is *structural* rather than a keyword: a
+    `proof[].match` carrying an escape token (D13), a `run:` block scalar whose
+    entire body is the declared argv and nothing else (D12), and a comment
+    naming a checker-internal term while claiming a `run:` spelling the checker
+    cannot see (D12). It does **not** prescribe a `run:` spelling — doing that
+    would be a second copy of a decision core owns, and `courier`'s block scalar
+    is correct for three real reasons.
+  - Wired into `tests/validate.sh` as `adopting repositories (no workaround for
+    a fixed core defect)`, with the fleet root discovered beside the repository
+    and a reported SKIP when there is none — the same treatment the
+    core-allowlist check already gets, for the same reason.
+  - **Three breakages in `tests/self_test.sh` (24-26)**, over a synthetic fleet
+    built in the work directory, because kit is one repository and the fleet is
+    fifteen. All three name the check they expect to go red, and the control is
+    now the check's *positive* case: a sweep that has only ever run against a
+    red fleet has proved it can fail and nothing about whether it is right.
+  - `cafaye-rb`'s primary checkout is **red on this check today**, which is the
+    check working: it carries the D12 workaround and the comment justifying it.
+    It is fixed on `worker/kit-15-restore` and this is the report's evidence
+    that the sweep found it.
+
+  **The first version of the checker was a keyword scan and it cried wolf** —
+  4 repositories, 24 findings, nearly all false, including `core/gate.yml` for
+  the sentence "That is MD12's collect-then-run machinery" (`D12` is a substring
+  of `MD12`) and `caf`'s declaration for comments arguing that a workaround is
+  now *unnecessary*. Both fixes came from reading every comment it flagged, and
+  both narrowed the check rather than loosening it. A check that fires on
+  correct work teaches the reader to ignore it, and it had taught on the first
+  repository scanned.
+
 - **kit-07 — the declared tier, and the allowlist that is supposed to shrink.**
   A tier is a class of test that needs a real dependency. The failure this
   exists to prevent has already happened in this fleet: a green run in which the
@@ -2110,6 +2152,22 @@ e
 .
 ### Fixed
 
+- **`expect_red_check` reported a successful match as a failure, once the output
+  was large enough.** It read the checker's verdict through
+  `printf '%s\n' "$out" | grep -qF "FAIL $want"`. `grep -q` exits the instant it
+  matches, so `printf` takes SIGPIPE while still writing; `set -o pipefail` then
+  reports 141 for a pipeline that **succeeded**, and a passing breakage reads as
+  "the gate went red, but NOT via `<the named check>`".
+
+  It surfaced on breakage 25, whose check emits several hundred lines and is
+  therefore the first output in this file big enough to overflow the 64K pipe
+  buffer. Breakages 7-24 all pass on smaller output, which is the worst shape a
+  latent defect can have: it presents as a failure of the thing under test while
+  being a failure of the harness reading it. Measured rather than reasoned
+  about — 2000 lines of output still returns 0 and 5000 returns 141, same match,
+  same grep. The threshold is a property of the pipe buffer and would move with
+  the machine, so the fix is to **stop piping** (a `case` pattern) rather than to
+  bound the output.
 - **A check that a comment could satisfy.** The `-count=1` assertion was a plain
   substring test over the go step's `run:` body, and that body's own comment
   block names the flag twice while explaining why removing it would be a

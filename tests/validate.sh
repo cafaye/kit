@@ -2594,6 +2594,71 @@ STUB
   check 'core/vendir/ + core/renovate/  (structurally what Renovate and vendir need)' \
     core_fanout_check
 
+  # ------------------------------------------------------------------ fleet
+  # NO ADOPTER CARRIES A WORKAROUND FOR A FIXED CORE DEFECT.
+  #
+  # `core` shipped two checker defects that forced repositories which adopted
+  # `gate.yml` into local workarounds: D12 (`RUN_KEY` could not see a one-line
+  # `run:`, fixed in 63fd319) and D13 (proofs matched against bytes carrying
+  # ANSI colour, fixed in c63af27). Both are fixed. A workaround for a fixed
+  # defect is not neutral — it is a second, local, unpolicied copy of a
+  # decision that now lives in core, and it is the kind that rots. So a rule
+  # about it belongs here, in the thing that distributes the gate format, rather
+  # than in a report nobody re-reads.
+  #
+  # THE FLEET ROOT IS FOUND, NOT ASSUMED, and its absence is a reported SKIP
+  # rather than a pass — the same treatment the core-allowlist check above gets,
+  # for the same reason. A sweep that could not read a single declaration has
+  # not found the fleet.
+  #
+  # `$ROOT/..` is checked FIRST and it is where this repository's worktrees live
+  # during a packet, which is the whole point: the check has to see the state
+  # the fleet is in today, not the state on a CI runner that has no siblings.
+  # A CI runner legitimately reaches the SKIP, and the summary says so.
+  fleet_root() {
+    local cand
+    # `..` and `../cafaye`, and NOT `../..`. This was `../..` in the first
+    # version and it found a fleet: a leftover copy of a cafaye repository in a
+    # shared temp directory two levels up, whose branch still carried the D12
+    # workaround this check had just retired. The gate went red on a tree with
+    # nothing wrong with it, naming a file nobody had touched in weeks.
+    #
+    # A sweep that reaches further than it owns is worse than no sweep, so the
+    # search is exactly the two layouts this repository is actually cloned into:
+    # beside its siblings, or inside a directory of them.
+    for cand in "$ROOT/.." "$ROOT/../cafaye"; do
+      # At least one `gate.yml` under it, or it is not a fleet and pointing at
+      # it would report "no adopting repository found" — technically true and
+      # completely useless, which is why this tests for the file rather than the
+      # directory.
+      if [ -n "$(find "$cand" -maxdepth 2 -name gate.yml -not -path '*/.venv/*' 2>/dev/null | head -1)" ]; then
+        (cd "$cand" && pwd)
+        return 0
+      fi
+    done
+    return 1
+  }
+
+  gate_workaround_check() {
+    local root
+    root="$(fleet_root)" || {
+      echo "no fleet root: no directory beside this one holds a gate.yml."
+      echo "set KIT_FLEET=<path> to point at one."
+      return 1
+    }
+    KIT_FLEET="$root" "$PY" "$ROOT/tests/gate_declaration_check.py" "$root"
+  }
+  section 'static: no adopting repository carries a D12/D13 workaround'
+  if [ -n "${KIT_FLEET:-}" ]; then
+    check 'adopting repositories  (no workaround for a fixed core defect)' \
+      "$PY" "$ROOT/tests/gate_declaration_check.py" "$KIT_FLEET"
+  elif fleet_root >/dev/null 2>&1; then
+    check 'adopting repositories  (no workaround for a fixed core defect)' \
+      gate_workaround_check
+  else
+    report SKIP 'adopting repositories  (no fleet beside this one — set KIT_FLEET)'
+  fi
+
   # Dogfood lint/yamllint.yml on every YAML in the tree, not just the two
   # compose templates. kit ships the config and a repo that copies it lints its
   # own CI against it on day one, so a YAML that breaks the config is a YAML
