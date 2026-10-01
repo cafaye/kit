@@ -348,6 +348,15 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   documented in the very file that contained them; it is now a `contains` helper
   all three assertion helpers share, because the failure is a property of how the
   harness READS output and has nothing to do with which check it is reading.
+- **A gate that reported nothing is not a red gate, and a proof that could not be
+  evaluated is not a proof that failed.** The two demand different responses, so
+  they get different verdicts: `self_test` counts an environment failure
+  (`env_skips`) apart from a missing toolchain (`skips`), and both are fatal.
+  Collapsing them is how a busy machine gets filed as a weakened check. The test
+  is the finding, not the exit status — `validate.sh` exits 1 on a FAIL and also
+  exits 1 from bootstrap when it cannot install its own dependencies, and only
+  the first ever ran a check. The same rule as breakage 39, which asserts the
+  explanation rather than the status for exactly this reason.
 - **Parse what you hand out.** A file a service copies has to parse in its own
   language, and the extension kit gives it must not stop you checking. This is
   not hypothetical: `rack_middleware.rb.snippet` shipped with

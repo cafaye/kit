@@ -15,6 +15,40 @@ it without a copy (see kit-12 below).
 
 ### Fixed
 
+- **a gate that exited non-zero reporting NO finding was reported as "the gate
+  went red, but NOT via `<the named check>`", which blames a check for a machine
+  problem.** `expect_red_check` had exactly two verdicts — green, or red-for-a-
+  different-reason — and neither of them is true when the nested gate died before
+  reporting anything: it is neither a proof the mutation escaped nor a proof the
+  check failed to catch, it is a proof that could not be **evaluated**.
+
+  It surfaced on kit-19's own full gate, at load average 15 on a 16GB box:
+  breakage 35 came back `exit 1` with an empty finding list and was counted as a
+  check that failed to catch a half-adopted language. `validate.sh` exits 1 on a
+  FAIL *and* exits 1 from bootstrap when it cannot install its own dependencies
+  (lines 132 and 3195), and the second never reaches a single check — so the two
+  are indistinguishable from the exit status alone.
+
+  A third verdict now exists, `SKIP`, and it is distinguished from a missing
+  toolchain by a **separate counter** (`env_skips` against `skips`) because they
+  are two different problems demanding two different responses. Both remain
+  fatal: a proof nobody ran is not a proof, and an unevaluated one is not a proof
+  either — but neither is reported as a gate defect, so the next reader does not
+  go looking for a weakened check that is in fact fine. The summary names the
+  count explicitly, because `env_skips` cannot appear in the PASS line at all
+  (it is non-zero only on a run that exits 1).
+
+  Verified against all four cases with the predicate isolated from the harness —
+  a dead gate with no output classifies as an environment failure; a real red
+  naming a *different* check still classifies as a red-for-the-wrong-reason; the
+  named check firing is a pass; and green-with-no-finding is still a failure.
+  That last one is the point: this widens what counts as an excuse by exactly the
+  case where the gate said nothing, and no further.
+
+  Same principle as breakage 39, which asserts the **explanation** rather than
+  the exit status for the same reason: a red that misattributes itself sends the
+  next reader to the wrong file.
+
 - **`expect_green_check` read a MATCH as a non-match once the gate's output was
   large enough, so breakage 59 reported the adoption ceiling red when it had
   passed.** `printf '%s\n' "$out" | grep -qF` is the SIGPIPE defect

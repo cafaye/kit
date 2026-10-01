@@ -366,6 +366,11 @@ trap 'rm -rf "$WORK"' EXIT
 
 failures=0
 skips=0
+# Distinct from `skips`, and the reason is in `expect_red_check`: a missing
+# toolchain is a machine you cannot equip, and a gate that exited without
+# reporting a finding is a proof that could not be evaluated at all. Reporting
+# the second as the first sends the next reader after the wrong file.
+env_skips=0
 copy_name=""
 
 # A fresh throwaway copy per breakage: one breakage must never mask the next,
@@ -566,6 +571,36 @@ expect_red_check() {
   if contains "$out" "FAIL $want"; then
     printf 'PASS self_test: %s — caught by `%s`\n' "$label" "$want"
   else
+    # A gate that exited non-zero having reported NO finding at all is not a red
+    # gate — it is a gate that never ran, and reporting it as "the gate went red,
+    # but not via <the named check>" blames the check for an environment failure.
+    # The distinction matters because the two demand opposite responses: a red
+    # means the mutation escaped, a non-finding exit means this machine was too
+    # busy, the tree was incomplete, or a tool was missing.
+    #
+    # It is not hypothetical. Under load average 15 on a 16GB box, kit-19's own
+    # full gate reported breakage 35 this way — `exit 1` with an empty finding
+    # list — and the only honest description is that the recipe could not be
+    # evaluated. Breakage 39 already exists for the same reason and asserts the
+    # EXPLANATION rather than the exit status, on the principle that a red which
+    # misattributes itself sends the next reader to the wrong file.
+    #
+    # `validate.sh` exits 1 on a FAIL, 2 on a usage error, and (line 132, 3195)
+    # 1 from bootstrap when it cannot install its own dependencies — the last of
+    # which prints its reason and never reaches a single check. So: a non-zero
+    # exit WITH findings is a real red; a non-zero exit with NONE is an
+    # environment failure, and it is named as one rather than counted as a
+    # breakage the check failed to catch.
+    if [ "$ec" -ne 0 ] && ! printf '%s\n' "$out" | grep -qE '^(FAIL|SKIP)'; then
+      printf 'SKIP self_test: %s — the gate exited %s with NO finding reported\n' \
+        "$label" "$ec"
+      printf '%s\n' "$out" | tail -5 | sed 's/^/       /'
+      printf '       This is an ENVIRONMENT failure, not a check that failed to\n'
+      printf '       catch its defect. Treating it as a red would blame\n'
+      printf '       `%s` for a machine problem.\n' "$want"
+      env_skips=$((env_skips + 1))
+      return
+    fi
     if [ "$ec" -eq 0 ]; then
       printf 'FAIL self_test: %s — the gate stayed GREEN\n' "$label"
     else
@@ -2634,13 +2669,28 @@ expect_red_check 'breakage 60: the same copy in an ADOPTING service is a hard FA
 unset KIT_FLEET
 
 printf '\n'
+# TWO skip kinds, counted apart, because they are two different problems and one
+# message would misdescribe half of them.
+#
+#   `skips`         a missing TOOLCHAIN. The recipe is sound and the machine
+#                   cannot run it. Fix the machine.
+#   `env_skips`     the gate exited non-zero reporting NO finding at all (see
+#                   `expect_red_check`). The recipe could not be EVALUATED, so
+#                   this is not evidence about the check and must never be
+#                   reported as one.
+#
+# Both are fatal, and both stay fatal: a proof nobody ran is not a proof, and
+# collapsing the second into the first is how a machine problem gets filed as a
+# gate defect and "fixed" by weakening something.
 if [ "$failures" -ne 0 ]; then
   echo "FAIL: self_test — $failures breakage(s) the gate did not catch."
   [ "$skips" -eq 0 ] || echo "note: $skips breakage(s) skipped (no toolchain) — reported above."
+  [ "$env_skips" -eq 0 ] || echo "note: $env_skips breakage(s) SKIPPED as ENVIRONMENT failures (the gate reported no finding) — reported above. These are not gate defects."
   exit 1
 fi
-if [ "$skips" -ne 0 ]; then
-  echo "FAIL: self_test — $skips breakage(s) skipped for a missing toolchain. A skipped proof is not a proof."
+if [ "$skips" -ne 0 ] || [ "$env_skips" -ne 0 ]; then
+  [ "$skips" -eq 0 ] || echo "FAIL: self_test — $skips breakage(s) skipped for a missing toolchain. A skipped proof is not a proof."
+  [ "$env_skips" -eq 0 ] || echo "FAIL: self_test — $env_skips breakage(s) could not be evaluated (the gate exited without reporting a finding). An unevaluated proof is not a proof, and this one is an environment failure rather than a gate defect."
   exit 1
 fi
 # The count is COUNTED, not written down. Every breakage above calls exactly one
@@ -2663,7 +2713,14 @@ fi
 #   and is deliberately not in either count: it is a control, and its label
 #   carries a number so the header can name the claim without giving a control a
 #   numbered entry. `tests/validate.sh` says the same thing in the same words.
+#
+#   `env_skips` cannot appear in this sentence at all, and that is deliberate: it
+#   is non-zero only on a run that exits 1 above, so the PASS line is only ever
+#   printed when every recipe was EVALUATED. A count of proofs that ran is not a
+#   claim that they held, which is why the sentence says "hold" and why the
+#   unevaluated case is fatal rather than footnoted.
 counted=$(grep -cE '^ *expect_red(_check|_lang|_script)? +.breakage +[0-9]+[a-z]*:' "$0" || true)
 total=$(grep -cE '^ *expect_(red(_check|_lang|_script)?|skip_check|green_check) +.breakage +[0-9]+[a-z]*:' "$0" || true)
 green_check=$(grep -cE '^ *expect_green_check +.breakage +[0-9]+[a-z]*:' "$0" || true)
 echo "PASS: self_test — all $total breakages hold ($counted assert red, $((total - counted - green_check)) assert a green gate with a named skip, $green_check assert a green gate with a named finding), and the unbroken tree is green."
+echo "       Every recipe above was EVALUATED: 0 environment failures, 0 skipped for a missing toolchain."

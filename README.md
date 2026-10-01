@@ -1412,7 +1412,8 @@ unambiguous: `LICENSE` deleted, and a root manifest declaring a licence the file
 contradicts. The second is the one that makes the check a check — see
 [`## License`](#license).
 
-One defect in this harness was found by that packet rather than by a reader.
+Two defects in this harness were found by that packet rather than by a reader.
+
 `expect_green_check` asserted on the gate's output with `printf … | grep -qF`,
 which reads a **match** as a non-match once the output overflows the 64K pipe
 buffer: `grep -q` closes the pipe at the first match, `printf` dies of SIGPIPE,
@@ -1426,6 +1427,15 @@ assertion helpers now match the captured variable through one `contains`
 helper. The alternative fix — making the new check quieter — was worse twice
 over: it contradicts `check`'s documented behaviour, and the threshold it hides
 behind is a property of the pipe buffer, so it moves with the machine.
+
+And `expect_red_check` had no verdict for a gate that exited non-zero reporting
+**no finding at all**, so it fell into "red, but not via the named check" and
+blamed a healthy check for a machine that was too busy — `validate.sh` exits 1
+on a FAIL *and* exits 1 from bootstrap when it cannot install its dependencies,
+and the second never reaches a check. There is now a third verdict, `SKIP`,
+counted separately from a missing toolchain because the two need different
+responses, and still fatal: a proof nobody ran is not a proof. It widens the
+excuse by exactly the case where the gate said nothing, and no further.
 
 Any `FAIL` exits 1. A `SKIP` is always reported in the summary, never hidden.
 PyYAML, yamllint, zizmor, hadolint and gitleaks are required and are

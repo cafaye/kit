@@ -94,7 +94,9 @@ green-expecting proofs (23b a SKIP, 59 a FINDING) would have gone red for that
 reason. A check that cannot run in a copy is a proof that proves nothing while
 reporting something.
 
-## A latent harness bug this packet exposed, and the fix
+## Two latent harness bugs this packet exposed, and the fixes
+
+### 1. `expect_green_check` read a MATCH as a non-match
 
 The first full self-test run came back with **one** failure, and it was not one of
 mine:
@@ -140,6 +142,65 @@ nothing to do with which check it is reading.
 This is a fix to a check, not a weakening of one, and it is the same fix
 `expect_red_check` received for breakage 30. No recipe, threshold or pin changed.
 
+### 2. A gate that reported nothing was reported as a red for the wrong check
+
+The **full** gate on the merged tree then came back with a second, unrelated
+failure, and this one was a real defect in the harness rather than in the tree:
+
+```
+FAIL self_test: breakage 35: kit offers `language: bun` but ships no primer for
+  it — the gate went red, but NOT via `tests/artifacts.json  (…)`
+```
+
+Breakage 35's mutation is deleting `templates/bin-prime/bun.sh`, and I confirmed
+the named check fires on exactly that state:
+
+```
+# a copy with templates/bin-prime/bun.sh deleted
+FAIL bun  (Dockerfile + bin/prime present)
+FAIL tests/artifacts.json  (every declared source exists, for every language)
+FAIL: 2 check(s) failed.
+```
+
+So the recipe and the check are both sound. What the log shows is that the
+failing run printed **no nested `FAIL` line at all** — the inner gate exited
+non-zero having reported nothing, and `expect_red_check` had no verdict for that,
+so it fell into "red, but not via the named check" and blamed
+`tests/artifacts.json` for it.
+
+`validate.sh` exits 1 on a FAIL **and** exits 1 from bootstrap when it cannot
+install its own dependencies (lines 132 and 3195), and the second path never
+reaches a single check. The two are indistinguishable from the exit status alone.
+Load average was 15 on a 16GB box with other workers' gates running.
+
+The fix is a third verdict, `SKIP`, and the deliberate detail is that it uses a
+**separate counter** (`env_skips`, against the existing `skips`) because a
+missing toolchain and an unevaluated proof are different problems: the first is
+a machine you cannot equip, the second is a recipe that could not be evaluated at
+all. Both stay fatal, because a proof nobody ran is not a proof — but neither is
+reported as a check that failed to catch its defect, which is what would send the
+next reader to weaken something that is fine.
+
+Isolating the predicate and running all four cases, so the classification is
+measured rather than asserted:
+
+| the nested gate | classified as |
+| --- | --- |
+| `exit 1`, no output at all | SKIP — environment failure |
+| red, naming a **different** check | FAIL — red for the wrong reason (unchanged) |
+| the named check fires | PASS (unchanged) |
+| green, no finding | FAIL — stayed green (unchanged) |
+
+The last row is the one to read carefully: this widens what counts as an excuse
+by **exactly** the case where the gate said nothing, and no further. Same
+principle as breakage 39, which asserts the explanation rather than the exit
+status for the same reason — a red that misattributes itself is worse than no
+red.
+
+`env_skips` deliberately cannot appear in the PASS summary line, because it is
+non-zero only on a run that exits 1; the summary states the count on its own line
+instead, and says the number of recipes that were *evaluated*.
+
 ## Counts, and where they are checked
 
 The self-test is now **67 breakages, 65 of which must go red, 2 green-expecting,
@@ -156,6 +217,46 @@ and 47 asserting the named check**. Three places carry those numbers:
 
 `fresh_copy`'s control ("the gate is green on an unbroken tree") passes, so the
 two new breakages are the only reason the new check goes red anywhere.
+
+## The gate, and its real exit status
+
+The full run, `bash tests/validate.sh`, **exit 0**:
+
+| phase | verdict |
+| --- | --- |
+| static (every check, including `LICENSE`) | PASS |
+| telemetry — six traceparent suites, executed | PASS |
+| telemetry — the canary harness, five vectors | PASS |
+| observability — canary reaches no exporter | PASS (real collector) |
+| observability — service serves with the collector killed | PASS |
+| observability — the fetched stack runs; trace and metric land | PASS |
+| classifier + staleness, executed | PASS (19 + 26 cases) |
+| lint — four linters run against failing fixtures | PASS (14 assertions) |
+| self_test — 67 breakages | PASS, `0 environment failures, 0 skipped` |
+
+`note: 2 check(s) skipped` — both reported, neither hidden:
+`templates/tier/{bun,node}/tier.test.ts`, because `node --check` cannot read
+TypeScript and there is no type-stripping parser. That is the honest-skip rule
+working as written, not a passing tier.
+
+`note: 4 tier(s) ran under a time bound; none was reached` — the three docker
+stacks and the self-test each ran under their ceiling and none hit it, so all
+four completed rather than being abandoned.
+
+Getting here took three full runs, and the sequence is the point:
+
+1. red on **breakage 59** — the SIGPIPE bug (fixed: `contains`).
+2. red on **breakage 35** — the no-finding misattribution (fixed: the third
+   verdict).
+3. green, exit 0.
+
+Between runs 2 and 3 a standalone self-test was SIGKILLed at breakage 40 — the
+exit-137 case this repository already documents, on a 16GB box that was at load
+15 with other workers' gates running. Nothing in the tree changed between that
+kill and the green run; only the machine's load did. It is the clearest
+demonstration in this packet of why an unevaluated proof is reported as an
+environment failure rather than as a check that failed: the evidence for "the
+code is fine" is a run that completed, and a killed run is not that.
 
 ## Not done, and why
 
