@@ -148,4 +148,18 @@ useDefault = true
 description = "the jwt rule on tests/deploy_test.sh only: kit-16's JWT_CANARY is a deliberate fixture proving the deploy redactor catches JWT-shaped input it was never told about, so the finding is the scanner working"
 condition = "AND"
 targetRules = ["jwt"]
-paths = ['''^tests/deploy_test\.sh$''']
+# THE PATH IS MATCHED AGAINST WHAT gitleaks CALLS THE FILE, AND THAT IS NOT THE
+# SAME STRING IN BOTH SCAN MODES. A history scan reports paths relative to the
+# repository root; a `--no-git` directory scan — which is the mode
+# `tests/gitleaks_gate.sh` selects for a throwaway copy, and this file has been
+# scanned that way by every one of self_test.sh's copies — reports the ABSOLUTE
+# path. Anchored at `^tests/`, the entry matched the first and not the second,
+# so the copy's scan exited 1 and the self-test control read "the gate is RED on
+# an unbroken tree" for a reason that had nothing to do with the tree.
+#
+# Both are matched rather than one, because the alternative is an allowlist that
+# is only true in the mode its author happened to run: an entry that stops
+# applying the moment the scan moves is an entry that is a default, and the
+# comment three entries above this one explains exactly why a redaction rule that
+# can be taught nothing must not be one of them.
+paths = ['''(^|.*/)tests/deploy_test\.sh$''']

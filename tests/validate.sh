@@ -3905,7 +3905,7 @@ def is_worktree(path):
 #      pre-commit hook — reads the local file, while kit's CI reads kit's. Two
 #      policies in one repository, one of them enforced nowhere it is written
 #      down. And the copy becomes live again the moment the `--config` flag goes
-#      missing, which is breakage 25, and silently, because a copy is always
+#      missing, which is breakage 29, and silently, because a copy is always
 #      weaker than the thing it was copied from.
 #
 # The check is therefore not "the file hijacks the build". It is "the file and
@@ -5709,7 +5709,7 @@ PY
   # first version of that grep was defeated by a comment: `#   - --redact, always`
   # satisfies `grep -- --redact`, and the comment is a sentence explaining that
   # the flag is mandatory. A check that a comment satisfies is a check that
-  # reports the comment. Self_test breakage 26 proved it — the flag removed, the
+  # reports the comment. Self_test breakage 43 proved it — the flag removed, the
   # check still green — which is the only reason this is a behavioural assertion.
   #
   # So: run the scan against a tree that contains a detectable credential, and
@@ -6743,11 +6743,11 @@ for orphan in sorted(carried - named, key=breakage_sort):
 
 # A throwaway-copy DIRECTORY variable that is REASSIGNED stops being a path.
 # This is here because it already happened, and it happened silently: the
-# renumber that gave breakages 24-34 descriptive directory names gave breakage
-# 33's directory the name `canary_literal`, which was already the name of the
+# renumber that gave breakages 41-51 descriptive directory names gave breakage
+# 50's directory the name `canary_literal`, which was already the name of the
 # canary VALUE assembled six lines below it. The reassignment meant `edit` was
 # handed `cafaye_canary_.../templates/secrets/go/canary.go`, the recipe died with
-# a FileNotFoundError, and breakage 33 never ran — taking 34 with it, because
+# a FileNotFoundError, and breakage 50 never ran — taking 51 with it, because
 # the script stops at the first crash. Two proofs dead, and the only symptom was
 # a traceback in a phase whose output nobody reads on a green run.
 #

@@ -235,7 +235,7 @@
 #   fires. One mutant per language proves the suite bites; it does not prove the
 #   suite is complete, and nothing here should be read as claiming that is.
 #
-#   The same applies to breakages 24-34. They prove each check CAN fail; they do
+#   The same applies to breakages 41-51. They prove each check CAN fail; they do
 #   not prove the check is complete. A check that fires on the defect it was
 #   written for is the floor, and the floor is what a gate nobody runs has.
 #
@@ -311,7 +311,20 @@ fresh_copy() {
   # files in it and read files in it, and a copy without it would fail on a
   # missing path rather than on the defect under test — which is a self_test
   # that proves nothing.
-  for entry in .github AGENTS.md README.md CHANGELOG.md core docker lint templates tests; do
+  # `.gitleaks.toml` is here for the same reason, and its absence is the loudest
+  # version of that failure this file has: kit-08's gitleaks check reads it by
+  # path and REFUSES to run without it, so a copy that left it behind failed the
+  # control — "the gate is RED on an unbroken tree" — for a reason that had
+  # nothing to do with the tree. Three checks went red at once (the allowlist's
+  # own shape, the behavioural `--redact` proof, and the scan), and every one of
+  # them was reporting the missing file.
+  #
+  # The list below is therefore the set of things the gate READS, and it has to
+  # be re-extended whenever a packet adds a check that reads a new path. That is
+  # a real coupling between the harness and the tree, and it is better than the
+  # alternative: a check that silently cannot run in a copy is a proof that
+  # proves nothing while reporting something.
+  for entry in .gitleaks.toml .github AGENTS.md README.md CHANGELOG.md core docker lint templates tests; do
     [ -e "$ROOT/$entry" ] && cp -R "$ROOT/$entry" "$dst/"
   done
   # KIT_GITLEAKS, unlike the other two, must ALSO be resolved before the first
@@ -387,7 +400,7 @@ expect_red() {
 # `if` then reads a match as a NON-match.
 #
 # That is not theoretical here; it is what the first run of this merge
-# produced. Breakage 11 (hadolint) and breakage 25 (the working-tree
+# produced. Breakage 11 (hadolint) and breakage 42 (the working-tree
 # credential) both produce a gate run larger than the 64KB pipe buffer, and both
 # were reported as "the gate went red, but NOT via `<the check that fired>`" —
 # while printing that very check among the FAIL lines it had just proven was
@@ -411,9 +424,9 @@ expect_red_check() {
   # — then reports 141 for a pipeline that SUCCEEDED, and a passing breakage
   # reads as "the gate went red, but NOT via <the named check>".
   #
-  # It hit breakage 29, whose check emits several hundred lines of report and
+  # It hit breakage 30, whose check emits several hundred lines of report and
   # therefore the first output in this file big enough to overflow the 64K pipe
-  # buffer. Breakages 7-24 all pass on a small enough output, which is the worst
+  # buffer. Breakages 7-29 all pass on a small enough output, which is the worst
   # shape a latent defect has: it looks like a failure of the thing under test
   # and is actually a failure of the harness reading it.
   #
