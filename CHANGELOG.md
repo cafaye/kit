@@ -83,6 +83,108 @@ semver contract — it is consumed by *calling*
 
 ### Added
 
+- **kit-16 — the first deployment, and the shape the other eight copy.**
+  Nine services, nine languages, nine green gates, and not one of them had ever
+  been deployed: there was no `deploy/` or `infra/` directory anywhere in the
+  organisation and no ruling that mentioned production deployment. This is one
+  reference deployment, run end to end, with the differences between the nine
+  runtimes tabled rather than papered over.
+
+  - **`templates/deploy/` — the distribution shape.** `compose.deploy.yml` is a
+    real, runnable file rather than a template with holes in it: every value is
+    a compose substitution, so it runs once `SERVICE_NAME` and
+    `KIT_DEPLOY_IMAGE` are set. No `build:` section, `restart: unless-stopped`
+    on every service, a healthcheck on every service, and **no credential
+    anywhere in the file** — which is the property that shapes everything else.
+
+  - **`templates/bin/deploy.sh` — the tool**, beside `dev.sh`, the other script
+    kit hands out. `up` / `verify` / `rollback` / `status` / `down`. A deploy
+    does not report success until the container's own healthcheck says
+    `healthy`; a deploy that cannot reach green **rolls itself back** rather
+    than leaving a broken version quietly replacing a working one.
+
+  - **Credentials arrive on an inherited file descriptor and nowhere else.**
+    There is no `--secrets-file`; `deploy` refuses the option by name. Values
+    go into a **tmpfs** (RAM, per container, destroyed with the container)
+    through the container's own stdin, so they never appear in `docker
+    inspect`, in `docker compose config`, on the host disk, or in the image.
+    The container starts and the application does not: `entrypoint.sh` waits
+    for `/run/secrets/.loaded`, which the tool creates only once every claimed
+    secret is in place, and **exits non-zero if it never arrives**.
+
+  - **`templates/deploy/redact.py` — the log redactor.** Everything the tool
+    prints is filtered: `docker inspect`, `docker compose config`, migration
+    output, the health gate's own messages. Two layers — the exact values it
+    was given, and **shape** (JWT, bearer token, AWS key, provider key, GitHub
+    token, connection URL with a password, PEM header, any `*password*`/
+    `*secret*`/`*token*` assignment) — because a filter that only knows its own
+    inputs is defeated by anything it did not already hold. The credential's
+    *name* survives, so the log still says which one was in play.
+
+  - **`templates/deploy/reference/courier.deploy.yml` — the reference
+    deployment**, and the thing this packet actually ran. `courier` (Elixir/
+    Phoenix, 535 tests at `35c6a27`) was chosen over `caf` deliberately: it
+    already has a release build and a readiness endpoint that really checks
+    its database, so the template is written against the best story in the
+    fleet rather than the worst. `caf` was rejected because a bug in its deploy
+    path carries the authority to destroy shared Docker state.
+
+  - **Rollback that is demonstrated, not described.** The previous artifact is
+    recorded in a ledger (image tags and digests only — no secrets) *before*
+    the new container starts, and `deploy rollback` runs the same deploy code
+    path with a different tag and the same health gate.
+
+  - **`tests/deploy_test.sh` — 66 assertions in nine sections, no sleeps.**
+    Every health gate is demonstrated red **and** green: the database is taken
+    away underneath the running service (`docker pause`, not `stop` — stopping
+    the container destroys its tmpfs, so restarting it brings the database back
+    *without its password* and tests the wrong thing), and `/readyz` is watched
+    going 503, the container healthcheck is watched going unhealthy, and
+    `deploy verify` is watched exiting non-zero; then all three are watched
+    coming back. `/healthz` is asserted to stay 200 throughout, because a
+    liveness probe that fails on a dependency turns a database blip into a
+    crash-restart loop. The leak audit runs last, against the accumulated
+    deploy log, the rendered compose config and `docker inspect`, and asserts
+    the secret is present in the container's tmpfs so the negatives are real
+    negatives.
+
+    Two further sections close claims that would otherwise rest on reading the
+    source. One deploys a **deliberately broken artifact** — the good image minus
+    `/app/bin/migrate`, so the two differ by exactly the thing under test — and
+    requires the deploy to report failure, to say it is rolling back, and to
+    leave the previous artifact serving. The other creates a **decoy container
+    and volume outside the compose project** and requires both to survive `down`
+    *and* `down --purge`, so "never touch state you do not own" is executed
+    rather than grepped for; it goes red if `cmd_down` ever grows a prune.
+
+    **13 static proofs run without Docker; the 53 live ones SKIP loudly when the
+    daemon or the image is absent, never silently.**
+
+  - **The polyglot table, and why it is a table.** `docker/Dockerfile.go` and
+    `docker/Dockerfile.rust` are `gcr.io/distroless/static` — **no shell, no
+    coreutils** — so a shell-script secret gate cannot be mounted into them at
+    all. The tool asks the container rather than the operator and switches to
+    a tar streamed over `docker cp` when there is no shell, with the `.loaded`
+    barrier as an extra tar member so a distroless service gets the identical
+    guarantee; measured end to end against a distroless image carrying one bare
+    binary and deliberately no `/bin/sh`. Separately, a `curl` healthcheck needs
+    `curl`, and **the `-slim` runtimes ship neither `curl` nor `wget`** — a
+    shell they do have, measured on `python:3.13-slim`. So each service writes
+    its healthcheck in its own runtime's HTTP client, or, for distroless, in
+    exec-form against a `healthcheck` subcommand the service itself provides.
+    Migrations are a per-service label rather than a rule, because
+    `bin/rails db:migrate`, `manage.py migrate` and `/app/bin/migrate` have no
+    common form and Go and Rust have no schema at all.
+
+  - **The database is pinned `postgres:17-alpine`**, the fleet's standard tag and
+    the one `templates/compose/docker-compose.yml` already uses, so a deploy and
+    a `bin/dev up` run the same server. Measured rather than assumed: `/bin/sh`
+    (busybox), `pg_isready`, uid 0 and `docker-entrypoint.sh` on `PATH` — and no
+    `curl`, with `wget` present, which is why the database's health probe is
+    `pg_isready` and not an HTTP fetch. It runs behind the same secret gate as
+    the application, because a `POSTGRES_PASSWORD` in `environment:` is a
+    password `docker inspect` prints.
+
 - **kit-07 — the declared tier, and the allowlist that is supposed to shrink.**
   A tier is a class of test that needs a real dependency. The failure this
   exists to prevent has already happened in this fleet: a green run in which the

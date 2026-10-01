@@ -1,0 +1,153 @@
+---
+# The deployment shape, as a file you can run.
+#
+# This is not a diagram of a deployment and it is not a template with holes in
+# it: every value below is a real docker compose substitution, so this file
+# runs as-is once KIT_DEPLOY_IMAGE and SERVICE_NAME are set, and the reference
+# deployment in `reference/` is nothing more than this file with a service's
+# own values filled in. There is no second, better version.
+#
+# THE THING THAT MAKES IT A DEPLOYMENT AND NOT A DEV STACK
+#
+#   * no `build:` section — a deploy ships an artifact, and the artifact is an
+#     image tag. A deployment that rebuilds from source on the target is a
+#     deployment nobody can roll back to.
+#   * `restart: unless-stopped` on everything, so a crashed process comes
+#     back without a human.
+#   * a healthcheck on every service, and the healthcheck is the service's own
+#     definition of readiness — not "is the process alive".
+#   * credentials are NOT in this file, and the mechanism that replaces them
+#     is the whole reason the file is shaped this way: every service runs
+#     behind the secret gate, and the gate is fed on stdin.
+#
+# WHAT IS STILL LOCAL ABOUT THIS FILE, STATED HERE RATHER THAN IN THE REPORT
+#
+#   `ports:` publishes to 127.0.0.1. In a real deployment that line becomes a
+#   reverse proxy or a load-balancer target and the port is not published at
+#   all. It is published here so that a probe can reach the service from
+#   outside the container, which is the one thing a local target can do that a
+#   production target must not.
+#
+#   The `restart:` policy is Docker's, not an orchestrator's. A real target
+#   has a scheduler that replaces unhealthy instances on other hosts, so the
+#   blast radius of one bad deploy is one container rather than one host.
+#   Nothing in this file pretends otherwise.
+#
+# REQUIRED ENVIRONMENT
+#   SERVICE_NAME      the service this stack belongs to; also the compose
+#                     project name, so every object created is namespaced
+#   KIT_DEPLOY_IMAGE  the immutable artifact, a tag built elsewhere
+#
+name: kit-deploy-${SERVICE_NAME:?set SERVICE_NAME}
+
+services:
+  db:
+    # Pinned, never `latest` and never a floating major: the artifact this
+    # deployment is tested against has to be the artifact that gets deployed.
+    # `postgres:17-alpine` is the fleet's standard pin — the same tag
+    # `templates/compose/docker-compose.yml` uses for the developer stack, so a
+    # deploy and a `bin/dev up` are running the same database.
+    #
+    # `-alpine` is measured, not assumed. Verified against this image: /bin/sh
+    # present (busybox), `pg_isready` present, runs as uid 0 so the gate can
+    # write the tmpfs, and `docker-entrypoint.sh` on PATH — but NO `curl`.
+    # `pg_isready` is the health probe for exactly that reason: it is the one
+    # thing this image ships that means "the server ACCEPTS CONNECTIONS".
+    image: postgres:17-alpine
+    restart: unless-stopped
+
+    # The database goes through the SAME secret gate as the application. This
+    # is the part that is easy to leave out and that leaks the moment you do:
+    # a postgres with POSTGRES_PASSWORD in `environment:` has that password
+    # printed by `docker inspect` and by `docker compose config`, and the
+    # official image supports POSTGRES_PASSWORD_FILE precisely so that it
+    # does not have to be.
+    entrypoint: ["/bin/sh", "/kit/entrypoint.sh"]
+    environment:
+      KIT_APP_CMD: "docker-entrypoint.sh postgres"
+      # NOT POSTGRES_PASSWORD_FILE. The official postgres entrypoint treats it
+      # and POSTGRES_PASSWORD as mutually exclusive and refuses to start when
+      # both are set — and the gate exports POSTGRES_PASSWORD from the
+      # injected file, so declaring the _FILE variant as well is a database
+      # that dies on boot. Measured, not assumed; see
+      # reference/courier.deploy.yml.
+      POSTGRES_USER: ${DB_USER:-app}
+      POSTGRES_DB: ${DB_NAME:-app}
+      PGDATA: /var/lib/postgresql/data/pgdata
+
+    tmpfs:
+      # RAM, per container, destroyed with the container. A secret on a
+      # tmpfs is not "at rest" anywhere; the same secret in `environment:` is
+      # on disk in the container's config and in every `docker inspect` this
+      # machine will ever be asked to print.
+      - /run/secrets:rw,noexec,nosuid,size=1m,mode=0755
+    volumes:
+      - ../entrypoint.sh:/kit/entrypoint.sh:ro
+      - pgdata:/var/lib/postgresql/data
+
+    healthcheck:
+      # pg_isready is the only signal that is true when the server ACCEPTS
+      # CONNECTIONS. `is the container running` is true thirty seconds
+      # earlier and is the reason first-boot migrations fail.
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-app} -d ${DB_NAME:-app}"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 20s
+
+    labels:
+      kit.deploy/secrets: "POSTGRES_PASSWORD"
+      kit.deploy/restart-policy: "unless-stopped"
+
+  app:
+    # Required, and deliberately so: a deploy that reaches this point with no
+    # artifact is a deploy that was going to run `latest` by accident.
+    image: ${KIT_DEPLOY_IMAGE:?the deploy tool sets KIT_DEPLOY_IMAGE}
+    restart: unless-stopped
+
+    entrypoint: ["/bin/sh", "/kit/entrypoint.sh"]
+    environment:
+      # The application is operator configuration, not a secret. It is safe in
+      # this file and stays here, where an operator can read it.
+      KIT_APP_CMD: ${KIT_APP_CMD:-"/app/bin/server"}
+      PORT: ${APP_PORT:-4000}
+    tmpfs:
+      - /run/secrets:rw,noexec,nosuid,size=1m,mode=0755
+    volumes:
+      - ../entrypoint.sh:/kit/entrypoint.sh:ro
+
+    ports:
+      - "127.0.0.1:${KIT_DEPLOY_PORT:-16800}:${APP_PORT:-4000}"
+
+    depends_on:
+      db:
+        condition: service_healthy
+
+    healthcheck:
+      # The service's own readiness endpoint, which must exercise the
+      # dependency rather than the process. A check that returns 200 because
+      # the HTTP server is up is worth very little; the reference deployment
+      # proves this one can go red by stopping the database underneath it.
+      test: ["CMD-SHELL", "curl -fsS http://127.0.0.1:${APP_PORT:-4000}/readyz || exit 1"]
+      interval: 5s
+      timeout: 5s
+      retries: 12
+      # Long enough to cover credential injection and a cold start. A short
+      # start_period turns a slow first boot into a permanently red container.
+      start_period: 30s
+
+    labels:
+      # Per-service configuration, read back off the running container by the
+      # deploy tool. Migrations are here rather than in the tool because nine
+      # languages genuinely disagree about what running them means.
+      kit.deploy/migrate: "/app/bin/migrate"
+      kit.deploy/probe-url: "http://127.0.0.1:${KIT_DEPLOY_PORT:-16800}/readyz"
+      kit.deploy/restart-policy: "unless-stopped"
+      kit.deploy/secrets: "DATABASE_URL SECRET_KEY_BASE"
+
+volumes:
+  # Named, so `docker compose down --volumes` can remove it, and so nothing
+  # this project creates can be confused with a volume belonging to somebody
+  # else on a shared machine. The name is derived from the compose project,
+  # which is `kit-deploy-<service>`, so it is namespaced by construction.
+  pgdata:
