@@ -13,6 +13,21 @@ it without a copy (see kit-12 below).
 
 ## Unreleased
 
+### Added — the profile, and what it says
+
+- **`PROFILE-gate.md` — where this gate's time actually goes, measured rather
+  than guessed.** `self_test` is **~96%** of a full run (~4,905 s of ~5,103 s
+  projected), because each of its 94 breakages is a whole `tests/validate.sh`
+  running 113.6 timed checks to learn one fact about one named check. The top
+  three costs are **98.2%** of the run; the longest tail row is 1.2 s. The run
+  it is from was truncated at 569.0 s and the file says so in its own first
+  paragraph.
+
+- **`HANDOFF-kit-gate-speed.md`** — the successor's brief, including the finding
+  that decides the order of work: **`--only`, which the recipe comments call
+  "the 60×", is appended by `expect_red_check` and by nothing else, so 21 of 94
+  recipes still run the whole static phase.** The real factor is ~47×.
+
 ### Added — the gate can now say where its own time went
 
 - **`KIT_PROFILE=<file>` writes a timing profile of any gate run.** A gate that
