@@ -1066,7 +1066,30 @@ down() {
   resolve_stack
   # `down` without -v on purpose: your local data is the thing you are not
   # throwing away by typing `bin/dev down`.
-  compose down
+  #
+  # AND IT STOPS THE WHOLE PROJECT, NOT THE PART THIS SHELL'S VARIABLE NAMES.
+  # Measured, and it is the mirror of the `print_urls` fix: the observability
+  # backends are behind a profile, and `docker compose down` without that
+  # profile does not touch them. So after
+  #
+  #     KIT_DEV_PROFILES=observability bin/dev up
+  #     bin/dev down                          # the cheap path, variable unset
+  #
+  # `down` exits 0, prints "stopping the stack", and leaves tempo, loki and
+  # grafana RUNNING AND HEALTHY. You have to type `down` a second time with the
+  # variable set. A teardown that reports success while three containers and
+  # their memory limits are still up is the same defect as a printed URL that
+  # does not resolve, and it is worse: this one costs memory on the machine.
+  #
+  # The profiles come from `compose config --profiles`, so the list is the
+  # PROJECT's own and a profile added to the compose file needs nothing here.
+  # A hardcoded `observability` would be a second copy of a name that already
+  # lives in the compose file, which is the ratchet this file keeps avoiding.
+  local -a pf=()
+  while IFS= read -r p; do
+    [ -n "$p" ] && pf+=(--profile "$p")
+  done < <(compose config --profiles 2>/dev/null || true)
+  compose "${pf[@]+"${pf[@]}"}" down
 }
 
 nuke() {
@@ -1074,7 +1097,15 @@ nuke() {
   step "stopping the stack and DELETING its volumes"
   resolve_stack
   info "postgres, nats and redis data in this stack are gone after this."
-  compose down --volumes --remove-orphans
+  # Same reason as `down`, and it matters MORE here: a `nuke` that leaves the
+  # observability containers running has removed the volumes they were writing
+  # to, so Docker recreates those volumes empty on the next start and the
+  # developer is left with a half-deleted stack rather than a clean one.
+  local -a pf=()
+  while IFS= read -r p; do
+    [ -n "$p" ] && pf+=(--profile "$p")
+  done < <(compose config --profiles 2>/dev/null || true)
+  compose "${pf[@]+"${pf[@]}"}" down --volumes --remove-orphans
 }
 
 # --------------------------------------------------------------------------

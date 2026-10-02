@@ -13,6 +13,32 @@ it without a copy (see kit-12 below).
 
 ## Unreleased
 
+### Fixed — `bin/dev down` left the observability containers running
+
+- **Measured, and it is the mirror of the `print_urls` fix.** The backends are
+  behind a compose profile, and `docker compose down` without that profile does
+  not touch them. So `KIT_DEV_PROFILES=observability bin/dev up` followed by a
+  plain `bin/dev down` exited 0, printed "stopping the stack (volumes kept)", and
+  left tempo, loki and grafana **running and healthy**. A teardown that reports
+  success while three containers and their memory limits are still up costs more
+  than a printed URL that does not resolve.
+
+- **`down` and `nuke` now stop the whole project.** Both read the project's own
+  profile list from `compose config --profiles` and pass every one, so the
+  teardown covers what is actually running whichever variable the shell happens
+  to have. The list comes from the compose file because a hardcoded
+  `observability` would be a second copy of a name that already lives there.
+
+- **`nuke` mattered more.** It removes the volumes the observability containers
+  were writing to while leaving those containers running, so Docker recreated
+  the volumes empty on the next start — a half-deleted stack rather than a clean
+  one.
+
+- Re-measured after the full stack is up: `bin/dev down` with `KIT_DEV_PROFILES`
+  unset leaves **0 containers and 6 volumes**, which is what "stop, keep the
+  data" says.
+
+
 ### Changed — the metrics store is gone, and nothing is left dialled at nothing
 
 - **The fourth backend left the stack: mimir.** Its own healthcheck was
