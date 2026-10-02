@@ -3213,6 +3213,46 @@ fi
 
 
 # ---------------------------------------------------------------------------
+# 88: the SECOND tenant.
+#
+# Every other recipe in this file proves that ONE service gets a database. This
+# one is the first to ask what happens when a second name is appended, and it
+# exists because that question had never been asked and the answer was wrong.
+#
+# The defect was measured on a live cluster, not inferred:
+#
+#   $ KIT_POSTGRES_DATABASES="billing neighbour" bin/dev up
+#   postgres-1 | [cluster] provisioning billingneighbour
+#   postgres-1 | [cluster] done: 1 service database(s), one role each, PUBLIC holds CONNECT on none of them
+#
+# One database, named after BOTH services fused together, and a stack reporting
+# success. `require_identifier` — whose own comment names "builds one identifier
+# out of two tokens" as the failure worth preventing — could not see it, because
+# the `tr -d '[:space:]'` in front of it DELETED the space first and handed the
+# validator a perfectly legal identifier. Every check that could have caught
+# this was looking at a single name.
+#
+# That is the shape of the blind spot, and it is worth stating plainly: this
+# suite proved the one-cluster promise for the first tenant and was silent about
+# the second. A fleet of nine services is nine repetitions of a case nobody had
+# run twice.
+#
+# The proof runs the real `10-cluster.sh` with the real `psql` stubbed by a
+# recording function, so it asserts the actual parse — which names it
+# provisions and whether it refuses — without needing a container or a volume.
+# ---------------------------------------------------------------------------
+
+base88="$(fresh_copy kit-88)"
+# Put the OLD parse back: strip ALL whitespace, so two names fuse into one.
+edit "$base88/templates/compose/postgres/initdb/10-cluster.sh" \
+  'service="$trimmed"' \
+  'service="$(printf '"'"'%s'"'"' "$entry" | tr -d '"'"'[:space:]'"'"')"'
+expect_red_script 'breakage 88: two tenants separated by a space fuse into one database' \
+  "$base88" tests/multi_tenant_split_test.sh '' \
+  'REFUSING'
+
+
+# ---------------------------------------------------------------------------
 # 68-74: the one-cluster topology and the connection contract.
 #
 # Seven checks, seven breakages, and every one of them is a check that could

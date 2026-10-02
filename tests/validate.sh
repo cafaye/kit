@@ -8778,6 +8778,23 @@ section 'fetch: the pinned kit ref resolves, and a moving one is refused'
 check 'tests/fetch_test.sh  (a pin fetches, a branch is refused, offline is real)' \
   bash "$ROOT/tests/fetch_test.sh"
 
+section 'tenancy: how one shared cluster is split into per-service databases'
+# ONE CLUSTER, A DATABASE AND A ROLE PER SERVICE is the topology this fleet is
+# built around, and until now every check of it exercised exactly ONE service.
+# That is not a small gap: it is the difference between proving the promise once
+# and proving it for the second name in the list, and the second name is where
+# this file's sibling checks had nothing to say.
+#
+# It is not a static shape check either. It runs the shipped
+# `templates/compose/postgres/initdb/10-cluster.sh` with `psql` stubbed, so the
+# real parse runs and the real refusals fire, without a container or a volume —
+# seconds where the live measurement took a full `bin/dev up`.
+#
+# Deliberately OUTSIDE the `RUN_STATIC` guard: this is a property of the script,
+# not a grep over it, and a gate that skips is not green.
+check 'tests/multi_tenant_split_test.sh  (a second tenant is split, not fused; identifiers hold in every locale)' \
+  bash "$ROOT/tests/multi_tenant_split_test.sh"
+
 section 'staleness: the fleet reporter tells the states apart'
 # The case count is READ OUT OF THE RUN rather than counted in the source, and
 # that is not pedantry. Counting `printf 'PASS …'` sites in the file gives 27

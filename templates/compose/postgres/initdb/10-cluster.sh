@@ -37,6 +37,40 @@
 
 set -euo pipefail
 
+# The C locale, for this script only, and it is load-bearing rather than
+# hygienic.
+#
+# Shell bracket ranges — `[a-z]`, `[!a-z0-9_]` — are COLLATION-DEPENDENT, and
+# `require_identifier` below is built entirely out of them. Under `en_US.UTF-8`,
+# which is the default on the machine this fleet is developed on, collation is
+# case-insensitive at the primary level, so `[a-z]` matches `B` and `[!a-z]` does
+# NOT match it. Measured, same pattern, two locales:
+#
+#   $ LC_ALL=C          bash -c 'case Billing in [!a-z_]*) echo REFUSE;; *) echo ACCEPT;; esac'
+#   REFUSE
+#   $ LC_ALL=en_US.UTF-8 bash -c '…'
+#   ACCEPT
+#
+# So on a developer Mac the identifier rule was enforcing roughly half of what
+# its own message claims. `Billing`, `BILLING` and `cafayé` were all accepted
+# while the error string said `must match [a-z_][a-z0-9_]*`.
+#
+# That is not injection — the characters that would break out of an unquoted
+# identifier (quotes, semicolons) still sort outside `[a-z]` and are still
+# refused under either locale. It is worse than that, quietly: Postgres folds
+# unquoted identifiers to lower case, so `KIT_POSTGRES_DATABASES=Billing` and
+# `…=billing` name the SAME database. Two services differing only in case would
+# share one database and one role — which is precisely the harm
+# `require_identifier`'s own message says it exists to prevent, arriving by the
+# one route that produces a legal-looking name.
+#
+# `LC_ALL=C` is set rather than the pattern being rewritten with `[[:lower:]]`
+# because the locale also governs `tr`, `sort` and `printf %q` further down, and
+# a provisioning script that compares strings differently depending on whose
+# laptop ran it is not deterministic in any sense that matters. Exported, so the
+# `psql` calls inherit it too.
+export LC_ALL=C
+
 # Fail by name, and before anything is created.
 #
 # The Postgres documentation points at mrts/docker-postgresql-multiple-databases
@@ -84,9 +118,42 @@ provisioned=0
 for entry in "${entries[@]}"; do
   # A comma-separated list in a `.env` file is very often written with a space
   # after the comma, and trailing whitespace is not a syntax error anybody
-  # should have to notice.
-  service="$(printf '%s' "$entry" | tr -d '[:space:]')"
-  [ -n "$service" ] || continue
+  # should have to notice — so the entry is trimmed, not policed.
+  #
+  # WHITESPACE *INSIDE* an entry is a different thing and is refused rather than
+  # trimmed, and this is the second half of `require_identifier`'s promise. That
+  # function already rejects a name containing a space or a capital, but the
+  # `tr` below used to run first and DELETE the space, so the two names arrived at
+  # the validator already fused into one valid-looking identifier:
+  #
+  #     KIT_POSTGRES_DATABASES=billing neighbour     # space, no comma
+  #       [cluster] provisioning billingneighbour
+  #       [cluster] done: 1 service database(s), one role each, PUBLIC holds CONNECT on none of them
+  #
+  # That is the exact failure the validator's own comment names — "builds one
+  # identifier out of two tokens" — reached by the only route that produces a
+  # *legal* identifier, which is why no other check in this file could see it. The
+  # stack reports success, one service's database does not exist, and the second
+  # service's migrations fail against a database nobody created. On a fleet whose
+  # whole plan is "one cluster, a database and a role per service", the
+  # multi-tenant path failing on the SECOND tenant is the worst place it could
+  # fail: the single-tenant case, which is every case anyone had run, is green.
+  #
+  # So the trim is split in two: outer whitespace goes, inner whitespace is an
+  # error naming the entry and the separator that was probably meant.
+  trimmed="$(printf '%s' "$entry" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
+  [ -n "$trimmed" ] || continue
+
+  case "$trimmed" in
+    *[[:space:]]*)
+      note "REFUSING '$trimmed' as a service name: it holds whitespace, which reads as two names with no comma between them."
+      note "  KIT_POSTGRES_DATABASES is COMMA-separated: 'billing,courier', not 'billing courier'."
+      note "  A space after a comma is fine; a space instead of one fuses the names into the single database '$trimmed', and this stack reported itself healthy while doing it."
+      exit 1
+      ;;
+  esac
+
+  service="$trimmed"
   require_identifier service "$service"
   note "provisioning $service"
 

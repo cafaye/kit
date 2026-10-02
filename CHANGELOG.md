@@ -13,6 +13,84 @@ it without a copy (see kit-12 below).
 
 ## Unreleased
 
+### Fixed — the shared cluster worked for exactly one tenant, and the identifier rule was half a rule
+
+Both of these were found by **running a second tenant**, which is the operation
+"one Postgres cluster for the whole fleet, a database and a role per service" is
+actually made of. Everything kit had checked about the cluster was true of the
+first service and untested for the second — and the second is the case that makes
+the shared cluster worth having.
+
+**1. Two tenants separated by a space became one database, and the stack said it worked.**
+
+```console
+$ KIT_POSTGRES_DATABASES="billing neighbour" bin/dev up
+postgres-1 | [cluster] provisioning billingneighbour
+postgres-1 | [cluster] done: 1 service database(s), one role each, PUBLIC holds CONNECT on none of them
+```
+
+One database, named after both services fused together, on a healthy-looking
+stack. The parse split on commas and then ran `tr -d '[:space:]'` over each
+entry to tolerate `billing, neighbour`, so a space *instead of* a comma arrived
+at `require_identifier` with the space already deleted — a perfectly legal
+identifier.
+
+That is why nothing caught it. `require_identifier`'s own comment names this as
+the failure worth preventing — *"builds one identifier out of two tokens"* — but
+the only route to that outcome produced an **identifer that passed validation**,
+and every check in kit was looking at a single name. The fused database exists,
+the second service's migrations then fail against a database nobody created, and
+the service that does have one reports clean.
+
+Outer whitespace is now trimmed and inner whitespace is refused by name, with the
+separator that was probably meant.
+
+**2. `require_identifier` was enforcing about half of what its error message said.**
+
+The rule is built entirely from shell bracket ranges — `[!a-z_]`,
+`[![:a-z0-9_]]` — and those follow **collation**, which is locale-dependent.
+Under `en_US.UTF-8`, the default on the machine this fleet is developed on,
+collation is case-insensitive at the primary level, so `[!a-z]` does not match
+`B`. Measured, same pattern, two locales:
+
+```console
+$ LC_ALL=C          bash -c 'case Billing in [!a-z_]*) echo REFUSE;; *) echo ACCEPT;; esac'
+REFUSE
+$ LC_ALL=en_US.UTF-8 bash -c '…'
+ACCEPT
+```
+
+So `Billing`, `BILLING` and `cafayé` were all accepted while the error string
+promised `must match [a-z_][a-z0-9_]*`.
+
+This is **not** injection: the characters that would break out of an unquoted
+identifier still sort outside `[a-z]` and were refused under either locale. It is
+a quieter failure with a worse shape. Postgres folds unquoted identifiers to lower
+case, so `KIT_POSTGRES_DATABASES=Billing` and `…=billing` name **the same
+database** — two services differing only in case would share one database and one
+role, which is exactly the harm `require_identifier`'s message says it exists to
+prevent, arriving by the one route that yields a legal-looking name.
+
+`10-cluster.sh` now exports `LC_ALL=C`. That is the whole fix rather than
+rewriting the pattern with `[[:lower:]]`, because the locale also governs `tr`,
+`sort` and `printf` further down, and a provisioning script that compares strings
+differently depending on whose laptop ran it is not deterministic in any sense
+that matters.
+
+**What now checks both.** `tests/multi_tenant_split_test.sh` is kit's first check
+that asks what a *second* tenant does. It runs the shipped init script with
+`psql` stubbed — the real parse, the real refusals, no container and no volume —
+and covers 28 cases: the fused-name refusal, the four legitimate comma-separated
+spellings people actually write, empty and trailing entries, `require_identifier`
+still refusing what it refused before, and the identifier rule re-checked under
+`C`, `en_US.UTF-8`, `en_GB.UTF-8` and `POSIX` with a legal name alongside each so
+the fix cannot pass by refusing everything. Breakage 88 reverts the parse and
+watches it go red.
+
+The honest summary of why these survived: **every proof kit held about the
+cluster was a proof about the first tenant.** A fleet of nine services is nine
+repetitions of a case nobody had run twice.
+
 ### Fixed — the shared cluster provisioned nothing, and reported itself healthy
 
 Two defects, and the reason they survived is the same one: each was invisible to
