@@ -21,7 +21,7 @@ it without a copy (see kit-12 below).
   (`cafaye.unprotected_tables/0`). Measured, before and after.
 
 - **`templates/database/tenancy/isolation.sql` + `assertions.txt`.** The assertion
-  set — **24 assertions**, run twice, once as the login role and once as the
+  set — **39 assertions**, run twice, once as the login role and once as the
   owner — and the manifest they are compared against. `templates/database/<lang>/
   tenancy_test.*` drives it in all six languages kit templates.
 
@@ -32,7 +32,40 @@ it without a copy (see kit-12 below).
   carrying another tenant's identity: **1 row with FORCE, 3 without.**
   `tests/tenancy_test.sh` deletes the statement and requires six assertions to go
   red — all of them `owner/` or `sweep/`, with the `login/` half staying green,
-  which is what makes the control specific rather than merely present.
+  which is what makes the control specific rather than merely present. With the
+  credential fixture added it is **eleven** red on the same terms, and the five new
+  ones are the credential half's owner rows: an owner that bypasses its own table
+  turns a resolution context into a browsing context, which is exactly the failure
+  a resolution path has to be proved against.
+
+- **Credential resolution — `cafaye.protect_credential_table/3`, the one answer to
+  "the account is what the query is for".** `identity` adopted the substrate
+  (migration 00016) and then measured, against its real protected `api_keys` table
+  and as the OWNER, that a request presenting a scoped token reads **zero** rows:
+  the account cannot scope the lookup that is trying to learn it, so every machine
+  credential authenticates to a **401 "not found"**. `protect_credential_table` is
+  **one call, the same size as `protect_table`'s**, and it protects the table
+  exactly as `protect_table` does and then adds a fifth policy:
+
+  ```sql
+  using (token_digest = (select cafaye.current_credential_digest()))
+  ```
+
+  The predicate lives in the **policy**, not only in the caller's query, which is
+  the whole design — policies combine permissively, so a policy saying "a
+  credential session may select this table" would be a table-wide `SELECT` and
+  every key in the database browsable. The honest semantics, asserted in both
+  roles: **a resolution session may read exactly the credential row whose digest
+  it presented, and nothing else in the database** — `select *` returns that one
+  row, and every other table reads zero. It also cannot write (so a resolution
+  cannot mint a credential), it is a second transaction-local GUC for the pool
+  reason `begin_account/1` is, and `cafaye.credential_tables/0` is the audit that
+  answers *which tables can be read with no account*. Rejected and why:
+  a `BYPASSRLS` role (right for Supabase's topology, which has a separate service
+  role and no per-request one), a `SECURITY DEFINER` function (**does not work
+  under `FORCE`** — it applies to the definer), dropping `FORCE`, and leaving
+  `api_keys` unprotected. `DECISIONS.md` **MD24** carries the argument and the five
+  things the mechanism cannot do.
 
 - **`(select …)` around the identity call, measured rather than asserted.**
   `tests/tenancy_test.sh` counts invocations over five rows on every run:

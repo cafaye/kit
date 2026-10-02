@@ -81,3 +81,27 @@ policies/written-for-the-init-plan
 sweep/names-an-unprotected-table
 sweep/every-account-scoped-table-is-protected
 sweep/the-only-finding-is-the-control
+
+# --- THE CREDENTIAL HALF. The one table whose access path is "find the row by a
+# --- value you present and learn the account from it", where the account cannot
+# --- also be what the query is scoped BY. Six per role, and the two that a
+# --- permissive implementation fails are `resolution-cannot-browse` and
+# --- `resolution-does-not-open-another-table`; without a credential table with
+# --- TWO rows the first of them is satisfied by a table-wide SELECT.
+login/credential-no-context-reads-no-rows
+login/credential-resolves-by-digest-with-no-account-identity
+login/credential-resolution-cannot-browse
+login/credential-wrong-digest-resolves-nothing
+login/credential-resolution-does-not-open-another-table
+login/credential-cannot-write-in-a-resolution-context
+owner/credential-no-context-reads-no-rows
+owner/credential-resolves-by-digest-with-no-account-identity
+owner/credential-resolution-cannot-browse
+owner/credential-wrong-digest-resolves-nothing
+owner/credential-resolution-does-not-open-another-table
+owner/credential-cannot-write-in-a-resolution-context
+
+# --- the credential mechanism's own three, which no denial above can see ------
+credential/the-mechanism-is-auditable
+credential/resolve-policy-names-the-roles
+credential/resolve-policy-is-written-for-the-init-plan
