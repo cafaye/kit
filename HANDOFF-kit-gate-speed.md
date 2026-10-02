@@ -1,115 +1,113 @@
-# HANDOFF — kit-gate-speed-02
+# HANDOFF — kit-gate-speed-03
 
-**Read `REPORT-kit-gate-speed-02.md` for the numbers. This file is the state of
-the work.** The short version: the change landed and is verified, and the
-premise it was handed was wrong by a factor of six — so the next worker should
-read §2 of the report before spending an hour on the line of work this one
-finished.
+**Read `REPORT-kit-gate-speed-03.md` for the evidence. This file is the state of
+the work.** Short version: the gate is green again, the unclosed breakage was
+**59**, and the fix was a revert. The one thing the next worker must not
+misread is the handoff-02 warning below — it was **wrong**, and believing it is
+what cost this packet an hour.
 
 ## Done and verified
 
-- **`--only` now reaches every recipe in `tests/self_test.sh` that it can reach**
-  (commits `c556dda`, `ab25775`). Breakages 2, 2b, 3, 4, 5 and 6 moved from
-  `expect_red` to `expect_red_check`; `expect_green_check` (59) grew the same
-  four-line filter block. Gate-running recipes without a filter: **9 → 4.**
-  - **The seventh conversion was reverted, and the run caught it.** `expect_skip_check`
-    (23b) cannot be filtered: its `$want` is the SKIP's **verdict text**, while
-    `--only` matches on the check's **label**, and filtering on the verdict text
-    selects no check — which `validate.sh` turns into `exit 1`, failing the
-    recipe's own first assertion. `expect_red_check` and `expect_green_check` are
-    safe because there `$want` *is* the label. Reasoning is in the file.
-  - **Verified:** every surviving candidate filter was probed against its own
-    mutation on its own tree first, and every one printed `FAIL <the named
-    check>` — table in the report §4b, with times.
-  - **Verified:** the control. An unbroken tree under breakage 6's filter exits 0
-    and prints `PASS .github/workflows/ci.reusable.yml  (opt-in telemetry job,
-    defaults intact)`. A filter that only ever fails is not a proof.
-  - **Verified:** `timeout 900 bash tests/self_test.sh`, run in the background.
-    36 recipes reached. **35 PASS, 1 FAIL — the 23b regression above, since
-    reverted.** Every other recipe, including the unbroken-tree control and all
-    six conversions, passed; each conversion named its check.
-  - **Verified:** `bash -n` clean, `shellcheck -S warning` clean, and the two
-    counts `tests/validate.sh` derives from this file are **unchanged** (94
-    breakages, 92 reds) because `expect_red_check` was already in both patterns.
-  - **Verified:** `tests/validate.sh` is **not modified** by this packet. The
-    gate's printed output — the load-bearing part — is byte-for-byte what it was.
-- **Six proofs got stronger, not just faster.** `expect_red` asserted only "the
-  gate went red"; each of the six now asserts `FAIL <the check it names>`, and
-  each label is a variable so a rename on either side breaks the file loudly.
+- **Breakage 59's `--only` conversion is reverted** (`0399c23`).
+  `expect_green_check` appended `--only=$want`; the verdict it names is emitted
+  by a **`report`**, and `--only` is applied inside `check`, `check_par`,
+  `report_par` and `bounded_check` only. `report()` (`tests/validate.sh:351`)
+  has **no filter**: every `PASS`/`FAIL`/`SKIP` it emits is printed and counted
+  unconditionally. So no `--only` value could select it, the gate's own
+  no-match rule turned that into `exit 1`, and the recipe's **first** assertion
+  failed — reporting that **the adoption ceiling is not in force**, with a green
+  gate's own findings printed underneath. Measured failure is in the report §1b.
+- **Verified both directions on the recipe itself**, same fixture, minutes
+  apart: with the conversion, `failures=1` and the failure above; with it
+  reverted, `PASS self_test: breakage 59: … stayed green and named the debt` and
+  `failures=0`.
+- **The six `expect_red_check` conversions (2, 2b, 3, 4, 5, 6) are sound**,
+  measured one at a time on their own mutated trees, and independently covered
+  by an unsharded run that reached breakage 23 with every recipe a PASS.
+  Do not re-open them.
+- **`bash tests/validate.sh --static-only` → exit 0**, `PASS: every check
+  passed.` The two FAILs handoff-02 §5 recorded are **gone**: both named
+  `wt-m39-core-rls-scan-01`, another session's live worktree that was parked
+  inside this one and is not there now.
+- `bash -n` clean, `shellcheck -S warning` clean. Counts `tests/validate.sh`
+  derives from `tests/self_test.sh` are **unchanged: 94 breakages, 92 reds**.
+- **`tests/validate.sh` is not modified in `0399c23`.** The gate's printed
+  output is byte-for-byte what it was.
 
-## Measured, and what it says about the plan
+## The correction that matters — handoff-02 §2 was wrong
 
-| | |
-| --- | --- |
-| one child gate, unfiltered `--static-only` | **42.70 s** |
-| one child gate, `--only` one check | **7.88 s** |
-| the 6 converted recipes, each on its own mutated tree | **7.87 s mean** |
-| this packet's total saving | **~221 s (~3.7 min)** |
-| `self_test` | **~17 min before, ~13 min after** — not the 82 the handoff claimed |
+It said:
 
-## Two things that will waste an hour if nobody says them
+> `$want` and the label are only the same string in two of the three helpers.
+> `expect_red_check` and `expect_green_check` filter correctly because there
+> `$want` is the check's label.
 
-1. **Do not edit `tests/self_test.sh` while an instance of it is running.** This
-   packet did, and the log ends `exit 127` at `line 2375: eck: command not
-   found` — bash reads a script incrementally by byte offset, so a rewrite
-   mid-run makes it resume mid-line. That is not a defect in the tree; every
-   recipe up to breakage 31b is valid evidence and everything after it is absent.
-2. **`$want` and the label are only the same string in two of the three
-   helpers.** `expect_red_check` and `expect_green_check` filter correctly
-   because there `$want` is the check's label. `expect_skip_check`'s is the
-   verdict text, and the mismatch fails a green proof (23b). If a fourth helper
-   ever wants a filter, check that first.
+**Both halves of the second sentence are wrong.** `$want` in
+`expect_green_check` *is* the label, and that is exactly why the filter fails:
+it is a label belonging to a `report`, and no `--only` value selects a
+`report`.
+
+The rule that replaces it:
+
+> **`--only` reaches `check`, `check_par`, `report_par` and `bounded_check`, and
+> nothing else.** Whether `$want` *is* the label is a necessary condition and not
+> a sufficient one. Ask instead **which helper emits the verdict**, because that
+> is what decides reachability.
+
+Three sites now say this in the file — breakage 1, `expect_skip_check`,
+`expect_green_check`. It was rediscovered once per packet until this one wrote
+it down three times.
 
 ## Half-done, and why
 
-- **The full `bash tests/validate.sh` was not re-run.** It does not fit beside a
-  bounded `self_test` in one hour, and the packet allows the committed BEFORE
-  numbers as the comparison. The report's full-gate figure is **arithmetic on
-  measured parts** and is labelled that way in all four places it appears.
-  `logs-profile-after.tsv` was **not** written; there is no AFTER TSV in this
-  branch.
-- **The bounded `self_test` run did not reach the end.** It reached breakage ~23
-  of 94 in 900 s on a box running several gates at once — ~15 s per recipe there
-  against 7.87 s measured in isolation. Breakages 24–92 are **unexercised by this
-  packet**. They were not touched by the commit (only the three helpers' argument
-  handling changed, and `expect_red_check`, which carries 73 of them, is
-  untouched), but "unexercised" is the honest word. `AGENTS.md` says what to do
-  about a `BOUND` self_test: run the unreached recipes by hand.
-- **The worktree's own root gate exits 1**, on two FAILs that name
-  `wt-m39-core-rls-scan-01` — another session's live git worktree parked inside
-  this one (created 21:46, on `worker/core-rls-scan-01`, still being written to).
-  Not mine, not touched; `fresh_copy` copies a fixed path list that excludes it,
-  so every child gate and every proof in this packet ran on a clean tree. It
-  should disappear when that session ends. **If it is still there, the root gate
-  is red for that reason and nothing else.**
+- **No single unsharded `bash tests/self_test.sh` finished inside the hour, and
+  this report does not claim one.** The packet budgets ~13 min; measured here an
+  unsharded run reached **breakage 23 in ~15 min** with every recipe a PASS,
+  projecting ~55–60 min for all 94 on this box. Full coverage was instead taken
+  with the harness's own `KIT_SELF_TEST_SHARD=1/4` × 4 shards — **all four, so
+  every recipe ran** — and the numbers are in report §4c. That is *sharded*
+  coverage, not one continuous run, and the distinction is the whole honesty
+  clause on that feature.
+- `no_telemetry_in_readiness.sh` (63 s) and `stack_live_test.sh` (44 s) are
+  **still untouched** — 2.2% of the corrected run, last, as planned.
 
 ## The next worker's first move
 
-**Overlap the child gates. Do not touch `--only` again — it is done.**
+**Overlap the child gates. Do not touch `--only` again — it is done, twice over.**
 
-1. **The 73 already-filtered child gates are 85% of `self_test`** (73 × 7.87 s of
-   ~774 s), and they are independent by construction: `fresh_copy` gives every
-   breakage its own parent directory precisely so they cannot see each other.
-   `KIT_SELF_TEST_SHARD` already exists (`tests/self_test.sh`, `_shard_claims`)
-   and is the natural seam — a bounded pool of `n` parallel workers, one shard
-   each. **Four workers is the obvious first number to try**, and the honest
-   ceiling is `min(4, cores)`; measure cores before choosing it.
-2. **A shard run must not change the summary.** `_shard_ran` and
-   `_shard_claimed_total` already exist for this; the risk is a shard reporting
-   a number that is true for itself and false for the suite.
-3. Only then `no_telemetry_in_readiness.sh` (63 s) and `stack_live_test.sh`
-   (44 s) — 2.2% of the corrected run. Worth doing last, as planned.
+1. **The filtered child gates are ~85% of `self_test`** (73 × 7.87 s of ~774 s)
+   and are independent by construction: `fresh_copy` gives every breakage its own
+   parent directory precisely so they cannot see each other.
+   `KIT_SELF_TEST_SHARD` already exists (`_shard_claims`) and is the seam.
+   **This packet proved the seam works** — four shards ran the whole suite
+   inside one hour, which one unsharded run could not. Measure `cores` before
+   choosing the pool size; `min(4, cores)` is the first number to try.
+2. **The shard key is the breakage NUMBER, not the line number** (`_shard_claims`),
+   so adding a recipe does not silently move every later recipe into a different
+   shard. Keep it that way.
+3. **A shard must not report a number that is true for itself and false for the
+   suite.** `_shard_ran` and `_shard_claimed_total` exist for this; a shard that
+   ran nothing already fails. A run that executes *all* shards is the one case
+   that may claim the whole suite — and it must say it was sharded.
+4. Only then `no_telemetry_in_readiness.sh` and `stack_live_test.sh`.
 
-**Do not make `--only` reach `report`-based verdicts to serve breakage 1.** It
-would mean threading a filter through every `report` call site in a 10,554-line
-gate, for 35 s. Measured and left alone, and the report says so.
+**Do not make `--only` reach `report`-based verdicts** to serve breakage 1 or 59.
+It means threading a filter through every `report` call site in a 10,554-line
+gate, changing which lines print under a filter, for ~35 s each. Measured and
+declined twice now.
 
-## The measurement to distrust in `PROFILE-gate.md`
+**Do not weaken the no-match rule** (`tests/validate.sh:10527`) to make a
+converted recipe pass. It is the entire safety net under `--only`: a filter that
+names nothing runs nothing and proves nothing. The failure this packet chased was
+*caused* by that rule doing its job.
 
-Its headline — `self_test` is ~96% of the run, ~4,905 s — is **arithmetic from a
-bad mean**. The four child gates that finished before that run was killed were
-breakages 1, 2, 2b and 3, and **all four already paid the full static phase**;
-the 51.63 s mean was then applied to all 94 as though none were filtered. The
-corrected population is two numbers, 42.70 s and 7.88 s, and §2 of the report has
-the arithmetic. Its §4 is right and this packet acted on it; its table and its
-first three answers should be re-derived before anyone quotes them again.
+## Still to distrust
+
+**`PROFILE-gate.md`'s headline** — `self_test` is ~96% of the run, ~4,905 s — is
+**arithmetic from a bad mean** (see handoff-02, which has the working). Its §4
+is right and the earlier packet acted on it; its table and first three answers
+should be re-derived before anyone quotes them again. This packet added no TSV.
+
+**`logs-self-test-after.log`** (committed by `ab25775`) is a **truncated** run
+that ends `exit 127` mid-line. Every recipe up to breakage 31b in it is valid
+evidence; nothing after it exists. Do not read it as a complete suite.
