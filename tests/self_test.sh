@@ -1731,7 +1731,16 @@ expect_red_check 'breakage 11: a Dockerfile pins nothing (hadolint DL3013)' \
 #     present and wrong, and a missing USER is silence. This is the check that
 #     has to exist precisely because the real parser cannot cover it.
 twelve="$(fresh_copy dockerfile-as-root)"
-edit "$twelve/docker/Dockerfile.go" 'USER nonroot:nonroot' '# USER removed'
+# `USER 65532:65532`, not `USER nonroot:nonroot`. The Go runtime stage stopped
+# naming distroless's user when it moved to `debian:*-slim` — distroless ships
+# that account, Debian does not, and a Dockerfile that names a user the base does
+# not have fails at `docker run`, not at build — so the line became numeric. The
+# recipe did not fail quietly when it stopped matching: it printed "breakage no
+# longer applies", which is the behaviour this suite wants, and then failed the
+# run. Which is the right outcome, and the reason this comment exists: a recipe
+# whose subject moved is a proof of nothing, and the loud version of that is
+# better than the quiet version but is still a red gate.
+edit "$twelve/docker/Dockerfile.go" 'USER 65532:65532' '# USER removed'
 expect_red_check 'breakage 12: a Dockerfile final stage runs as root' \
   "$twelve" "$DOCKERLINT" --static-only
 
