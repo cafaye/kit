@@ -3345,6 +3345,13 @@ fi
 #   claim that they held, which is why the sentence says "hold" and why the
 #   unevaluated case is fatal rather than footnoted.
 if [ -n "$_shard_i" ]; then
+  # The suite's size, counted from THIS SOURCE rather than from a running
+  # total. A shard does not run every recipe, so a counter incremented as
+  # recipes execute would report the shard's OWN count here and print
+  # "ran N of N" -- true of every shard, and a claim about the suite made by a
+  # run that never saw the suite. Counted the same way the un-sharded summary
+  # below counts it, so both agree on what "the suite" means.
+  total=$(grep -cE '^ *expect_(red(_check|_lang|_script)?|skip_check|green_check) +.breakage +[0-9]+[a-z]*:' "$0" || true)
   # A SHARD, not the suite. This line is deliberately NOT the sentence above: a
   # sharded run has not evaluated every breakage, so claiming it did is the one
   # false statement available here. It reports the shard, how many recipes it
