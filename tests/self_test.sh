@@ -305,41 +305,71 @@
 #         its OWN service, which is the legitimate case — so the check also
 #         proves it stays quiet about that, on every fixture recipe in this
 #         file, without a separate control.
-# 61-65. THE KAMAL CONFIG, which is the one place kit generates YAML that a
+# 78-82. THE KAMAL CONFIG, which is the one place kit generates YAML that a
 #         THIRD-PARTY BINARY has to accept. Everything else kit hands out is
 #         read by the service's own toolchain; this is read by `kamal` and
 #         `kamal-backup`, so a template can be valid YAML, parse cleanly, and
 #         still be a config neither tool will take.
-#           61. the generated deploy.yml made INVALID for kamal -> the
+#
+#         RENUMBERED, and the header was not moved with it. This block read
+#         `61-65` and described these five at 61, 62, 63, 64 and 65; the recipes
+#         were renumbered to 78-82 (4a037f3, whose own body note records the
+#         collision that forced the move) and this header was left behind. The
+#         damage was not cosmetic and not confined to this block: 61 and 62 were
+#         REUSED, and by the LICENCE breakages below, which really do exist.
+#         So the header claimed two different sets of proofs under the same two
+#         numbers, and `self_test_claims` — which exists precisely to catch a
+#         block of prose drifting from the recipes — reported both directions at
+#         once: "header documents breakage 63 but no recipe carries it" and
+#         "recipe proves breakage 78 but the header does not document it". Six
+#         findings from one unrenumbered comment, on master, with the integrity
+#         check itself being the thing that found it.
+#           78. the generated deploy.yml made INVALID for kamal -> the
 #                kamal_test check goes red. `builder.arch` is the mutation
 #                because it is a real one: removing it is valid YAML, and kamal
 #                refuses the file outright ("Builder arch not set").
-#           62. the image name given the registry host it already has ->
+#           79. the image name given the registry host it already has ->
 #                kamal_test goes red. The sharpest of the five, and the one no
 #                parse check could ever have caught: `image: ghcr.io/org/repo`
 #                with `registry.server: ghcr.io` resolves to
 #                `ghcr.io/ghcr.io/org/repo`. Both files are valid, `kamal
 #                config` exits 0, and the deploy fails at the push.
-#           63. one kamal/ artifact DELETED -> the presence check goes red.
+#           80. one kamal/ artifact DELETED -> the presence check goes red.
 #                Half a set is worse than none, and here the two configs are one
 #                contract rather than two files.
-#           64. the superseded custom backup toolchain RESTORED -> the
+#           81. the superseded custom backup toolchain RESTORED -> the
 #                must-be-gone check goes red. The only breakage here that is
 #                about something being PRESENT, and it exists because "we
 #                removed it" is a claim with no mechanical form until something
 #                asserts the absence.
-#           65. the drill's refusal of a production-looking scratch name WEAKENED
+#           82. the drill's refusal of a production-looking scratch name WEAKENED
 #                -> kamal_test goes red. The safety property, mutated the way a
 #                well-meaning commit would mutate it: the `*prod*` pattern
 #                narrowed so the common names still match and the awkward one
 #                does not.
 #
-#   ...and one GREEN control for the Kamal work, 61b: an UNMODIFIED tree's
+#   ...and one GREEN control for the Kamal work, 78b: an UNMODIFIED tree's
 #        generated config must PASS kamal and kamal-backup. Every other recipe
 #        here proves a check can go red; this proves the thing they are all
 #        measured against actually works, which is the half that decays without
 #        a symptom. It is written as prose rather than numbered because
 #        `self_test_claims` counts only the red-expecting helpers.
+#
+# 84-87. THE SHARED CLUSTER, and specifically the two defects that meant no
+#         service in the fleet ever had a database on it while reporting itself
+#         healthy. Prose for these lives with the recipes, far below and out of
+#         this header, because they were added long after the numbers were first
+#         laid out; the entry is here only so the set agrees. 83 is NOT in this
+#         block and 84-87 do not include it: kit-29 claimed 83 for the
+#         superuser-override check in a different worktree, and two packets
+#         numbering a breakage the same way is precisely what makes this header
+#         unable to say which recipe a line describes.
+#
+#         87 is the fourth because removing the `:-` fallback from
+#         `KIT_POSTGRES_DATABASES` — which is what 84-86 exist to insist on —
+#         turned out to break kit's OWN live harness, and 214 static checks and
+#         86 proofs did not notice. So the rule now covers kit's own harnesses
+#         too, statically, and 87 is the proof that it does.
 #
 # 61-62. THE LICENCE, in the two ways the grant stops being unambiguous. A
 #         licence is only unambiguous when exactly ONE place in a repository can
@@ -1074,6 +1104,15 @@ expect_skip_check() {
 # the same trap `expect_red_lang` documents, and the reason it is written out
 # again here rather than shared: the harness has no library.
 expect_green() {
+  # Shard guard: a recipe outside this shard is not run at all, and is not
+  # counted as a pass. See KIT_SELF_TEST_SHARD above. Every sibling helper has
+  # this; this one did not, which is why it was worth writing down rather than
+  # fixing silently — a helper that does not count is a helper a sharded run
+  # silently skips while still claiming a number.
+  if ! _shard_claims "$1"; then
+    return 0
+  fi
+  _shard_ran=$((_shard_ran + 1))
   local label="$1" dir="$2"
   shift 2
   local out ec=0
@@ -3146,6 +3185,100 @@ if command -v kamal >/dev/null 2>&1 && command -v kamal-backup >/dev/null 2>&1; 
     '*prod* | *PROD* | *live* | *LIVE*)' '*production* | *PROD* | *live* | *LIVE*)'
   expect_red_check 'breakage 82: the drill stops refusing a production-looking scratch name' \
     "$sixtyfive" "$KAMALCHECK" --static-only
+
+  # 84-86. The two defects that meant the shared cluster provisioned nothing,
+  # both proven able to come back. They are here as three recipes rather than
+  # one because they are three SEPARATE rules, and one recipe proving one of
+  # them red says nothing about the other two - which is the exact shape of the
+  # original miss, where a check over a hand-written list of five vendor configs
+  # never mentioned the postgres service.
+  #
+  # NUMBERED 84-86, NOT 83-85, and 83 belongs to someone else. kit-29 added
+  # `breakage 83: a service overrides the shared cluster POSTGRES_USER` for the
+  # superuser-override check, independently and in a different worktree, so two
+  # packets claimed 83. Numbering is not cosmetic here: `self_test_claims`
+  # cross-checks the header against the recipes, so a duplicate does not merely
+  # read badly - it makes the integrity check unable to say which recipe a
+  # header line is claiming. 83 was already reviewed and committed as e88c345,
+  # so these three moved up. If you are adding a recipe, take the next free
+  # number above BOTH this block and whatever e88c345 carries.
+  #
+  # THE WHOLE CHECK LABEL, PREFIX INCLUDED, and that is not fussiness.
+  # `expect_red_check` asserts on the literal string `FAIL $want`, and the gate
+  # prints the check's registered name - which is `check '<label>' <fn>` and
+  # begins with the PATH, not with the prose. So `want` has to be the whole
+  # registered name or the comparison is looking for `FAIL every vendor config
+  # ...` inside a line that reads `FAIL templates/compose/ + bin/dev  (every
+  # vendor config ...`. I wrote both of these as the prose alone and both
+  # reported "the gate went red, but NOT via <the named check>" while the log
+  # right underneath showed the named check red. The mutation had worked; the
+  # harness was reading the wrong string. The trailing paren closes the label.
+  STACKMOUNT='templates/compose/ + bin/dev  (every vendor config mounts from the fetched tree)'
+  ENVTENANT='templates/compose/.env.example  (every placeholder documented, no tenant named)'
+  HARNESSTENANT='kit harnesses  (every .env-writing harness declares its own tenant)'
+
+  # 84. The initdb mount goes back to being relative. Docker CREATES a missing
+  # bind source as an empty directory, so this mutation cannot fail visibly at
+  # runtime - the cluster comes up healthy with no roles and no databases. The
+  # whole reason it needs a static proof is that its failure has no symptom.
+  eightythree="$(fresh_copy postgres-initdb-mount-relative)"
+  edit "$eightythree/templates/compose/docker-compose.yml" \
+    $'\n      - ${KIT_COMPOSE_DIR:-.}/postgres/initdb:/docker-entrypoint-initdb.d:ro' \
+    $'\n      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro'
+  expect_red_check 'breakage 84: the initdb mount is relative again, so the cluster provisions nothing' \
+    "$eightythree" "$STACKMOUNT" --static-only
+
+  # 85. `.env.example` names a tenant again. This is the one that reads as a
+  # helpful default: a literal service name in a shared-cluster template looks
+  # like an example, and `bin/dev` copies it verbatim into every adopter's
+  # git-ignored `.env`, where Compose prefers it over the adopting service's own
+  # committed compose file. The service's declaration stops applying and nothing
+  # is in any diff.
+  eightythree="$(fresh_copy env-example-names-a-tenant)"
+  #     ANCHORED AT LINE START, with a leading newline, and that is the whole
+  #     difference between this proving the rule and proving nothing. `edit` is a
+  #     `body.replace(old, new, 1)`, so it takes the FIRST match anywhere in the
+  #     file - and `.env.example` line 164 is a COMMENT that quotes the very
+  #     string this recipe is looking for: "This file used to say
+  #     `KIT_POSTGRES_DATABASES=courier`". So the unanchored recipe rewrote the
+  #     sentence describing the defect, left the assignment empty, and the gate
+  #     correctly stayed GREEN. The recipe reported that as the mutation
+  #     escaping, which is the worst possible shape: a green gate blamed for a
+  #     proof that never touched the thing it names. Verified unique - one
+  #     occurrence each - so this is an anchor and not a coincidence.
+  edit "$eightythree/templates/compose/.env.example" \
+    $'\nKIT_POSTGRES_DATABASES=' $'\nKIT_POSTGRES_DATABASES=courier'
+  expect_red_check 'breakage 85: .env.example names a service as the fleet default tenant' \
+    "$eightythree" "$ENVTENANT" --static-only
+
+  # 86. And the compose file's own fallback names one. Kept separate from 84
+  # because they are caught by different halves of the same rule, and because
+  # fixing only the .env leaves a template that still hands a real service's
+  # database to any adopter that does not override it.
+  eightythree="$(fresh_copy compose-default-names-a-tenant)"
+  edit "$eightythree/templates/compose/docker-compose.yml" \
+    'KIT_POSTGRES_DATABASES: ${KIT_POSTGRES_DATABASES}' \
+    'KIT_POSTGRES_DATABASES: ${KIT_POSTGRES_DATABASES:-courier}'
+  expect_red_check 'breakage 86: the shared template defaults the tenant list to one of its own services' \
+    "$eightythree" "$ENVTENANT" --static-only
+
+  # 87. And kit's own harness stops declaring its tenant.
+  #
+  # This one is here because of a regression that every other check in the suite
+  # passed straight through. Removing the `:-` fallback above was CORRECT, and it
+  # broke `tests/stack_live_test.sh`, which had never declared a tenant because
+  # for its whole life the fallback had been doing it. 214 static checks and 86
+  # proofs were green. The stack live test was not, and it took ten minutes and
+  # eight containers to say so.
+  #
+  # So the rule now also holds for kit's own harnesses, statically. What this
+  # recipe is really proving is that the static rule catches the mistake the
+  # live test caught — one second instead of ten minutes, and with no docker.
+  eightythree="$(fresh_copy harness-stops-declaring-its-tenant)"
+  edit "$eightythree/tests/stack_live_test.sh" \
+    $'\nKIT_POSTGRES_DATABASES=kit_probe' ''
+  expect_red_check 'breakage 87: a .env-writing harness stops declaring its tenant' \
+    "$eightythree" "$HARNESSTENANT" --static-only
 else
   # SKIPPED, and loudly, because a skipped proof is not a proof. The recipes above
   # are the only place kit asserts that its generated config is ACCEPTED by the
@@ -3155,6 +3288,46 @@ else
   printf 'SKIP self_test: breakages 78-82 — kamal or kamal-backup is not installed\n'
   skips=$((skips + 1))
 fi
+
+
+# ---------------------------------------------------------------------------
+# 88: the SECOND tenant.
+#
+# Every other recipe in this file proves that ONE service gets a database. This
+# one is the first to ask what happens when a second name is appended, and it
+# exists because that question had never been asked and the answer was wrong.
+#
+# The defect was measured on a live cluster, not inferred:
+#
+#   $ KIT_POSTGRES_DATABASES="billing neighbour" bin/dev up
+#   postgres-1 | [cluster] provisioning billingneighbour
+#   postgres-1 | [cluster] done: 1 service database(s), one role each, PUBLIC holds CONNECT on none of them
+#
+# One database, named after BOTH services fused together, and a stack reporting
+# success. `require_identifier` — whose own comment names "builds one identifier
+# out of two tokens" as the failure worth preventing — could not see it, because
+# the `tr -d '[:space:]'` in front of it DELETED the space first and handed the
+# validator a perfectly legal identifier. Every check that could have caught
+# this was looking at a single name.
+#
+# That is the shape of the blind spot, and it is worth stating plainly: this
+# suite proved the one-cluster promise for the first tenant and was silent about
+# the second. A fleet of nine services is nine repetitions of a case nobody had
+# run twice.
+#
+# The proof runs the real `10-cluster.sh` with the real `psql` stubbed by a
+# recording function, so it asserts the actual parse — which names it
+# provisions and whether it refuses — without needing a container or a volume.
+# ---------------------------------------------------------------------------
+
+base88="$(fresh_copy kit-88)"
+# Put the OLD parse back: strip ALL whitespace, so two names fuse into one.
+edit "$base88/templates/compose/postgres/initdb/10-cluster.sh" \
+  'service="$trimmed"' \
+  'service="$(printf '"'"'%s'"'"' "$entry" | tr -d '"'"'[:space:]'"'"')"'
+expect_red_script 'breakage 88: two tenants separated by a space fuse into one database' \
+  "$base88" tests/multi_tenant_split_test.sh '' \
+  'REFUSING'
 
 
 # ---------------------------------------------------------------------------
@@ -3197,8 +3370,18 @@ expect_red_check 'breakage 69: the cluster is pinned back to an alpine variant' 
   "$base69" 'postgres tag  (.env.example and compose agree' --static-only
 
 base70="$(fresh_copy kit-70)"
+# The search string carries the FIXED form of the line. It did not used to, and
+# that is worth recording because the failure mode was silent in the worst way:
+# `edit` `sys.exit`s when its search string is absent, so when the P0 fix
+# changed the mount from a bare `./postgres/initdb` to
+# `${KIT_COMPOSE_DIR:-.}/postgres/initdb` this recipe stopped matching and the
+# whole suite DIED partway through, mid-run, after sixty-odd breakages had
+# already been reported green. A harness that stops is not a harness that
+# reports. Breakage 83 is the same mutation with the opposite polarity - it puts
+# the bare form back and asserts the NEW rule catches it - so the two together
+# now say both halves: the fixed line is accepted, and the reverted line is not.
 edit "$base70/templates/compose/docker-compose.yml" \
-  '      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
+  '      - ${KIT_COMPOSE_DIR:-.}/postgres/initdb:/docker-entrypoint-initdb.d:ro
 ' ''
 expect_red_check 'breakage 70: the init script is never mounted, so no service gets a database' \
   "$base70" 'the cluster  (one database + role per service' --static-only
@@ -3451,5 +3634,42 @@ fi
 counted=$(grep -cE '^ *expect_red(_check|_lang|_script)? +.breakage +[0-9]+[a-z]*:' "$0" || true)
 total=$(grep -cE '^ *expect_(red|green)(_check|_lang|_script)? +.breakage +[0-9]+[a-z]*:|^ *expect_skip_check +.breakage +[0-9]+[a-z]*:' "$0" || true)
 green_check=$(grep -cE '^ *expect_green_check +.breakage +[0-9]+[a-z]*:' "$0" || true)
+
+# THE CLAIM BELOW IS "EVERY RECIPE WAS EVALUATED", AND UNTIL THIS LINE IT WAS
+# NOT CHECKED. It was asserted from the SOURCE — `total` is a `grep` of the
+# recipes this file contains — while the number of recipes that actually RAN was
+# never compared to it. That is the same false statement the shard guard above
+# exists to prevent, one level up: a shard that ran nothing is caught, but a
+# FULL run that stopped early is not.
+#
+# Measured, on this machine, with the disk full:
+#
+#   $ bash tests/self_test.sh; echo "EXIT=$?"
+#   … PASS self_test: breakage 78: the generated deploy.yml is invalid for kamal
+#   tests/self_test.sh: line 682: cannot create temp file for here document: No space left on device
+#   EXIT=0
+#
+# EXIT=0. Eighty-nine recipes in the file, the run reached seventy-eight, and the
+# shell reported success — because `cp` failing inside the suite is not the suite
+# failing, and nothing between the first recipe and this summary noticed. The
+# eleven unevaluated breakages included the one added for the multi-tenant split,
+# so the run that was supposed to prove that fix proved nothing about it.
+#
+# A suite whose failure mode is "stops early and says PASS" is worse than no
+# suite, because it is believed. So the count of recipes that RAN is now compared
+# against the count that EXIST, and a shortfall is a failure in its own right —
+# named as a shortfall, because "the suite failed" would send somebody looking for
+# a broken check instead of at the eleven proofs that never ran.
+if [ "$_shard_ran" -ne "$total" ]; then
+  echo "FAIL: self_test — the file declares $total breakage(s) but only $_shard_ran were EVALUATED."
+  echo "       $((total - _shard_ran)) recipe(s) never ran. A suite that stops early and"
+  echo "       reports success is worse than no suite, because it is believed."
+  echo "       Look for an environment failure ABOVE this line (a full disk, a missing"
+  echo "       tool, a deleted worktree) rather than for a broken check: the checks that"
+  echo "       would have reported a defect are among the ones that never ran."
+  echo "       Skipped for a missing toolchain: $skips"
+  exit 1
+fi
+
 echo "PASS: self_test — all $total breakages hold ($counted assert red, $((total - counted - green_check)) assert a green gate with a named skip, $green_check assert a green gate with a named finding), and the unbroken tree is green."
-echo "       Every recipe above was EVALUATED: 0 environment failures, 0 skipped for a missing toolchain."
+echo "       Every recipe above was EVALUATED — $_shard_ran ran against $total declared, and the two are compared rather than assumed: 0 environment failures, 0 skipped for a missing toolchain."
