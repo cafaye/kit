@@ -12,6 +12,31 @@ it without a copy (see kit-12 below).
 > `workflows/ci.reusable.yml` until the move recorded in Unreleased/Changed.
 
 ## Unreleased
+
+### Fixed
+
+- **`KIT_SELF_TEST_SHARD=n/n` verified NOTHING and reported PASS.** The shard
+  index a caller passes is 1-based (`1/4` … `4/4`) and the shard key was
+  computed as `num % n`, which lands in `0..n-1`. Shard `n/n` therefore asked for
+  a residue class nobody is in, matched no breakage, ran zero recipes and — the
+  part that mattered — was reported green by a four-way merge gate that had
+  covered three quarters of the suite and said "all four shards green". The key
+  is now `((num - 1) % n + 1)`, 1-based at both ends.
+  - `i` is refused outside `1..n`, including the `0/n` spelling that used to mean
+    "the shard carrying the unnumbered controls". Those controls now run on shard
+    `1/n`.
+  - An **over-provisioned** `n` — one above the suite's highest breakage number —
+    is refused at the door with both numbers rather than discovered at the end of
+    a run that verified nothing.
+  - `tests/shard_test.sh` (new) evaluates the real `_shard_claims` out of
+    `tests/self_test.sh` and proves the n shards partition the suite exactly once
+    for n in 1, 2, 3, 4, 5, 7, 8 and the largest gap-free n. It runs in ~23s and
+    asserts the refusals above.
+  - Measured: with 97 breakages numbered 1..93 sparsely, the largest n with no
+    empty shard is **62** — breakage numbers 63..67 are unused, so `n` in 64..93
+    leaves a shard empty. That case is reported as a FAIL by the summary, not a
+    PASS.
+
 ### Added — `security_definer_view`, the one ERROR/SEC rule the advisor never carried
 
 - **`templates/database/tenancy/advisor.sql` gains a ninth rule**, and the header
