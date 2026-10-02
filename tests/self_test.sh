@@ -395,6 +395,14 @@
 #         defect, different fix — and a header number that covers two of those
 #         is a number that cannot say which recipe a line describes.
 #
+# 89. THE REUSABLE WORKFLOW'S OWN SCHEMA, which every service inherits by CALLING
+#         it rather than copying it — which is the property that makes one bad
+#         input here a fleet-wide outage rather than a local bug. `workflow_call`
+#         inputs do not accept an `options:` block the way `workflow_dispatch`
+#         inputs do, and GitHub rejects the FILE for it: not a warning on one
+#         input, but a workflow that will not load at all, so every service that
+#         calls it fails before a single job starts.
+#
 # 61-62. THE LICENCE, in the two ways the grant stops being unambiguous. A
 #         licence is only unambiguous when exactly ONE place in a repository can
 #         declare one.
@@ -3398,9 +3406,19 @@ base88="$(fresh_copy kit-88)"
 edit "$base88/templates/compose/postgres/initdb/10-cluster.sh" \
   'trimmed="$(printf '"'"'%s'"'"' "$entry" | sed -e '"'"'s/^[[:space:]]*//'"'"' -e '"'"'s/[[:space:]]*$//'"'"')"' \
   'trimmed="$(printf '"'"'%s'"'"' "$entry" | tr -d '"'"'[:space:]'"'"')"'
+# The needle is the FUSED NAME, not `REFUSING`. Those are not interchangeable, and
+# picking the wrong one is how a proof that genuinely works still gets reported as
+# broken: with the mutation above, the test goes red because the script exited 0
+# having provisioned one database called `billingneighbour`, and that sentence
+# never says REFUSING. A needle naming the refusal would have sent the harness
+# looking for evidence the defect does not produce.
+#
+# `billingneighbour` appears in exactly two failure messages -- "provisioned:
+# billingneighbour" and "the refusal did not create the fused database" -- and in
+# neither on a green run, so it pins the defect rather than the file's mood.
 expect_red_script 'breakage 88: two tenants separated by a space fuse into one database' \
   "$base88" tests/multi_tenant_split_test.sh '' \
-  'REFUSING'
+  'billingneighbour'
 
 
 # ---------------------------------------------------------------------------
