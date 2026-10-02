@@ -1068,6 +1068,15 @@ expect_skip_check() {
 # the same trap `expect_red_lang` documents, and the reason it is written out
 # again here rather than shared: the harness has no library.
 expect_green() {
+  # Shard guard: a recipe outside this shard is not run at all, and is not
+  # counted as a pass. See KIT_SELF_TEST_SHARD above. Every sibling helper has
+  # this; this one did not, which is why it was worth writing down rather than
+  # fixing silently — a helper that does not count is a helper a sharded run
+  # silently skips while still claiming a number.
+  if ! _shard_claims "$1"; then
+    return 0
+  fi
+  _shard_ran=$((_shard_ran + 1))
   local label="$1" dir="$2"
   shift 2
   local out ec=0
@@ -3556,5 +3565,42 @@ fi
 counted=$(grep -cE '^ *expect_red(_check|_lang|_script)? +.breakage +[0-9]+[a-z]*:' "$0" || true)
 total=$(grep -cE '^ *expect_(red|green)(_check|_lang|_script)? +.breakage +[0-9]+[a-z]*:|^ *expect_skip_check +.breakage +[0-9]+[a-z]*:' "$0" || true)
 green_check=$(grep -cE '^ *expect_green_check +.breakage +[0-9]+[a-z]*:' "$0" || true)
+
+# THE CLAIM BELOW IS "EVERY RECIPE WAS EVALUATED", AND UNTIL THIS LINE IT WAS
+# NOT CHECKED. It was asserted from the SOURCE — `total` is a `grep` of the
+# recipes this file contains — while the number of recipes that actually RAN was
+# never compared to it. That is the same false statement the shard guard above
+# exists to prevent, one level up: a shard that ran nothing is caught, but a
+# FULL run that stopped early is not.
+#
+# Measured, on this machine, with the disk full:
+#
+#   $ bash tests/self_test.sh; echo "EXIT=$?"
+#   … PASS self_test: breakage 78: the generated deploy.yml is invalid for kamal
+#   tests/self_test.sh: line 682: cannot create temp file for here document: No space left on device
+#   EXIT=0
+#
+# EXIT=0. Eighty-nine recipes in the file, the run reached seventy-eight, and the
+# shell reported success — because `cp` failing inside the suite is not the suite
+# failing, and nothing between the first recipe and this summary noticed. The
+# eleven unevaluated breakages included the one added for the multi-tenant split,
+# so the run that was supposed to prove that fix proved nothing about it.
+#
+# A suite whose failure mode is "stops early and says PASS" is worse than no
+# suite, because it is believed. So the count of recipes that RAN is now compared
+# against the count that EXIST, and a shortfall is a failure in its own right —
+# named as a shortfall, because "the suite failed" would send somebody looking for
+# a broken check instead of at the eleven proofs that never ran.
+if [ "$_shard_ran" -ne "$total" ]; then
+  echo "FAIL: self_test — the file declares $total breakage(s) but only $_shard_ran were EVALUATED."
+  echo "       $((total - _shard_ran)) recipe(s) never ran. A suite that stops early and"
+  echo "       reports success is worse than no suite, because it is believed."
+  echo "       Look for an environment failure ABOVE this line (a full disk, a missing"
+  echo "       tool, a deleted worktree) rather than for a broken check: the checks that"
+  echo "       would have reported a defect are among the ones that never ran."
+  echo "       Skipped for a missing toolchain: $skips"
+  exit 1
+fi
+
 echo "PASS: self_test — all $total breakages hold ($counted assert red, $((total - counted - green_check)) assert a green gate with a named skip, $green_check assert a green gate with a named finding), and the unbroken tree is green."
-echo "       Every recipe above was EVALUATED: 0 environment failures, 0 skipped for a missing toolchain."
+echo "       Every recipe above was EVALUATED — $_shard_ran ran against $total declared, and the two are compared rather than assumed: 0 environment failures, 0 skipped for a missing toolchain."
