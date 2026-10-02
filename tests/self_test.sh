@@ -11,7 +11,7 @@
 #   *different* check, so a passing self_test means the checks are independent
 #   and not one lucky assertion standing in for all of them.
 #
-# THE SEVENTY-SEVEN BREAKAGES, and one GREEN control (20 from the tier work, 21
+# THE SEVENTY-NINE BREAKAGES, and one GREEN control (20 from the tier work, 21
 #                               from the fan-out work, 24-26 from the fleet gate,
 #                               27-32c from the lint work, 33-40 from the
 #                               staleness/parity work, 41-51 from the secrets
@@ -19,7 +19,8 @@
 #                               from the licence, 68-74 from the shared-cluster
 #                               work, 75 from the rename that disarmed the
 #                               fleet check, 76-77 from the bin/dev commands the
-#                               documentation promises; 18 shared before the
+#                               documentation promises, 78-79 from the second
+#                               callable standard; 18 shared before the
 #                               lint packet)
 #   1. delete a language template   -> the artifact-presence check goes red
 #   68. .env.example's Postgres tag disagrees with compose's default -> the
@@ -48,6 +49,11 @@
 #        exist.
 #   77. `bin/dev` keeps the command but loses the SUBCOMMAND -> red. The harder
 #        half: a check that only asks "is `db` dispatched" is green here.
+#   78. a COPY of a declared standard parked at another path -> red. The
+#        original defect, still caught after kit-32 widened the check.
+#   79. a callable workflow at a path kit does not DECLARE -> red. The new one:
+#        the widening must exempt declared paths and nothing else, or it has
+#        stopped being a check.
 #   2. add a collector exporter    -> the privacy check goes red
 #   2b. DELETE the tempo exporter   -> the same check goes red from the other
 #        side. A set difference only catches the extra; this catches the
@@ -1606,7 +1612,7 @@ expect_red 'breakage 6: the `none` job is no longer gated on its own input' "$si
 #      stops being true while every other check stays green. Each names the
 #      specific check that must catch it, because "the gate went red" is a weak
 #      claim when the callable check is one of forty that could have gone red.
-CALLABLE='.github/workflows/ci.reusable.yml  (callable: exists, on: workflow_call, docs agree)'
+CALLABLE='reusable workflows  (callable: exists, on: workflow_call, docs agree)'
 
 # 7. The documented call points at a file that EXISTS. `ci.yml` is right there
 #    in the same directory, so a typo that resolves to a real path is invisible
@@ -3555,6 +3561,47 @@ open(path, "w", encoding="utf-8").write(
 PYEOF
 expect_red_check 'breakage 77: bin/dev takes a command whose subcommand four files promise is gone' \
   "$base77" 'bin/dev  (every command the documentation promises' --static-only
+
+# ---------------------------------------------------------------------------
+# 78-79: kit OWNS A SECOND CALLABLE STANDARD, AND THE WIDENED COPY CHECK IS
+#         STILL A COPY CHECK.
+#
+# kit-32 added `.github/workflows/image.reusable.yml` — the workflow that builds
+# a service's image and pushes it to ghcr.io — because nothing in the fleet
+# built the image `config/deploy.yml` deploys. Adding it made `callable_check`
+# go RED, naming a second copy of the CI standard where there was a second
+# STANDARD. The check's rule was "exactly one file may declare
+# `workflow_call`", which is a freeze dressed as a drift check, and kit-32
+# widened it: files at paths in REUSABLE_WORKFLOWS are exempt, and everything
+# else is judged on its parsed `name:`.
+#
+# A widened check is a check that might have been widened into uselessness, and
+# the only way to know is to break it in both directions it now claims to cover.
+# Two breakages rather than one, for that reason, and they must be caught by
+# DIFFERENT findings in the same check: 78 is the original defect (a parked
+# copy), 79 is the new one the widening made possible (a callable workflow
+# nobody declared).
+#
+# Without them the honest description of the widening would be "a check that had
+# been reporting a defect that did not exist now reports nothing at all", which
+# is a plausible sentence and, as far as anyone would know, an accurate one.
+# ---------------------------------------------------------------------------
+base78="$(fresh_copy kit-78)"
+cp "$base78/.github/workflows/ci.reusable.yml" \
+   "$base78/.github/workflows/ci-parked-elsewhere.yml"
+expect_red_check 'breakage 78: a COPY of a declared standard is parked where no caller can reach it' \
+  "$base78" "$CALLABLE" --static-only
+
+base79="$(fresh_copy kit-79)"
+# NOT a copy. A different `name:` is the whole point: this is the file kit-32
+# added, parked at a path nothing declares. Being under `.github/workflows/` was
+# never what exempted it — being at a DECLARED path is, which is exactly the
+# distinction the widening was supposed to preserve.
+printf -- '---\nname: image\non:\n  workflow_call:\njobs:\n  build:\n    runs-on: ubuntu-latest\n    steps:\n      - run: "true"\n' \
+  >"$base79/.github/workflows/image.yml"
+rm "$base79/.github/workflows/image.reusable.yml"
+expect_red_check 'breakage 79: a callable workflow ships at a path kit does not declare, so nothing polls it' \
+  "$base79" "$CALLABLE" --static-only
 
 printf '\n'
 # TWO skip kinds, counted apart, because they are two different problems and one
