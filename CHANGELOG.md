@@ -13,15 +13,64 @@ it without a copy (see kit-12 below).
 
 ## Unreleased
 
+### Fixed — the `--only` conversion on breakage 59, which could not have held
+
+- **`expect_green_check` no longer appends `--only=<the check the recipe names>`,
+  and breakage 59 runs the unfiltered gate again.** Its verdict is emitted by
+  `report`, not by `check`:
+
+      tests/validate.sh:5474  report PASS "fleet  (adopting repositories clean; …"
+
+  `--only` is applied inside `check`, `check_par`, `report_par` and
+  `bounded_check` — the four that spawn work. `report()` has no filter: every
+  `PASS`/`FAIL`/`SKIP` it emits is printed and counted unconditionally. So no
+  `--only` value could select it, and the gate's own no-match rule turned "the
+  filter matched nothing" into `exit 1`, which failed the recipe's **first**
+  assertion:
+
+      FAIL self_test: breakage 59: an UNADOPTED service copies the stack —
+        green, and named — the gate went RED (exit 1), so the ceiling is not in force
+             FAIL: --only='fleet  (adopting repositories clean;' selected NO check
+                    out of the suite.
+             87 check(s) were excluded.
+
+  Read that failure carefully, because it is the worst direction to be wrong in:
+  it **accuses the adoption ceiling of not being in force** and prints a green
+  gate's own findings underneath. The ceiling was in force throughout.
+
+- **It was the SEVENTH conversion, and the only one never measured.** The reach
+  table in `REPORT-kit-gate-speed-02.md` §4b walked the six `expect_red_check`
+  conversions plus a control. `expect_green_check` is a *different helper* with a
+  *different single caller*, so the conversion was made and never run. A
+  conversion nobody ran is a conversion nobody proved — the same lesson as
+  breakage 59's own history in that helper, which was once reported red because
+  the harness read the gate through a pipe.
+
+- **Cost, honestly: ~35 s on one recipe out of 94.** The alternative is a filter
+  that names nothing, or one naming an unrelated `check` while the verdict under
+  assertion is a `report` — a decoration on the command line that proves nothing
+  about the thing the recipe is about. That is the weakened gate this suite
+  exists to refuse, and it is the same trade already made for `expect_skip_check`
+  (23b).
+
+- **Verified both directions on the real recipe, not by reading the code:** with
+  the conversion present, breakage 59 fails with the output above and
+  `failures=1`; with it reverted, the same recipe on the same fixture prints
+  `PASS self_test: breakage 59: … stayed green and named the debt` and
+  `failures=0`.
+
 ### Changed — `--only` now reaches every recipe it can reach, and two helpers
   prove less than they did
 
 - **`tests/self_test.sh`: breakages 2, 2b, 3, 4, 5 and 6 now run
-  `expect_red_check`, and `expect_green_check` (59) and `expect_skip_check`
-  (23b) append `--only=<the check the recipe names>`** — the mechanism that was
-  already in `expect_red_check` and in nothing else. Measured on this machine: a
-  full `--static-only` gate run is **42.70 s** and a run filtered to one check is
-  **7.88 s**, so each converted recipe saves ~35 s.
+  `expect_red_check` and append `--only=<the check the recipe names>`** — the
+  mechanism that was already in `expect_red_check` and in nothing else. Measured
+  on this machine: a full `--static-only` gate run is **42.70 s** and a run
+  filtered to one check is **7.88 s**, so each converted recipe saves ~35 s.
+  **`expect_green_check` (59) and `expect_skip_check` (23b) were converted by
+  this packet too and have since been reverted** — see the Fixed entry above and
+  `git show ab25775`. Both name a verdict that is a `report`, and `--only`
+  cannot reach a `report`.
 
 - **Six proofs got STRONGER, not just faster.** `expect_red` asserts only "the
   gate went red", which is a weak claim when forty checks can make it red; all

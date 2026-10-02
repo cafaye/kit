@@ -1024,25 +1024,47 @@ expect_green_check() {
   local label="$1" dir="$2" want="$3" needle="$4"
   shift 4
   local out ec=0
-  # `--only=$want`, for the reason given in full at `expect_red_check`: this run is
-  # here to learn one fact about ONE named check, and the other ~213 cannot change
-  # its verdict. Measured on this machine, a full `--static-only` run is 42.70s
-  # and a run filtered to one check is 7.88s, so the filter is worth ~35s per
-  # recipe.
+  # DELIBERATELY NOT FILTERED, and this is `expect_skip_check`'s defect again,
+  # in the one helper whose reach table nobody ran.
   #
-  # It does not weaken the assertion BELOW, which still demands the gate exit 0,
-  # that the named check report PASS, and that it name the specific finding.
-  # Narrowing WHICH checks run is not loosening WHAT they must prove.
+  # `--only` matches a check's LABEL, and it is applied inside `check`,
+  # `check_par`, `report_par` and `bounded_check` — the four that spawn work.
+  # `report()` (`tests/validate.sh:351`) has no filter of its own: every
+  # `PASS`/`FAIL`/`SKIP` it emits is printed and counted unconditionally. The
+  # verdict this recipe names is emitted by a `report`:
   #
-  # Skipped when the caller supplied its own `--only`, because two filters would
-  # be an AND and a breakage naming a check its caller already filtered out would
-  # find nothing — and then this recipe would agree with a run that checked
-  # nothing, which is the vacuous pass `--only`'s own no-match rule exists to
-  # refuse.
-  case " $* " in
-    *" --only="*) ;;
-    *) set -- "$@" "--only=$want" ;;
-  esac
+  #     tests/validate.sh:5474  report PASS "fleet  (adopting repositories clean; …)"
+  #
+  # So no `--only` value can select it, and the gate's own no-match rule turns
+  # "selected NO check" into `exit 1` — which is the correct behaviour and which
+  # fails this recipe's FIRST assertion, on a filter rather than on a defect:
+  #
+  #     FAIL self_test: breakage 59: an UNADOPTED service copies the stack —
+  #       green, and named — the gate went RED (exit 1), so the ceiling is not in force
+  #            FAIL: --only='fleet  (adopting repositories clean;' selected NO check
+  #                   out of the suite.
+  #                   87 check(s) were excluded.
+  #
+  # Read that failure carefully, because it is the worst direction to be wrong
+  # in: it accuses the ADOPTION CEILING of not being in force, and prints a green
+  # gate's own findings underneath. The ceiling was in force throughout. This is
+  # the same shape as breakage 23b — a green-expecting proof reported red for a
+  # reason with nothing to do with the property under test — and the two cost the
+  # same thing: a filter whose correctness depends on a string that is not a
+  # filterable label.
+  #
+  # It is the SEVENTH conversion and the one the reach table in
+  # REPORT-kit-gate-speed-02.md §4b never measured: that table walked the six
+  # `expect_red_check` conversions, and `expect_green_check` is a DIFFERENT
+  # helper with a DIFFERENT single caller. A conversion nobody ran is a
+  # conversion nobody proved.
+  #
+  # The whole gate is the correct trade here, exactly as it is in
+  # `expect_skip_check`: it costs ~35s on one recipe out of 94. The alternative is
+  # a filter that names nothing, or one that names some unrelated `check` while
+  # the verdict being asserted is a `report` — a decoration on the command line
+  # that proves nothing about the thing the recipe is about, which is the
+  # weakened gate this file exists to refuse.
   out=$(cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" 2>&1) || ec=$?
   if [ "$ec" -ne 0 ]; then
     printf 'FAIL self_test: %s — the gate went RED (exit %s), so the ceiling is not in force\n' \
