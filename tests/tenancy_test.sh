@@ -17,7 +17,7 @@
 #   breaks on the first `bin/dev up`; this is the answer to that for the account
 #   boundary, which cannot be checked any other way.
 #
-# FOUR THINGS, and the last three are what make the first one mean something:
+# SIX THINGS, and the last five are what make the first one mean something:
 #
 #   1. every assertion in isolation.sql passes.        (the property)
 #   2. the CONTROL: with `FORCE ROW LEVEL SECURITY` removed, the OWNER half of the
@@ -29,6 +29,12 @@
 #      saying so is not a measurement)
 #   4. the assertion set is EXACTLY the one assertions.txt names, both ways.
 #      (the proof has not quietly shrunk)
+#   5. an ADOPTER'S FIXTURE SCHEMA, planted before the proof runs, is out of the
+#      sweep's scope and the proof is still green.  (0b: the sweep does not
+#      assume it owns the database)
+#   6. an unprotected account-scoped table in a schema the substrate DOES own
+#      turns the proof red.                            (5: and scoping the sweep
+#      did not turn it into a green constant)
 #
 #   Assertion 2 is the expensive and the important one. It is the control this
 #   repository's rules insist on: a control that never runs differently proves
@@ -36,6 +42,19 @@
 #   also pass on a template with no FORCE at all — which is precisely the trap
 #   this file exists for, because FORCE is absent from Supabase's guide and no
 #   lint in this fleet checks for it.
+#
+#   Assertions 0b and 5 are one measurement in two directions, and neither means
+#   anything alone. `identity` adopted this substrate and its whole-suite run then
+#   failed kit's account-isolation control: its test helper builds a private
+#   fixture schema per test by cloning tables with `LIKE ... INCLUDING ALL`, which
+#   does not copy row-level security, so every fixture carries an `account_id`
+#   column and no policies -- and a sweep that scanned the whole database named
+#   all of them, with the count moving per run (5, then 21) as neighbours went in
+#   and out of flight. 0b plants that shape and requires it to be ignored. 5
+#   requires an unprotected table in the substrate's OWN schema to still be
+#   named. Narrow the scope to `pg_temp` alone and 0b passes forever while 5 goes
+#   red, because every real table in every adopter is then outside it: which is
+#   the only reason 5 exists rather than 0b by itself.
 #
 # SKIPS LOUDLY, NEVER SILENTLY. No docker, no image, no network to GHCR: this is a
 # SKIP that names what it needed, and `validate.sh` counts it. A skip is honest; a
@@ -229,6 +248,65 @@ docker cp "$ISOLATION" "$C:/tmp/isolation.sql" >/dev/null
 say "   installed: schema cafaye, current_account_id/0, begin_account/1, protect_table/2, unprotected_tables/0"
 
 # ---------------------------------------------------------------------------
+# ASSERTION 0b — AN ADOPTER'S FIXTURE SCHEMA, PLANTED BEFORE THE PROOF RUNS.
+#
+# This is identity's shape, reproduced rather than described. Its test helper
+# builds a private fixture schema per test by cloning tables with
+# `LIKE ... INCLUDING ALL`, and `LIKE` does not copy row-level security: an
+# `account_id` column with no policies. A sweep that scans the whole database
+# names every one of those, so `identity`'s whole-suite run failed kit's
+# account-isolation control on a database whose five real tables were all
+# protected -- and the count moved per run with how many neighbours were
+# mid-flight.
+#
+# It is planted HERE, before assertion 1 runs, and permanently rather than in a
+# transaction the proof rolls back, because the defect is precisely that the
+# sweep sees a schema it did not create and does not roll back.
+#
+# The clone is a real `LIKE ... INCLUDING ALL` rather than a hand-written
+# `create table`, because a hand-written table is not the thing that went wrong:
+# the shape that matters is a fixture built by a helper the substrate never saw,
+# and a fixture authored here would be a different shape wearing the same name.
+say ""
+say "== assertion 0b: an adopter's fixture schema is present, and out of the sweep's scope"
+psql_in "$ALPHA" "$ALPHA" "
+  set client_min_messages = warning;
+  drop schema if exists kit_neighbour_fixture cascade;
+  create schema kit_neighbour_fixture;
+  create table kit_neighbour_fixture.account_users (
+    id bigint generated always as identity primary key,
+    account_id uuid not null,
+    email text not null
+  );
+  create table kit_neighbour_fixture.api_keys (
+    id bigint generated always as identity primary key,
+    account_id uuid not null
+  );
+" >/dev/null
+
+# ...and it really is unprotected, so a green proof below cannot be a sweep that
+# found nothing to ignore. Both halves are read from the catalog rather than
+# assumed: an `account_id` column, and neither `relrowsecurity` nor a policy.
+got="$(psql_in "$ALPHA" "$ALPHA" "
+  SELECT count(*) FROM pg_class c
+    JOIN pg_namespace n ON n.oid = c.relnamespace
+    JOIN pg_attribute a ON a.attrelid = c.oid AND a.attname = 'account_id' AND NOT a.attisdropped
+   WHERE n.nspname = 'kit_neighbour_fixture'
+     AND c.relkind = 'r'
+     AND NOT c.relrowsecurity
+     AND NOT EXISTS (SELECT 1 FROM pg_policy p WHERE p.polrelid = c.oid)")"
+[ "$got" = "2" ] || fail "the fixture schema holds $got unprotected account-scoped table(s), not 2, so assertion 0b is not testing what it claims"
+
+# The sweep must not name either of them. Read the function's own answer rather
+# than inferring it from the proof's verdicts, so a failure here says "the sweep
+# reached into a foreign schema" instead of "some assertion went red".
+leaked="$(psql_in "$ALPHA" "$ALPHA" \
+  "SELECT count(*) FROM cafaye.unprotected_tables() WHERE table_schema = 'kit_neighbour_fixture'")"
+[ "$leaked" = "0" ] || fail "the sweep named $leaked table(s) in an adopter's fixture schema. It is scoped to the schemas the substrate was applied in, and kit_neighbour_fixture is not one of them."
+say "   2 unprotected account-scoped tables in kit_neighbour_fixture, and the sweep names neither."
+say "   identity's whole-suite failure was exactly this, with the count moving per run."
+
+# ---------------------------------------------------------------------------
 # ASSERTION 1 — every assertion in the set passes.
 say ""
 say "== assertion 1: every assertion in templates/database/tenancy/isolation.sql passes"
@@ -353,6 +431,57 @@ say "   the login-role half stayed green throughout, which is what makes this sp
 say "   an isolation suite written only against the application role passes on a"
 say "   template with no FORCE at all."
 
+# ---------------------------------------------------------------------------
+# ASSERTION 5 — THE SWEEP'S OWN CONTROL, INSIDE THE SCOPED SWEEP.
+#
+# Assertion 0b proves the scope is narrow enough. This proves narrowing it did
+# not turn the sweep into a green constant — which is the failure mode of every
+# tempting version of this fix. Scope the sweep to `pg_temp` alone, or to
+# `cafaye` alone, and all three sweep assertions pass forever while naming no
+# real table in any adopter: `sweep/names-an-unprotected-table` finds the
+# control, `sweep/every-account-scoped-table-is-protected` counts it, and
+# `sweep/the-only-finding-is-the-control` matches it. Three greens, zero
+# information, and the sweep's positive control is now a control of nothing.
+#
+# So: a SECOND unprotected account-scoped table, planted in a schema the
+# substrate WAS applied in and left there permanently, must turn the proof red.
+# The scope is derived from the policies `protect_table` wrote, so this is the
+# honest question -- "is a real account-scoped table in the substrate's own
+# territory still named?" -- rather than an artefact of how the scope is spelled.
+#
+# It is `$ALPHA`'s own public schema, which is exactly where a service's tables
+# live and exactly what a service reaches by adding a column to a new table and
+# forgetting the substrate.
+say ""
+say "== assertion 5: the sweep still names an unprotected table in a schema the substrate OWNS"
+psql_in "$ALPHA" "$ALPHA" "
+  create table if not exists kit_sweep_control (
+    id int primary key,
+    account_id uuid not null
+  )" >/dev/null
+
+ctl_scope="$(run_script "$ALPHA" /tmp/isolation.sql)"
+scope_failures="$(printf '%s\n' "$ctl_scope" | grep '@fail@' || true)"
+if [ -z "$scope_failures" ]; then
+  say "FAIL: an unprotected account-scoped table in the substrate's own schema was NOT named."
+  say "      The sweep is scoped to the schemas it was applied in, and this table is in one of"
+  say "      them, so it is exactly what the sweep exists to find. A sweep that cannot go red on"
+  say "      it is a green constant: it would pass on a service that never protected anything."
+  fail "the sweep's control cannot fail inside its own scope"
+fi
+# ...and by the sweep assertion, not by an unrelated one going red.
+printf '%s\n' "$ctl_scope" | grep -q '^sweep/every-account-scoped-table-is-protected@' || {
+  say "FAIL: the planted table went red, but NOT via sweep/every-account-scoped-table-is-protected."
+  printf '%s\n' "$scope_failures" | awk -F@ '{print "       red instead: " $1}' | head -8
+  fail "the scoped sweep's control is red for the wrong reason"
+}
+dropped="$(psql_in "$ALPHA" "$ALPHA" "DROP TABLE kit_sweep_control" >/dev/null && printf 'dropped')"
+[ "$dropped" = "dropped" ] || fail "could not remove the planted table, so every later assertion in this file would run against a red sweep"
+say "   one unprotected account-scoped table in the substrate's own schema, and the sweep"
+say "   named it: sweep/every-account-scoped-table-is-protected and"
+say "   sweep/the-only-finding-is-the-control both went red. The scope is narrow enough for"
+say "   an adopter (assertion 0b) and still able to fail (this)."
+
 # Put the substrate back so anything after this sees the real thing.
 docker exec -e PGPASSWORD=cafaye "$C" psql -U "$ALPHA" -d "$ALPHA" \
   -v ON_ERROR_STOP=1 -q -f /tmp/substrate.sql >/dev/null 2>&1
@@ -420,3 +549,5 @@ say "      proven able to fail."
 say "      $total assertions, every one passing, named identically in assertions.txt."
 say "      FORCE ROW LEVEL SECURITY removed: $ctl_failures red, all of them owner/ or sweep/."
 say "      identity function calls over five rows: $wrapped_calls wrapped, $bare_calls bare."
+say "      an adopter's fixture schema present: 0 of 2 of its tables named."
+say "      an unprotected table in the substrate's own schema: named, proof red."
