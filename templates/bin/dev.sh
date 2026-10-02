@@ -13,6 +13,12 @@
 #   bin/dev logs [svc] # tail the stack, or one service
 #   bin/dev migrate    # run migrations, nothing else
 #   bin/dev seed       # seed the local admin, nothing else
+#   bin/dev db grant <name>
+#                      # add one service to an ALREADY-RUNNING cluster.
+#                      #   initdb only runs on a fresh volume, so naming a
+#                      #   service in KIT_POSTGRES_DATABASES after the fact
+#                      #   creates nothing. This PRINTS the statements to
+#                      #   paste into psql; it does not run them.
 #   bin/dev --help
 #
 # WHAT IT PROMISES
@@ -813,6 +819,107 @@ seed() {
   fi
 }
 
+# db_grant <name> — the statements that add one service to a RUNNING cluster.
+#
+# WHY THIS EXISTS, AND WHY IT PRINTS RATHER THAN RUNS.
+#
+# `docker-entrypoint-initdb.d` runs once per volume, so a service named after the
+# cluster was first provisioned never gets a database. The documented answer was
+# `bin/dev down -v && bin/dev up`, which is correct and destroys the developer's
+# data. Four files in this repository — templates/database/README.md,
+# DECISIONS.md, the init script and the compose file — told the reader to run
+# `bin/dev db grant <name>` instead, and no such command existed. A promise to a
+# command that is not there is the same defect DECISIONS.md itself was created to
+# fix, one layer down: the reader is told the way out exists and then finds that
+# it does not.
+#
+# It PRINTS rather than executes, and that is the decision rather than a
+# limitation. These are `CREATE ROLE` and `CREATE DATABASE` — a role and a
+# database, on a cluster a developer's service is about to be handed credentials
+# for. A command whose failure mode is "half-provisioned, and the service's
+# migrations then run against a database that was never created" is not something
+# a wrapper should perform on a stack it did not start. So this prints the exact
+# statements, in the order the init script uses, validated, and the reader pastes
+# them into `psql`. The alternative — a `--yes` flag — is a second thing to get
+# right in the one command whose mistake is a stray superuser role.
+#
+# It is the same boundary the init script applies, not a smaller one: the REVOKE
+# and the per-role limits are load-bearing for isolation, and a database created
+# here without them is a database every role in the cluster can walk into.
+db_grant() {
+  local svc="${1:-}"
+  if [ -z "$svc" ]; then
+    die "usage: bin/dev db grant <service-name>"
+  fi
+  # The same validator the init script uses, and for the same reason: the name is
+  # pasted unquoted into identifiers, and a service name is a value from a `.env`
+  # file rather than a trusted literal. Silently mangling an identifier here is
+  # how one service ends up owning another's database.
+  case "$svc" in
+    [!a-z_]* | *[!a-z0-9_]*)
+      die "'$svc' is not a bare identifier. It must match [a-z_][a-z0-9_]*, and it has to be the SAME name as your database, your role and your application_name."
+      ;;
+  esac
+
+  # Read the cluster's own settings rather than assuming the defaults, so the
+  # connection line printed below is the one that works on THIS machine.
+  # shellcheck disable=SC1091
+  [ -f .env ] && { set -a && . ./.env && set +a; }
+  local port="${KIT_POSTGRES_PORT:-15500}"
+  local user="${KIT_POSTGRES_USER:-cafaye}"
+  local pass="${KIT_POSTGRES_PASSWORD:-cafaye}"
+  local admin_db="${KIT_POSTGRES_DB:-cafaye_platform}"
+
+  cat <<SQL
+bin/dev db grant $svc — add one service to a cluster that is already running.
+
+  docker-entrypoint-initdb.d only runs on a FRESH volume, so naming this service
+  in KIT_POSTGRES_DATABASES and running \`bin/dev up\` will not create anything.
+  (And \`bin/dev down -v && bin/dev up\` DOES work, by deleting your data.)
+
+Paste this into the cluster. It is the same provisioning the init script performs,
+in the same order, and every statement in it is load-bearing:
+
+  psql -h localhost -p $port -U $user -d $admin_db   # password: $pass
+
+  CREATE ROLE "$svc" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
+    PASSWORD '$pass';
+  CREATE DATABASE "$svc" OWNER "$svc";
+
+  -- the boundary. Without this line EVERY role in the cluster can CONNECT to
+  -- $svc, and isolation becomes "nobody happened to grant you SELECT".
+  REVOKE ALL ON DATABASE "$svc" FROM PUBLIC;
+  GRANT CONNECT, TEMPORARY ON DATABASE "$svc" TO "$svc";
+
+  -- blast radius, so this service cannot take the connections the other eight need
+  ALTER ROLE "$svc" CONNECTION LIMIT ${KIT_POSTGRES_ROLE_CONNECTIONS:-10};
+  ALTER ROLE "$svc" SET statement_timeout = '${KIT_POSTGRES_STATEMENT_TIMEOUT_MS:-15000}';
+  ALTER ROLE "$svc" SET idle_in_transaction_session_timeout = '${KIT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS:-30000}';
+
+Then, in that database:
+
+  psql -h localhost -p $port -U $user -d $svc
+  REVOKE CREATE ON SCHEMA public FROM PUBLIC;   -- PG15+; already the default, stated so it is true
+SQL
+
+  # The extension step is conditional and cluster-wide, so it is reported rather
+  # than assumed: the admin role has to create them, and a service role cannot.
+  if [ -n "${KIT_POSTGRES_EXTENSIONS:-}" ]; then
+    cat <<SQL
+
+  And in EACH database above, as the admin role — a service role cannot:
+  CREATE EXTENSION IF NOT EXISTS ${KIT_POSTGRES_EXTENSIONS%%,*} [ , … per name in KIT_POSTGRES_EXTENSIONS ];
+SQL
+  fi
+
+  cat <<SQL
+
+  Then add the name to KIT_POSTGRES_DATABASES in your .env, so a FRESH volume
+  provisions it without any of this. The statements above are for the volume you
+  already have.
+SQL
+}
+
 print_urls() {
   # Read from .env rather than hardcoding, so the printed URL is the URL that
   # actually works on this machine. A printed URL that does not resolve is worse
@@ -1076,6 +1183,16 @@ main() {
       ;;
     migrate) migrate ;;
     seed) seed ;;
+    db)
+      shift
+      case "${1:-}" in
+        grant)
+          shift
+          db_grant "${1:-}"
+          ;;
+        *) die "usage: bin/dev db grant <service-name>" ;;
+      esac
+      ;;
     -h | --help | help) usage ;;
     *)
       printf 'bin/dev: unknown command: %s\n\n' "$1" >&2

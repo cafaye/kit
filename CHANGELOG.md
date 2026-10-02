@@ -165,6 +165,283 @@ it without a copy (see kit-12 below).
 
 ### Fixed
 
+- **four self-test recipes asserted a string the check does not emit.** All four
+  were *correct checks* on *correct mutations* whose recipe could not tell either
+  from a failure, and all four reported "the gate went red, but NOT via …" —
+  three of them while printing the needle two lines above the complaint.
+
+  `expect_red_check` matches `FAIL $want`, so the needle has to be the check's
+  **label**. Breakages 75, 76 and 77 asserted the finding's own wording
+  (`"which is the image kit's stack already ships"`, `"promises a command the
+  script does not dispatch"`), and those strings are printed as indented detail
+  lines *under* the `FAIL <label>` header. Breakage 71 asserted
+  `the connection budget  (max_connections covers` against a label that read
+  `max_connions` — a misspelling of a setting that does not exist, in the one line
+  a reader greps for to learn what a check measures.
+
+  Two consequences beyond the four recipes. The `max_connions` label is corrected
+  to `max_connections`, which is the variable the check reads. And a check label
+  that a self-test asserts is now a **contract**: renaming one silently un-proofs
+  the breakage, which is the same coupling as the `callable path` check and is now
+  written down in `AGENTS.md` with the diagnostic to use next time — read the real
+  FAIL line before assuming the check missed the defect.
+
+- **the connection-contract check was satisfied by a comment.** It tested
+  `if key not in body` over the whole snippet, and the go snippet's header says
+  "1. `application_name` — THE ONE THAT IS NOT OPTIONAL". So deleting the single
+  line that *sets* it left the substring in the file and the contract reported
+  satisfied — and **self-test breakage 72, which performs exactly that deletion,
+  was green.** This is the rule AGENTS.md already states about `-count=1` ("a
+  check that a comment can satisfy is not a check") arriving in a new place, and
+  the only reason it is written down here is that the self-test could not see it:
+  the mutation was real, the recipe ran, and the check agreed with the tree.
+
+  All three of the check's tests now read code with the comments stripped, per
+  language — `//` for go/node/rust, `#` for python, and for elixir a `#` that is
+  **not** `#{`, because interpolation is code and can carry a setting. The
+  stripper does not track string literals, which is deliberate and conservative:
+  a comment marker inside a string leaves its line scanned rather than eating the
+  code after it, so the failure this can cause is a missed setting, never a
+  setting wrongly reported absent.
+
+  Fixing it also corrected `contract.json`'s bounded-pool token: it listed
+  `:pool_size`, a spelling that existed only in the Elixir snippet's *prose*,
+  while the code says `pool_size: @pool_size`. Once the comments stopped
+  counting, the token read as absent and named a real defect in the token list.
+
+- **`self_test.sh` classified a caught defect as a machine failure, on a large
+  gate report.** The `env_skips` branch added in `1d98e42` tested for a finding
+  with `printf '%s\n' "$out" | grep -qE '^(FAIL|SKIP)'` — while the verdict three
+  lines above it had been changed to the non-piping `contains` for exactly this
+  reason. **The fix was applied to one branch and missed in the one beside it.**
+
+  The mechanism, measured: on a 239KB gate report whose findings sit at the top,
+  that pipeline exits **141** *with the match present*. `grep -q` closes the pipe
+  on its first match, `printf` dies of SIGPIPE, and `set -o pipefail` promotes 141
+  to the pipeline's status — so the verdict flipped on the SIZE of the output
+  rather than on what was in it. The threshold is a property of the pipe buffer,
+  so it moves with the machine.
+
+  And it fails in the worst direction available: the false answer is "this is an
+  ENVIRONMENT failure", which is precisely the verdict that excuse was added to
+  stop being lost. Four breakages — 71, and the three this packet adds (75, 76,
+  77) — were reported as unevaluated on a run where every one of them had in fact
+  been caught, and 72 was reported as "the gate stayed GREEN". Now a `contains`
+  call, like its neighbours.
+
+- **`fleet_check.py` no longer reported a clean fleet while five repositories
+  carried their own Postgres.** `check_stale_copy` — failure mode 1, the check
+  whose entire job is naming a service running its own copy of the shared
+  platform — matched a service's image against kit's by **bare repository
+  name**. kit-21 made the cluster a *built* image (MD21b), so kit's went from
+  `postgres:${KIT_POSTGRES_TAG:-…}` to `kit-postgres:${…}`; a duplicating service
+  still writes `postgres`, and the two stopped matching. Measured on the commit
+  that shipped it:
+
+  ```console
+  $ fleet_check.py --repos-dir <a fleet whose alpha runs postgres:17>
+  PASS fleet: no service carries a copy of kit's stack, none weakens the
+               redaction boundary, no collector config is dead, …
+  ```
+
+  The comparison is now over the **upstream** image kit's stack is built *from*,
+  not over the name of the local artefact kit built it into — a service cannot
+  know to write `kit-postgres`, which is a build tag that exists on one
+  developer's machine.
+
+  It went unnoticed for a reason worth recording, because it is the same shape as
+  the bug: self-test breakages 52/59/60 mutate a fixture to carry a stale copy
+  **with a `ports:` entry**, and `check_override_surface` reports a published
+  port by *service name* — a name the rename never touched. So breakage 60 went
+  red on the port half while the image half was dead, and a green control was
+  evidencing a different check. New **breakage 75** mutates the same fixture
+  *without* the port, so the image comparison is the only thing that can go red;
+  it is red on the pre-fix code and green on the post-fix code, both measured.
+
+- **`bin/dev db grant` now exists.** Four files in this repository told a service
+  author to run it — `templates/database/README.md`, `DECISIONS.md`,
+  `templates/compose/postgres/initdb/10-cluster.sh` and
+  `templates/compose/docker-compose.yml` — and `bin/dev` had no `db` command at
+  all. Every one of those four is a reader who is told the way out of "my
+  service's database was never created" exists, runs it, and gets
+  `unknown command`. `DECISIONS.md` was created to stop this repository
+  referencing a document that did not exist; this was the same defect one layer
+  down, and it is now a check (**breakages 76 and 77**) rather than a fix, since
+  the class is "a document names an interface and the interface disagrees".
+
+  The command **prints** the statements and does not run them: they are
+  `CREATE ROLE` and `CREATE DATABASE` on a cluster a service is about to be
+  handed credentials for, and a wrapper whose failure mode is half-provisioned is
+  not something to perform on a stack it did not start. It prints the
+  `REVOKE ALL ON DATABASE … FROM PUBLIC` with them, which is the whole point —
+  see the next entry.
+
+- **the operator-side half of the isolation boundary is now stated rather than
+  implied.** `DECISIONS.md` listed "the `REVOKE` for a database added by hand"
+  among the things left to the operator, in one line, as a pointer to a command
+  that did not exist. It now says what the position actually is: the boundary
+  holds **by construction** for every database declared in
+  `KIT_POSTGRES_DATABASES` on a fresh volume, and a database added afterwards is
+  **the operator's to close** — because `docker-entrypoint-initdb.d` runs once per
+  volume and cannot sweep a database that does not exist yet. A database created
+  by hand and not revoked is reachable by every role in the cluster, whatever the
+  table grants say. `tests/isolation_test.sh` proves the first half against a real
+  cluster; the second is a documented step, and the document now says so where an
+  adopter will read it.
+
+### Changed
+
+- **`templates/deploy/compose.deploy.yml`'s comment claimed its Postgres was "the
+  same tag `templates/compose/docker-compose.yml` uses", so "a deploy and a
+  `bin/dev up` are running the same database."** Both halves became false at
+  kit-21: the dev stack moved to `postgres:17` because pgvector is a glibc-linked
+  layer (MD21b), and the developer topology became one cluster of N databases
+  rather than one database. The tag is unchanged and the deploy file is
+  deliberately a *different* topology — one database for one service, with no
+  initdb script, no per-service roles and no revoke, because there is nothing to
+  isolate it from. The comment now says that, so the two are not "unified" by a
+  reader in a hurry.
+
+### Added
+
+- **one Postgres cluster, one database and one role per service, and the database
+  is the isolation boundary.** Nine services, one cluster, no pooler. A service
+  adds its own name to `KIT_POSTGRES_DATABASES` and gets a role, a database and a
+  refused-at-the-door boundary — there is no second container, no second port and
+  no second volume, which is the entire point of sharing a cluster.
+
+  `templates/compose/postgres/initdb/10-cluster.sh` provisions one non-superuser
+  role and one owned database per name, then applies the boundary by **sweeping
+  `REVOKE ALL ON DATABASE … FROM PUBLIC` over every non-template database** in
+  the cluster rather than over a list of the ones it created. Measured, and this
+  is the load-bearing part: with the revoke, `psql -U courier -d billing` answers
+  `FATAL: permission denied for database "billing"` / `DETAIL: User does not have
+  CONNECT privilege` before a query is parsed; without it, the connection
+  **succeeds** and only the `SELECT` on billing's table is refused — by the
+  accident that nobody granted it. A cluster provisioned without the revoke has,
+  by Postgres's default, no isolation at all, and fails open silently.
+
+- **`tests/isolation_test.sh` — the proof, not the claim.** Brings the *shipped*
+  stack up through compose, creates two service databases and two service roles,
+  and asserts service A cannot reach service B's, printing the refused query and
+  the server's answer. Four assertions: A reaches its own; A is refused B's; B is
+  refused A's (one lucky direction is not isolation); and a **control cluster of
+  the same shape with the revoke removed must let A in**.
+
+  The control is the assertion that makes the rest mean anything, and it is
+  there because of the rule this repository already applies to allowlists and
+  proofs: an assertion that cannot be shown to fail is not known to be
+  load-bearing. Without it, a check asserting "A cannot SELECT from B's rows"
+  would pass on a cluster with no isolation at all. Wired into the gate's
+  observability phase with its own `BOUND` bound (1800s — three container
+  lifecycles and two initdb runs), and a loud SKIP when docker is absent.
+
+- **`templates/database/` — the connection contract, published and consumed.** The
+  topology is only finished if a service's config actually works against it, so
+  the four settings that only matter on a shared cluster are generated per
+  language rather than described in a comment:
+
+  | setting | what it prevents on one cluster |
+  |---|---|
+  | `application_name` | an unattributable query — nine services in one `pg_stat_activity` and no way to say whose |
+  | `statement_timeout` | one service's runaway query occupying shared resources |
+  | `idle_in_transaction_session_timeout` | one forgotten `BEGIN` blocking `VACUUM` cluster-wide |
+  | a bounded pool | one service taking the connections the other eight need |
+
+  Six languages (go, elixir, python, ruby, node — also bun — and rust), each
+  parsed by **its own parser** in the gate, and each required to carry the
+  contract by `templates/database/contract.json` rather than by a grep repeated
+  six times. The cluster sets the two timeouts **per role** as a backstop, so a
+  service that forgets them is bounded rather than unbounded.
+
+- **the pooler decision, as a check rather than a paragraph.** kit runs **no
+  PgBouncer**: direct connections, `max_connections` raised to 200, a per-role
+  `CONNECTION LIMIT`, and per-role timeouts. The argument is in
+  `templates/database/README.md` and the measurements in `DECISIONS.md` (MD21); the
+  deciding sentence is from PgBouncer's own configuration documentation, which
+  describes `RECONNECT` on its admin console as the remedy for
+  `ERROR: cached plan must not change result type` after a DDL migration — a
+  manual operator step after every schema change in nine repositories.
+
+  The pooler workarounds are **forbidden** in `contract.json` and the gate fails
+  the build if one appears in any generated config. A service carrying
+  `prepare: :unnamed` on a fleet with no pooler is slower and looks entirely
+  correct, so nothing else would ever find it.
+
+- **`DECISIONS.md` — the file seven places referenced and that did not exist.**
+  `AGENTS.md` (twice), `README.md` (twice, one of them a markdown link),
+  `.github/zizmor.yml`, `ci.reusable.yml` (three times) and three of the gate's
+  own scripts all pointed at it. A reference to a decision document that is not
+  there tells the reader the trade was made and then leaves them with nothing to
+  read — worse than not claiming it, because the absence looks like they have not
+  looked hard enough. It now exists, with MD10, MD12, MD13 and the four MD21
+  entries this packet decided, and a check asserts it is present, records real
+  entries, and that every reference to it resolves.
+
+### Changed
+
+- **the cluster image is `postgres:17` (Debian), not `postgres:17-alpine`.**
+  pglayers publishes each extension as a glibc-linked layer built from the PGDG
+  Debian packages, and alpine is musl. Measured, on the alpine base: the image
+  **builds cleanly** and then `CREATE EXTENSION vector` reports the extension is
+  not available, with `ldd` showing `Error loading shared library
+  ld-linux-*.so.1`. Two independent failures — the loader cannot resolve a glibc
+  binary, and alpine's PostgreSQL looks under
+  `/usr/local/share/postgresql/extension` while pglayers writes to
+  `/usr/share/postgresql/17/extension`. On `postgres:17` the same layer answers a
+  real query. An image that claims pgvector and does not have it is worse than one
+  that is visibly missing it.
+
+  The layer is composed rather than pulled: `pglayers-full` would be one line
+  instead of four, but it *replaces* the official `postgres` image with a
+  community build for every service permanently, and loads 80+ extensions and a
+  raised `max_worker_processes` onto the cluster whether or not any is used.
+  Trade recorded as MD21b, including that pglayers is a community project and
+  **not** a PostgreSQL one — it layers onto the official images, which is a
+  weaker claim.
+
+- **extensions are a cluster decision, created by the admin role.** A service role
+  cannot `CREATE EXTENSION`: pgvector's control file is not marked `trusted`, so
+  a non-superuser is refused with `HINT: Must be superuser to create this
+  extension`. Verified against pglayers' layer *and* upstream pgvector v0.8.6,
+  whose `vector.control` is byte-identical — this is pgvector's own
+  classification, not something the packaging drops. The `SET ROLE` design that
+  looked right could not work, and the measurement is why.
+
+- **`lint/hadolint.yaml` ignores DL3067 as well as DL3008.** The cluster image is
+  `COPY --from=<layer> / /`, which is pglayers' whole mechanism and has no
+  narrower form on PG17. The rule's rationale — an accidental whole-filesystem
+  copy pastes in unreviewed files — is answered by pinning a specific published
+  version of one extension rather than by the rule.
+
+- **`templates/compose/.env.example` said `KIT_POSTGRES_TAG=16.6-alpine` while
+  `docker-compose.yml` defaulted to `17-alpine`, and `.env.example` WINS** —
+  `bin/dev` copies it to `.env` on first run, so every developer's stack ran 16.6
+  while the compose file, this README and the CHANGELOG all said 17. Commit
+  `48689e6` fixed the compose default and left the file that overrides it alone,
+  which is the more dangerous half of that fix: it made the repository agree with
+  itself and the developer's machine disagree with both.
+
+  Now asserted in **both directions** — a tag in `.env.example` that is not the
+  compose default fails, and a compose default that is not that tag fails. A
+  check that only asked "is `KIT_POSTGRES_TAG` in `.env.example`" would be
+  satisfied by the broken state, because the broken state has it. The check also
+  refuses an alpine variant, with the reason. self_test breakage 68 is the shipped
+  defect and breakage 69 is the alpine regression.
+
+- **`artifacts.json` documented an `optional` field that no code implemented.**
+  "Such an artefact is reported but does not, by itself, make a service look
+  broken" — a property stated in the table's own `_about` and asserted in zero
+  places, because no artefact in the table used it. kit-21 added the first
+  optional artefacts and the reporter turned every one into an unpinned finding
+  for every service in the fleet, which is the opposite of what the field says.
+  `staleness.py` now implements it, and the exemption is **`absent` only**: a
+  `diverged` optional artefact is a copy that has drifted and still needs a pin,
+  and an `unknown` one is an unmeasured artefact and inherits the fail-closed
+  rule rather than copying it.
+
+### Fixed (previously open in this release)
+
 - **a gate that exited non-zero reporting NO finding was reported as "the gate
   went red, but NOT via `<the named check>`", which blames a check for a machine
   problem.** `expect_red_check` had exactly two verdicts — green, or red-for-a-

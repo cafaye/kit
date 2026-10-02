@@ -11,14 +11,43 @@
 #   *different* check, so a passing self_test means the checks are independent
 #   and not one lucky assertion standing in for all of them.
 #
-# THE SIXTY-SEVEN BREAKAGES, and one GREEN control (20 from the tier work, 21
+# THE SEVENTY-SEVEN BREAKAGES, and one GREEN control (20 from the tier work, 21
 #                               from the fan-out work, 24-26 from the fleet gate,
 #                               27-32c from the lint work, 33-40 from the
 #                               staleness/parity work, 41-51 from the secrets
 #                               work, 52-60 from the fetched-stack work, 61-62
-#                               from the licence; 18 shared before the lint
-#                               packet)
+#                               from the licence, 68-74 from the shared-cluster
+#                               work, 75 from the rename that disarmed the
+#                               fleet check, 76-77 from the bin/dev commands the
+#                               documentation promises; 18 shared before the
+#                               lint packet)
 #   1. delete a language template   -> the artifact-presence check goes red
+#   68. .env.example's Postgres tag disagrees with compose's default -> the
+#        agreement check goes red. This is the defect that SHIPPED: the stack
+#        ran 16.6 on every developer's machine while the compose file, the
+#        README and the CHANGELOG all said 17, and commit 48689e6 fixed the
+#        compose file and left the file that overrides it alone.
+#   69. the tag is switched back to an alpine variant -> red, because pgvector
+#        is a glibc-linked layer and does not load on musl.
+#   70. the init script is never mounted -> red. Nothing reports a cluster with
+#        one database and no per-service roles except this.
+#   71. the connection budget set below what the topology needs -> red.
+#   72. a generated config stops setting `application_name` -> red.
+#   73. a generated config carries a POOLER WORKAROUND -> red. The invisible
+#        one: `prepare: :unnamed` on a fleet with no pooler is slower and looks
+#        correct, so this list is the only way anyone finds out.
+#   74. `DECISIONS.md` deleted -> red. Seven places reference it; it did not
+#        exist until this packet, so nothing had ever checked.
+#   75. a service runs its own postgres IMAGE, with no published port for
+#        another check to report -> red. The regression this packet's own
+#        earlier commit shipped: making the cluster a BUILT image renamed kit's
+#        from `postgres` to `kit-postgres`, which silently disarmed the fleet
+#        check that names a service running its own copy of the platform.
+#   76. `bin/dev` stops dispatching a command four files tell the reader to run
+#        -> red. `bin/dev db grant` was documented in four places and did not
+#        exist.
+#   77. `bin/dev` keeps the command but loses the SUBCOMMAND -> red. The harder
+#        half: a check that only asks "is `db` dispatched" is green here.
 #   2. add a collector exporter    -> the privacy check goes red
 #   2b. DELETE the tempo exporter   -> the same check goes red from the other
 #        side. A set difference only catches the extra; this catches the
@@ -475,7 +504,15 @@ fresh_copy() {
   # fails that check on every breakage — and the two green-expecting proofs
   # (23b, 59) would then be red for a reason that has nothing to do with the
   # defect under test, which is the failure mode this list exists to prevent.
-  for entry in .gitleaks.toml .github AGENTS.md README.md CHANGELOG.md LICENSE core docker lint templates tests; do
+  # `DECISIONS.md` is here for the same reason as `LICENSE`, and its absence is a
+  # red on EVERY breakage rather than a false green: `decisions_check` reads it
+  # by path to assert the file exists and records real entries, so a copy without
+  # it fails that check sixty-odd times over — and the green-expecting proofs
+  # (23b, 59) would report a red for a reason that has nothing to do with the
+  # defect under test. kit-21 is what exposed this: the file did not exist at all
+  # until that packet, so nothing had ever needed it here.
+  for entry in .gitleaks.toml .github AGENTS.md README.md CHANGELOG.md LICENSE \
+    DECISIONS.md core docker lint templates tests; do
     [ -e "$ROOT/$entry" ] && cp -R "$ROOT/$entry" "$dst/"
   done
   # KIT_GITLEAKS, unlike the other two, must ALSO be resolved before the first
@@ -515,6 +552,33 @@ fresh_copy() {
 contains() {
   case "$1" in
     *"$2"*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+
+# starts_with_line <text> <prefix> — does any LINE of `text` begin with `prefix`?
+#
+# A SECOND reader, and it exists because `contains` is the wrong tool for this
+# one job. A bare substring test for `FAIL` matches the fleet check's own CEILING
+# banner, which is printed on GREEN runs and contains the sentence "a finding
+# inside a repository that has a kit.ref is a FAIL". So a check asking "did the
+# gate report a finding?" would be answered YES by a passing gate — and the
+# `env_skips` branch would then swallow every genuine environment failure and
+# report them as caught defects. That is the inverse of the bug it replaced, and
+# it is a reminder that a matcher loosened to stop false negatives will meet a
+# false positive.
+#
+# Same reason as `contains` for not piping: a `grep -qE '^FAIL'` pipeline exits
+# 141 on a report large enough to overflow the pipe buffer, with the match
+# present. This walks the string in the shell instead. The trailing-newline
+# question matters and is handled by the explicit newline before the first probe:
+# `$out` from `$(…)` has its trailing newlines stripped, so a finding on the very
+# last line would otherwise never be seen.
+starts_with_line() {
+  case "
+$1" in
+    *"
+$2"*) return 0 ;;
     *) return 1 ;;
   esac
 }
@@ -626,7 +690,37 @@ expect_red_check() {
     # exit WITH findings is a real red; a non-zero exit with NONE is an
     # environment failure, and it is named as one rather than counted as a
     # breakage the check failed to catch.
-    if [ "$ec" -ne 0 ] && ! printf '%s\n' "$out" | grep -qE '^(FAIL|SKIP)'; then
+    #
+    # `starts_with_line`, and NOT `printf … | grep -qE '^(FAIL|SKIP)'`. This is
+    # the same broken-pipe defect the `FAIL $want` test above was fixed for —
+    # fixed there and missed here, and the consequence is measured rather than
+    # argued: on a 239KB gate report whose findings sit at the TOP, the piped form
+    # exits **141** with the match present, so `! pipeline` is true and a gate
+    # that printed `FAIL: 1 check(s) failed.` was classified as having reported no
+    # finding at all.
+    #
+    # The mechanism is that `grep -q` closes the pipe on its first match,
+    # `printf` dies of SIGPIPE, and `set -o pipefail` promotes 141 to the
+    # pipeline's status. So the verdict flips on the size of the output rather
+    # than on what is in it, and the threshold is a property of the pipe buffer —
+    # it would move with the machine and come back as a flake on somebody else's
+    # packet. It is also the *worst* direction to be wrong in: the failure mode is
+    # a real red being excused as a machine problem, which is the outcome this
+    # counter was added to prevent being lost. Four breakages (71, 75, 76, 77)
+    # were reported as ENVIRONMENT failures on a run where every one of them had
+    # in fact been caught.
+    #
+    # `starts_with_line` rather than a bare `contains 'FAIL'`, and the reason is
+    # measured too: the fleet check's CEILING banner is printed on GREEN runs and
+    # contains the sentence "…a finding inside a repository that has a kit.ref is
+    # a FAIL". A substring test is therefore answered YES by a passing gate, and
+    # this branch would swallow every genuine environment failure and report it
+    # as a caught defect — the exact inverse of the bug being fixed. A matcher
+    # loosened to stop reporting false negatives meets a false positive; see the
+    # helper for the full argument.
+    if [ "$ec" -ne 0 ] \
+       && ! starts_with_line "$out" 'FAIL' \
+       && ! starts_with_line "$out" 'SKIP'; then
       printf 'SKIP self_test: %s — the gate exited %s with NO finding reported\n' \
         "$label" "$ec"
       printf '%s\n' "$out" | tail -5 | sed 's/^/       /'
@@ -1045,6 +1139,46 @@ new = (
 )
 if old not in body:
     sys.exit(f"self_test: break_stale_copy: {old!r} not in {path}")
+open(path, "w", encoding="utf-8").write("volumes:\n  alpha-pg:\n" + body.replace(old, new, 1))
+PYEOF
+}
+
+# break_stale_copy_no_ports — the SAME copy, minus the `ports:` line.
+#
+# One difference from `break_stale_copy`, and it is the whole point: without a
+# published port `check_override_surface` has nothing to report, so the ONLY
+# thing in the fixture that can turn the gate red is `check_stale_copy`'s IMAGE
+# comparison. Breakage 60 keeps the port and so can be satisfied by either half;
+# this one cannot be satisfied by either half but the right one, which is what
+# makes it a proof that the image predicate is load-bearing rather than a proof
+# that some check somewhere went red.
+#
+# Factored rather than inlined for the same reason `break_stale_copy` was: two
+# hand-written copies of this mutation would drift, and the drift would show up
+# as "75 went green because it was mutating something else".
+break_stale_copy_no_ports() {
+  "$PY" - "$1/alpha/docker-compose.yml" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+body = open(path, encoding="utf-8").read()
+old = "  alpha:\n    image: cafaye/alpha:dev"
+# Byte-for-byte `break_stale_copy`'s copy EXCEPT the `ports:` stanza, which is
+# the one line that lets a different check report the same defect.
+new = (
+    "  db:\n    image: postgres:17\n    environment:\n      POSTGRES_USER: alpha\n"
+    "      POSTGRES_DB: alpha\n"
+    "    volumes:\n      - alpha-pg:/var/lib/postgresql/data\n    healthcheck:\n"
+    "      test: [\"CMD\", \"pg_isready\", \"-U\", \"alpha\"]\n"
+    "      interval: 10s\n      timeout: 5s\n      retries: 5\n"
+    "  alpha:\n    image: cafaye/alpha:dev"
+)
+if old not in body:
+    sys.exit(f"self_test: break_stale_copy_no_ports: {old!r} not in {path}")
+if 'ports:' in new:
+    sys.exit("self_test: break_stale_copy_no_ports: this copy must not publish a "
+             "port, or check_override_surface can report the defect instead and "
+             "the image predicate stops being load-bearing")
 open(path, "w", encoding="utf-8").write("volumes:\n  alpha-pg:\n" + body.replace(old, new, 1))
 PYEOF
 }
@@ -2815,6 +2949,223 @@ else
   printf 'SKIP self_test: breakages 61-65 — kamal or kamal-backup is not installed\n'
   skips=$((skips + 1))
 fi
+
+
+# ---------------------------------------------------------------------------
+# 68-74: the one-cluster topology and the connection contract.
+#
+# Seven checks, seven breakages, and every one of them is a check that could
+# pass while the thing it is about is broken:
+#
+#   68  the Postgres tag disagrees between .env.example and compose — THE
+#       defect that shipped (16.6-alpine against a 17-alpine default) and that
+#       48689e6 fixed in the compose file only.
+#   69  the tag is switched back to alpine — which builds cleanly and cannot
+#       create an extension.
+#   70  the init script is not mounted, so no service gets a database.
+#   71  the budget is set below what the declared topology needs.
+#   72  a generated config drops `application_name`.
+#   73  a generated config carries a POOLER WORKAROUND — the invisible one, and
+#       the reason the forbidden list exists.
+#   74  DECISIONS.md is deleted — the file seven places reference and that did
+#       not exist until this packet.
+#
+# 73 is the one worth the most: nothing about it looks wrong. A service carrying
+# `prepare: :unnamed` on a fleet with no pooler is slower and correct-looking,
+# and the ONLY way anyone finds out is a check that looks for it.
+# ---------------------------------------------------------------------------
+
+base68="$(fresh_copy kit-68)"
+edit "$base68/templates/compose/.env.example" \
+  'KIT_POSTGRES_TAG=17' 'KIT_POSTGRES_TAG=16.6-alpine'
+expect_red_check 'breakage 68: the Postgres tag in .env.example disagrees with compose' \
+  "$base68" 'postgres tag  (.env.example and compose agree' --static-only
+
+base69="$(fresh_copy kit-69)"
+edit "$base69/templates/compose/.env.example" \
+  'KIT_POSTGRES_TAG=17' 'KIT_POSTGRES_TAG=17-alpine'
+edit "$base69/templates/compose/docker-compose.yml" \
+  'POSTGRES_TAG: ${KIT_POSTGRES_TAG:-17}' \
+  'POSTGRES_TAG: ${KIT_POSTGRES_TAG:-17-alpine}'
+expect_red_check 'breakage 69: the cluster is pinned back to an alpine variant' \
+  "$base69" 'postgres tag  (.env.example and compose agree' --static-only
+
+base70="$(fresh_copy kit-70)"
+edit "$base70/templates/compose/docker-compose.yml" \
+  '      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
+' ''
+expect_red_check 'breakage 70: the init script is never mounted, so no service gets a database' \
+  "$base70" 'the cluster  (one database + role per service' --static-only
+
+base71="$(fresh_copy kit-71)"
+edit "$base71/templates/compose/.env.example" \
+  'KIT_POSTGRES_MAX_CONNECTIONS=200' 'KIT_POSTGRES_MAX_CONNECTIONS=12'
+expect_red_check 'breakage 71: the connection budget is below what the topology needs' \
+  "$base71" 'the connection budget  (max_connections covers' --static-only
+
+# The two halves of the connection contract, and they are broken in opposite
+# directions on purpose: 72 removes something the service NEEDS, 73 adds
+# something it must not carry. A check that only did one of them would be
+# satisfied by a config that has the wrong settings in place of the right ones.
+base72="$(fresh_copy kit-72)"
+# The whole assignment goes, not its value: an EMPTY value still contains the
+# key, so a check that greps for `application_name` would be satisfied by the
+# exact defect — a service whose queries cannot be attributed to it, which is the
+# bug the setting exists to prevent.
+#
+# AND THIS RECIPE WAS GREEN ON A CHECK THAT COULD NOT SEE IT, which is the
+# second half and the reason it is worth the paragraph above. The go snippet's
+# header comment reads "1. application_name — THE ONE THAT IS NOT OPTIONAL", so
+# after the line above was deleted the substring was still in the file — in a
+# COMMENT — and the contract check reported the contract satisfied. The recipe
+# ran, the mutation was real, and the check agreed with the tree.
+#
+# The rule is the one AGENTS.md states about `-count=1` — a check a comment can
+# satisfy is not a check — and the check now strips comments per language before
+# looking for a required setting. The two things this recipe proves are
+# different and both matter: the SETTING is required (it is), and the check reads
+# code rather than prose (it now does). A recipe that passed for the first reason
+# would have been green either way.
+edit "$base72/templates/database/go/database.go.snippet" \
+  '	cfg.ConnConfig.RuntimeParams["application_name"] = serviceName
+' ''
+expect_red_check 'breakage 72: a generated config does not set application_name' \
+  "$base72" 'templates/database/*  (the contract, in the generated output' --static-only
+
+base73="$(fresh_copy kit-73)"
+edit "$base73/templates/database/elixir/repo.exs.snippet" \
+  '        application_name: @service_name,' \
+  '        application_name: @service_name,
+      prepare: :unnamed,'
+expect_red_check 'breakage 73: a generated config carries a POOLER WORKAROUND' \
+  "$base73" 'templates/database/*  (the contract, in the generated output' --static-only
+
+base74="$(fresh_copy kit-74)"
+rm -f "$base74/DECISIONS.md"
+expect_red_check 'breakage 74: DECISIONS.md deleted — seven places reference it' \
+  "$base74" 'DECISIONS.md  (exists, records trades' --static-only
+
+# ---------------------------------------------------------------------------
+# 75: THE ONE THAT WOULD HAVE CAUGHT A REGRESSION KIT-21 SHIPPED.
+#
+# kit-21 turned the cluster into a BUILT image, so kit's compose went from
+#
+#     image: postgres:${KIT_POSTGRES_TAG:-…}      ->  image: kit-postgres:${…}
+#
+# and `check_stale_copy` — FAILURE MODE 1, the check whose whole job is naming
+# the services running their own copy of the platform — matched a service's image
+# against kit's by BARE REPOSITORY NAME. The rename changed `postgres` to
+# `kit-postgres`, a duplicating service still writes `postgres`, and the two
+# stopped matching. Measured, on the commit that shipped it:
+#
+#     $ fleet_check.py --repos-dir <fleet whose alpha runs postgres:17>
+#     PASS fleet: no service carries a copy of kit's stack, …
+#
+# Five repositories in the real fleet carry their own postgres, so the check
+# written to name them was reporting a clean fleet, and it did so SILENTLY: it
+# still ran, still printed PASS, and printed no skip.
+#
+# WHY 52/59/60 DID NOT CATCH IT, which is the part worth a breakage of its own.
+#
+# `break_stale_copy` writes a `ports:` entry on the copy, and
+# `check_override_surface` reports a published port by SERVICE NAME — a name the
+# rename never touched. So breakage 60 went red on the port half and nobody found
+# out the image half had stopped working. The recipe was green; the check it was
+# proving was half dead.
+#
+# That is a green control proving less than it appears to, and this repository's
+# own rule about controls says so directly: a control that goes red for a reason
+# another check created is not evidence. So 75 is the SAME defect with the
+# `ports:` line REMOVED, which leaves `check_override_surface` nothing to report
+# and makes the image comparison the only thing that can go red. If the image
+# half is ever disarmed again, 60 stays green and 75 does not.
+#
+# The needle is the finding's own text rather than the check's PASS line, so a
+# `check_stale_copy` that stopped firing and a fleet check that passed for some
+# other reason cannot be confused for one another.
+# ---------------------------------------------------------------------------
+base75="$(fresh_copy kit-75)"
+seventyfive_fixture="$(fixture_fleet stale-image-only)"
+break_stale_copy_no_ports "$seventyfive_fixture"
+export KIT_FLEET="$seventyfive_fixture"
+# The needle is the CHECK LABEL, not the finding's wording — and that is the
+# correction, because the first version of this recipe asserted the finding text
+# and was therefore WRONG for a reason that had nothing to do with the check it
+# was proving. `expect_red_check` matches `FAIL $want`, and the finding is not in
+# the label: it is an indented detail line under it.
+#
+#     FAIL fleet  (no stale copy, no weakened boundary, …)
+#            - alpha/db: runs 'postgres:17', which is the image kit's stack …
+#
+# So the recipe reported "the gate went red, but NOT via `which is the image
+# kit's stack already ships`" while printing that exact string two lines above the
+# complaint — which is the signature of the 64K pipe-buffer defect this file
+# already documents, except here the cause is the needle rather than the reader.
+# The general rule, and it is the same one as `reportUnusedDisableDirectives`: a
+# needle has to be a thing the check actually EMITS, and the check emits its
+# label.
+expect_red_check 'breakage 75: a service runs its own postgres IMAGE, with no port to catch it' \
+  "$base75" 'fleet  (no stale copy, no weakened boundary' --static-only
+unset KIT_FLEET
+
+# ---------------------------------------------------------------------------
+# 76-77: THE DOCUMENTED `bin/dev` COMMANDS ARE REAL.
+#
+# kit-21 added `bin/dev db grant` to four files' prose — templates/database/
+# README.md, DECISIONS.md, the init script and the compose file — and never added
+# the command. Every one of those four is a reader told the way out of "my
+# service's database was never created" exists, running it, and getting
+# `unknown command`. DECISIONS.md exists because this repository referenced a
+# document that did not exist; this is the same defect one layer down, and it is
+# the reason there is now a check for it.
+#
+# TWO recipes rather than one, because there are two ways to break it and they
+# fail differently. Removing the whole `db` arm leaves a documented COMMAND with
+# nothing behind it. Removing only the `grant` arm leaves a command whose
+# SUBCOMMAND is gone — and that is the harder one, because a check which only
+# asks "is `db` dispatched" reports a clean tree while four files still promise
+# `db grant`. Both were measured by hand before they were written down here.
+#
+# The needle is the finding's own wording, so a `bin_dev_command_check` that had
+# silently stopped firing cannot be confused with a different check going red.
+# ---------------------------------------------------------------------------
+base76="$(fresh_copy kit-76)"
+"$PY" - "$base76/templates/bin/dev.sh" <<'PYEOF'
+import re
+import sys
+
+path = sys.argv[1]
+body = open(path, encoding="utf-8").read()
+# The whole arm, which is several lines ending in `      ;;`.
+stripped = re.sub(r"^    db\)\n(?:.*\n)*?      ;;\n", "", body, count=1, flags=re.M)
+if stripped == body:
+    sys.exit("self_test: breakage 76: the `db` arm was not found in "
+             "templates/bin/dev.sh — the recipe's subject has moved")
+open(path, "w", encoding="utf-8").write(stripped)
+PYEOF
+expect_red_check 'breakage 76: bin/dev does not dispatch a command four files tell you to run' \
+  "$base76" 'bin/dev  (every command the documentation promises' --static-only
+
+base77="$(fresh_copy kit-77)"
+"$PY" - "$base77/templates/bin/dev.sh" <<'PYEOF'
+import sys
+
+path = sys.argv[1]
+body = open(path, encoding="utf-8").read()
+old = """        grant)
+          shift
+          db_grant "${1:-}"
+          ;;
+"""
+if old not in body:
+    sys.exit("self_test: breakage 77: the `grant` subcommand arm was not found in "
+             "templates/bin/dev.sh — the recipe's subject has moved")
+open(path, "w", encoding="utf-8").write(
+    body.replace(old, '        *) die "no subcommand" ;;\n', 1)
+)
+PYEOF
+expect_red_check 'breakage 77: bin/dev takes a command whose subcommand four files promise is gone' \
+  "$base77" 'bin/dev  (every command the documentation promises' --static-only
 
 printf '\n'
 # TWO skip kinds, counted apart, because they are two different problems and one

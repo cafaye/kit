@@ -148,15 +148,91 @@ volumes:
 
 services:
   # ------------------------------------------------------------------ postgres
+  #
+  # ONE CLUSTER. ONE DATABASE PER SERVICE. ONE ROLE PER SERVICE.
+  #
+  # This is the whole of kit's data topology, and it is worth being explicit
+  # about what it is not: it is not one Postgres per service. There is ONE
+  # container here, shared by every service in the fleet, and the DATABASE is
+  # the isolation boundary rather than the machine. Two services cannot read
+  # each other's rows because `REVOKE ALL ON DATABASE ... FROM PUBLIC` in the
+  # init script below refuses role `courier` at the door of database `billing`
+  # before a query is parsed — not because they are on different hosts.
+  #
+  # WHY THE IMAGE IS BUILT AND NOT PULLED. `postgres:17-alpine` cannot carry
+  # pgvector: pglayers publishes glibc-linked layers, and the alpine base is
+  # musl, so the extension fails to load at run time on an image that builds
+  # cleanly. Measured, with the output, in
+  # templates/compose/postgres/Dockerfile. The base is therefore `postgres:17`
+  # (Debian), which is the official image with exactly one extension layer on it.
   postgres:
-    image: postgres:${KIT_POSTGRES_TAG:-17-alpine}
+    build:
+      # `POSTGRES_TAG` and `PGVECTOR_TAG` are ARGs, so a service raises them in
+      # its own compose override rather than kit shipping one version for nine
+      # services. Nothing is `:latest` and nothing floats.
+      context: ./postgres
+      dockerfile: Dockerfile
+      args:
+        POSTGRES_TAG: ${KIT_POSTGRES_TAG:-17}
+        PGVECTOR_TAG: ${KIT_PGVECTOR_TAG:-17-0.8.6}
+    # `image:` names the BUILT artefact so `docker compose` can reuse it across
+    # the several checkouts a developer runs on one laptop. Without it every
+    # checkout builds its own copy of an identical image.
+    image: kit-postgres:${KIT_POSTGRES_TAG:-17}
     environment:
       POSTGRES_USER: ${KIT_POSTGRES_USER:-cafaye}
       POSTGRES_PASSWORD: ${KIT_POSTGRES_PASSWORD:-cafaye}
-      # Every service owns its own database (one container, several databases).
-      # A service that reaches into another's database is a bug in review, not a
-      # config problem to solve here.
+      # The cluster's OWN database. It is not a service's: it holds cluster
+      # administration state and nothing a service reads. A service that wants
+      # a database names itself in KIT_POSTGRES_DATABASES below.
       POSTGRES_DB: ${KIT_POSTGRES_DB:-cafaye_platform}
+      # THE DECLARATION. Comma-separated; each name becomes BOTH a role and a
+      # database owned by that role. This is the input the init script reads,
+      # and it is the single place a service's database and role come from.
+      #
+      # A service adds ITS OWN name here and nothing else. It does not get a
+      # container, a port, or a volume — the point of one cluster is that the
+      # nine services share all three.
+      KIT_POSTGRES_DATABASES: ${KIT_POSTGRES_DATABASES:-courier}
+      # Extensions, created by the admin role into EVERY database above. They
+      # are a CLUSTER decision rather than a per-service one because the
+      # extension's binaries are in the image, so they are available to every
+      # service on the cluster whether or not anybody creates one. The list
+      # decides who pays the disk cost, and that is an operator's call.
+      KIT_POSTGRES_EXTENSIONS: ${KIT_POSTGRES_EXTENSIONS:-vector}
+      # BLAST RADIUS, PER ROLE. These are the settings that only matter once
+      # the cluster is shared, and they are what replaces the isolation a pooler
+      # would have provided:
+      #
+      #   CONNECT LIMIT   one service cannot consume the cluster's connections.
+      #   statement_timeout      one service's runaway query cannot occupy
+      #                          shared resources until the cluster is unusable.
+      #   idle_in_transaction    one service's forgotten BEGIN cannot hold a
+      #                          snapshot open and block VACUUM for the other
+      #                          eight. On one database per machine this is one
+      #                          service's problem; on one cluster it is nine.
+      KIT_POSTGRES_ROLE_CONNECTIONS: ${KIT_POSTGRES_ROLE_CONNECTIONS:-10}
+      KIT_POSTGRES_STATEMENT_TIMEOUT_MS: ${KIT_POSTGRES_STATEMENT_TIMEOUT_MS:-15000}
+      KIT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS: ${KIT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS:-30000}
+    # THERE IS NO POOLER, AND THAT IS A DECISION.
+    #
+    # `max_connections` is raised from Postgres's 100 and `superuser_reserved_
+    # connections` is left alone, because the answer to "one cluster for nine
+    # services" is a connection budget with a per-service cap rather than a
+    # pooler. The reasoning, the PgBouncer measurements behind it, and the
+    # driver-level flags this decision makes unnecessary are in
+    # templates/database/README.md; the short version is that PgBouncer's own
+    # documentation says the remedy for its worst failure mode is `RECONNECT`
+    # on its admin console after a DDL migration, and that is a manual step
+    # after every schema change in nine repositories.
+    #
+    # N is a FLOOR for the cluster, and `KIT_POSTGRES_MAX_CONNECTIONS` is
+    # checked against it: with nine services at the per-role limit above, 100 is
+    # not enough and raising it is the decision, not an accident.
+    command:
+      - "postgres"
+      - "-c"
+      - "max_connections=${KIT_POSTGRES_MAX_CONNECTIONS:-200}"
     ports:
       # Host side is parameterized AND in kit's block; the container side is
       # not, because the image is what fixes it. Only the host side is ever a
@@ -164,6 +240,13 @@ services:
       - "${KIT_POSTGRES_PORT:-15500}:5432"
     volumes:
       - postgres-data:/var/lib/postgresql/data
+      # THE INIT SCRIPT. `docker-entrypoint-initdb.d` runs once, on a FRESH
+      # volume, which is why the provisions below appear to vanish after a
+      # `bin/dev nuke` and reappear after a `bin/dev down`: adding a service to
+      # KIT_POSTGRES_DATABASES does not provision its database until the volume
+      # is recreated. `bin/dev`'s `db grant` prints the statements for a new
+      # database rather than telling anybody to nuke their data.
+      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       # A REAL QUERY, against the database this container actually has.
       #

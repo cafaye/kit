@@ -1,0 +1,275 @@
+#!/usr/bin/env bash
+#
+# One Postgres CLUSTER. One DATABASE per service. One ROLE per service.
+#
+# This is the whole of kit's isolation contract, and database-per-service is
+# why the cluster is shared rather than one-per-service: the DATABASE is the
+# boundary. Two services that each own a database cannot read each other's
+# rows, because `REVOKE ALL ON DATABASE ... FROM PUBLIC` below means role
+# `courier` is refused at the door of database `billing` before a single query is
+# parsed.
+#
+# WHY A ROLE PER SERVICE AND NOT A SHARED ROLE. A shared role can CONNECT to
+# every database in the cluster, so "cannot read another service's data" becomes
+# a GRANT somebody has to remember to withhold. One role per service makes the
+# refusal structural: there is no second credential to leak and no grant to get
+# right, because the ONLY role holding CONNECT on `billing` is `billing`.
+#
+# WHY THE REVOKE IS HERE AND NOT LEFT TO THE OPERATOR. Postgres grants CONNECT
+# on every database to PUBLIC by default, including ones created after this
+# script runs. A cluster provisioned without these lines therefore has, by
+# default, NO isolation: every role in the fleet can open every database. It
+# fails open and silently, and the symptom is a cross-service query that works
+# in development and is a report in production.
+#
+# It is also per-database and per-run. An operator who adds a database by hand
+# gets Postgres's default rather than this contract, which is why
+# `templates/bin/dev.sh`'s `db grant` prints the exact statements for one new
+# database instead of assuming they happened.
+#
+# WHAT IS NOT HERE. Credentials are not. Every role below takes
+# `$POSTGRES_PASSWORD`, because this runs on a developer's machine and a shared
+# development password is the point. Isolation is by PRIVILEGE and never by
+# secret, which is exactly why the proof in `tests/isolation_test.sh` can
+# demonstrate the boundary while knowing every password in the cluster. In
+# production the roles carry distinct passwords from the deployment secret
+# store, and nothing about the boundary below changes.
+
+set -euo pipefail
+
+# Fail by name, and before anything is created.
+#
+# The Postgres documentation points at mrts/docker-postgresql-multiple-databases
+# for this shape. kit does not vendor that repository and does adopt its
+# instinct, because its failure mode is why this paragraph exists: an unset
+# variable leaves you with one database and a stack that looks perfectly fine. A
+# service whose migrations then run against a database that was never created
+# fails much later and much less legibly.
+: "${KIT_POSTGRES_DATABASES:?KIT_POSTGRES_DATABASES is unset. Name the services, comma-separated. A service with no entry has no database, and its migrations fail against a database that was never created.}"
+
+statement_timeout_ms="${KIT_POSTGRES_STATEMENT_TIMEOUT_MS:-15000}"
+idle_in_transaction_ms="${KIT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS:-30000}"
+role_connection_limit="${KIT_POSTGRES_ROLE_CONNECTIONS:-10}"
+extensions="${KIT_POSTGRES_EXTENSIONS:-}"
+
+note() { printf '  [cluster] %s\n' "$1"; }
+
+# The one validator. Both a service name and an extension name are pasted
+# unquoted into an identifier below, and both come from a service's own `.env`,
+# so neither may be trusted to be a bare identifier. An unvalidated name either
+# errors several statements away from the mistake or — the version worth
+# preventing — builds one identifier out of two tokens.
+require_identifier() {
+  case "$2" in
+    "" | [!a-z_]* | *[!a-z0-9_]*)
+      note "REFUSING '$2' as $1: must match [a-z_][a-z0-9_]*. Silently mangling an identifier here is how one service ends up owning another's database."
+      exit 1
+      ;;
+  esac
+}
+
+# psql against the admin database. `ON_ERROR_STOP=1` is not decoration: without
+# it psql logs the error, carries on, and still exits 0. Every statement in this
+# file is load-bearing, and a load-bearing statement whose failure is ignored is
+# how a cluster comes up holding two of nine databases and reports itself
+# healthy.
+admin() {
+  psql --no-psqlrc --quiet --username "$POSTGRES_USER" --dbname "$POSTGRES_DB" \
+    --set=ON_ERROR_STOP=1 "$@"
+}
+
+IFS=',' read -r -a entries <<<"$KIT_POSTGRES_DATABASES"
+provisioned=0
+
+for entry in "${entries[@]}"; do
+  # A comma-separated list in a `.env` file is very often written with a space
+  # after the comma, and trailing whitespace is not a syntax error anybody
+  # should have to notice.
+  service="$(printf '%s' "$entry" | tr -d '[:space:]')"
+  [ -n "$service" ] || continue
+  require_identifier service "$service"
+  note "provisioning $service"
+
+  # ONE STATEMENT PER psql CALL for the two below, and this is measured rather
+  # than stylistic.
+  #
+  # Read from a heredoc, psql sends consecutive statements as a single simple
+  # query, which the server wraps in an implicit transaction — and
+  # `CREATE DATABASE` refuses inside one:
+  #
+  #   ERROR:  CREATE DATABASE cannot run inside a transaction block
+  #
+  # with `ON_ERROR_STOP=1` on. So the obvious shape — one psql call per service
+  # holding `CREATE ROLE` and `CREATE DATABASE` together — provisions the ROLE
+  # and then dies, and because this script runs during initdb the whole cluster
+  # refuses to start. `CREATE INDEX CONCURRENTLY` and `VACUUM` fail the same
+  # way; the rule is that these two cannot share a batch.
+  admin --set=svc="$service" --set=pw="$POSTGRES_PASSWORD" <<'SQL' >/dev/null
+CREATE ROLE :"svc" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
+  PASSWORD :'pw';
+SQL
+
+  # The database, OWNED by that role. Ownership is what makes the schema grants
+  # below unnecessary rather than merely repeated: from PG15 the `public` schema
+  # belongs to `pg_database_owner`, the database owner is implicitly a member of
+  # it, and so the owning role keeps CREATE on `public` with no GRANT anywhere.
+  # That is why this cluster's PostgreSQL floor is 15.
+  admin --set=svc="$service" <<'SQL' >/dev/null
+CREATE DATABASE :"svc" OWNER :"svc";
+SQL
+
+  # THE BOUNDARY, plus blast radius. Each statement is load-bearing:
+  #
+  #   REVOKE ALL ON DATABASE  PUBLIC holds CONNECT by default. Withdrawing it
+  #                         is the entire mechanism; the rest is bookkeeping.
+  #   GRANT CONNECT, TEMPORARY gives the one role that belongs back in. A
+  #                         database nobody may enter is a tombstone, not a
+  #                         service.
+  #   ALTER ROLE ... CONNECTION LIMIT
+  #                         caps one service's share, so a pool that grows
+  #                         without bound exhausts its own service instead of
+  #                         refusing connections for the other eight.
+  #   statement_timeout        a runaway query in one service stops itself
+  #                           rather than occupying shared resources until the
+  #                           cluster is unusable.
+  #   idle_in_transaction_session_timeout
+  #                           the shared-cluster killer. One forgotten BEGIN
+  #                           holds a snapshot open, which blocks VACUUM
+  #                           cluster-wide and grows every table on the box. On
+  #                           one database per machine this is one service's
+  #                           problem; on one cluster it is nine services'.
+  admin --set=svc="$service" --set=conn_limit="$role_connection_limit" \
+    --set=stmt_ms="$statement_timeout_ms" --set=idle_ms="$idle_in_transaction_ms" <<'SQL' >/dev/null
+REVOKE ALL ON DATABASE :"svc" FROM PUBLIC;
+GRANT CONNECT, TEMPORARY ON DATABASE :"svc" TO :"svc";
+ALTER ROLE :"svc" CONNECTION LIMIT :conn_limit;
+ALTER ROLE :"svc" SET statement_timeout = :'stmt_ms';
+ALTER ROLE :"svc" SET idle_in_transaction_session_timeout = :'idle_ms';
+SQL
+
+  # PG15 REMOVED the default `CREATE` grant on the `public` schema, so a role
+  # that is not the database owner cannot create objects in somebody else's
+  # database any more. That is the change that makes database-per-service an
+  # actual boundary rather than a naming convention, and it is asserted here
+  # rather than inherited: this statement is already the PG15+ default, so on a
+  # supported floor it changes nothing, and its value is that the contract is
+  # stated in the cluster rather than assumed from a version's behaviour.
+  #
+  # No GRANT CREATE for the owner, because `pg_database_owner` already carries
+  # it. Granting it a second way would be a second fact to keep true, and the
+  # first one is a documented property of the server rather than of this file.
+  psql --no-psqlrc --quiet --username "$POSTGRES_USER" --dbname "$service" \
+    --set=ON_ERROR_STOP=1 <<'SQL' >/dev/null
+REVOKE CREATE ON SCHEMA public FROM PUBLIC;
+SQL
+
+  # Extensions, created BY THE ADMIN ROLE, and that is a finding rather than a
+  # shortcut.
+  #
+  # The obvious design — `SET ROLE <service>; CREATE EXTENSION` — cannot work,
+  # and the reason is worth recording because it corrects a reasonable
+  # assumption. pgvector's control file is not marked `trusted` (PG13+), so
+  # `CREATE EXTENSION` by a non-superuser is refused with:
+  #
+  #   ERROR:  permission denied to create extension "vector"
+  #   HINT:  Must be superuser to create this extension.
+  #
+  # Checked against pglayers' layer and against upstream pgvector v0.8.6, whose
+  # `vector.control` is byte-identical — this is pgvector's own classification,
+  # not something pglayers drops.
+  #
+  # So extension availability is a CLUSTER decision, made once by the operator,
+  # rather than something a service installs for itself. That is the right shape
+  # for a shared cluster anyway: the extension's binaries are in the image and
+  # therefore available to every service regardless, so the only thing a
+  # per-service grant would have governed is who gets to pay the disk cost.
+  if [ -n "$extensions" ]; then
+    IFS=',' read -r -a ext_list <<<"$extensions"
+    for raw_ext in "${ext_list[@]}"; do
+      ext="$(printf '%s' "$raw_ext" | tr -d '[:space:]')"
+      [ -n "$ext" ] || continue
+      require_identifier extension "$ext"
+      note "$service: CREATE EXTENSION IF NOT EXISTS $ext"
+      # Own psql call for the same reason as CREATE DATABASE: `SET ROLE` and
+      # `CREATE EXTENSION` in one batch put both statements in a single
+      # transaction, and the extension's privilege check then runs before the
+      # role change is visible — measured, and it fails with the misleading
+      # "must be superuser" above even though the superuser was doing it.
+      psql --no-psqlrc --quiet --username "$POSTGRES_USER" --dbname "$service" \
+        --set=ON_ERROR_STOP=1 --set=ext="$ext" <<'SQL' >/dev/null
+CREATE EXTENSION IF NOT EXISTS :"ext";
+SQL
+    done
+  fi
+
+  provisioned=$((provisioned + 1))
+done
+
+if [ "$provisioned" -eq 0 ]; then
+  note "REFUSING to finish with zero databases. An empty KIT_POSTGRES_DATABASES brings up a cluster that satisfies every statement in this script and isolates nothing."
+  exit 1
+fi
+
+# THE CONTRACT, ENFORCED OVER EVERY DATABASE RATHER THAN A LIST OF THEM.
+#
+# This block replaces a list, and the reason is that the list was not the whole
+# truth. The official image creates TWO databases before any init script is
+# sourced — the one named by `POSTGRES_DB`, and a stock `postgres` maintenance
+# database that nothing here had touched. So the cluster came up with
+# `has_database_privilege('public','postgres','CONNECT') = true` while this
+# script printed "PUBLIC holds CONNECT on none of them". A closing sentence that
+# is wrong is worse than no closing sentence, because it is the one a reader
+# trusts.
+#
+# Sweeping every non-template database makes the invariant hold BY CONSTRUCTION
+# rather than by a list somebody has to remember to extend, and `postgres` is
+# covered because it is a database rather than because it was named.
+#
+# A DO block rather than a shell loop because this needs `pg_database`, which a
+# REVOKE cannot be made conditional against from bash without a separate
+# existence test per database — and the per-database existence test is exactly
+# where this went wrong first: psql does NOT interpolate `:'vars'` in a
+# `--command` string (measured: "syntax error at or near \":\""), so the test
+# failed, and because it sat inside an `if [ -n "$(…)" ]` its failure was
+# SWALLOWED. The script then carried on, skipped the revoke, and exited 0
+# reporting a boundary it had not applied. `set -e` does not reach inside a
+# command substitution used as an `if` condition; only an explicit check does.
+#
+# Which is the general shape of the lesson rather than a detail of this line: a
+# load-bearing statement whose failure is ignored is how a cluster comes up
+# holding three of nine databases and reports itself healthy. Hence one call,
+# no `if`, and `ON_ERROR_STOP` doing the work.
+#
+# ...and the body below carries NO COMMENTS AT ALL, which is the third way this
+# same block went wrong and the reason for the rule rather than the fix:
+#
+#   - a `#` line is not a SQL comment. Inside a DO block it is a syntax error
+#     ("syntax error at or near …").
+#   - the dollar-quote TAG appears inside the body. Writing that tag in a
+#     comment inside a dollar-quoted block ENDS the block at that point
+#     ("syntax error at or near \"span\""), because a dollar-quoted string is
+#     closed by its own tag wherever that appears — comments do not shield it.
+#   - psql does not interpolate `:'vars'` inside a dollar-quoted body, so the
+#     admin role cannot be passed in that way either ("syntax error at or near
+#     \":\""). Hence `current_user`, which is that role already.
+#
+# All three failed loudly, which is the behaviour this block is supposed to
+# have: the cluster refused to start rather than coming up without a boundary.
+# The earlier version of this block did the opposite — see above. Explanation
+# lives in this comment, where it cannot be parsed.
+admin <<'SQL'
+DO $caf$
+DECLARE
+  d record;
+BEGIN
+  FOR d IN SELECT datname FROM pg_database WHERE NOT datistemplate ORDER BY datname
+  LOOP
+    EXECUTE format('REVOKE ALL ON DATABASE %I FROM PUBLIC', d.datname);
+    EXECUTE format('GRANT CONNECT, TEMPORARY ON DATABASE %I TO %I', d.datname, current_user);
+    RAISE NOTICE 'boundary applied: % reachable only by its own role and %', d.datname, current_user;
+  END LOOP;
+END
+$caf$;
+SQL
+
+note "done: $provisioned service database(s), one role each, PUBLIC holds CONNECT on none of them"

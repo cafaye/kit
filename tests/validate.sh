@@ -589,12 +589,29 @@ PY
   for f in "$ROOT"/.github/workflows/* "$ROOT"/lint/* "$ROOT"/docker/* \
     "$ROOT"/templates/bin-prime/* "$ROOT"/templates/compose/* \
     "$ROOT"/templates/kamal/drill.sh \
+    "$ROOT"/templates/compose/postgres/initdb/*.sh \
+    "$ROOT"/templates/compose/postgres/Dockerfile \
+    "$ROOT"/templates/database/contract.json \
     "$ROOT"/templates/bin/* "$ROOT"/templates/tier/*/* "$ROOT"/tests/*.sh; do
     [ -f "$f" ] || continue
     path="${f#"$ROOT"/}"
     case "$f" in
       *.sh) check "$path  (bash -n)" bash -n "$f" ;;
       *.yml | *.yaml) check "$path  (yaml.safe_load)" yaml_ok "$f" ;;
+      *.json)
+        # contract.json is where the connection check reads its requirements
+        # from, so a syntax error in it would be a check reading nothing rather
+        # than a red line. Parsed here so a malformed file fails on every
+        # machine — including one with no docker, which is the rest of the
+        # topology's dependency.
+        check "$path  (json.loads)" "$PY" -c \
+          'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$f"
+        ;;
+      # The cluster image. hadolint is its parser and runs below — reported
+      # there rather than here for the same reason docker/Dockerfile.* is:
+      # printing "no parser for this file type" beside a real hadolint result
+      # would say both "unchecked" and "checked" in the same run.
+      "$ROOT"/templates/compose/postgres/Dockerfile) ;;
       *.mjs)
         if have node; then
           check "$path  (node --check)" node --check "$f"
@@ -1165,7 +1182,7 @@ SNIPPETS
   if kit_bootstrap_binary hadolint \
     "https://github.com/hadolint/hadolint/releases/download/v${KIT_HADOLINT_VERSION}" \
     "$KIT_HADOLINT_SHA256S" "$ROOT"; then
-    for f in "$ROOT"/docker/Dockerfile.*; do
+    for f in "$ROOT"/docker/Dockerfile.* "$ROOT"/templates/compose/postgres/Dockerfile; do
       [ -f "$f" ] || continue
       rel="${f#"$ROOT"/}"
       # `--no-color`: the gate's output is read by humans and by CI log
@@ -2919,6 +2936,959 @@ PY
   }
   check 'templates/compose/.env.example  (every placeholder documented)' env_example_check
 
+  # -------------------------------------------------------------------------
+  # THE CONNECTION CONTRACT, ASSERTED AGAINST GENERATED OUTPUT, PER LANGUAGE.
+  #
+  #   A comment saying "remember to set prepare: :unnamed" is not a contract.
+  #   A comment saying "do NOT set it, and here is why" PLUS a check that fails
+  #   the build when it appears is one.
+  #
+  # Two directions, both load-bearing, both read from
+  # templates/database/contract.json so the requirements live in one file rather
+  # than being restated per language:
+  #
+  #   REQUIRED — every generated config carries application_name,
+  #   statement_timeout, idle_in_transaction_session_timeout, and a bounded
+  #   pool. A service missing one is unbounded on a shared cluster.
+  #
+  #   FORBIDDEN — no generated config carries a pooler workaround. This is the
+  #   half that catches the real failure: a service carrying `prepare:
+  #   :unnamed` or `default_query_exec_mode=simple_protocol` LOOKS correct, is
+  #   wrong (kit runs no pooler), and is measurably slower, and the only way to
+  #   notice is to look for the flag. See templates/database/README.md.
+  #
+  # The requirements are matched as TOKENS over the file's text rather than
+  # executed, and that is the honest bar: five of the six settings are
+  # connection-string or builder arguments whose effect is Postgres's, not the
+  # driver's, and asserting them by running them would mean standing up a
+  # cluster per language. What IS executed is the claim that would be cheap to
+  # fake — that each snippet parses in its own language — which is the same split
+  # `snippet_check` and the otel parse loop already make.
+  database_contract_check() {
+    "$PY" - "$ROOT" <<'PY'
+import json
+import os
+import re
+import sys
+
+root = sys.argv[1]
+contract_path = os.path.join(root, "templates/database/contract.json")
+if not os.path.isfile(contract_path):
+    sys.exit(
+        "templates/database/contract.json does not exist. The connection "
+        "requirements then have no single source, and the next language restates "
+        "them in its own snippet and disagrees with the other five."
+    )
+contract = json.load(open(contract_path, encoding="utf-8"))
+
+
+def strip_comments(src, lang):
+    """`src` with its COMMENTS removed, per language.
+
+    Exists because a required setting can be named in prose and not set in code,
+    and a substring test cannot tell the two apart. Measured: the go snippet's
+    header comment reads "1. application_name — THE ONE THAT IS NOT OPTIONAL",
+    so deleting the one line that sets it left the contract satisfied and
+    self-test breakage 72 green.
+
+    The rules, and the reasoning behind each:
+
+      * go / elixir / node / rust  — `//` to end of line. Elixir is the awkward
+        one: a `#` starts a comment there too, and `#{}` is interpolation, so a
+        `#` is only a comment when it is NOT inside `{}`.
+      * python                     — `#` to end of line.
+      * ruby (a `.yml`)            — `#` to end of line. The ruby snippet is
+        DATA, so this strips YAML comments; it is not ERB, because the file holds
+        `<%= ENV.fetch(…) %>` as a plain scalar.
+
+    String literals are NOT tracked, and that is the conservative choice in the
+    right direction: a comment marker inside a string is left in place, so the
+    code that follows it is still scanned and a real setting is still found. The
+    failure this could cause is a false NEGATIVE — a setting missed because a
+    `#` in a string opened a comment that ran to end of line — and every one of
+    the six snippets' settings is on its own line above such a marker, so it
+    survives. The opposite error, eating code that carries a setting, would make
+    this check red on a correct tree.
+    """
+    out = []
+    for line in src.splitlines():
+        marker = None
+        if lang in ("go", "node", "rust"):
+            marker = "//"
+        elif lang in ("python", "ruby"):
+            marker = "#"
+        elif lang == "elixir":
+            # `#` but not `#{…}`: interpolation is code and can hold a setting.
+            i = line.find("#")
+            if i != -1 and not (i + 1 < len(line) and line[i + 1] == "{"):
+                marker = "#"
+        if marker is None:
+            out.append(line)
+            continue
+        i = line.find(marker)
+        if i == -1:
+            out.append(line)
+        else:
+            # Keep the indentation so a reader of the finding can see where the
+            # line was; only the comment text goes.
+            out.append(line[:i].rstrip())
+    return "\n".join(out)
+
+
+required = contract.get("requiredSettings") or []
+pool = contract.get("boundedPool") or {}
+pool_tokens = pool.get("tokens") or []
+forbidden = (contract.get("pooler") or {}).get("forbidden") or []
+languages = contract.get("languages") or []
+
+problems = []
+if not required:
+    problems.append("contract.json declares no requiredSettings")
+if not pool_tokens:
+    problems.append("contract.json declares no boundedPool.tokens")
+if not forbidden:
+    problems.append(
+        "contract.json declares no forbidden pooler settings. An empty forbidden "
+        "list would make the half of this check that matters a no-op."
+    )
+if not languages:
+    problems.append("contract.json declares no languages")
+if problems:
+    sys.exit("; ".join(problems))
+
+for entry in languages:
+    lang = entry.get("lang", "?")
+    rel = entry.get("snippet", "")
+    path = os.path.join(root, rel)
+    if not rel or not os.path.isfile(path):
+        problems.append(f"{lang}: {rel} does not exist")
+        continue
+    body = open(path, encoding="utf-8").read()
+    # THE CODE, NOT THE PROSE. Measured, and it is the rule AGENTS.md states
+    # about `-count=1`: a check that a comment can satisfy is not a check.
+    #
+    # `application_name` appears in the go snippet's header comment — "1.
+    # application_name — THE ONE THAT IS NOT OPTIONAL" — so deleting the only
+    # line that ACTUALLY SETS it left the substring in the file and this check
+    # reported the contract satisfied. Self-test breakage 72 exists to catch
+    # precisely that, and it was green: the mutation it performs is the one this
+    # check could not see.
+    #
+    # So the required-setting test reads code with the comments removed. It is a
+    # per-language stripper rather than one regex because a line comment is `//`
+    # in four of the six languages, `#` in two, and a YAML or a doc comment is not
+    # a line comment at all — a stripper that got this wrong would either eat real
+    # code (a `#` inside a string) or leave the comment in.
+    #
+    # The stripper is deliberately CONSERVATIVE: it removes a comment it can
+    # recognise and leaves anything ambiguous alone, because a false NEGATIVE
+    # here (comment retained, check still satisfied) is the bug being fixed,
+    # while a false positive (code removed, a real setting reported absent) would
+    # be a red on a correct tree — and both directions are proven below.
+    code = strip_comments(body, entry.get("lang", ""))
+
+    for setting in required:
+        key = setting.get("key", "?")
+        if key not in code:
+            problems.append(
+                f"database/{lang}: does not set {key}. {setting.get('why', '')} "
+                f"The contract is templates/database/contract.json and this file "
+                f"is the generated output; a setting that is required there and "
+                f"absent here is the service running unbounded on a shared "
+                f"cluster."
+            )
+
+    if not any(t in code for t in pool_tokens):
+        problems.append(
+            f"database/{lang}: no bounded pool setting. Expected one of "
+            f"{pool_tokens}. {pool.get('why', '')}"
+        )
+
+    # The forbidden half, and it is checked per language rather than once over
+    # the directory: a single check over the directory would be satisfied by four
+    # clean files beside one that carries the flag.
+    for bad in forbidden:
+        if bad in code:
+            problems.append(
+                f"database/{lang}: contains {bad!r}, which is a pooler "
+                f"workaround. kit runs NO pooler — see "
+                f"templates/database/README.md for the argument, and "
+                f"DECISIONS.md for the measurements. Each of these trades real "
+                f"performance for compatibility with a component that is not in "
+                f"the path, and a service carrying one looks correct and is "
+                f"slower, so this is the only way it gets noticed."
+            )
+
+    # The service name, because `application_name` is only useful if it is the
+    # service's own name. Asserted as "the file names a service at all" rather
+    # than as a particular one, because kit's rule is that pins are placeholders
+    # and a service raises them in its own repository.
+    #
+    # Unquoted as well as quoted: the ruby snippet is YAML, where
+    # `application_name: courier` is the natural spelling, and a check that
+    # demanded quotes would fail the one language whose config is data.
+    if not any(re.search(rf"""["']?\b{n}\b["']?""", body)
+               for n in ("courier", "billing", "identity", "darkroom")):
+        problems.append(
+            f"database/{lang}: names no service, so application_name has nothing "
+            f"to attribute a query to. Every snippet ships a placeholder service "
+            f"name and the service changes it; none of them may ship without one."
+        )
+
+if problems:
+    sys.exit("\n       ".join([""] + problems))
+print(f"       contract: {len(languages)} language(s) x ({len(required)} required "
+      f"+ {len(pool_tokens)} pool tokens + {len(forbidden)} forbidden) — all satisfied")
+PY
+  }
+  check 'templates/database/*  (the contract, in the generated output, per language)' \
+    database_contract_check
+
+  # -------------------------------------------------------------------------
+  # DECISIONS.md EXISTS, AND EVERY REFERENCE TO IT RESOLVES.
+  #
+  # This file was referenced by AGENTS.md (twice), README.md (twice, one of them
+  # a MARKDOWN LINK), .github/zizmor.yml, the reusable workflow (three times) and
+  # three of the gate's own scripts — and did not exist. That is the worst shape
+  # a documentation reference can have: every reader is told the trade is written
+  # down, and the person who goes to read it finds nothing, and the natural
+  # conclusion is that the trade was never actually made.
+  #
+  # So this asserts both halves. The file exists and is a real file rather than an
+  # empty placeholder; and every `DECISIONS.md` reference in the tree names a
+  # file that exists, so a future rename is a FAIL rather than a dangling link.
+  decisions_check() {
+    "$PY" - "$ROOT" <<'PY'
+import os
+import re
+import sys
+
+root = sys.argv[1]
+rel = "DECISIONS.md"
+path = os.path.join(root, rel)
+problems = []
+
+if not os.path.isfile(path):
+    problems.append(
+        f"{rel} does not exist, and it is referenced from AGENTS.md, README.md, "
+        f".github/zizmor.yml, .github/workflows/ci.reusable.yml and three of the "
+        f"gate's own scripts. A reference to a decision document that is not "
+        f"there tells the reader the trade was made and then leaves them with "
+        f"nothing to read — which is worse than not claiming it, because the "
+        f"absence looks like they have not looked hard enough."
+    )
+else:
+    text = open(path, encoding="utf-8").read()
+    if len(text.strip()) < 400:
+        problems.append(
+            f"{rel} exists but is {len(text.strip())} characters. An empty or "
+            f"one-line DECISIONS.md satisfies every reference to it and records "
+            f"no trade, which is the failure this check exists to catch."
+        )
+    # A document of trades that records none is the same failure wearing a file.
+    headings = re.findall(r"^## ", text, re.M)
+    if len(headings) < 3:
+        problems.append(
+            f"{rel} has {len(headings)} top-level sections; a decisions "
+            f"document with fewer than three entries is a placeholder"
+        )
+
+# Every reference, wherever it is, must resolve. Only files, not REPORT-*.md:
+# the reports are historical records and are allowed to describe a state that
+# has since changed.
+skip_dirs = {".git", "REPORT", "CHANGELOG"}
+counted = 0
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [d for d in dirnames if d not in skip_dirs and d != ".venv"]
+    for name in filenames:
+        if not name.endswith((".md", ".sh", ".yml", ".yaml", ".toml", ".json")):
+            continue
+        full = os.path.join(dirpath, name)
+        if os.path.abspath(full) == os.path.abspath(path):
+            continue
+        try:
+            body = open(full, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        if "DECISIONS.md" not in body:
+            continue
+        counted += 1
+        relname = os.path.relpath(full, root)
+        # A reference that names a DIFFERENT file (`../DECISIONS.md` in a fleet
+        # repository) is about that repository's document and is not this
+        # check's business. A bare `DECISIONS.md` is about this one.
+        for match in re.findall(r"`?(\.{0,2}/?DECISIONS\.md)`?", body):
+            if match.startswith(".."):
+                continue
+            if not os.path.isfile(os.path.join(root, "DECISIONS.md")):
+                problems.append(f"{relname} references {match}, which does not exist")
+                break
+
+if problems:
+    sys.exit("; ".join(problems))
+print(f"       {rel} exists and {counted} referring file(s) resolve against it")
+PY
+  }
+  check 'DECISIONS.md  (exists, records trades, and every reference resolves)' decisions_check
+
+  # -------------------------------------------------------------------------
+  # EVERY `bin/dev <command>` THE DOCUMENTATION PROMISES IS ONE THE SCRIPT HAS.
+  #
+  # `DECISIONS.md` was created to stop this repository promising a document that
+  # does not exist, and four files in kit-21 then promised a COMMAND that did not:
+  # `bin/dev db grant <name>` is named in templates/database/README.md, in
+  # DECISIONS.md, in the init script and in the compose file, and `bin/dev` had no
+  # `db` command at all. Every one of those four is a reader who is told the way
+  # out of "my service's database was never created" exists, runs it, and gets
+  # `unknown command` — after `bin/dev up` has already told them the stack is fine.
+  #
+  # It is the same defect one layer down, and it is worth a check rather than a
+  # fix because the class is not the command: it is a document naming an interface
+  # and the interface disagreeing. So this reads the subcommands the script's own
+  # `case` dispatches, and fails on any documented one that is not there.
+  #
+  # Only COMMANDS are read, and only from prose that is telling a service author
+  # what to run. A prose mention of a flag, a URL, or a subcommand belonging to
+  # some other tool is not a promise about `bin/dev`, and a check that flagged
+  # those would be a check that fires on correct work.
+  bin_dev_command_check() {
+    "$PY" - "$ROOT" <<'PY'
+import os
+import re
+import sys
+
+root = sys.argv[1]
+dev = os.path.join(root, "templates/bin/dev.sh")
+if not os.path.isfile(dev):
+    sys.exit("templates/bin/dev.sh does not exist")
+
+source = open(dev, encoding="utf-8").read()
+
+# THE INTERFACE, TAKEN FROM THE SCRIPT — and read from the `case` in `main` by
+# BRACE MATCHING rather than by pattern-matching a line shape, because three
+# successive pattern attempts each reported a different wrong answer:
+#
+#   * requiring the line to END at `)` found four of the ten arms, and reported
+#     the real `bin/dev down` and `bin/dev nuke` as promised-but-missing;
+#   * requiring a bare `word)` on its own line, to spot a nested `case`, also
+#     matched a COMMENT, so `bin/dev pin v0` and `bin/dev logs tempo` were read as
+#     two-level promises — `v0` is a version;
+#   * and keying "does this arm take a subcommand" on the presence of that nested
+#     `case` meant that DELETING the nested `case` made the check go GREEN on
+#     `bin/dev db grant` — the exact defect it exists to catch.
+#
+# The last one is the reason the arms are read from `main` itself rather than
+# from the file. The lesson is not "write a better regex"; it is that a predicate
+# which infers an interface from a FORMATTING convention reports the interface
+# correctly only while the formatting holds, and this check got that wrong three
+# times in a row.
+_main = re.search(r"^main\(\)\s*\{(.*?^\})", source, re.M | re.S)
+if not _main:
+    sys.exit("templates/bin/dev.sh has no main() to read the command interface from")
+_main_body = _main.group(1)
+
+# Depth 1: `main`'s own arms, and depth 2: the arms of a `case` nested in one of
+# them, together with the arm they belong to. `help` and the two flag spellings
+# are dispatched by the same arm as each other and are not separate commands.
+dispatch = set()
+subcommands_of = {}
+for _m in re.finditer(r"^\s{4}([a-z][a-z0-9-]*|-h\s*\|\s*--help\s*\|\s*help)\)(.*?)(?=^\s{4}[a-z-]|\Z)",
+                      _main_body, re.M | re.S):
+    _arm, _body = _m.group(1), _m.group(2)
+    if "|" in _arm:
+        # One arm dispatching several spellings of the same thing.
+        for _alt in re.split(r"\|", _arm):
+            dispatch.add(_alt.strip())
+        continue
+    dispatch.add(_arm)
+    if re.search(r"^\s+case\s", _body, re.M):
+        # The `*)` catch-all is NOT a subcommand — it is the ABSENCE of one. So
+        # it is discarded, and an arm left with nothing is recorded as taking no
+        # subcommand at all. That distinction is load-bearing: with it, deleting
+        # `grant)` and leaving only `*) die …` empties the set, and the check
+        # reports the documented `bin/dev db grant` as a promise with nothing
+        # behind it — rather than deciding the arm has no subcommands and
+        # staying quiet about a promise four files make.
+        subs = {a for a in re.findall(r"^\s{8}([a-z][a-z0-9-]*)\)", _body, re.M)}
+        subs.discard("esac")
+        subs.discard("*")
+        subcommands_of[_arm] = subs
+dispatch -= {"esac", "in"}
+
+problems = []
+# A promise has to LOOK like a promise: inside backticks, or at the start of a
+# line in a usage block. The first version of this check matched the bare text
+# `bin/dev` followed by any lowercase word and reported thirty findings, every one
+# of them English — and it matched its OWN explanation, which is the shape
+# AGENTS.md records about `gate_declaration_check`: a check that fires on correct
+# work teaches the reader to ignore it.
+documented = {}
+skip_dirs = {".git", ".venv", "REPORT", "CHANGELOG", "copies"}
+# A backticked `bin/dev …` invocation. Two things about the shape, both measured:
+#
+#   * the space before the first argument is required, because
+#     `` `bin/dev` is the callable path `` is a SENTENCE about the script and
+#     appears in nine files; without it the closing backtick is skipped and the
+#     next English word reads as a command;
+#   * an ARGUMENT PLACEHOLDER has to be tolerated, because the four files naming
+#     `bin/dev db grant` all name it as `` `bin/dev db grant <name>` ``;
+#   * a word belongs to the invocation only when what FOLLOWS it is another word,
+#     a placeholder, or the CLOSING BACKTICK. A span that runs to the next
+#     backtick swallows the sentence after the command, which is how an earlier
+#     version reported `fetches`, `refuses` and `was` as promised subcommands —
+#     twenty-one findings, every one English;
+#   * and a command word is one the SCRIPT KNOWS, never a word that merely
+#     follows it. `` `bin/dev` fetches the stack `` is a sentence, and no amount
+#     of pattern work on the span distinguishes it from `` `bin/dev db grant` ``
+#     — the difference is that `db` is dispatched and `fetches` is not. So the
+#     candidates are intersected with the interface BEFORE anything is reported:
+#     an unknown first word is only a finding if it is not a plausible English
+#     continuation, and English is excluded by requiring the word to be followed
+#     by another word or the closing backtick AND by appearing in a span that
+#     opens with `bin/dev ` rather than `bin/dev` `.
+WORD = r"(?:[a-z][a-z0-9-]*|<[^>]*>)"
+# The opening is `bin/dev` followed by a SPACE and then a word — `bin/dev db
+# grant`. `` `bin/dev` `` with the backtick closing immediately is the script
+# being REFERRED TO, never being invoked, and every English finding in three
+# versions of this check came from reading past that backtick.
+CALL = re.compile(r"`bin/dev\s(" + WORD + r"(?:\s+" + WORD + r")*)\s?`")
+# A usage-block line: `bin/dev <word>` at the start, after any prompt strip.
+USAGE = re.compile(r"^\s*(?:\$|#)?\s*bin/dev((?:\s+" + WORD + r")*)", re.M)
+for dirpath, dirnames, filenames in os.walk(root):
+    dirnames[:] = [d for d in dirnames if d not in skip_dirs]
+    for name in filenames:
+        if not name.endswith((".md", ".sh", ".yml", ".yaml", ".toml", ".json")):
+            continue
+        full = os.path.join(dirpath, name)
+        # This check's own source, and `bin/dev` itself. The first version of
+        # this check reported `bin/dev is` — a phrase in its OWN explanation,
+        # quoted back at it by its own pattern. A check that reads its own
+        # comments is a check whose findings are about the check.
+        #
+        # `__file__` is NOT usable for that: this Python arrives on stdin, so it
+        # is `<stdin>` and the comparison never matches. Named literally instead.
+        if os.path.realpath(full) in (os.path.realpath(dev),
+                                      os.path.join(os.path.realpath(root), "tests/validate.sh")):
+            continue
+        try:
+            body = open(full, encoding="utf-8", errors="replace").read()
+        except OSError:
+            continue
+        rel = os.path.relpath(full, root)
+        for pattern in (CALL, USAGE):
+            for m in pattern.finditer(body):
+                words = [w for w in m.group(1).split()
+                         if not w.startswith("-") and not w.startswith("<")]
+                if not words:
+                    continue
+                first = words[0]
+                if first not in dispatch:
+                    documented.setdefault(f"{first} (command)", []).append(
+                        f"{rel} (as `bin/dev {first}`)"
+                    )
+                    continue
+                # The SECOND word is a subcommand only when the first word is an
+                # arm that dispatches any. `bin/dev pin v0.1.2` is a command and
+                # a version; `bin/dev db grant courier` is two levels of promise.
+                # And when the arm dispatches subcommands, the second word has to
+                # be one of THEM — which is what makes deleting the nested `case`
+                # a FAIL rather than a silence.
+                if len(words) > 1 and first in subcommands_of:
+                    second = words[1]
+                    if second not in subcommands_of[first]:
+                        documented.setdefault(f"{first} {second} (subcommand)", []).append(
+                            f"{rel} (as `bin/dev {first} {second}`)"
+                        )
+
+if documented:
+    listed = ", ".join(
+        f"`bin/dev {cmd}` cited in {len(where)} file(s)"
+        for cmd, where in sorted(documented.items())
+    )
+    sys.exit(
+        f"the documentation promises a command the script does not dispatch: {listed}. "
+        f"bin/dev dispatches: {', '.join(sorted(dispatch))}"
+        + (
+            f"; and under {', '.join(sorted(subcommands_of))}: "
+            + ", ".join(f"{a}->{sorted(s)}" for a, s in sorted(subcommands_of.items()))
+            if subcommands_of
+            else ""
+        )
+        + ". A reader told to run a command that does not exist is worse than one "
+        "told nothing — the promise is the whole message."
+    )
+
+print(f"       every documented bin/dev subcommand is dispatched ({len(dispatch)}: "
+      f"{', '.join(sorted(dispatch))})")
+PY
+  }
+  check 'bin/dev  (every command the documentation promises is one the script dispatches)' \
+    bin_dev_command_check
+
+  # -------------------------------------------------------------------------
+  # THE POSTGRES TAG, IN BOTH DIRECTIONS.
+  #
+  # This is a defect that shipped. `templates/compose/.env.example` said
+  # `KIT_POSTGRES_TAG=16.6-alpine` while docker-compose.yml defaulted to
+  # `17-alpine`, and .env.example WINS — `bin/dev` copies it to `.env` on first
+  # run. So every developer's stack ran 16.6 while the compose file, the README
+  # and the CHANGELOG all said 17. Commit 48689e6 fixed the compose default and
+  # left this line alone, which is the more dangerous half of that fix: it made
+  # the repository agree with itself and the developer's machine disagree with
+  # both.
+  #
+  # So this asserts the AGREEMENT, in both directions, over the parsed values
+  # rather than by grepping lines:
+  #
+  #   .env.example's tag == docker-compose.yml's `${KIT_POSTGRES_TAG:-…}` default
+  #
+  # Either one being changed alone is a FAIL. A check that only asked "is
+  # KIT_POSTGRES_TAG in .env.example" would be satisfied by the broken state,
+  # because the broken state has it.
+  postgres_tag_check() {
+    "$PY" - "$ROOT" <<'PY'
+import os
+import re
+import sys
+
+root = sys.argv[1]
+compose_path = os.path.join(root, "templates/compose/docker-compose.yml")
+example_path = os.path.join(root, "templates/compose/.env.example")
+
+problems = []
+compose = open(compose_path, encoding="utf-8").read()
+example = open(example_path, encoding="utf-8").read()
+
+# The image line, and the substitution's DEFAULT rather than the variable name.
+m = re.search(r"^\s*POSTGRES_TAG:\s*\$\{KIT_POSTGRES_TAG:-([^}]+)\}\s*$",
+              compose, re.M)
+if not m:
+    problems.append(
+        "docker-compose.yml does not pass POSTGRES_TAG as "
+        "${KIT_POSTGRES_TAG:-<default>}; without a default the stack cannot "
+        "start on a clone with no .env, and this check cannot compare anything"
+    )
+    compose_default = None
+else:
+    compose_default = m.group(1)
+
+m2 = re.search(r"^KIT_POSTGRES_TAG=(.*)$", example, re.M)
+if not m2:
+    problems.append(
+        ".env.example does not set KIT_POSTGRES_TAG. That is the state this check "
+        "exists for: an unset variable means the compose default silently wins, "
+        "which is the half of the disagreement nobody can see."
+    )
+    example_value = None
+else:
+    example_value = m2.group(1).strip()
+    if not example_value:
+        problems.append(
+            "KIT_POSTGRES_TAG= with no value. bin/dev copies .env.example to .env, "
+            "so an empty value here OVERRIDES the compose default with nothing — "
+            "and `postgres:` is an image reference with no tag."
+        )
+
+if compose_default and example_value and compose_default != example_value:
+    problems.append(
+        f"the Postgres tag disagrees. docker-compose.yml defaults to "
+        f"{compose_default!r} and templates/compose/.env.example sets "
+        f"{example_value!r}. .env.example WINS, because bin/dev copies it to .env "
+        f"on first run — so the stack a developer actually gets is "
+        f"{example_value!r} while every document in this repository says "
+        f"{compose_default!r}. Change both, or neither."
+    )
+
+# The variant is not decoration: pgvector arrives as a glibc-linked pglayers
+# layer and does not load on alpine's musl. A tag that is silently switched back
+# to `-alpine` produces an image that builds cleanly and cannot create an
+# extension, which is the failure mode templates/compose/postgres/Dockerfile
+# documents at length.
+for value, where in ((example_value, ".env.example"),
+                     (compose_default, "docker-compose.yml")):
+    if value and "alpine" in value:
+        problems.append(
+            f"{where} pins the Postgres tag as {value!r} (an alpine variant). "
+            "pgvector comes from pglayers as a glibc-linked layer and does not "
+            "load on musl — measured, in templates/compose/postgres/Dockerfile: "
+            "`Error loading shared library ld-linux-*.so` and `CREATE EXTENSION "
+            "vector` reporting the extension is not available. Use the Debian "
+            "variant."
+        )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check 'postgres tag  (.env.example and compose agree, and it is not alpine)' postgres_tag_check
+
+  # -------------------------------------------------------------------------
+  # THE CLUSTER'S TOPOLOGY, AND EVERY ${env:} IT DEPENDS ON HAS TO REACH THE
+  # CONTAINER.
+  #
+  # `collector_wiring_check` below holds that rule for the collector, and this is
+  # the same rule for postgres — with a sharper edge, because postgres's inputs
+  # are not endpoint URLs that fail loudly. `KIT_POSTGRES_DATABASES` unset does
+  # not stop the container: the official entrypoint creates its default database
+  # and reports ready, and the healthcheck passes. What is missing is the four
+  # service databases, discovered later as four services whose migrations run
+  # against a database that was never created.
+  #
+  # So this asserts the three agreements the topology rests on:
+  #
+  #   1. every KIT_POSTGRES_* the init script reads is passed by compose;
+  #   2. the init script is MOUNTED where the image will run it;
+  #   3. the image is BUILT from a Dockerfile that pins both tags, because a
+  #      compose `build:` with no Dockerfile, or one naming a floating tag, is a
+  #      cluster that either cannot start or silently changes major version.
+  cluster_topology_check() {
+    "$PY" - "$ROOT" <<'PY'
+import os
+import re
+import sys
+
+root = sys.argv[1]
+compose_path = os.path.join(root, "templates/compose/docker-compose.yml")
+init_path = os.path.join(root, "templates/compose/postgres/initdb/10-cluster.sh")
+dockerfile_path = os.path.join(root, "templates/compose/postgres/Dockerfile")
+
+problems = []
+compose = open(compose_path, encoding="utf-8").read()
+
+# (1) What the init script reads. `:-` defaults count as reads, because a
+# default is kit deciding a value on the operator's behalf.
+if not os.path.isfile(init_path):
+    sys.exit(
+        "templates/compose/postgres/initdb/10-cluster.sh does not exist, so the "
+        "cluster provisions exactly one database — POSTGRES_DB, the admin one — "
+        "and every service's migrations run against a database that was never "
+        "created."
+    )
+init = open(init_path, encoding="utf-8").read()
+read_vars = set(re.findall(r"\$\{(KIT_POSTGRES_[A-Z0-9_]+)[:\-]", init))
+
+svc = re.search(r"^  postgres:\n(.*?)(?=^  [a-z]|\Z)", compose, re.M | re.S)
+if not svc:
+    sys.exit("docker-compose.yml has no postgres service")
+block = svc.group(1)
+provided = set(re.findall(r"KIT_POSTGRES_[A-Z0-9_]+", block))
+for name in sorted(read_vars - provided):
+    problems.append(
+        f"the init script reads ${{{name}}} but docker-compose.yml does not pass "
+        f"{name} into the container, so it resolves empty and the cluster "
+        f"provisions whatever the script's default is rather than what the "
+        f"operator configured. This is the collector_wiring_check rule applied "
+        f"where the failure is SILENT: postgres still starts, and the missing "
+        f"thing is the databases."
+    )
+
+# (2) The mount. Without it the script never runs, and the symptom is again a
+# healthy cluster holding one database.
+if "/docker-entrypoint-initdb.d" not in block:
+    problems.append(
+        "the postgres service does not mount anything at "
+        "/docker-entrypoint-initdb.d, so initdb/10-cluster.sh never runs. The "
+        "cluster comes up healthy with a single database and no per-service "
+        "roles, and nothing reports it."
+    )
+
+# (3) The build. `image:` alone would be a pull of something kit does not
+# control, and `build:` with no `dockerfile:` is a convention rather than a
+# statement.
+if "build:" not in block:
+    problems.append(
+        "the postgres service has no build: stanza. The image is the official "
+        "postgres image plus the pglayers layer, which has to be composed — a "
+        "pull would be either a third-party postgres replacement or a cluster "
+        "with no pgvector."
+    )
+else:
+    if "dockerfile:" not in block:
+        problems.append(
+            "the postgres build: stanza names no dockerfile:, so which file is "
+            "built is a convention rather than a statement"
+        )
+    if not os.path.isfile(dockerfile_path):
+        problems.append("templates/compose/postgres/Dockerfile does not exist")
+    else:
+        df = open(dockerfile_path, encoding="utf-8").read()
+        for arg in ("POSTGRES_TAG", "PGVECTOR_TAG"):
+            if not re.search(rf"^ARG {arg}=", df, re.M):
+                problems.append(
+                    f"the cluster Dockerfile declares no ARG {arg}, so the tag "
+                    f"compose passes as a build arg is ignored and the image "
+                    f"silently uses whatever the ARG default is"
+                )
+        for tag in re.findall(r"^\s*FROM\s+(\S+)", df, re.M):
+            if tag.endswith(":latest") or ":" not in tag.rsplit("/", 1)[-1]:
+                problems.append(f"the cluster Dockerfile has an unpinned FROM: {tag}")
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check 'the cluster  (one database + role per service, wired end to end)' cluster_topology_check
+
+  # -------------------------------------------------------------------------
+  # THE CONNECTION BUDGET, AS AN ARITHMETIC IDENTITY rather than a comment.
+  #
+  # The pooler decision is "no pooler, and a stated budget instead" — and a
+  # stated budget that can be set below what the stack needs is a comment. This
+  # is the arithmetic that makes it a check:
+  #
+  #     max_connections  >=  (databases declared x per-role limit)  +  reserved
+  #
+  # Read out of the three files that hold the three numbers, so the check fails
+  # when any one of them moves without the others. Postgres reserves
+  # `superuser_reserved_connections` (3 by default) plus its own autovacuum and
+  # background workers, which is the `reserved` term.
+  connection_budget_check() {
+    "$PY" - "$ROOT" <<'PY'
+import os
+import re
+import sys
+
+root = sys.argv[1]
+example = open(
+    os.path.join(root, "templates/compose/.env.example"), encoding="utf-8"
+).read()
+compose = open(
+    os.path.join(root, "templates/compose/docker-compose.yml"), encoding="utf-8"
+).read()
+init = open(
+    os.path.join(root, "templates/compose/postgres/initdb/10-cluster.sh"),
+    encoding="utf-8",
+).read()
+
+problems = []
+
+def env_value(name):
+    m = re.search(rf"^{name}=(.*)$", example, re.M)
+    return int(m.group(1)) if m and m.group(1).strip().isdigit() else None
+
+def script_default(name):
+    m = re.search(rf'^\s*{name}="\$\{{{name}:-(\d+)\}}"', init, re.M)
+    return int(m.group(1)) if m else None
+
+max_conn = env_value("KIT_POSTGRES_MAX_CONNECTIONS")
+role_limit = env_value("KIT_POSTGRES_ROLE_CONNECTIONS")
+dbs_raw = re.search(r"^KIT_POSTGRES_DATABASES=(.*)$", example, re.M)
+
+for name, value in (
+    ("KIT_POSTGRES_MAX_CONNECTIONS", max_conn),
+    ("KIT_POSTGRES_ROLE_CONNECTIONS", role_limit),
+):
+    if value is None:
+        problems.append(
+            f".env.example does not set {name} to an integer, so the connection "
+            f"budget cannot be checked and a service that raises one of them has "
+            f"no idea whether the cluster can absorb it"
+        )
+if not dbs_raw or not dbs_raw.group(1).strip():
+    problems.append(
+        ".env.example sets no KIT_POSTGRES_DATABASES, so the example stack "
+        "provisions zero service databases. A default that exercises nothing "
+        "proves nothing on a developer's first `bin/dev up`."
+    )
+if problems:
+    sys.exit("; ".join(problems))
+
+dbs = [d.strip() for d in dbs_raw.group(1).split(",") if d.strip()]
+service_dbs = [d for d in dbs if not d.startswith("KIT_")]
+
+# The script's own default must not disagree with .env.example's, for the same
+# reason the tag check exists: two files, one fact, and the one that is silently
+# overridden is the one nobody sees.
+for name, from_env, from_script in (
+    ("KIT_POSTGRES_ROLE_CONNECTIONS", role_limit, script_default("KIT_POSTGRES_ROLE_CONNECTIONS")),
+):
+    if from_script is not None and from_script != from_env:
+        problems.append(
+            f"{name}: .env.example says {from_env} and initdb/10-cluster.sh's "
+            f"fallback says {from_script}. The script only reaches its fallback "
+            f"when compose does not pass the variable, so the two disagreeing is "
+            f"a shape that works on a developer's machine and not in CI."
+        )
+
+# Postgres's own reserves: superuser_reserved_connections (3) plus autovacuum
+# and background workers, which are not client connections but do occupy
+# superuser-reserved slots during a heavy autovacuum. 8 is the measured-safe
+# margin and is asserted rather than assumed.
+RESERVED = 8
+needed = len(service_dbs) * role_limit + RESERVED
+if max_conn < needed:
+    problems.append(
+        f"KIT_POSTGRES_MAX_CONNECTIONS is {max_conn} but the declared topology "
+        f"needs {len(service_dbs)} databases x {role_limit} connections "
+        f"(KIT_POSTGRES_ROLE_CONNECTIONS) + {RESERVED} for Postgres's own "
+        f"reserves = {needed}. With no pooler in the path, the connection budget "
+        f"IS the isolation story's other half: a service that cannot get a "
+        f"connection cannot reach another service's data, so an undersized "
+        f"budget shows up as a total outage rather than as a refused query."
+    )
+
+if problems:
+    sys.exit("; ".join(problems))
+print(
+    f"       budget: {max_conn} >= {len(service_dbs)} db x {role_limit} + "
+    f"{RESERVED} reserved = {needed}"
+)
+PY
+  }
+  # `max_connections`, which is the variable this check actually reads
+  # (`KIT_POSTGRES_MAX_CONNECTIONS`) and the GUC it compares. The label said
+  # `max_connions` — a different spelling of a thing that does not exist, in the
+  # one line a reader greps for when they want to know what this check measures.
+  # Self-test breakage 71 asserts the label as its needle, so the label is a
+  # contract: renaming it silently un-proofs the breakage, which is the same
+  # coupling as the `callable path` check and worth the same discipline.
+  check 'the connection budget  (max_connections covers the declared topology)' connection_budget_check
+
+  # Every database snippet must PARSE in its own language, and the parse has to
+  # be the LANGUAGE's own — a regex is not a parser.
+  #
+  # The otel snippets above exist because `rack_middleware.rb.snippet` shipped
+  # with `c.use_all, :auto_instrumentation`, which is not valid Ruby, and nothing
+  # in this file looked at it. A connection snippet has a higher cost for the
+  # same failure: a service that boots and then cannot reach its database fails
+  # in a way that looks like a cluster problem.
+  #
+  # Ruby and Node are the interesting cases and both are skipped loudly when the
+  # toolchain is absent rather than passed over, because this snippet is a file a
+  # service copies verbatim.
+  section 'static: every database snippet parses in its own language'
+  db_snippet_dir="$TMP/db-snippets"
+  rm -rf "$db_snippet_dir"
+  mkdir -p "$db_snippet_dir"
+
+  # <file>|<extension>|<command...>
+  #
+  # Only the languages a single command can honestly parse are here. Elixir and
+  # Rust are NOT, and each has a block below: `.exs` is EVALUATED rather than
+  # compiled, and `rustc` distinguishes an unresolved crate from a syntax error
+  # only by its error CODES. Both first shipped in this generic loop and both
+  # were wrong there — the generic form reported a missing `psycopg_pool` as a
+  # syntax error in python, and reported an unresolved `tokio_postgres` as one in
+  # rust, which is precisely the defect this repository's rules call out.
+  #
+  # node and TypeScript are decided on EXIT STATUS rather than on filtered
+  # output: `node --check` writes its warnings to stderr and exits 0, so
+  # grepping for a clean result reports a successful parse as a failure whenever
+  # node happens to print a hint line. The status is the verdict.
+  while IFS='|' read -r file ext cmd; do
+    [ -n "$file" ] || continue
+    src="$ROOT/templates/database/${file}"
+    [ -f "$src" ] || continue
+    # Named <lang><ext>, NOT <basename><ext>. The basename is
+    # `database.ts.snippet`, so the copy would be `database.ts.snippet.ts` — and
+    # node's type stripper refuses that:
+    #
+    #   TypeError [ERR_UNKNOWN_FILE_EXTENSION]: Unknown file extension ".ts"
+    #
+    # which is a check reporting a perfectly valid TypeScript file as unparseable
+    # on the strength of a filename this loop invented. The extension therefore
+    # comes from the TABLE rather than from the filename, because the filename's
+    # last dot-segment is `snippet`.
+    lang="${file%%/*}"
+    copy="$db_snippet_dir/$lang.$ext"
+    cp "$src" "$copy"
+    tool="${cmd%% *}"
+    if command -v "$tool" >/dev/null 2>&1; then
+      if out=$($cmd "$copy" 2>&1); then
+        report PASS "database/${file}  (parses as $ext)"
+      else
+        report FAIL "database/${file}  (parses as $ext)"
+        printf '%s\n' "$out" | head -8 | sed 's/^/       /'
+      fi
+    else
+      report SKIP "database/${file}  (parses as $ext — $tool not installed)"
+    fi
+  done <<'DBSNIPPETS'
+go/database.go.snippet|.go|gofmt -e -l
+python/database.py.snippet|.py|python3 -m py_compile
+ruby/database.yml.snippet|.yml|yaml_ok
+DBSNIPPETS
+
+  # Three of those need their own treatment, because the generic command cannot
+  # express them. All three copy their own file first — the generic loop's table
+  # deliberately does not list them, so there is one place per language that
+  # decides how it is parsed and no second spelling to keep in step.
+  #
+  # Elixir: a `.exs` file is EVALUATED, not merely compiled, so this is a real
+  # load. The snippet is written to be loadable with the standard library alone
+  # — it defines the settings module and deliberately does NOT define the
+  # `Courier.Repo` module, because `use Ecto.Repo` needs a dependency kit must
+  # not have and a module that cannot compile is a module the gate cannot check.
+  # The bar is therefore "loads with no CompileError and no SyntaxError", and
+  # the error COUNT rather than a grep for the word "error", because warnings
+  # about unresolved modules contain that word too.
+  #
+  # This shipped wrong twice. It first ran through the generic loop, which
+  # reported the snippet's own `use Ecto.Repo` as a syntax error; and it then
+  # reported a CompileError that was in fact an unresolved module. Both were the
+  # same mistake — treating a missing DEPENDENCY as a parse failure.
+  if have elixir; then
+    cp "$ROOT/templates/database/elixir/repo.exs.snippet" "$db_snippet_dir/elixir.exs"
+    out="$(elixir "$db_snippet_dir/elixir.exs" 2>&1 || true)"
+    if printf '%s\n' "$out" | grep -qE '\*\* \((Compile|Syntax)Error\)|^\s*error:'; then
+      report FAIL 'database/elixir/repo.exs.snippet  (loads as .exs)'
+      printf '%s\n' "$out" | head -8 | sed 's/^/       /'
+    else
+      report PASS 'database/elixir/repo.exs.snippet  (loads; stdlib only, as intended)'
+    fi
+  else
+    report SKIP 'database/elixir/repo.exs.snippet  (elixir not installed)'
+  fi
+
+  # Rust: `rustc --emit=metadata` fails with E0432/E0433 on an unresolved crate,
+  # which is NOT a syntax error and is exactly what a dependency-free kit should
+  # produce. So the check is "no error other than an unresolved-crate one", and it
+  # compares error CODES rather than lines — rustc's trailing "aborting due to N
+  # previous errors" carries no code, and a line-based test reports that summary
+  # as a syntax error. Which is what the otel loop's comment says about its own
+  # first version of this check, and about running `rustfmt` here: rustfmt wants
+  # an edition, says so on stderr, and a check that reads output rather than a
+  # status calls that a broken parse.
+  if have rustc; then
+    cp "$ROOT/templates/database/rust/database.rs.snippet" "$db_snippet_dir/rust.rs"
+    out="$(rustc --edition 2021 --crate-type lib --emit=metadata \
+      -o /dev/null "$db_snippet_dir/rust.rs" 2>&1 || true)"
+    codes="$(printf '%s\n' "$out" | grep -oE '^error\[E[0-9]+\]' | sort -u)"
+    unexpected="$(printf '%s\n' "$codes" | grep -vE 'E0432|E0433|E0463' || true)"
+    if [ -n "$unexpected" ]; then
+      report FAIL 'database/rust/database.rs.snippet  (parses as .rs)'
+      printf '%s\n' "$unexpected" | sed 's/^/       /'
+    elif [ -z "$codes" ]; then
+      report PASS 'database/rust/database.rs.snippet  (parses; crates resolved)'
+    else
+      report PASS 'database/rust/database.rs.snippet  (parses; crates unresolved, as expected)'
+    fi
+  else
+    report SKIP 'database/rust/database.rs.snippet  (rustc not installed)'
+  fi
+
+  # TypeScript: node's own type stripper is a parser, and it is in the node
+  # already running this gate. No typescript-eslint, no install.
+  if have node; then
+    # On EXIT STATUS, deliberately. `node --check` prints its warnings to stderr
+    # and exits 0, so a check that filters the output and looks for emptiness
+    # reports a clean parse as a failure whenever node adds a hint line — which
+    # it did here ("(Use `node --trace-warnings ...`)") and which the otel loop's
+    # version of this check hits the same way.
+    cp "$ROOT/templates/database/node/database.ts.snippet" "$db_snippet_dir/node.ts"
+    out="$(node --experimental-strip-types --check "$db_snippet_dir/node.ts" 2>&1)" \
+      && node_status=0 || node_status=$?
+    if [ "$node_status" -eq 0 ]; then
+      report PASS 'database/node/database.ts.snippet  (parses as .ts)'
+    else
+      report FAIL 'database/node/database.ts.snippet  (parses as .ts)'
+      printf '%s\n' "$out" | head -8 | sed 's/^/       /'
+    fi
+  else
+    report SKIP 'database/node/database.ts.snippet  (node not installed)'
+  fi
+
+  # -------------------------------------------------------------------------
   # bin/dev's escape hatch must actually WORK, and "must work" is a claim only
   # running it settles.
   #
@@ -5659,6 +6629,16 @@ for path in (
     "tests/fetch_test.sh",
     "tests/stack_live_test.sh",
     "tests/fleet_check.py",
+    # The cluster, its proof, and the connection contract. A README that
+    # documents a shared cluster without documenting that the DATABASE is the
+    # isolation boundary describes nine databases and says nothing about whether
+    # one service can read another's rows — which is the only question that
+    # matters about a shared cluster.
+    "tests/isolation_test.sh",
+    "templates/compose/postgres/Dockerfile",
+    "templates/compose/postgres/initdb/10-cluster.sh",
+    "templates/database/README.md",
+    "templates/database/contract.json",
 ):
     if path not in readme:
         problems.append(f"README.md never mentions {path}")
@@ -7330,6 +8310,27 @@ if [ "$RUN_OBSERVABILITY" -eq 1 ]; then
     # block was missing and once because Mimir's healthcheck named a directory.
     bounded_check 'tests/stack_live_test.sh  (the fetched stack runs; a trace and a metric land)' \
       900 bash "$ROOT/tests/stack_live_test.sh"
+
+    # THE CLUSTER, RUN, AND THE ANSWER IN THE OUTPUT.
+    #
+    # Every other claim about database-per-service is a claim about a file until
+    # this one runs. `docker compose config` is green on a stack whose
+    # `REVOKE ALL ON DATABASE ... FROM PUBLIC` is a comment, whose init script
+    # provisions two of nine databases, or whose service roles are superusers —
+    # and the symptom of all three is a cross-service query that works in
+    # development and is a report in production.
+    #
+    # It is in THIS phase rather than a new one because it is the same kind of
+    # claim: a security property that is worth nothing unexercised. And it prints
+    # the refused query and the server's answer rather than a summary line,
+    # because the evidence is the point — see `bounded_check`'s siblings above
+    # for why a proof nobody can see is a proof nobody ran.
+    #
+    # 1800s, not 900s: this suite builds the cluster image (a pull from ghcr.io
+    # on a cold cache), brings the stack up, and then brings a SECOND cluster up
+    # for the negative control. Three container lifecycles and two initdb runs.
+    bounded_check 'tests/isolation_test.sh  (service A cannot reach service B'"'"'s database)' \
+      1800 bash "$ROOT/tests/isolation_test.sh"
   fi
 fi
 # ===========================================================================
@@ -7582,10 +8583,25 @@ PY
   #
   # BOUNDED, and this is the phase that most needs it. Every recipe builds a
   # fresh throwaway copy of the tree and runs the whole static gate inside it, so
-  # the self-test is _n_ gates in sequence: 67 on this branch, and the number
+  # the self-test is _n_ gates in sequence: 77 on this branch, and the number
   # grows with every check this repository adds. On a quiet box it is the
   # longest phase in the run by a wide margin, and it is the one that grows
   # silently — nothing in it announces that the gate just got slower.
+  #
+  # The count in the LABEL above is computed from the recipes, so the number in
+  # this comment is the one place it can go stale, and it did: it read 67 for
+  # three packets. Corrected here rather than left, because a comment claiming a
+  # count is a claim, and this repository's rule about `DECISIONS.md` — that a
+  # reference to something that does not exist is worse than no reference — is the
+  # same rule one layer down.
+  #
+  # AND A BOUND IS NOT A RESULT ABOUT THE BREAKAGES IT DID NOT REACH. Measured on
+  # kit-22: this tier BOUNDed at breakage 56 of 77, so 21 recipes never ran, and
+  # the run still exited 0. That is the correct behaviour — a bound is neither a
+  # pass nor a skip, and it is reported — but it means a green gate is not
+  # evidence about the unreached recipes. Running them by hand is how kit-22 found
+  # breakage 72 green on a check that could not see its own defect. See
+  # AGENTS.md, "a BOUND self_test is a gate to run by hand".
   #
   # 5400s is measured, not chosen. The uninterrupted run recorded in
   # REPORT-kit-13.md §5.2 took ~44 minutes end to end, of which the self-test

@@ -128,6 +128,14 @@
           "dest": ".env.example"
         },
         {
+          "source": "templates/compose/postgres/Dockerfile",
+          "dest": "postgres/Dockerfile"
+        },
+        {
+          "source": "templates/compose/postgres/initdb/10-cluster.sh",
+          "dest": "postgres/initdb/10-cluster.sh"
+        },
+        {
           "source": "templates/compose/loki/loki-config.yaml",
           "dest": "loki/loki-config.yaml"
         },
@@ -164,6 +172,59 @@
           "dest": "grafana/provisioning/plugins/README.md"
         }
       ]
+    },
+    {
+      "id": "database/go",
+      "_about_contract": "THE CONNECTION CONTRACT, and the second half of kit's data topology. The `compose` bundle above is the CLUSTER — shared, identical for every service, fetched rather than copied — and these are what a service OWNS: the per-language config carrying `application_name`, `statement_timeout`, `idle_in_transaction_session_timeout` and a bounded pool, and carrying NO pooler workaround, because kit runs no pooler (DECISIONS.md MD21).",
+      "_about_one_per_language": "One artefact per language, with a LITERAL source rather than a `{lang}` template, and that is a deliberate shape rather than an inconsistency. `{lang}` interpolation cannot express these: the filename carries the language's own extension (`database.go.snippet`, `repo.exs.snippet`) and the destination differs per language too (`internal/db/db.go`, `lib/courier/database.ex`). Inventing a `perLanguage` field for it would be a change to what `tests/staleness.py` models, and this repository's rule is that a shape the reporter does not model is a decision that must be made deliberately and in the same commit — a reporter change, not an artefact-table change. So this uses the idiom both consumers already understand: a literal `source` with a `languages` filter. Six rows rather than one, and a service holding five of six is reported as five successes and one absence, which is the useful answer.",
+      "source": "templates/database/go/database.go.snippet",
+      "dest": "internal/db/db.go",
+      "languages": ["go"],
+      "optional": true,
+      "_about_optional": "kit does not expect universal adoption in one commit: a service adopts its own language's snippet when it migrates onto the cluster. Reported either way — `absent` is a finding, not a failure."
+    },
+    {
+      "id": "database/elixir",
+      "source": "templates/database/elixir/repo.exs.snippet",
+      "dest": "lib/courier/database.ex",
+      "languages": ["elixir"],
+      "optional": true
+    },
+    {
+      "id": "database/python",
+      "source": "templates/database/python/database.py.snippet",
+      "dest": "db.py",
+      "languages": ["python"],
+      "optional": true
+    },
+    {
+      "id": "database/ruby",
+      "source": "templates/database/ruby/database.yml.snippet",
+      "dest": "config/database.yml",
+      "languages": ["ruby"],
+      "optional": true
+    },
+    {
+      "id": "database/node",
+      "_about_node": "`node` and `bun` are ONE artefact with two languages, and deliberately so: bun runs node-postgres, so the snippet is byte-identical and a second file would be two things to keep in step for no difference in behaviour. `templates/database/contract.json` records the same fact as `alsoFor`, and a reader who wonders why there is no bun directory finds the answer in the node row's `languages` list.",
+      "source": "templates/database/node/database.ts.snippet",
+      "dest": "src/db.ts",
+      "languages": ["node", "bun"],
+      "optional": true
+    },
+    {
+      "id": "database/rust",
+      "source": "templates/database/rust/database.rs.snippet",
+      "dest": "src/db.rs",
+      "languages": ["rust"],
+      "optional": true
+    },
+    {
+      "id": "database/contract.json",
+      "source": "templates/database/contract.json",
+      "dest": "docs/database-contract.json",
+      "optional": true,
+      "_about": "The machine-readable requirements kit's gate checks the six snippets against. Optional for a service — `templates/database/README.md` is what a human reads, and this is what a program reads — but shipped, because a service that wants to check ITS config against the contract needs the file rather than a prose list it would have to keep in step."
     }
   ]
 }

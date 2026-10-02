@@ -1,0 +1,172 @@
+// kit template — the connection contract for a shared Postgres cluster.
+//
+//	# go get github.com/jackc/pgx/v5/pgxpool@v5.7.1
+//
+// THE FOUR SETTINGS, and each one exists because nine services share one
+// Postgres. On a database per machine you would need none of them.
+//
+//  1. application_name  — THE ONE THAT IS NOT OPTIONAL. `pg_stat_activity`
+//     shows nine services' queries in one list, and without an application_name
+//     that list cannot be attributed to any of them. It is also what a slow
+//     query log, a `pg_stat_statements` breakdown, and an operator asking "whose
+//     query is this?" all read. Set it from the service name, once.
+//
+//  2. statement_timeout — one service's runaway query occupies shared resources
+//     until it finishes. On its own machine that is its own outage; here it is
+//     everybody's. The cluster also sets this per role as a backstop, so a
+//     service that forgets it is still bounded — this is the first line, not the
+//     only one.
+//
+//  3. idle_in_transaction_session_timeout — THE SHARED-CLUSTER KILLER. A
+//     forgotten BEGIN holds a snapshot open, which blocks VACUUM and grows
+//     every table on the box. With one database per machine that is one
+//     service's problem; with one cluster it is nine services' problem, and it
+//     is silent until the disk fills.
+//
+//  4. a bounded pool — `pool_max_conns` is the share of the cluster's
+//     `max_connections` this service may take. Unbounded is how one service
+//     takes the connections the other eight need.
+//
+// There is NO pooler, and the absence of a pooler-specific setting here is
+// deliberate: the settings a service adds to SURVIVE a transaction-mode
+// connection pooler are absent, and templates/database/README.md explains why —
+// with PgBouncer's own documentation saying its remedy for a DDL-induced
+// `cached plan must not change result type` is `RECONNECT` on its admin
+// console. See the closing section of this file, and DECISIONS.md (MD21).
+package database
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgxpool"
+)
+
+// @service_name is the value that reaches `pg_stat_activity.application_name`.
+// It MUST equal your database and role name: one service, one database, one
+// role, one name, so a query on the cluster is attributable from the query
+// alone. See templates/compose/postgres/initdb/10-cluster.sh.
+const serviceName = "courier"
+
+// The timeouts. These are the values a pooler would have let you get away
+// without, and they are also the values the cluster's per-role settings apply
+// as a backstop — see KIT_POSTGRES_STATEMENT_TIMEOUT_MS and
+// KIT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS. Keeping the two in step means a
+// service that forgets this file is still bounded, and a service that raises
+// this file raises the cluster's backstop too.
+const (
+	statementTimeout        = 15 * time.Second
+	idleInTransactionTimout = 30 * time.Second
+)
+
+// poolMaxConns is this service's SHARE of the cluster's connection budget.
+//
+// It is bounded deliberately, and the number is a decision rather than a
+// default: the cluster raises `max_connections` to 200 and caps each role at 10
+// with `ALTER ROLE … CONNECTION LIMIT`. pgxpool's own `pool_max_conns` is the
+// SECOND cap, inside the process, and the two must agree in the direction that
+// is safe — a pool larger than the role's limit does not give you more
+// connections, it gives you errors.
+//
+// Ten is a ceiling, not a target. If your service genuinely needs more, raise
+// it in this file AND raise KIT_POSTGRES_ROLE_CONNECTIONS, and say in the PR why
+// the cluster's budget can absorb it.
+const poolMaxConns = 10
+
+// Open builds the pool.
+//
+// `dsn` is the connection URL, normally from DATABASE_URL, and it must NOT
+// carry the credentials in a committed file — see templates/kamal/README.md on
+// secrets. What kit adds on top of it is the four settings above, and it adds
+// them HERE rather than in the URL for one reason: a URL with a query string
+// holding three GUCs is unreadable, and the settings that matter are exactly
+// the ones a reader has to be able to find.
+func Open(ctx context.Context, dsn string) (*pgxpool.Pool, error) {
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		return nil, fmt.Errorf("database: parse dsn: %w", err)
+	}
+
+	// (1) The application name. pgx sends `RuntimeParams` in the startup packet,
+	// so this is set once per connection rather than per query.
+	//
+	// (2) and (3) are GUCs sent the same way. Setting them as runtime
+	// parameters rather than with `SET` matters: `SET` would run per connection
+	// after the pool hands it out, and a pool that grows would race.
+	//
+	// pgx formats durations for GUCs from a time.Duration as milliseconds,
+	// which is what both of these accept (`statement_timeout` is in ms; the
+	// rendered value here is `15000`, and the cluster backstop agrees).
+	cfg.ConnConfig.RuntimeParams["application_name"] = serviceName
+	cfg.ConnConfig.RuntimeParams["statement_timeout"] =
+		fmt.Sprintf("%d", statementTimeout.Milliseconds())
+	cfg.ConnConfig.RuntimeParams["idle_in_transaction_session_timeout"] =
+		fmt.Sprintf("%d", idleInTransactionTimout.Milliseconds())
+
+	// (4) The in-process cap, and the acquire timeout.
+	//
+	// `MinConns` is deliberately left at 0: a pool that pre-warms ten
+	// connections on a developer's laptop during `bin/dev up` is ten
+	// connections the rest of the stack cannot use, and the first request pays
+	// the cost instead.
+	cfg.MaxConns = poolMaxConns
+	cfg.MinConns = 0
+	cfg.MaxConnLifetime = time.Hour
+	cfg.MaxConnIdleTime = 30 * time.Minute
+	cfg.HealthCheckPeriod = time.Minute
+
+	pool, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		return nil, fmt.Errorf("database: open pool: %w", err)
+	}
+
+	// Fail loudly at startup rather than on the first request that needs the
+	// database. A service whose /up is green while its database is unreachable
+	// is a service that gets traffic it cannot serve, and the readiness probe
+	// is the only place that catches it cheaply.
+	if err := pool.Ping(ctx); err != nil {
+		pool.Close()
+		return nil, fmt.Errorf("database: ping: %w", err)
+	}
+	return pool, nil
+}
+
+// ---------------------------------------------------------------------------
+// WHAT IS NOT HERE, AND WHY — read this before "fixing" this file.
+//
+//   There is NO pooler compatibility setting in this file, and that omission is
+//   the load-bearing one. The usual workaround for a transaction-mode connection
+//   pooler is to stop using named prepared statements — in pgx, by moving the
+//   query-execution mode off its caching default. kit runs NO pooler, so there
+//   is nothing to be compatible with, and making that change here would make
+//   this service re-parse and re-plan every query for a component that is not in
+//   the path.
+//
+//   The full argument, with PgBouncer's and Postgrex's own words in it, is in
+//   templates/database/README.md and DECISIONS.md (MD21). The one sentence that
+//   decides it: PgBouncer's documentation describes `RECONNECT` on its admin
+//   console as the remedy for `ERROR: cached plan must not change result type`
+//   after a DDL migration — a manual operator step after every schema change in
+//   nine repositories.
+//
+//   So this file keeps pgx's default prepared-statement caching and needs no
+//   compatibility flag. `templates/database/contract.json` lists the pooler
+//   settings that are FORBIDDEN in generated config, and `tests/validate.sh`
+//   fails the build when one appears.
+//
+//   (This paragraph deliberately does not spell those settings out. The first
+//   version of it quoted them, and the check that forbids them flagged its own
+//   explanation — which is the failure mode AGENTS.md records about
+//   `gate_declaration_check`: a check that fires on correct work teaches the
+//   reader to ignore it. The names belong in the contract file, where a program
+//   reads them.)
+//
+//   If a pooler IS ever adopted, this file and templates/database/contract.json
+//   change together, and the change is a DECISIONS.md entry — not a one-line
+//   edit in nine repositories.
+// ---------------------------------------------------------------------------
+
+// compile-time proof that pgx is imported for the error type above.
+var _ = pgx.ErrNoRows

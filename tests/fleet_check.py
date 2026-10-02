@@ -249,7 +249,7 @@ _ComposeLoader.add_multi_constructor("!", lambda loader, suffix, node: node.valu
 def _expand(image: str) -> str:
     """`${KIT_X:-default}` -> `default`, for kit's own compose file.
 
-    kit writes its images as `postgres:${KIT_POSTGRES_TAG:-16.6-alpine}`, and a
+    kit writes its images as `kit-postgres:${KIT_POSTGRES_TAG:-17}`, and a
     service writes a literal. Comparing the two as text finds nothing, which is
     what the name-based version of this check did: six repositories running their
     own database, zero findings, because the strings had `${...}` in them.
@@ -261,6 +261,64 @@ def _expand(image: str) -> str:
     out = re.sub(r"\$\{[A-Za-z_][A-Za-z0-9_]*:-([^}]*)\}", r"\1", image)
     out = re.sub(r"\$\{[A-Za-z_][A-Za-z0-9_]*\}", "", out)
     return out
+
+
+# The upstream images kit's stack is BUILT from, per kit service, and the reason
+# this table exists at all.
+#
+# kit-21 made the cluster a BUILT image rather than a pulled one, because pgvector
+# has to be composed onto the official base (MD21b). That moved postgres from
+#
+#     image: postgres:${KIT_POSTGRES_TAG:-…}      # what kit used to publish
+#     image: kit-postgres:${KIT_POSTGRES_TAG:-…}  # what kit publishes now
+#
+# and `check_stale_copy` matches a service's image against kit's by BARE REPOSITORY
+# NAME. The rename changed `postgres` -> `kit-postgres`, and the bare name a service
+# writes when it duplicates the platform is still `postgres` — so the two stopped
+# matching and FAILURE MODE 1 stopped firing. Measured, after the rename:
+#
+#     $ fleet_check.py --repos-dir <a fleet whose alpha runs postgres:17>
+#     PASS fleet: no service carries a copy of kit's stack, …
+#
+# while the fixture held exactly the copy the check exists to report. Five
+# repositories in the real fleet carry their own postgres, and the check that was
+# written to name them had been silently reporting a clean fleet.
+#
+# The reason it went unnoticed is the shape AGENTS.md keeps warning about: the
+# check still RAN, still printed PASS, and its own self-test breakages 59 and 60
+# still went the right colour — because break_stale_copy's fixture writes a
+# `ports:` entry on the copy, and `check_override_surface` reports that by SERVICE
+# NAME, which the rename did not touch. So breakage 60 went red for the port and
+# nobody ever found out the image half had stopped working. A green control is
+# evidence about the whole gate, and this one was evidence about a different check.
+#
+# So the predicate below is the thing the check always meant: a service duplicates
+# the platform when it runs the UPSTREAM image kit's stack is built from. Keyed by
+# kit's service name, because that is what compose merges on, and read out of kit's
+# own compose file rather than a list here — except that the upstream name is no
+# longer visible in it, because kit names the artefact it built, not the base it
+# built FROM. Hence this one small table, which is a fact about the upstream
+# registry rather than about kit's own layout, and which fails loudly if kit ever
+# builds a different set.
+_UPSTREAM_BUILT_FROM = {"postgres": "postgres"}
+
+
+def _kit_duplicate_names(kit_name: str, kit_image: str) -> set:
+    """The image repository names that count as duplicating kit's `kit_name`.
+
+    Both the name kit publishes AND, when kit builds it, the upstream base that
+    name is an artefact of. A service cannot know to write `kit-postgres` — that
+    is a local build tag that exists on one developer's machine — so matching only
+    on it would report a fleet that is entirely non-compliant as clean.
+    """
+    names = set()
+    if kit_image:
+        bare = kit_image.split("@")[0].rsplit("/", 1)[-1]
+        names.add(bare.rsplit(":", 1)[0])
+    upstream = _UPSTREAM_BUILT_FROM.get(kit_name)
+    if upstream:
+        names.add(upstream)
+    return names
 
 
 def load_yaml(path: str):
@@ -292,6 +350,13 @@ def check_stale_copy(repo: str, name: str, compose: dict, problems: list) -> Non
     case a service actually hits, because choosing its own postgres major is the
     one override the packet says is legitimate and it is made by changing the
     tag on an image the service should not be running at all.
+
+    The comparison is over `_kit_duplicate_names`, not over kit's published
+    `image:` string alone: kit BUILDS its cluster image (MD21b), so what it
+    publishes is `kit-postgres:17` while what a duplicating service runs is
+    `postgres:17-alpine`. Matching on the published name only, which is what this
+    did until kit-21 renamed it, found nothing and reported a clean fleet - see
+    `_UPSTREAM_BUILT_FROM` for the measurement.
     """
     services = compose.get("services") or {}
     for svc_name, svc in services.items():
@@ -305,9 +370,10 @@ def check_stale_copy(repo: str, name: str, compose: dict, problems: list) -> Non
         for kit_name, kit_image in _kit_images.items():
             if not kit_image:
                 continue
-            kit_bare = kit_image.split("@")[0].rsplit("/", 1)[-1]
-            kit_repo_name = kit_bare.rsplit(":", 1)[0]
-            if image.split("@")[0] == kit_image.split("@")[0] or repo_name == kit_repo_name:
+            dupes = _kit_duplicate_names(kit_name, kit_image)
+            if not dupes:
+                continue
+            if image.split("@")[0] == kit_image.split("@")[0] or repo_name in dupes:
                 problems.append(
                     f"{name}/{svc_name}: runs {image!r}, which is the image kit's "
                     f"stack already ships for {kit_name!r}. A service does not get "
@@ -598,9 +664,11 @@ def main(argv: list) -> int:
     # each value, so the check raised AttributeError on the FIRST repository and
     # printed a traceback instead of a finding. Nothing had ever run it.
     #
-    # An `image:` is `${KIT_POSTGRES_TAG:-16.6-alpine}` in kit's own file, so the
+    # An `image:` is `${KIT_POSTGRES_TAG:-17}` in kit's own file, so the
     # stored string is the substitution with the default expanded — which is what
     # makes the comparison against a service's `postgres:18-alpine` work at all.
+    # For the cluster that string is `kit-postgres:17`, and the UPSTREAM half of
+    # the comparison comes from `_UPSTREAM_BUILT_FROM` rather than from here.
     for name, svc in (load_yaml(kit_compose_path).get("services") or {}).items():
         if isinstance(svc, dict):
             _kit_images[name] = _expand(svc.get("image") or "")

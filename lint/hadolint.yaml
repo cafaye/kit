@@ -35,3 +35,20 @@ ignored:
   # where one person owns one file — which is the whole "callers override,
   # they never fork" rule.
   - DL3008
+  # DL3067 — "do not copy an entire filesystem from another stage".
+  #
+  # The cluster image is `FROM scratch` extension layers overlaid onto the
+  # official `postgres` image, which is pglayers' whole mechanism:
+  #
+  #   FROM ghcr.io/pglayers/pgx-pgvector:17-0.8.6 AS pgvector
+  #   FROM postgres:17
+  #   COPY --from=pgvector / /
+  #
+  # There is no narrower copy that works. The rule's rationale — that an
+  # accidental whole-filesystem copy pastes in files nobody reviewed — is
+  # genuinely the risk here, and it is answered by the pin rather than by the
+  # rule: the layer is a specific published version of one extension, not a
+  # filesystem from an unreviewed build stage. A narrower path would need
+  # pglayers to lay its files out somewhere predictable, which its PG18 isolated
+  # layout does and its PG17 classic layout does not.
+  - DL3067

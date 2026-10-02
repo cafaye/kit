@@ -1,0 +1,162 @@
+# kit template — the connection contract for a shared Postgres cluster.
+#
+#     # mix deps.get
+#     #   {:postgrex, "~> 0.22"}
+#
+# FOUR SETTINGS, and each exists because nine services share one Postgres. On a
+# database per machine you would need none of them.
+#
+#   1. :application_name — THE ONE THAT IS NOT OPTIONAL. `pg_stat_activity` shows
+#      nine services' queries in one list; without an application_name that list
+#      cannot be attributed to any of them. Postgrex sends `:parameters` in the
+#      startup packet, so this is set once per connection.
+#
+#   2. :statement_timeout — one service's runaway query occupies shared resources
+#      until it finishes. The cluster also sets this per role as a backstop.
+#
+#   3. :idle_in_transaction_session_timeout — THE SHARED-CLUSTER KILLER. A
+#      forgotten BEGIN holds a snapshot open, blocks VACUUM and grows every table
+#      on the box.
+#
+#   4. :pool_size — this service's share of the cluster's connection budget.
+#
+# # This is the module and nothing else. It deliberately does NOT define the
+# `Courier.Repo` module itself, even though the settings above have to reach it:
+#
+#   * `mix phx.gen.repo` writes that module, with the `use Ecto.Repo` line and
+#     the adapter. Redefining it here would mean the reader pastes a file that
+#     fights the one their generator already wrote.
+#   * A snippet that cannot be loaded is a snippet nobody can check. `use
+#     Ecto.Repo` needs a dependency kit does not have and must not have, and a
+#     module that fails to compile is a module the gate cannot parse — which is
+#     the whole reason templates/otel/elixir's snippet is loadable with nothing
+#     but the standard library. So the contract lives in a module that loads, and
+#     the Repo stays the four-line `use` the reader already has.
+#
+# Wire it by passing `options/0` in, which is where the four settings go:
+#
+#     # config/runtime.exs
+#     config :courier, Courier.Repo,
+#       url: System.get_env("DATABASE_URL"),
+#       pool_size: 10,
+#       parameters: [application_name: "courier",
+#                    statement_timeout: "15000",
+#                    idle_in_transaction_session_timeout: "30000"]
+#
+# …which is `options/0` above, minus the URL, because `config/runtime.exs` is
+# the only place that may read the environment. Keeping the settings in one
+# function and the URL at the call site is what lets the settings be tested.
+defmodule Courier.Database do
+  @moduledoc """
+  The shared cluster's connection contract, in one readable place.
+
+  Built in code rather than by interpolating environment variables into
+  `config/runtime.exs`, so that the four settings below and the reason each one
+  exists are together, rather than four lines in a list that nobody reads.
+
+  The credentials come from the environment and are never named here. The
+  DATABASE_URL is a Kamal secret (`templates/kamal/README.md`) or a local
+  `.env`; nothing in kit holds a value.
+  """
+
+  # MUST equal your database and role name: one service, one database, one role,
+  # one name, so a query on the cluster is attributable from the query alone.
+  @service_name "courier"
+
+  # These are the values the cluster's per-role settings apply as a backstop
+  # (KIT_POSTGRES_STATEMENT_TIMEOUT_MS, KIT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS).
+  # Keeping the two in step means a service that forgets this module is still
+  # bounded.
+  @statement_timeout_ms 15_000
+  @idle_in_transaction_timeout_ms 30_000
+
+  # This service's SHARE of the cluster's connection budget. The cluster caps
+  # each role at 10 with `ALTER ROLE … CONNECTION LIMIT`; :pool_size is the
+  # cap inside the BEAM, and the two must agree in the direction that is safe.
+  # A pool larger than the role limit does not give you more connections, it
+  # gives you errors.
+  @pool_size 10
+
+  @doc """
+  The connection options. These are the whole contract.
+
+  `:parameters` is Postgrex's documented route for connection parameters — a
+  keyword list sent in the startup packet. It is the one that works against a
+  direct connection on a shared cluster, which is why the settings are here and
+  not in a URL query string: a URL carrying three GUCs is unreadable, and the
+  settings that matter are the ones a reader has to be able to find.
+  """
+  def options do
+    [
+      url: url(),
+      pool_size: @pool_size,
+      # `:queue_target` and `:queue_interval` are DBConnection's checkout policy.
+      # Left at their defaults on purpose: this is a tuned-for-humans setting and
+      # a service that needs a different queue depth has a latency problem to
+      # solve with a measurement, not a number copied out of a template.
+      parameters: [
+        application_name: @service_name,
+        statement_timeout: Integer.to_string(@statement_timeout_ms),
+        idle_in_transaction_session_timeout: Integer.to_string(@idle_in_transaction_timeout_ms)
+      ],
+      # `:connect_timeout` bounds the time a dead host costs a caller. The
+      # default is `:timeout` (15s), which is the same as a query timeout and
+      # therefore doubles the worst case for anything that opens a connection.
+      connect_timeout: 5_000
+    ]
+  end
+
+  @doc """
+  The connection URL, from the environment, or nil.
+
+  nil rather than a raise, because `config/runtime.exs` is evaluated for
+  `mix compile`, `mix test` and `iex -S mix` alike — three contexts in which a
+  hard failure on a missing variable is wrong at least twice.
+  """
+  def url, do: System.get_env("DATABASE_URL")
+
+  @doc """
+  Whether a database URL is present. The readiness probe's question.
+
+  Kept separate from `url/0` so that "no database configured" is a VALUE a
+  caller can branch on rather than an exception it has to rescue — and so that
+  the startup log can say which of the two happened.
+  """
+  def configured?, do: is_binary(url()) and url() != ""
+end
+
+# ---------------------------------------------------------------------------
+# WHAT IS NOT HERE, AND WHY — read this before "fixing" this module.
+#
+#   There is NO pooler compatibility setting in this module, and that omission
+#   is the load-bearing one. The usual workaround for a transaction-mode
+#   connection pooler is to stop preparing named statements — in Postgrex, by
+#   setting its `:prepare` option away from its `:named` default. kit runs NO
+#   pooler, so there is nothing to be compatible with, and making that change
+#   would stop Ecto caching queries at all, which is most of what Ecto is for.
+#
+#   Postgrex's own documentation is why it is tempting: from 0.22.4's
+#   `start_link/1`, with a transaction-mode pooler older than 1.21, "named
+#   prepared queries cannot be used". The argument for running no pooler at all
+#   is in templates/database/README.md and DECISIONS.md (MD21), and the sentence
+#   that decides it is from PgBouncer's own configuration documentation: the
+#   remedy for `ERROR: cached plan must not change result type` after a DDL
+#   migration is `RECONNECT` on its admin console — a manual operator step after
+#   every schema change in nine repositories.
+#
+#   So `:prepare` stays at its default and no migration in this fleet needs
+#   anybody to remember a console command. `templates/database/contract.json`
+#   lists the pooler settings that are FORBIDDEN in generated config, and
+#   `tests/validate.sh` fails the build when one appears.
+#
+#   (This paragraph deliberately does not spell those settings out. The first
+#   version of it quoted them, and the check that forbids them flagged its own
+#   explanation — which is the failure mode AGENTS.md records about
+#   `gate_declaration_check`: a check that fires on correct work teaches the
+#   reader to ignore it. The names belong in the contract file, where a program
+#   reads them.)
+#
+#   If a pooler IS ever adopted, this module and templates/database/contract.json
+#   change together, and that is a DECISIONS.md entry rather than a one-line
+#   edit in nine repositories.
+# ---------------------------------------------------------------------------

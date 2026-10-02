@@ -1,0 +1,119 @@
+# kit template — the connection contract for a shared Postgres cluster.
+#
+#   bundle add "pg" "~> 1.5"
+#
+# FOUR SETTINGS, and each exists because nine services share one Postgres. On a
+# database per machine you would need none of them.
+#
+#   1. application_name  — THE ONE THAT IS NOT OPTIONAL. `pg_stat_activity` shows
+#      nine services' queries in one list and cannot attribute any of them
+#      without it. libpq sends it in the startup packet.
+#
+#   2. statement_timeout — one service's runaway query occupies shared resources
+#      until it finishes. The cluster sets this per role as a backstop too.
+#
+#   3. idle_in_transaction_session_timeout — THE SHARED-CLUSTER KILLER. A
+#      forgotten BEGIN holds a snapshot open, blocks VACUUM and grows every table
+#      on the box.
+#
+#   4. pool              — this service's share of the cluster's connection
+#      budget.
+#
+# Copy into `config/database.yml` and change the service name. Symbols are the
+# Rails/ActiveRecord convention; this file is the plain-PG one, so it works in a
+# non-Rails service too.
+
+default: &default
+  # Credentials live in the URL, which is a Kamal SECRET and never a value in a
+  # committed file (templates/kamal/README.md).
+  url: <%= ENV.fetch("DATABASE_URL") %>
+
+  # (1) MUST equal your database and role name: one service, one database, one
+  # role, one name, so a query on the cluster is attributable from the query
+  # alone.
+  application_name: courier
+
+  # (2) and (3). These are the values the cluster's per-role settings apply as a
+  # backstop (KIT_POSTGRES_STATEMENT_TIMEOUT_MS,
+  # KIT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS), so a service that forgets them
+  # is still bounded rather than unbounded.
+  #
+  # They are connection PARAMETERS and not an `after_connect` callback on
+  # purpose. libpq sends parameters in the startup packet, so they cannot be
+  # missed by a connection the pool opens later; a `PG.connect` block that runs
+  # `SET` has to be given to every checkout path or a new connection silently
+  # misses it.
+  statement_timeout: 15000
+  idle_in_transaction_session_timeout: 30000
+
+  # (4) This service's SHARE of the cluster's connection budget. The cluster
+  # caps each role at 10 with `ALTER ROLE … CONNECTION LIMIT`, and `pool` is the
+  # cap inside this process. The two must agree in the direction that is safe: a
+  # pool larger than the role limit does not give you more connections, it gives
+  # you errors.
+  pool: 10
+
+  # `checkout_timeout` bounds how long a caller waits for a free connection.
+  # Deliberately below the 15s statement_timeout so a caller finds out about
+  # exhaustion while its own timeout still has somewhere to go.
+  checkout_timeout: 5
+
+  # Fail at BOOT rather than on the first request that needs the database. A
+  # service whose /up is green while its database is unreachable gets traffic
+  # it cannot serve, and the readiness probe is the only cheap place to catch it.
+  connect_timeout: 5
+  # `reconnect_attempts` and friends are deliberately at their defaults. A
+  # reconnect loop in a service with a *pool* is the wrong shape: the pool
+  # already replaces dead connections, and a reconnect loop on top of it turns
+  # one dead backend into a retry storm against a cluster eight other services
+  # share.
+
+development:
+  <<: *default
+
+test:
+  <<: *default
+
+production:
+  <<: *default
+
+# ---------------------------------------------------------------------------
+# WHAT IS NOT HERE, AND WHY — read this before "fixing" this file.
+#
+#   There is NO pooler compatibility setting in this file, and that omission is
+#   the load-bearing one. The usual workaround for a transaction-mode connection
+#   pooler is to stop preparing named statements, and to enumerate the handful of
+#   session GUCs a pooler will not carry across a reused backend. kit runs NO
+#   pooler, so there is nothing to be compatible with.
+#
+#   The second omission is the more interesting one, and it is evidence rather
+#   than a convenience: a pooler's list of parameters it will preserve across a
+#   reused server connection does not include `statement_timeout`, and its own
+#   documentation warns that "Most parameters cannot be fully tracked this way."
+#   So the timeout above would not survive transaction pooling reliably anyway.
+#   That is a second, independent reason the contract is four settings on a
+#   direct connection rather than four settings behind a pooler.
+#
+#   The argument for running no pooler at all is in
+#   templates/database/README.md and DECISIONS.md (MD21), and the sentence that
+#   decides it is from PgBouncer's own configuration documentation: the remedy
+#   for `ERROR: cached plan must not change result type` after a DDL migration is
+#   `RECONNECT` on its admin console — a manual operator step after every schema
+#   change in nine repositories.
+#
+#   So libpq's default prepared-statement behaviour stays exactly as it is.
+#   `templates/database/contract.json` lists the pooler settings that are
+#   FORBIDDEN in generated config, and `tests/validate.sh` fails the build when
+#   one appears.
+#
+#   (This comment deliberately does not spell those settings out. The first
+#   version of it quoted them, and the check that forbids them flagged its own
+#   explanation — which is the failure mode AGENTS.md records about
+#   `gate_declaration_check`: a check that fires on correct work teaches the
+#   reader to ignore it. The names belong in the contract file, where a program
+#   reads them.)
+#
+#   If a pooler IS ever adopted, this file and templates/database/contract.json
+#   change together, and that is a DECISIONS.md entry rather than a one-line
+#   edit in nine repositories.
+# ---------------------------------------------------------------------------

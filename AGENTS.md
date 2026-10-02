@@ -18,8 +18,8 @@
 kit/
 ├── README.md                             # what kit is, how a repo adopts it
 ├── LICENSE                               # MIT. The whole grant, and nothing can disagree
-├── .gitleaks.toml                        # the allowlist, and nothing else
 ├── DECISIONS.md                          # the trades this repo has NOT made
+├── .gitleaks.toml                        # the allowlist, and nothing else
 ├── .github/
 │   ├── workflows/
 │   │   ├── ci.reusable.yml               # the workflow six repos call
@@ -44,6 +44,7 @@ kit/
     ├── validate.sh                       # THE gate
     ├── self_test.sh                      # proves the gate can go red
     ├── lint_test.sh                      # the linters RUN, against fixtures
+    ├── isolation_test.sh                 # the cluster, RUN; A cannot reach B's database
     ├── gitleaks_gate.sh                  # the one secret scan, for CI and here
     ├── zizmor_gate.sh                    # the one zizmor split, ditto
     ├── bootstrap.sh                      # the gate installs its own tools
@@ -52,7 +53,22 @@ kit/
     ├── core_fanout_check.py              # structural checks on core/vendir, core/renovate
     ├── gate_declaration_check.py         # no adopter carries a D12/D13 workaround
     └── self_test.sh                      # every check, broken once, asserted red
-```
+
+templates/ holds everything a service adopts, and it is split by **how a thing
+reaches a service**, not by subject:
+
+- `templates/compose/` — **FETCHED**, never copied. One file for every service,
+  pinned by `kit.ref`.
+- `templates/bin/`, `templates/otel/`, `templates/tier/`,
+  `templates/secrets/`, `templates/database/` — **COPIED** into the service, per
+  language.
+- `templates/compose/postgres/` — the cluster image and its init script, and the
+  only place a database, a role or an extension is created.
+
+**One cluster, one database per service, one role per service.** The DATABASE is
+the isolation boundary rather than the machine, and there is **no pooler** — see
+`templates/database/README.md` for the argument and `DECISIONS.md` (MD21) for the
+measurements behind it.
 
 Flat on purpose. `grep -r` finds everything; there is no plugin system to
 learn.
@@ -224,7 +240,7 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   is the one that tells a working config from a valid one, and — unlike every
   other phase — it is **fatal on a skip**, because the claim under test is "kit's
   configs work" and a run in which no linter executed has not tested it.
-- **self_test** — sixty-seven breakages of a throwaway copy. Sixty-five assert
+- **self_test** — seventy-seven breakages of a throwaway copy. Seventy-five assert
   the gate goes red; two assert it stays **green** while naming what it said —
   23b a SKIP, because a check that turns a red into an honest skip is
   load-bearing precisely by not going red, and 59 a FINDING, because kit-13's
@@ -232,12 +248,36 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   One further GREEN control (31b) asserts a service config that AGREES with
   kit's does not fail, because a check satisfied by banning the file would train
   every service to delete one. Six are a semantic mutation of one language each,
-  so **every suite is proven able to fail** rather than assumed to. Forty-seven
+  so **every suite is proven able to fail** rather than assumed to. Fifty-seven
   assert that one *named* check reported `FAIL`, so a check written for a specific
   defect is proven still load-bearing. Two assert that a *proof* goes red: one
   inverts the classifier's fail-closed property, and one makes the staleness
   reporter call an undeclared pin `current`. A property nobody has tried to break
   is a property nobody has tested.
+  Seven are the shared-cluster work (68-74), and **73 is the one worth the
+  most**: a generated config carrying `prepare: :unnamed` on a fleet with no
+  pooler is slower and looks entirely correct, so the forbidden-list check is the
+  only thing that will ever find it.
+  - **75 is the one worth the second-most, and it exists because a green control
+    was evidencing a different check.** kit-21 turned the cluster into a *built*
+    image, which renamed kit's from `postgres` to `kit-postgres` — and
+    `check_stale_copy`, whose whole job is naming a service running its own copy
+    of the platform, matched on that bare repository name. The two stopped
+    matching, and **five repositories in the real fleet carry their own postgres
+    while the check that names them reported a clean fleet, silently** (still ran,
+    still printed PASS, printed no skip). Breakages 52/59/60 did not catch it
+    because their fixture carries a `ports:` entry, and `check_override_surface`
+    reports a published port by *service name* — a name the rename never
+    touched. So 60 went red on the port half while the image half was dead.
+    **75 is the same mutation with the port removed**, which leaves the image
+    comparison as the only thing that can go red; it is red on the pre-fix code
+    and green after, both measured. The general rule this earns: a control
+    satisfiable by two different checks proves the gate can go red and says
+    nothing about either.
+  - **76 and 77** are the two ways a documented `bin/dev` command can stop
+    existing, and they fail differently — the command gone, and the *subcommand*
+    gone. 77 is the harder one: a check that only asks "is `db` dispatched" is
+    green on it.
 - **A toolchain's floor is checked against the floor the ARTIFACT declares.**
   `KitOtel::RUBY_FLOOR` says what `templates/otel/ruby` needs and the gate reads
   that constant rather than restating the number. Below the floor is a loud,
@@ -247,6 +287,79 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   six that needs this: the other five refuse an old toolchain themselves, at
   build time, with a message naming their own requirement. Ruby 2.6 is the only
   one that loads the template happily and raises on first use.
+- **A self-test needle must be a thing the check EMITS.** `expect_red_check`
+  matches `FAIL $want`, so `$want` has to be the check's **label** — not the
+  wording of its finding, and not a paraphrase of either. Two failures on kit-22,
+  both from recipes whose *check* was correct:
+  - Breakages 75/76/77 asserted the finding's text
+    (`"which is the image kit's stack already ships"`,
+    `"promises a command the script does not dispatch"`). Those strings are
+    printed as **indented detail lines under** the `FAIL <label>` header, so
+    `FAIL $want` never matched and all three reported "the gate went red, but NOT
+    via …" **while printing the needle two lines above the complaint**. A check
+    that works, a mutation that works, and a recipe that cannot tell either from a
+    failure.
+  - Breakage 71 asserted `the connection budget  (max_connections covers` against
+    a label that read `max_connions` — a misspelling of a setting that does not
+    exist, in the one line a reader greps for to learn what a check measures.
+  - So: the needle is the label, and **a label a self-test asserts is a contract.**
+    Renaming one silently un-proofs the breakage, which is the same coupling as
+    the `callable path` check. When a recipe reports "red, but not via `<label>`",
+    read the actual FAIL line before assuming the check missed the defect — the
+    three failures above were all in the recipe.
+- **`self_test` hits its 90-minute bound on a busy box, and a `BOUND` tier is
+  not evidence about the breakages it never reached.** This repository's machine
+  runs several kit gates at once, and the self-test is *n* whole gates in
+  sequence, so it is the phase that binds first. Measured on kit-22: the full
+  gate **exited 0** while `self_test` reported `BOUND` at breakage **56 of 77** —
+  so 57-77 were never executed, and a green gate says nothing whatever about
+  them.
+  - The `BOUND` verdict is what made that legible, and it is why the bound is not
+    a failure: the point of the run is to reach the end and say so, and a bound
+    reported as a pass would be the silent skip this file forbids. It bought
+    nothing here, and the summary line is how a reader finds it.
+  - **So a `BOUND` self_test is a gate to run BY HAND, not a gate to report.**
+    Take the recipes that were not reached, apply each one's own mutation to a
+    throwaway copy, and run the static gate in it. On kit-22 that is how
+    breakage 72 was found to be green on a check that could not see the defect
+    it was written to catch — the `BOUND` did not hide a failure, it created the
+    gap where one was found.
+- **A green control that two different checks could satisfy proves neither.**
+  This is the `reportUnusedDisableDirectives` rule's other half, and breakage 75
+  exists because it was violated by kit's own self-test. The rule above is about
+  an allowlist entry that never matches; this one is about a proof that goes red
+  for a reason the recipe did not introduce. Both are the same defect — a control
+  whose green is not about the thing it names.
+  - Measured, on the commit that shipped it: `break_stale_copy`'s fixture gives
+    `alpha` a stale `postgres` **with a `ports:` entry**, so two checks can report
+    it — `check_stale_copy` on the image, `check_override_surface` on the
+    published port. Renaming kit's image to `kit-postgres` killed the first and
+    left the second, and breakage 60 stayed green throughout. The check it was
+    proving had been dead for the whole run.
+  - So a fixture that mutates one thing must mutate **one** thing, and where two
+    checks can see the same mutation there is a second fixture with the other
+    half removed. Read the fixture and ask what ELSE could go red.
+- **Never read the gate's output through a pipe, and fix every occurrence at
+  once.** `printf '%s\n' "$out" | grep -q …` is a broken-pipe bug, not a style
+  choice: `grep -q` closes the pipe on its first match, `printf` dies of SIGPIPE,
+  and `set -o pipefail` promotes 141 to the pipeline's status. So the verdict
+  flips on the SIZE of the output rather than on what is in it. Measured, on
+  identical content: 2000 lines returns 0, a 239KB report returns **141 with the
+  match present**.
+  - The threshold is the pipe buffer, so it moves with the machine and returns as
+    a flake on somebody else's packet. The fix is to stop piping, not to bound the
+    output — `contains` is a shell `case` over a variable already in memory.
+  - **This bit twice, and the second time is the reason for the rule.** `1d98e42`
+    fixed it in `expect_red_check`'s `FAIL $want` test and left the `env_skips`
+    branch four lines below it on the old form. The result was four breakages
+    (71, 75, 76, 77) reported as ENVIRONMENT failures on a run where all four had
+    been caught, and one (72) reported as "the gate stayed GREEN" — the *worst*
+    direction to be wrong in, since the false answer is "this is a machine
+    problem", which is the verdict that branch exists to protect.
+  - So: when a check reads a captured variable with a pipe, grep the whole file
+    for that shape. The seven remaining `printf … | grep` calls in
+    `tests/self_test.sh` only **print** diagnostics, where a truncated line costs
+    nothing — and that difference is the whole test for which is which.
 - **No adopter carries a workaround for a fixed core defect.** `core`'s gate
   checker had two defects that forced adopting repositories into local
   workarounds — D12 (`RUN_KEY` could not see a one-line `run:`, core `63fd319`)
@@ -371,7 +484,7 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   rubocop ran on kit's own Ruby with kit's own config. That is the only way an
   obsolete key surfaces before six repos inherit it.
 - The suite must be able to fail: `self_test` breaks a throwaway copy of the
-  tree sixty-seven ways and asserts the run goes red. If you change the suite,
+  tree seventy-seven ways and asserts the run goes red. If you change the suite,
   keep that true.
 
 ## The classifier fails closed, and that is a rule about code
@@ -447,6 +560,65 @@ The count is printed on PASS and it is a measurement, not a ledger to shrink.
 It is currently **80**, which is a bad number, and the way to move it is to
 re-copy an artefact and delete the entry — never to delete an entry, which the
 dead-entry rule turns red.
+
+## One cluster, and the database is the boundary
+
+**Nine services, ONE Postgres, one database and one role per service.** Isolation
+between services is the database, not the machine. There is **no pooler**.
+
+Four rules, and each one is load-bearing:
+
+- **The `REVOKE` is the boundary, not the table grants.** Postgres grants
+  `CONNECT` on every database to `PUBLIC` by default, so a cluster provisioned
+  without `REVOKE ALL ON DATABASE … FROM PUBLIC` has, by default, **no
+  isolation at all** — it fails open and silently. Measured both ways: with the
+  revoke, `FATAL: permission denied for database "billing"` before a query is
+  parsed; without it, the connection succeeds and only the `SELECT` on the other
+  service's table is refused, by the accident that nobody granted it. A check
+  asserting "A cannot SELECT from B's rows" would therefore pass on a cluster
+  with no isolation whatsoever, which is why `tests/isolation_test.sh`'s fourth
+  assertion builds a **control** cluster without the revoke and requires it to
+  let A in.
+- **The boundary is applied by SWEEP, not by a list.** The init script revokes
+  `PUBLIC`'s `CONNECT` on *every* non-template database in the cluster, so the
+  invariant holds by construction. An earlier version enumerated the databases it
+  knew about and printed "PUBLIC holds CONNECT on none of them" while the stock
+  `postgres` database still granted it — a closing sentence that was wrong, and
+  worse than no closing sentence because it is the one a reader trusts.
+- **An init script that cannot apply the boundary does not start.** `ON_ERROR_STOP`
+  is on every call and there is no `if` around any of it. `set -e` does not reach
+  inside a command substitution used as an `if` condition, and a load-bearing
+  statement whose failure is ignored is how a cluster comes up holding two of nine
+  databases and reports itself healthy.
+- **PG15 is the floor**, because PG15 removed the default `CREATE` grant on the
+  `public` schema and that change is what makes database-per-service a boundary
+  rather than a naming convention.
+
+**Extensions are a cluster decision.** They live in the image (pglayers) and are
+created by the **admin role** into every declared database. A service role cannot
+create one: pgvector's control file is not `trusted`, so `CREATE EXTENSION` by a
+non-superuser is refused. That is pgvector's own classification — pglayers'
+`vector.control` is byte-identical to upstream's — and it is the right shape
+anyway, since an extension's binaries are available to every service on the
+cluster whether or not anybody creates one.
+
+**`postgres:17-alpine` cannot carry pgvector.** pglayers publishes glibc-linked
+layers and alpine is musl, so the image builds and then fails to create the
+extension. The cluster base is `postgres:17` (Debian); the measurement is in
+`templates/compose/postgres/Dockerfile` and the trade is MD21b.
+
+**The four settings every service's config carries**, and none would be needed
+with one database per service: `application_name` (the only way to attribute a
+query on a shared cluster), `statement_timeout`, `idle_in_transaction_session_timeout`
+(the shared-cluster killer), and a bounded pool. The cluster sets the middle two
+**per role** as a backstop, so a service that forgets is bounded rather than
+unbounded.
+
+**The pooler decision is a CHECK, not a paragraph.** The pooler workarounds are
+forbidden in `templates/database/contract.json` and the gate fails the build if
+one appears in any generated config. A service carrying `prepare: :unnamed` on a
+fleet with no pooler is slower and looks entirely correct, so nothing else would
+ever find it.
 
 ## Adding a language
 

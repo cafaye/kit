@@ -1,0 +1,158 @@
+# kit template — the connection contract for a shared Postgres cluster.
+#
+#   pip install "psycopg[binary,pool]>=3.2.3"
+#
+# FOUR SETTINGS, and each exists because nine services share one Postgres. On a
+# database per machine you would need none of them.
+#
+#   1. application_name  — THE ONE THAT IS NOT OPTIONAL. `pg_stat_activity` shows
+#      nine services' queries in one list and cannot attribute any of them
+#      without it. psycopg takes it as a connection keyword.
+#
+#   2. statement_timeout — one service's runaway query occupies shared resources
+#      until it finishes. The cluster sets this per role as a backstop too.
+#
+#   3. idle_in_transaction_session_timeout — THE SHARED-CLUSTER KILLER. A
+#      forgotten BEGIN holds a snapshot open, blocks VACUUM and grows every table
+#      on the box.
+#
+#   4. max_conns         — this service's share of the cluster's connection
+#      budget, on the pool.
+#
+# Copy into your settings module and change SERVICE_NAME.
+
+from __future__ import annotations
+
+import os
+from typing import Final
+
+from psycopg_pool import ConnectionPool
+
+# MUST equal your database and role name: one service, one database, one role,
+# one name, so a query on the cluster is attributable from the query alone.
+SERVICE_NAME: Final[str] = "courier"
+
+# These are the values the cluster's per-role settings apply as a backstop
+# (KIT_POSTGRES_STATEMENT_TIMEOUT_MS, KIT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS).
+# Keeping the two in step means a service that forgets this module is still
+# bounded rather than unbounded.
+STATEMENT_TIMEOUT_MS: Final[int] = 15_000
+IDLE_IN_TRANSACTION_TIMEOUT_MS: Final[int] = 30_000
+
+# This service's SHARE of the cluster's connection budget. The cluster caps each
+# role at 10 with `ALTER ROLE … CONNECTION LIMIT`; `max_conns` is the cap inside
+# this process, and the two must agree in the direction that is safe. A pool
+# larger than the role limit does not give you more connections, it gives you
+# errors.
+MAX_CONNS: Final[int] = 10
+
+
+def dsn() -> str:
+    """The connection URL, from the environment.
+
+    Raises rather than returning an empty string, because every caller of this
+    module needs a database and a service that silently runs without one turns
+    a missing configuration into a runtime error in whatever code path happened
+    to touch the pool first.
+    """
+    url = os.environ.get("DATABASE_URL")
+    if not url:
+        raise RuntimeError(
+            "DATABASE_URL is not set. The shared cluster holds one database and "
+            "one role per service, named after the service; this process will not "
+            "guess either."
+        )
+    return url
+
+
+def connection_kwargs() -> dict[str, str]:
+    """The per-connection keyword arguments. This is the whole contract.
+
+    `application_name` and `options` are the two psycopg routes that matter here,
+    and the choice between them is worth one sentence: `application_name` has a
+    first-class keyword because it is a REPORTED parameter (Postgres sends it
+    back on connect, which is how `pg_stat_activity` shows it), whereas the
+    timeouts are generic GUCs and go in `options` as `-c name=value` pairs.
+
+    `options` rather than `SET` statements on connect, deliberately: a `SET`
+    after connect runs per connection, and a pool that grows would have to
+    re-run it for every new one. `options` is part of the startup packet, so it
+    cannot be forgotten by a connection this process did not open.
+
+    Credentials are never named here — `dsn()` reads them from the environment.
+    """
+    return {
+        "application_name": SERVICE_NAME,
+        "options": (
+            f"-c statement_timeout={STATEMENT_TIMEOUT_MS}"
+            f" -c idle_in_transaction_session_timeout={IDLE_IN_TRANSACTION_TIMEOUT_MS}"
+        ),
+    }
+
+
+def pool() -> ConnectionPool:
+    """A pool bounded to this service's share of the cluster.
+
+    `open=False` and no eager warm-up: a pool that opens `max_conns` connections
+    at construction means a service that imports this module to read
+    configuration takes ten connections out of a 200-connection cluster before
+    it has served a request.
+
+    `timeout` is a checkout timeout, not a connect timeout: it is how long a
+    caller waits for a free connection before the pool raises `PoolTimeout`.
+    Five seconds is well inside the cluster's 15s `statement_timeout`, so a
+    caller finds out about exhaustion while its own timeout still has somewhere
+    to go.
+    """
+    return ConnectionPool(
+        conninfo=dsn(),
+        kwargs=connection_kwargs(),
+        min_size=0,
+        max_size=MAX_CONNS,
+        open=False,
+        timeout=5.0,
+        # `check` is a real query, and it is what makes a connection returned to
+        # the pool usable again rather than merely present. Without it a
+        # connection the far end closed stays in the pool and is handed to the
+        # next caller, which sees a connection error with no obvious cause.
+        #
+        # `ConnectionPool.check_connection` is psycopg_pool's own implementation
+        # rather than a hand-rolled `SELECT 1`: it skips the check when it knows
+        # the connection is already usable, so a healthy pool pays nothing.
+        check=ConnectionPool.check_connection,
+    )
+
+
+# ---------------------------------------------------------------------------
+# WHAT IS NOT HERE, AND WHY — read this before "fixing" this module.
+#
+#   There is NO pooler compatibility setting in this module, and that omission is
+#   the load-bearing one. The usual workaround for a transaction-mode connection
+#   pooler is to turn psycopg's prepared-statement threshold off, so the driver
+#   stops naming statements. kit runs NO pooler, so there is nothing to be
+#   compatible with, and doing that here would re-parse and re-plan every query
+#   for a component that is not in the path.
+#
+#   The argument for running no pooler at all is in
+#   templates/database/README.md and DECISIONS.md (MD21), and the sentence that
+#   decides it is from PgBouncer's own configuration documentation: the remedy
+#   for `ERROR: cached plan must not change result type` after a DDL migration is
+#   `RECONNECT` on its admin console — a manual operator step after every schema
+#   change in nine repositories.
+#
+#   So psycopg's default prepared-statement behaviour stays exactly as it is.
+#   `templates/database/contract.json` lists the pooler settings that are
+#   FORBIDDEN in generated config, and `tests/validate.sh` fails the build when
+#   one appears.
+#
+#   (This comment deliberately does not spell those settings out. The first
+#   version of it quoted them, and the check that forbids them flagged its own
+#   explanation — which is the failure mode AGENTS.md records about
+#   `gate_declaration_check`: a check that fires on correct work teaches the
+#   reader to ignore it. The names belong in the contract file, where a program
+#   reads them.)
+#
+#   If a pooler IS ever adopted, this module and templates/database/contract.json
+#   change together, and that is a DECISIONS.md entry rather than a one-line
+#   edit in nine repositories.
+# ---------------------------------------------------------------------------
