@@ -3702,6 +3702,64 @@ edit "$base92/templates/database/tenancy/assertions.txt" \
 expect_red_check 'breakage 92: the assertion manifest and the proof stop agreeing' \
   "$base92" "$TENANCY" --static-only
 
+# 93. THE ADVISOR AND THE PROOF THAT IT FIRES, STOPPED AGREEING. `advisor.sql`
+# is the only thing in the account boundary that grades the LIVE DATABASE, and
+# every rule in it is graded by a fixture in `tests/tenancy_test.sh` — a script
+# `--static-only` never runs. So before this check the two lists were compared by
+# nothing: a rule could be renamed, or its trip fixture renamed with it, and
+# every static check in this repository stayed green while the suite proved a
+# rule that no longer existed.
+#
+# THE MUTATION IS THE RULE'S OWN NAME, in the union arm that produces it. That is
+# deliberately the smallest thing that moves: the SQL still installs, still
+# parses, still returns rows, and the rule is still every bit as correct. It just
+# no longer agrees with the fixture that trips it — which is the exact shape of
+# the drift this catches, and the drift is silent in the worst direction, since a
+# renamed rule is a rule whose proof no longer runs rather than a rule that is
+# broken.
+#
+# AND WHAT THIS RECIPE DOES NOT CLAIM, which is worth as much as what it does.
+# The FIRST version of this mutation stripped the rule's `having` — the
+# condition that requires the view to read something protected — on the theory
+# that removing the narrowing would make the rule fire everywhere and that this
+# check could see it. Measured: the gate stayed GREEN. The check compares rule
+# NAMES, so a rule that is present, correctly named and no longer selective is
+# invisible to it by construction. A static check that read rule bodies would
+# have to parse SQL, which is the parse whose misses are silent and which this
+# file has already declined three times (advisor.sql is SKIPped by the parser
+# loop with a note saying `tests/tenancy_test.sh` is its check).
+#
+# So the two properties are proved by two different files, deliberately:
+#   * THAT THE RULE FIRES, and does not misfire -> tests/tenancy_test.sh, which
+#     runs a real cluster and asserts both positives AND six negatives.
+#   * THAT THE ADVISOR AND ITS PROOF AGREE -> this check, statically.
+# Neither substitutes for the other, and this recipe says which is which rather
+# than claiming a mutation it cannot make.
+base93="$(fresh_copy kit-93)"
+edit "$base93/templates/database/tenancy/advisor.sql" \
+  "  select 'security_definer_view'::text as name,
+         'ERROR'::text as level," \
+  "  select 'security_definer_view_v2'::text as name,
+         'ERROR'::text as level,"
+expect_red_check 'breakage 93: the advisor and the fixtures that trip its rules stop agreeing' \
+  "$base93" "$TENANCY" --static-only
+
+# 93. THE ADVISOR AND THE PROOFS THAT TRIP ITS RULES STOP AGREEING. The last
+#     hole of the account boundary's own gate: `advisor.sql` is the only thing
+#     here that grades the LIVE DATABASE, its rules are proved by fixtures in
+#     `tests/tenancy_test.sh`, and `--static-only` runs neither. So nothing
+#     compared the two lists, and a rule renamed with its fixture left the whole
+#     static gate green while the suite proved a rule that no longer existed.
+#     `tenancy_contract_check` now compares the rule NAMES both ways.
+#
+#     This is the SECOND check on the account boundary, and not a third: the one
+#     that proves the RULES FIRE is `tests/tenancy_test.sh` and cannot be a
+#     static check, and the first attempt at this recipe mutated the rule's
+#     `having` clause instead of its name — and the gate stayed GREEN, because a
+#     rule that is present, correctly named and no longer selective is invisible
+#     to a check that compares names. Measured, and written down at the recipe
+#     rather than quietly corrected: the mutation a check can see is not always
+#     the mutation that matters, and the two are proved by two files.
 base68="$(fresh_copy kit-68)"
 edit "$base68/templates/compose/.env.example" \
   'KIT_POSTGRES_TAG=17' 'KIT_POSTGRES_TAG=16.6-alpine'

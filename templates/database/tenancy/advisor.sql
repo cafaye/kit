@@ -3,10 +3,10 @@
 --     psql "$MIGRATIONS_DATABASE_URL" -f advisor.sql
 --     select * from cafaye.advisor_findings();
 --
--- WHAT THIS IS. Nine row-level-security rules, one function, one output shape:
--- every finding is a row carrying `(name, level, facing, categories, description,
--- detail, remediation, metadata, cache_key)`. A gate reads the rows; nothing has
--- to parse anything.
+-- WHAT THIS IS. Ten rules over one function, one output shape: every finding is
+-- a row carrying `(name, level, facing, categories, description, detail,
+-- remediation, metadata, cache_key)`. A gate reads the rows; nothing has to parse
+-- anything.
 --
 -- WHY IT EXISTS BESIDE `substrate.sql` AND THE SIX DRIVERS. Those three grade
 -- what the templates SAY: the substrate as text, the assertion set as names, and
@@ -17,16 +17,13 @@
 -- (table, role, command) combine with OR. This file grades the LIVE DATABASE, and
 -- that is the only layer that can see either.
 --
--- NINE RULES, AND WHY THE COUNT IS NINE. The shape is taken from Supabase's
+-- TEN RULES, AND WHERE THE TENTH CAME FROM. The shape is taken from Supabase's
 -- database advisor (`pg-meta`'s `studio/advisor/lints.ts`), which is where the
 -- row-per-rule union-all query and the nine-column output come from. NOTHING is
 -- copied from it: it is MIT-licensed and its own rule is that an adopter must not
 -- vendor it, and this repository's rule is that nothing in `moon/refs/` is ever
 -- copied in. Every query below was written against this fleet's catalogs, and
 -- every one that had to differ says so at the point of the difference.
---
--- Two of the source's rules count as one here, which is why six bullets read as
--- eight and the number is nine:
 --
 --   1. `policy_exists_rls_disabled`              ERROR   policies, no ENABLE
 --   2. `rls_disabled_in_public`                   ERROR   no RLS on a table the API reaches
@@ -36,15 +33,28 @@
 --   6. `login_role_security_definer_executable`   WARN    SECURITY DEFINER the login role can run
 --   7. `auth_rls_initplan`                        WARN    an identity call not wrapped for the InitPlan
 --   8. `rls_enabled_no_policy`                    INFO    RLS on, no policy: the table is unreadable
---   9. (counted as two in the source: `anon_…` and `authenticated_…`) — see rule 6.
+--   9. `security_definer_view`                    ERROR   a view that enforces its owner's RLS
 --
---   Rule 8 is the source's `rls_enabled_no_policy`, which the packet's list does
---   not name and which is kept because it is the AVAILABILITY half of the
---   boundary and costs one union arm: a table with RLS enabled and no policy
---   denies every row to every role, which is fail-closed and therefore not a
---   security hole, and is also how a migration fails at 3am rather than in
---   review. It is INFO, not ERROR, and the proof below asserts zero ERROR/WARN
---   rows precisely so that an INFO here is visible without being a failure.
+--   TWO OF THOSE NUMBERS ARE NOT TWO RULES. Rule 6 is one rule here and two in
+-- the source (`anon_…_security_definer_function_executable` and
+-- `authenticated_…`), because the distinction the source draws between "nobody
+-- signed in" and "somebody signed in" has no second state in a fleet with no
+-- `anon`. And rule 9 was MISSING here for the whole life of this file while
+-- being present, ERROR, and category SECURITY in the source: it is
+-- `security_definer_view`, and in this fleet it is not a nice-to-have, because
+-- the owner of an account-scoped table is itself a NOINHERIT LOGIN role that
+-- bypasses its own policies unless the table is FORCE'd. A view that enforces
+-- its owner's policies is therefore a hole with nothing watching it, and the
+-- whole point of adding the rule is that the hole was real and no lint in this
+-- fleet could see it. See the block above rule 9 for the whole argument.
+--
+--   Rule 8 is the source's `rls_enabled_no_policy`, which is kept because it is
+-- the AVAILABILITY half of the boundary and costs one union arm: a table with
+-- RLS enabled and no policy denies every row to every role, which is fail-closed
+-- and therefore not a security hole, and is also how a migration fails at 3am
+-- rather than in review. It is INFO, not ERROR, and the proof in
+-- `tests/tenancy_test.sh` asserts zero ERROR/WARN rows precisely so that an INFO
+-- here is visible without being a failure.
 --
 -- ---------------------------------------------------------------------------
 -- WHAT WAS MAPPED, AND WHAT WAS DROPPED. Every substitution is here, not in a
@@ -161,6 +171,25 @@
 --       properly means deciding what a rule claims when it cannot see the text,
 --       which is a change to the RULES and not to a regexp — deliberately out of
 --       scope here, and written down rather than left for a reader to infer.
+--
+--   * WHAT A VIEW PROJECTS. Rule 9 asks "does this view read a table that has
+--       row level security", and it asks it of `pg_depend`, which records the
+--       RELATION a rewrite rule reaches and not which columns it selects. So a
+--       view over an account-scoped table that projects one non-account column
+--       is reported exactly as loudly as one that projects the whole table. That
+--       is the same trade rule 4's keyword half makes and it is kept for the
+--       same reason: narrowing it means parsing `pg_get_viewdef`, and a rule
+--       that reads view text has its misses where nobody is looking. The detail
+--       names the tables, so the reader can make that judgement in one read.
+--
+--   * WHETHER THE OWNER IS ALSO THE CALLER. `pg_depend` says which relations a
+--       view reaches; it does not say who could have read them directly. Rule 9
+--       does not need that distinction, and the reason is this fleet's: the
+--       owner of an account-scoped table IS a NOINHERIT LOGIN role that bypasses
+--       its own policies unless the table is FORCE'd, so owner-is-the-caller and
+--       owner-is-another-service are the same hole with a different blast
+--       radius. The detail names the owner so a reader who wants the narrower
+--       story has it.
 
 -- ---------------------------------------------------------------------------
 -- rule 5's exemption, stated here because it is the only judgement in this file
@@ -382,6 +411,149 @@ normalized as (
          replace(replace(replace(lower(coalesce(po.qual, '')), ' ', ''), e'\n', ''), e'\t', '')          as n_qual,
          replace(replace(replace(lower(coalesce(po.with_check, '')), ' ', ''), e'\n', ''), e'\t', '') as n_check
   from policy_once po
+),
+
+-- (8) EVERY VIEW IN SCOPE, THE TABLES IT REACHES, AND WHETHER IT IS AN INVOKER.
+--     Resolved from `pg_depend` and NOT from `pg_get_viewdef`.
+--
+--     The catalog answer is available and it is the right one: Postgres records a
+--     view's rewrite rule as depending on each relation the view reads, so
+--     `pg_depend` with `classid = pg_rewrite` names the tables by OID. That is
+--     the same mechanism rule 4's catalog half uses for a policy's expression,
+--     and for the same reason — it survives renaming, it needs no parsing, and a
+--     parse of view text is a parse whose misses are silent. `pg_get_viewdef`
+--     would additionally have the `search_path` defect recorded three CTEs
+--     above, which is a third way to answer this question that would be right
+--     for one reader and wrong for another.
+--
+--     `security_invoker` is read from `reloptions` rather than inferred, and the
+--     regexp accepts the three boolean spellings Postgres itself accepts. The
+--     stored form is canonical (`security_invoker=true`), so this is a
+--     mitigation for a future writer rather than a repair of a measured one —
+--     stated as such so a reader does not go looking for the measurement.
+--
+--     `relkind = 'v'` and nothing else. A MATERIALIZED view is excluded
+--     deliberately: it holds a COPY, refreshed by the owner, and RLS is not
+--     enforced on reads from it at all — so a matview over an account-scoped
+--     table is a much larger finding than this rule's, and reporting it as this
+--     rule would be reporting the wrong hole. A FOREIGN table has no policies at
+--     all, so `relkind = 'f'` never reaches the rule either.
+views as (
+  select v.oid as view_oid,
+         n.nspname,
+         v.relname,
+         own.rolname as owner,
+         v.reloptions,
+         not exists (
+           select 1
+           from unnest(coalesce(v.reloptions, '{}'::text[])) as opt
+           where opt ~* '^security_invoker\s*=\s*(true|on|1)$'
+         ) as is_definer,
+         exists (select 1 from unnest(coalesce(v.reloptions, '{}'::text[])) as opt
+                 where opt ~* '^security_invoker\s*=\s*(false|off|0)$') as security_invoker_false
+  from pg_class v
+  join pg_namespace n on n.oid = v.relnamespace
+  join scoped s on s.nspname = n.nspname
+  join pg_roles own on own.oid = v.relowner
+  where v.relkind = 'v'
+    -- extension-owned views are excluded for the same reason tables are: a view
+    -- this substrate cannot change is a finding that trains the reader to
+    -- ignore the report.
+    and not exists (select 1 from pg_depend ve
+                     where ve.classid = 'pg_class'::regclass
+                       and ve.objid = v.oid
+                       and ve.deptype = 'e')
+),
+
+-- and the relations each of those views reaches, one row per (view, relation).
+--
+--     THE DEPENDENCY GRAPH IS WALKED TRANSITIVELY, and the reason is that a
+--     view over a view is the SAME hole rather than a milder one. Postgres
+--     evaluates the outer view with the outer view's owner's privileges, and the
+--     inner view with the inner one's; there is no point in that chain where a
+--     caller's policies come back into force. So `report_v` over
+--     `account_summary` over `account_users` reads every account's rows exactly
+--     as `account_summary` does, and a rule that stopped at the first hop would
+--     report the inner view and stay silent about the one a caller actually
+--     queries. Measured on this fixture: `nested_view` reads only `definer_view`
+--     and no RLS'd table directly, and it reads every row `definer_view` reads.
+--
+--     `DISTINCT` in `view_reads` is not tidiness. `pg_depend` records one row
+--     per (rewrite rule, reference), and a view that names a table twice in its
+--     body records it twice here: measured, `{plain, plain}` — one relation,
+--     reported as two.
+--
+--     The self-reference row (`refobjid = the view's own oid`, `deptype = 'i'`)
+--     is dropped by the relkind filter rather than by an oid comparison,
+--     because it is the only row in this join whose `refobjid` is the view
+--     itself and the filter says so in the same word as everything else.
+view_reads as (
+  with recursive reached(view_oid, rel_oid, depth) as (
+      select w.view_oid, t.oid, 1
+      from views w
+      join pg_rewrite rw on rw.ev_class = w.view_oid
+      join pg_depend d
+        on d.classid = 'pg_rewrite'::regclass
+       and d.objid = rw.oid
+       and d.refclassid = 'pg_class'::regclass
+      join pg_class t on t.oid = d.refobjid
+      where t.relkind in ('r', 'p', 'v', 'm')
+        and t.oid <> w.view_oid
+    union
+      -- The chain STOPS at an invoker view, and that is the whole meaning of the
+      -- flag. A `security_invoker` view runs its own query as whoever called IT
+      -- — which, reached from another view, is that view's owner — so policies
+      -- come back into force at that hop. Walking past it would report a chain
+      -- whose innermost link is already fixed.
+      select r.view_oid, t.oid, r.depth + 1
+      from reached r
+      -- `mid` is read through the `views` CTE rather than `pg_class`, which is
+      -- what makes this hop agree with the rule's OWN definition of an invoker.
+      -- Writing the test a second time against `reloptions` is how the two
+      -- disagree, and they did: an equality test against the literal string
+      -- `security_invoker=true` misses `security_invoker = on`.
+      --
+      -- MEASURED, and this is not hypothetical. Postgres stores reloptions
+      -- VERBATIM — it does not canonicalise the boolean — so all three spellings
+      -- survive as written:
+      --
+      --     security_invoker = true   ->  {security_invoker=true}
+      --     security_invoker = on     ->  {security_invoker=on}
+      --     security_invoker = false  ->  {security_invoker=off}   (for `off`)
+      --
+      -- and `core`'s own fixture at
+      -- `harness/tests/fixtures/tenancy/conforming/migrations/0002_rls.sql:89`
+      -- writes `with (security_invoker = on)`. So the spelling that is idiomatic
+      -- in this very fleet is the one an equality test does not match, and the
+      -- walk would have carried on past a view whose policies are already in
+      -- force — reporting a chain as broken that is not.
+      join views mid on mid.view_oid = r.rel_oid
+      join pg_rewrite rw on rw.ev_class = r.rel_oid
+      join pg_depend d
+        on d.classid = 'pg_rewrite'::regclass
+       and d.objid = rw.oid
+       and d.refclassid = 'pg_class'::regclass
+      join pg_class t on t.oid = d.refobjid
+      where t.relkind in ('r', 'p', 'v', 'm')
+        and t.oid <> r.view_oid
+        and mid.is_definer
+        -- `pg_depend` is finite and the chain stops at an invoker, but the depth
+        -- bound is here anyway: a cycle is not something a checker should hang
+        -- on, and a bound that is never reached costs nothing when it is not
+        -- needed. 16 is three orders of magnitude above any view stack a human
+        -- writes and one below the depth at which the walk is suspect anyway.
+        and r.depth < 16
+  )
+  select distinct
+         w.view_oid, w.nspname, w.relname, w.owner, w.is_definer,
+         w.reloptions, w.security_invoker_false,
+         t.oid as table_oid, tn.nspname as table_schema, t.relname as table_name,
+         t.relkind in ('r', 'p') as is_table,
+         t.relrowsecurity
+  from views w
+  join reached rr on rr.view_oid = w.view_oid
+  join pg_class t on t.oid = rr.rel_oid
+  join pg_namespace tn on tn.oid = t.relnamespace
 ),
 
 -- ===========================================================================
@@ -751,6 +923,136 @@ rule_rls_no_policy as (
     and c.relrowsecurity
     and d.objid is null
     and not exists (select 1 from pg_policy p where p.polrelid = c.oid)
+),
+
+-- ===========================================================================
+-- 9. `security_definer_view` — a view that enforces its OWNER's row-level
+--    security rather than the caller's.
+--
+--    THE HOLE, in one sentence. Postgres gives a view the privileges and the
+--    row-level-security EXEMPTION of the role that created it, so a view over an
+--    account-scoped table enforces the policies that apply to its owner — and a
+--    policy that applies to the owner is not a policy at all, because the owner
+--    bypasses its own policies unless the table is FORCE'd. Writing a view over
+--    `account_users` is therefore a way to hand every caller who can reach it
+--    every account's rows, and it reads in review as a SELECT.
+--
+--    WHY THIS FILE WAS THE ONLY PLACE THAT COULD CATCH IT, and why it is ERROR
+--    here rather than WARN: kit's boundary is per-service NOINHERIT login roles
+--    that OWN their tables, so "the owner is exempt from its own policies" is
+--    not a corner case of the definer model — it is every table in the fleet.
+--    The reference's rule is `security_definer_view` at its `lints.ts:604-614`,
+--    level ERROR, category SECURITY, and what is ported here is the SHAPE: the
+--    same nine columns, one union arm per rule, the same level vocabulary.
+--
+--    THE THREE NARROWINGS, each of which is the difference between a rule that
+--    is trusted and a rule that is switched off:
+--
+--      * A view with `security_invoker = true` is NOT this finding, because such
+--        a view runs its queries as the caller and therefore enforces the
+--        CALLER's policies. That is the entire remedy, so reporting it would be
+--        reporting the fix as the disease.
+--
+--      * A view that reads no table with row level security is NOT this finding.
+--        There is no policy to bypass, and views over reference tables or a bare
+--        `select 1` are most views in a real schema. This guard is what stops the
+--        rule from becoming "every view in the database is an ERROR".
+--
+--      * A view no login role can SELECT is NOT this finding — `has_table_
+--        privilege`, not a grant scan, for rule 2's reason: a grant is not the
+--        capability, and a role that inherits SELECT reaches a view nobody
+--        granted it to.
+--
+--    AND THE RESIDUAL LIMITS, listed here rather than left for a reader to infer:
+--    it asks whether the view reads an RLS'd TABLE, not whether that table is in
+--    another schema or on another cluster; and it does not resolve view TEXT, so
+--    a view projecting one non-account column over an account-scoped table is
+--    reported as loudly as one projecting the whole table. Both are in "what
+--    this does not find", and the second is the same trade rule 4's keyword half
+--    makes: narrowing it means parsing `pg_get_viewdef`, and a parse's misses are
+--    silent.
+--
+--    THE VERSION FLOOR, because it changes what the rule MEANS rather than what
+--    it matches. `security_invoker` arrived in Postgres 15. On 14 or older the
+--    option does not exist, so `CREATE VIEW ... WITH (security_invoker = true)`
+--    is refused and EVERY view in the database is a definer view — which means
+--    this rule fires on every view over an RLS'd table, and every one of those
+--    findings is TRUE. There is no flag to set and no way to silence one, so a
+--    service on an old server sees an ERROR it cannot fix by remediation. That is
+--    reported in the `remediation` column rather than in this comment, because a
+--    reader who acts on the finding is the one who needs it:
+--
+--        When current_setting('server_version_num')::int < 150000 the remediation
+--        names the version rather than printing an ALTER that would be refused.
+--
+--    This fleet's floor is PG15 (`templates/compose/postgres/Dockerfile`, and
+--    MD21b's PG17), so on kit's own cluster the branch is unreachable — which is
+--    exactly why it is written rather than left implicit. A checker that means
+--    something different on two supported server versions is not a checker that
+--    can be trusted on either.
+-- ===========================================================================
+rule_security_definer_view as (
+  select 'security_definer_view'::text as name,
+         'ERROR'::text as level,
+         array['SECURITY']::text[] as categories,
+         'A view reads a table that has row level security, and the view is not `security_invoker`, so its queries run with the privileges of the role that owns the VIEW rather than the role that is asking. Row-level security is then evaluated against the owner, and the owner is exempt from its own policies unless the table is FORCE''d. Every policy on the underlying table is silently bypassed for anyone who can SELECT the view.'::text as description,
+         format('View %I.%I (owner %s) reads %s table(s) with row level security: %s. Of %s relation(s) it reads, the rest are: %s. It is not `security_invoker` (%s). %s login role(s) can SELECT it: %s.',
+                nspname, relname, owner,
+                count(*) filter (where relrowsecurity),
+                coalesce(string_agg(distinct table_schema || '.' || table_name, ', ') filter (where relrowsecurity), '(none)'),
+                count(*)::text,
+                coalesce(string_agg(distinct table_schema || '.' || table_name, ', ') filter (where not relrowsecurity), '(none)'),
+                case when reloptions is null or reloptions = '{}' then 'it carries no reloptions at all'
+                     else 'its reloptions are ' || array_to_string(reloptions, ', ') end,
+                (select count(*)::text
+                   from api_roles r
+                  where has_table_privilege(r.rolname, min(view_reads.view_oid), 'SELECT')),
+                coalesce((select string_agg(r.rolname, ', ' order by r.rolname)
+                            from api_roles r
+                           where has_table_privilege(r.rolname, min(view_reads.view_oid), 'SELECT')),
+                         '(none — no login role can SELECT this view)'))::text as detail,
+         -- THE REMEDIATION IS VERSION-SENSITIVE, and it is branched rather than
+         -- footnoted because a reader who acts on this column is the one who
+         -- needs to know. `ALTER VIEW ... SET (security_invoker = true)` is
+         -- refused outright below PG15, and on that server EVERY view is a
+         -- definer view, so every finding this rule reports is true and none of
+         -- them is fixable with the flag. Printing the ALTER there would hand
+         -- out a remediation that cannot execute — which is the one thing a
+         -- remediation column must never do.
+         case when current_setting('server_version_num')::int < 150000
+              then format('This server is Postgres %s, which predates `security_invoker` (added in 15), so there is no flag that makes a view enforce the caller''s policies and this finding cannot be cleared by an ALTER. It is reported anyway, because on this version the bypass is real and unavoidable. The remedy is to stop exposing the view: GRANT SELECT on %s to the roles that need it and read the table directly, or drop the view.',
+                          current_setting('server_version'),
+                          coalesce(string_agg(distinct table_schema || '.' || table_name, ', ') filter (where relrowsecurity), '(none)'))
+              else format('ALTER VIEW %I.%I SET (security_invoker = true); then run this advisor again. That makes the view run its queries as the caller, so the policies on %s apply to the caller rather than to the owner.',
+                          nspname, relname,
+                          coalesce(string_agg(distinct table_schema || '.' || table_name, ', ') filter (where relrowsecurity), '(none)'))
+         end::text as remediation,
+         jsonb_build_object('schema', nspname, 'name', relname, 'type', 'view',
+                            'owner', owner,
+                            'security_invoker', false,
+                            'reloptions', coalesce(reloptions, array[]::text[]),
+                            -- DISTINCT in both, and not as tidiness: `pg_depend`
+                            -- records one row per (rewrite rule, reference) and a
+                            -- view that names a table twice in its body records it
+                            -- twice here too. Measured, on this fixture:
+                            -- `{"vf.plain","vf.plain"}` — one relation, reported
+                            -- as two.
+                            'rls_relations', (select coalesce(array_agg(distinct vr2.table_schema || '.' || vr2.table_name
+                                                    order by vr2.table_schema || '.' || vr2.table_name),
+                                                   array[]::text[])
+                                                from view_reads vr2
+                                               where vr2.view_oid = min(view_reads.view_oid)
+                                                 and vr2.relrowsecurity),
+                            'all_relations', array_agg(distinct table_schema || '.' || table_name
+                                                       order by table_schema || '.' || table_name)) as metadata,
+         format('security_definer_view_%s_%s', nspname, relname)::text as cache_key
+  from view_reads
+  where is_definer
+    and not security_invoker_false
+  group by nspname, relname, owner, is_definer, reloptions
+  having count(*) filter (where relrowsecurity) > 0
+     and exists (select 1 from api_roles r
+                  where has_table_privilege(r.rolname, min(view_reads.view_oid), 'SELECT'))
 )
 
 select f.name,
@@ -771,6 +1073,7 @@ from (
   union all select * from rule_security_definer
   union all select * from rule_initplan
   union all select * from rule_rls_no_policy
+  union all select * from rule_security_definer_view
 ) f
 -- Ordered by the KEY rather than by the finding, so a run that gains and loses
 -- findings produces a diff a reader can read. `cache_key` is the one column here

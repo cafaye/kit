@@ -591,3 +591,56 @@ which goes red on `owner/credential-no-context-reads-no-rows` and
 `owner/credential-resolution-cannot-browse` when `FORCE` is deleted — the owner
 bypassing its own table is precisely how a resolution context turns into a
 browsing context.
+
+---
+
+## MD25 — **the advisor does not read view TEXT, and the gate does not read rule BODIES**
+
+Two trades this packet made, recorded together because they are the same trade
+seen from two files: **a static check reads what it can name, and the thing that
+needs a database is run against a database.**
+
+**Not made, twice:**
+
+1. `templates/database/tenancy/advisor.sql`'s `security_definer_view` does not
+   parse `pg_get_viewdef` to decide *which columns* a view projects. It asks
+   `pg_depend` which **relations** a view reaches, and reports a view that
+   projects one non-account column over an account-scoped table exactly as
+   loudly as one that projects the whole table.
+2. `tests/validate.sh`'s tenancy contract check compares the advisor's **rule
+   names** against the fixtures in `tests/tenancy_test.sh` — not rule bodies,
+   not conditions, not the shape of a narrowing.
+
+**What each costs:**
+
+1. **False positives on wide-but-harmless views.** A reporting view that selects
+   `count(*)` over an account-scoped table is reported. The detail names the
+   tables, so the reader can make that judgement in one read, and the alternative
+   — a parse of view text — has misses that are *silent*, which is the
+   substrate's own standing argument about `pg_get_expr` ("an audit query that
+   returns an empty column forever looks exactly like an audit query that found
+   nothing"). This is the same trade rule 4's keyword half already makes.
+2. **A rule can go from selective to indiscriminate without the static gate
+   noticing.** This was measured, not reasoned about: the first version of
+   `self_test` breakage 93 deleted the `having` clause that requires the view to
+   read something protected, and **the gate stayed green**. The check compares
+   names, so a rule that is present, correctly named and no longer narrow is
+   invisible to it by construction.
+
+**Why not, in both cases:** the same reason the file already declines to parse
+`advisor.sql` at all — it is `SKIP`ped by the parser loop with a note saying
+`tests/tenancy_test.sh` is its check, precisely because a SQL file's meaning is
+a question for a database. A static check that parsed rule bodies would be a
+fourth implementation of a rule rather than a parser of a file, and its misses
+would be indistinguishable from a tree with nothing wrong in it.
+
+**What is enforced instead, and why the split is honest rather than a dodge:**
+`tests/tenancy_test.sh` runs a real cluster and proves the rule **fires** (two
+positives: a plain definer view, and a view over a *view*) and **does not
+misfire** (six negatives, silent for six different reasons — its own remedy, no
+protected table, unreachable, and reachable only through an invoker view spelled
+both `true` and `on`). The static check proves the advisor and its proof
+**agree**. A rule whose narrowing was deleted passes the static check; a renamed
+rule passes the cluster suite's collection but not the static one. Neither file
+covers the other, and the report for this packet names which is which rather
+than claiming a single proof of both.

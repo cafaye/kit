@@ -4533,6 +4533,70 @@ if iso_raw and listed:
                 f"defect this whole directory exists for."
             )
 
+# ------------------------------------------- the advisor and the proof of it
+#
+# WHY THIS HALF EXISTS, and it is the same reason breakage 92 exists one section
+# up. `advisor.sql` is the only thing in the account boundary that grades the
+# LIVE DATABASE, and its rules are graded by fixtures in a script that
+# `--static-only` never runs. So a rule can be added, renamed or deleted, the
+# fixture that trips it can be renamed with it, and every static check stays
+# green -- because nothing here was comparing the two lists.
+#
+# The comparison is both ways and it is over RULE NAMES, not over counts. A count
+# would be satisfied by nine rules and nine fixtures that do not correspond,
+# which is precisely the state this check exists to make impossible.
+adv_raw, err = read("templates/database/tenancy/advisor.sql")
+adv_rules = set()
+if err:
+    problems.append(f"tenancy/advisor: {err}")
+else:
+    adv_code = strip_sql_comments(adv_raw)
+    # `select '<name>'::text as name` — the shape every arm uses, so it is read
+    # from the arms and not from the prose. A comment listing the rules is
+    # documentation; this is the union that produces them.
+    adv_rules = set(re.findall(r"select\s+'([a-z0-9_]+)'::text\s+as\s+name", adv_code))
+    if not adv_rules:
+        problems.append(
+            "tenancy/advisor: no rule names found in advisor.sql. The pattern reads "
+            "`select '<name>'::text as name`, which is the shape every union arm uses. "
+            "If the arms were rewritten this check would find nothing and pass — which "
+            "is the state it is meant to make impossible, so it says so rather than "
+            "reporting a clean file."
+        )
+
+ten_raw, err = read("tests/tenancy_test.sh")
+if err:
+    problems.append(f"tenancy/tenancy_test.sh: {err}")
+else:
+    # The trip list, read as the `rule:fixture` PAIRS the assertion-7 loop
+    # iterates, so what is compared against the advisor is what is actually
+    # asserted rather than every mention of a rule name in the file (which
+    # includes the comments that explain them).
+    trip_pairs = re.findall(
+        r"^ *'([a-z0-9_]+):([a-z0-9_]+)'", ten_raw, re.M
+    )
+    tripped = {r for r, _ in trip_pairs}
+    if not tripped:
+        problems.append(
+            "tests/tenancy_test.sh: no `<rule>:<fixture>` trip pairs found. The pattern "
+            "reads the quoted pairs the assertion-7 loop iterates. Without them this "
+            "half of the check has nothing to compare and reports agreement between "
+            "two empty sets."
+        )
+    for rule in sorted(adv_rules - tripped):
+        problems.append(
+            f"tenancy/advisor: rule {rule!r} has NO fixture that trips it in "
+            f"tests/tenancy_test.sh. A detective that has never fired is a detective "
+            f"nobody can trust, and one that cannot fire is indistinguishable from a "
+            f"detective that does not work."
+        )
+    for rule in sorted(tripped - adv_rules):
+        problems.append(
+            f"tests/tenancy_test.sh: asserts a rule {rule!r} that advisor.sql does not "
+            f"define. Either the rule was renamed or removed and the fixture was not, "
+            f"and the suite would then be proving a rule that no longer exists."
+        )
+
 # ---------------------------------------------------------------- the drivers
 drivers = tenancy.get("drivers") or {}
 DRIVER_FILES = {
