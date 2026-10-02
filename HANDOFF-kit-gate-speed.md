@@ -29,6 +29,9 @@ what cost this packet an hour.
   passed.` The two FAILs handoff-02 §5 recorded are **gone**: both named
   `wt-m39-core-rls-scan-01`, another session's live worktree that was parked
   inside this one and is not there now.
+- **The whole suite, sharded, green**: 4/4 shards `PASS`, exit 0, **zero
+  `FAIL self_test:` and zero `SKIP self_test:` lines** — including zero
+  `SKIP … exited N with NO finding`, the fatal environment verdict.
 - `bash -n` clean, `shellcheck -S warning` clean. Counts `tests/validate.sh`
   derives from `tests/self_test.sh` are **unchanged: 94 breakages, 92 reds**.
 - **`tests/validate.sh` is not modified in `0399c23`.** The gate's printed
@@ -61,13 +64,17 @@ it down three times.
 ## Half-done, and why
 
 - **No single unsharded `bash tests/self_test.sh` finished inside the hour, and
-  this report does not claim one.** The packet budgets ~13 min; measured here an
+  nothing here claims one.** The packet budgets ~13 min; measured here an
   unsharded run reached **breakage 23 in ~15 min** with every recipe a PASS,
   projecting ~55–60 min for all 94 on this box. Full coverage was instead taken
-  with the harness's own `KIT_SELF_TEST_SHARD=1/4` × 4 shards — **all four, so
-  every recipe ran** — and the numbers are in report §4c. That is *sharded*
-  coverage, not one continuous run, and the distinction is the whole honesty
-  clause on that feature.
+  with the harness's own `KIT_SELF_TEST_SHARD=i/4` × 4 shards — **all four, so
+  every recipe ran** — and the numbers are in report §4c. Coverage was verified
+  by NAME (96 declared recipes, 96 ran, no gap either way), not by the shards
+  summing to 97, because the summing is the arithmetic that can hide a gap.
+  That is *sharded* coverage, not one continuous run, and the distinction is the
+  whole honesty clause on that feature: a shard's summary cannot claim the suite,
+  and four shard summaries concatenated are not the sentence the unsharded run
+  prints.
 - `no_telemetry_in_readiness.sh` (63 s) and `stack_live_test.sh` (44 s) are
   **still untouched** — 2.2% of the corrected run, last, as planned.
 
