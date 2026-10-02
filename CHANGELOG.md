@@ -117,7 +117,6 @@ it without a copy (see kit-12 below).
   output as it was printed, and a dated report is a record of what a packet did.
   Rewriting it would make the history lie about itself.
 
-||||||| parent of 8a60a75 (kit-32: image.reusable.yml, so a service's image is built by something)
 ### Added — `image.reusable.yml`: the fleet's images are now built by something
 
 **Nothing in the fleet built the image its deploy config names.** Every
@@ -284,7 +283,6 @@ The honest summary of why these survived: **every proof kit held about the
 cluster was a proof about the first tenant.** A fleet of nine services is nine
 repetitions of a case nobody had run twice.
 
-||||||| parent of e52b9ed (kit-32: image.reusable.yml, so a service's image is built by something)
 ### Fixed — the shared cluster provisioned nothing, and reported itself healthy
 
 Two defects, and the reason they survived is the same one: each was invisible to
