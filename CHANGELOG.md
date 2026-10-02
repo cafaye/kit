@@ -117,6 +117,95 @@ it without a copy (see kit-12 below).
   output as it was printed, and a dated report is a record of what a packet did.
   Rewriting it would make the history lie about itself.
 
+||||||| parent of 8a60a75 (kit-32: image.reusable.yml, so a service's image is built by something)
+### Added — `image.reusable.yml`: the fleet's images are now built by something
+
+**Nothing in the fleet built the image its deploy config names.** Every
+deployable service has a `config/deploy.yml` saying `image: <org>/<repo>` with
+`registry.server: ghcr.io`, and as of kit-32 not one repository had a workflow, a
+Makefile target or a script that produced that artifact. `config/deploy.yml` was
+a description of a deploy whose input had no pipeline behind it, so
+`kamal build push` on an operator's laptop was the only way the image came to
+exist — one machine, one person, no record of which commit it was built from.
+
+The new `.github/workflows/image.reusable.yml` is called rather than copied, for
+the same reason `ci.reusable.yml` is:
+
+```yaml
+# .github/workflows/publish.yml, in a service repository
+on:
+  push:
+    branches: [master]
+permissions:
+  contents: read
+  packages: write        # the caller's to grant — a reusable workflow cannot
+jobs:                    # grant itself a permission
+  image:
+    uses: cafaye/kit/.github/workflows/image.reusable.yml@master
+    with:
+      push: true
+```
+
+Five decisions in it, each of which is a decision somebody could get wrong in a
+way that still produces a green run:
+
+- **GitHub Packages, with `GITHUB_TOKEN` as the only credential.** No PAT, no
+  `secrets:` entry, no registry account, nothing to rotate. The caller grants
+  `packages: write`; without it the push fails 401, which reads like a wrong
+  password rather than a missing grant, so the header says so at the example.
+- **`push` defaults to `false`.** Publishing is opt-in at the call site. A
+  reusable workflow that pushed by default would publish from every caller that
+  only meant to check a Dockerfile still builds.
+- **The image name is DERIVED — `ghcr.io/${{ github.repository }}`,
+  lowercased — and is not an input.** An input is a string each service copies
+  into its own repository, and a copied string drifts from the repository it
+  names; CI would push to one place while `kamal` pulled from another and the
+  deploy would fail hours later on a release whose build was green. The
+  lowercasing is a real step rather than a comment, because GitHub Packages
+  404s an uppercase path and says so by naming a package.
+- **Tags are `sha-<full 40>`, `<branch>`, and `latest`; no semver.** The sha tag
+  is immutable, so a deploy that names it means it. A semver tag here would let
+  a release pin `v1.0.0` to whichever commit happened to be on master that week.
+- **`provenance: mode=max` and `sbom: true`**, costing two referrers, because a
+  registry of launch artifacts with no recorded provenance cannot be audited
+  after the fact and adding it later means it was never there.
+
+The build also refuses to publish from a `pull_request` even if a caller adds
+that trigger — the condition is `inputs.push && github.event_name !=
+'pull_request'`, which is the fork that `GITHUB_TOKEN` cannot write to anyway,
+refused before the attempt rather than after it.
+
+### Fixed — the copy check was a freeze, and a second standard made it say so
+
+Adding the workflow above made kit's own `callable_check` go **red**, reporting
+`a second workflow declaring workflow_call exists` — naming, as drift, a second
+*standard* added on purpose. The rule it enforced was "exactly one file in the
+tree may declare `workflow_call`", which is not a drift check. It is a freeze,
+and following it would mean kit could never grow past one standard no matter how
+many the fleet needed.
+
+It is now: files at paths declared in a new `REUSABLE_WORKFLOWS` variable are
+exempt, and every other file is judged on its **parsed `name:`**, with the two
+failures reported as the two different mistakes they are —
+
+- same `name:` as a declared standard → a **copy** parked where no caller can
+  reach it, which is the original defect and is still the failure the walk
+  exists to catch;
+- a different `name:` → an **undeclared standard**, a callable workflow kit ships
+  without listing, which is this packet's own bug class one file over.
+
+Declaring the second path also asserted, for the first time, that every path in
+the list exists and is callable — otherwise widening the list would have exempted
+a path with no file behind it, quietly weakening the check it was added to
+police.
+
+**Both new branches are proved by breakage** (78 and 79), because a widened
+check is a check that may have been widened into uselessness and the only way to
+know is to break it in both directions it now claims to cover. Breakage 78 is
+the original defect and 79 is the one the widening made possible; a check that
+had been reporting a defect that did not exist and now reports nothing at all is
+a plausible sentence, and as far as anyone would know an accurate one.
+
 ### Fixed — the shared cluster worked for exactly one tenant, and the identifier rule was half a rule
 
 Both of these were found by **running a second tenant**, which is the operation
@@ -195,6 +284,7 @@ The honest summary of why these survived: **every proof kit held about the
 cluster was a proof about the first tenant.** A fleet of nine services is nine
 repetitions of a case nobody had run twice.
 
+||||||| parent of e52b9ed (kit-32: image.reusable.yml, so a service's image is built by something)
 ### Fixed — the shared cluster provisioned nothing, and reported itself healthy
 
 Two defects, and the reason they survived is the same one: each was invisible to

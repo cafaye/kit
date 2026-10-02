@@ -58,6 +58,30 @@ trap 'rm -rf "$TMP"' EXIT
 # exists to fix — see the `callable path` check below.
 WORKFLOW='.github/workflows/ci.reusable.yml'
 
+# The SECOND reusable workflow kit hands out, added by kit-32: the one that
+# builds a service's image and publishes it to ghcr.io. It is a variable for
+# the same reason WORKFLOW is — the callable-path check reads it, and a path
+# that is wrong in one place and right in another is the exact class of defect
+# that check exists to catch.
+IMAGE_WORKFLOW='.github/workflows/image.reusable.yml'
+
+# Both of them, for the checks that iterate kit's callable SURFACE rather than
+# naming one standard. Two standards means two paths a caller may `uses:`, and
+# a check written while there was only one has to be widened rather than
+# pointed at a new file.
+#
+# WIDENING, AND THE FAILURE THAT PROMPTED IT. The `callable` check refused any
+# second file declaring `workflow_call` anywhere in the tree, on the reasoning
+# that two copies of the CI standard is the drift kit exists to prevent. Adding
+# a SECOND STANDARD — not a second copy — made it go red, and the message named
+# a defect that did not exist. That is the check being wrong rather than the
+# tree, and the difference matters: "exactly one workflow may be callable" is a
+# rule about kit, not about drift, and following it would mean kit can never
+# grow. So the walk below now distinguishes the two cases. A second file that
+# is a copy of a standard still fails; a file that is a DIFFERENT standard, at
+# a declared path, is the thing kit-32 added on purpose.
+REUSABLE_WORKFLOWS="$WORKFLOW $IMAGE_WORKFLOW"
+
 # The three files that make the secret scanner one decision rather than three.
 # Paths as variables for the same reason WORKFLOW is: the path being wrong is the
 # class of defect this file exists to catch, and a literal repeated in a dozen
@@ -7296,7 +7320,8 @@ PY
   # sentence in this file. So the examples are parsed and checked against the
   # workflow's real inputs, and a doc that lies fails the gate.
   caller_check() {
-    "$PY" - "$ROOT" "$WORKFLOW" <<'PY2'
+    "$PY" - "$ROOT" "$REUSABLE_WORKFLOWS" <<'PY2'
+import os
 import re
 import sys
 
@@ -7311,11 +7336,59 @@ callers = [b for b in blocks if "uses: cafaye/kit/" in b]
 if not callers:
     sys.exit("no documented caller of the reusable workflow found in README.md")
 
-with open(sys.argv[2], encoding="utf-8") as fh:
-    doc = yaml.safe_load(fh)
-triggers = doc.get("on") or doc.get(True) or {}
-declared = ((triggers.get("workflow_call") or {}).get("inputs")) or {}
+# ONE MAP OF PATH -> DECLARED INPUTS, not one workflow's inputs.
+#
+# Before kit-32 this read a single file and compared every documented `with:`
+# against it, which was correct while kit handed out one standard and became a
+# false positive the moment it handed out two: README's documented publish
+# caller names `push`, the CI workflow does not declare `push`, and the check
+# reported a documentation defect against a document that was right.
+#
+# So the inputs are resolved PER `uses:` PATH. A block that names a declared
+# standard is checked against that standard; a bare `with:` fragment with no
+# `uses:` line is checked against the CI standard, which is what every such
+# fragment in the README is about. Which is the rule, stated once: a documented
+# caller is checked against the workflow it actually calls.
+def _inputs_of(path):
+    full = os.path.join(root, path)
+    if not os.path.isfile(full):
+        return None
+    with open(full, encoding="utf-8") as fh:
+        doc = yaml.safe_load(fh)
+    triggers = (doc or {}).get("on") or (doc or {}).get(True) or {}
+    return (((triggers.get("workflow_call") or {}).get("inputs")) or {})
+
+reusables = sys.argv[2].split()
+by_path = {p: _inputs_of(p) for p in reusables}
+default_path = reusables[0]
+declared = by_path[default_path]
 required = {k for k, v in declared.items() if (v or {}).get("required")}
+
+# `cafaye/kit/.github/workflows/x.yml@master` -> `.github/workflows/x.yml`
+def _path_of(uses):
+    return uses.partition("@")[0].replace("cafaye/kit/", "", 1)
+
+
+def uses_values(node):
+    """Every value assigned to a `uses:` key, at any depth.
+
+    Restated here rather than imported: this check is its own script with its
+    own heredoc, and the `callable` check below has its own copy for the same
+    reason. A shared module would be a file the walk in that check would have to
+    exempt, which is a small price for not having the two readers of `uses:`
+    disagree.
+    """
+    found = []
+    if isinstance(node, dict):
+        for key, value in node.items():
+            if key == "uses" and isinstance(value, str):
+                found.append(value)
+            else:
+                found.extend(uses_values(value))
+    elif isinstance(node, list):
+        for item in node:
+            found.extend(uses_values(item))
+    return found
 
 def _find_with_keys(node):
     """Every key set under a `with:` mapping, at any depth."""
@@ -7362,17 +7435,30 @@ for n, block in enumerate(callers, 1):
     for job_name, job in (doc_n.get("jobs") or {}).items():
         if not isinstance(job, dict) or "cafaye/kit/" not in str(job.get("uses", "")):
             continue
+        # Resolved per job, not per file: one README block may show a service
+        # calling both standards, and each job's `with:` is checked against the
+        # workflow THAT job calls.
+        called = _path_of(str(job.get("uses", "")))
+        inputs = by_path.get(called)
+        if inputs is None:
+            problems.append(
+                f"documented caller #{n} job {job_name} calls {called}, which is "
+                f"not one of kit's declared standards ({', '.join(reusables)})"
+            )
+            continue
+        req = {k for k, v in inputs.items() if (v or {}).get("required")}
         passed = set(job.get("with") or {})
-        unknown = sorted(passed - set(declared))
-        missing = sorted(required - passed)
+        unknown = sorted(passed - set(inputs))
+        missing = sorted(req - passed)
         if unknown:
             problems.append(
-                f"documented caller #{n} job {job_name}: passes {unknown}, which "
-                f"the workflow does not declare"
+                f"documented caller #{n} job {job_name} (calling {called}): "
+                f"passes {unknown}, which the workflow does not declare"
             )
         if missing:
             problems.append(
-                f"documented caller #{n} job {job_name}: omits required {missing}"
+                f"documented caller #{n} job {job_name} (calling {called}): "
+                f"omits required {missing}"
             )
 
 # Any documented `with:` block names workflow inputs, whether or not the block
@@ -7387,11 +7473,25 @@ for n, block in enumerate(blocks, 1):
         parsed = yaml.safe_load(block)
     except Exception:
         continue
+    # Resolved FROM THE BLOCK, per block. A block carrying a `uses:` line is
+    # checked against the workflow it names, so the README's documented publish
+    # caller is not reported as passing an input the CI standard does not
+    # declare. A block with no `uses:` line is a bare fragment, and every such
+    # fragment in this README documents the CI standard — which is stated in the
+    # failure message, because "which workflow did you mean" is not a question a
+    # reader can answer from the message alone.
+    named = [v for v in uses_values(parsed) if "cafaye/kit/" in v]
+    block_path = _path_of(named[0]) if named else default_path
+    block_inputs = by_path.get(block_path)
+    if block_inputs is None:
+        # The per-caller loop above already reports an unknown standard, with
+        # the job name. Skipping here keeps one defect to one message.
+        continue
     for keys in _find_with_keys(parsed):
-        unknown = sorted(set(keys) - set(declared))
+        unknown = sorted(set(keys) - set(block_inputs))
         if unknown:
             problems.append(
-                f"yaml block #{n}: a `with:` names {unknown}, which the workflow "
+                f"yaml block #{n}: a `with:` names {unknown}, which {block_path} "
                 f"does not declare as an input"
             )
 
@@ -7464,7 +7564,7 @@ PY2
   # and AGENTS.md both now do — is not a call site, and a check that flags its
   # own explanation is a check people delete.
   callable_check() {
-    "$PY" - "$ROOT" "$WORKFLOW" <<'PY3'
+    "$PY" - "$ROOT" "$WORKFLOW" "$REUSABLE_WORKFLOWS" <<'PY3'
 import os
 import re
 import sys
@@ -7473,6 +7573,9 @@ import yaml
 
 root = sys.argv[1]
 workflow = sys.argv[2]
+# Every path kit declares callable, so step 5 can tell a second COPY of a
+# standard from a second STANDARD.
+reusables = sys.argv[3].split()
 remote = "cafaye/kit/" + workflow
 local = "./" + workflow
 
@@ -7498,6 +7601,35 @@ else:
             f"with no explanation"
         )
 
+# --- 2b: every OTHER declared standard is at its declared path and callable ---
+#
+# The same two claims about each remaining entry in REUSABLE_WORKFLOWS, because
+# a variable listing a path is not evidence the file is there. Declaring
+# `image.reusable.yml` in order to widen step 5 would otherwise have the effect
+# of exempting a path from the copy walk that does not exist — the drift check
+# silently weakened to accommodate the file it was written to police.
+for other in reusables:
+    if other == workflow:
+        continue
+    other_path = os.path.join(root, other)
+    if not os.path.isfile(other_path):
+        problems.append(
+            f"{other} is declared callable in REUSABLE_WORKFLOWS but does not "
+            f"exist. Either ship the file or drop it from the list: an entry "
+            f"naming a path with no file behind it makes step 5 exempt a path "
+            f"nothing can call"
+        )
+        continue
+    with open(other_path, encoding="utf-8") as fh:
+        other_doc = yaml.safe_load(fh)
+    other_triggers = (other_doc or {}).get("on") or (other_doc or {}).get(True) or {}
+    if not isinstance(other_triggers, dict) or "workflow_call" not in other_triggers:
+        problems.append(
+            f"{other} does not declare `on: workflow_call`, so it is not callable "
+            f"at all. It is in REUSABLE_WORKFLOWS because it is a standard kit "
+            f"hands out, and a standard nobody can call is a comment"
+        )
+
 
 def uses_values(node):
     """Every value assigned to a `uses:` key, at any depth."""
@@ -7518,9 +7650,15 @@ def uses_values(node):
 call_sites = []  # (where, value)
 
 # 3a. the fenced yaml blocks in the two documents a reader copies from.
+#
+# EACH DECLARED STANDARD NEEDS AN EXAMPLE IN EACH DOCUMENT, not one example of
+# one of them. That is the widened form: kit-32 added a second callable
+# workflow, and a README that documents calling the CI standard while shipping
+# an image workflow nobody is told how to call has reproduced exactly the defect
+# this check exists for — a standard with no call to copy.
+documented_paths = set()
 for doc_name in ("README.md", "AGENTS.md"):
     body = open(os.path.join(root, doc_name), encoding="utf-8").read()
-    found_remote = 0
     for n, block in enumerate(re.findall(r"```yaml\n(.*?)```", body, re.S), 1):
         try:
             parsed = yaml.safe_load(block)
@@ -7531,15 +7669,16 @@ for doc_name in ("README.md", "AGENTS.md"):
                 continue
             call_sites.append((f"{doc_name} yaml block #{n}", value))
             if value.startswith("cafaye/kit"):
-                found_remote += 1
-    # Both documents must show the call. AGENTS.md is not decoration: it is the
+                documented_paths.add(value.partition("@")[0].replace("cafaye/kit/", "", 1))
+    # Both documents must show the calls. AGENTS.md is not decoration: it is the
     # file a contributor reads before touching the workflow, and it was the one
     # telling people to edit `workflows/ci.reusable.yml` for six months.
-    if found_remote == 0:
-        problems.append(
-            f"{doc_name} shows no `uses: cafaye/kit/{workflow}@<ref>` example, so "
-            f"a reader of that file has no call to copy"
-        )
+    for rel in reusables:
+        if rel not in documented_paths:
+            problems.append(
+                f"{doc_name} shows no `uses: cafaye/kit/{rel}@<ref>` example, so "
+                f"a reader of that file has no call to copy for that standard"
+            )
 
 # 3b. this repo's own workflow files. Comments are not yaml and are skipped by
 #     parsing, so the header of the reusable workflow — which shows the same
@@ -7580,13 +7719,18 @@ for where, value in call_sites:
     # path made every correct `...@master` look wrong, which is the check
     # failing on the very line it exists to bless.
     ref_path, _, ref = value.partition("@")
-    if ref_path != remote:
-        # It names kit, and it is not the path. Say what the right one is,
-        # because the reader of this message is a person who is about to paste
-        # a `uses:` line into thirteen repositories.
+    # NOT `!= remote`. Before kit-32 that compared against the one CI path, so a
+    # correct `uses: cafaye/kit/.github/workflows/image.reusable.yml@master` in
+    # README was reported as "a path GitHub cannot resolve" — the check telling
+    # a reader their documented call is wrong about the thing the check was
+    # added to protect. With two standards, ANY of them resolves; what must not
+    # resolve is a path kit does not declare.
+    declared_rel = ref_path.replace("cafaye/kit/", "", 1)
+    if declared_rel not in reusables:
         problems.append(
-            f"{where}: `uses: {value}` is not a path GitHub can resolve; callers "
-            f"must write `uses: {remote}@<ref>`"
+            f"{where}: `uses: {value}` names {declared_rel}, which is not one of "
+            f"kit's declared standards ({', '.join(reusables)}). Callers must write "
+            f"`uses: cafaye/kit/<declared-path>@<ref>`"
         )
     elif not ref:
         problems.append(
@@ -7629,11 +7773,41 @@ else:
                 f"the network"
             )
 
-# --- 5: one copy, at the reachable path -------------------------------------
+# --- 5: one copy per standard, at the reachable path ------------------------
 # Walked rather than globbed, because the whole failure mode is a file parked
 # somewhere the documented path does not point. `.git` and the gate's own
 # gitignored `.venv` are the only trees skipped; everything else is fair game.
+#
+# THE EXEMPTION IS THE SET, NOT THE ONE FILE. Before kit-32 this skipped a
+# single path and refused every other `workflow_call` file in the tree, which
+# works until kit owns a second standard — and then the check reports a defect
+# that does not exist, on a file added deliberately. A rule that makes kit
+# unable to grow is not a drift check; it is a freeze.
+#
+# So a file is exempt when its path is one kit DECLARES callable, and every
+# other file is compared on content. Two cases, deliberately reported
+# differently, because they are different mistakes:
+#
+#   - same `name:` as a declared standard  -> a COPY, parked where no caller
+#     can reach it. This is the original defect and it is still the failure
+#     this step exists for.
+#   - a different `name:`                 -> an UNDECLARED standard. Not drift;
+#     a callable workflow kit ships without listing it, which is the same
+#     documentation/agreement bug the whole packet is about, one file over.
+#
+# A file that neither declares nor matches is skipped, which is where the
+# walker's own self_test.sh and the workflow headers live.
+declared_names = {}
+for rel in reusables:
+    full = os.path.join(root, rel)
+    try:
+        with open(full, encoding="utf-8") as fh:
+            declared_names[yaml.safe_load(fh).get("name")] = rel
+    except Exception:
+        continue
+
 copies = []
+undeclared = []
 for dirpath, dirnames, filenames in os.walk(root):
     dirnames[:] = [
         # tests/.bin is the gate's own fetched scanners (hadolint, gitleaks).
@@ -7644,7 +7818,7 @@ for dirpath, dirnames, filenames in os.walk(root):
     for filename in filenames:
         full = os.path.join(dirpath, filename)
         rel = os.path.relpath(full, root)
-        if rel == workflow:
+        if rel in reusables:
             continue
         # shell scripts are excluded for the same reason, and because the
         # walker's own self_test.sh names `workflow_call` in a comment explaining
@@ -7661,21 +7835,49 @@ for dirpath, dirnames, filenames in os.walk(root):
         if "workflow_call" not in head:
             continue
         # A third-party reference in a comment is not a copy.
-        if re.search(r"^\s*workflow_call\s*:", head, re.M):
-            copies.append(rel)
+        if not re.search(r"^\s*workflow_call\s*:", head, re.M):
+            continue
+        # Which mistake is this? Read the parsed `name:` rather than guessing
+        # from the path, because the two failures need two different fixes: a
+        # copy gets deleted, an undeclared standard gets added to
+        # REUSABLE_WORKFLOWS.
+        try:
+            with open(full, encoding="utf-8") as fh:
+                parsed = yaml.safe_load(fh)
+            found_name = (parsed or {}).get("name")
+        except Exception:
+            found_name = None
+        if found_name in declared_names:
+            copies.append(f"{rel} (a copy of {declared_names[found_name]})")
+        else:
+            undeclared.append(f"{rel} (name: {found_name!r})")
 
 if copies:
     problems.append(
-        f"a second workflow declaring `workflow_call` exists at {copies}. Two copies "
-        f"of the CI standard is the drift kit exists to prevent, and only "
-        f"{workflow} is reachable by a caller"
+        f"a copy of a declared standard exists at {copies}. Two copies of one "
+        f"standard is the drift kit exists to prevent, and only the paths in "
+        f"REUSABLE_WORKFLOWS are reachable by a caller"
+    )
+if undeclared:
+    problems.append(
+        f"a callable workflow exists at {undeclared} and is not in "
+        f"REUSABLE_WORKFLOWS. A standard kit hands out has to be listed there: "
+        f"the list is what makes it exempt from the copy check above, so an "
+        f"unlisted one is invisible to the drift check rather than exempt from "
+        f"it. Either add the path or delete the file"
     )
 
 if problems:
     sys.exit("; ".join(problems))
 PY3
   }
-  check "$WORKFLOW  (callable: exists, on: workflow_call, docs agree)" callable_check
+  # The label says "reusable workflows" rather than naming one file, because kit
+  # has declared TWO standards and this check governs both. A label reading
+  # `ci.reusable.yml` on a failure that is actually inside `image.reusable.yml`
+  # sends the next reader to the wrong file — which is the same defect the check
+  # exists to catch, one level up: a name that has stopped matching what it is
+  # about.
+  check "reusable workflows  (callable: exists, on: workflow_call, docs agree)" callable_check
 
   # -------------------------------------------------------------------------
   # Secrets. Two scanners and two different questions, and this section is the

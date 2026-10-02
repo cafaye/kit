@@ -84,6 +84,15 @@ check in `tests/validate.sh` exists to catch. The same reasoning forbids a
 second copy: one file, and if you ever mirror it, the gate must fail when the
 copies differ.
 
+**"One file" means one copy PER STANDARD, and kit now has two.** Besides
+`ci.reusable.yml` there is `.github/workflows/image.reusable.yml`, which builds
+a service's image and publishes it to ghcr.io. The `REUSABLE_WORKFLOWS` variable
+in `tests/validate.sh` is the list of what callers may reach; the gate fails on a
+file declaring `workflow_call` that is not on it, and separately on a file that
+duplicates one that is. Both branches are proved by breakages 78 and 79, because
+a check widened to accommodate a second standard is exactly the kind of thing
+that ends up widened into uselessness.
+
 A caller writes exactly this, and nothing else:
 
 ```yaml
@@ -99,8 +108,27 @@ jobs:
       language: go
 ```
 
-`kit` itself calls it with the local form instead, which is the whole point of
-having the file here at all:
+And the service that also needs a deployable artifact calls the second one:
+
+```yaml
+---
+name: publish
+on:
+  push:
+    branches: [master]
+permissions:
+  # The caller grants it; a reusable workflow cannot grant itself a permission.
+  contents: read
+  packages: write
+jobs:
+  image:
+    uses: cafaye/kit/.github/workflows/image.reusable.yml@master
+    with:
+      push: true
+```
+
+`kit` itself calls the CI workflow with the local form instead, which is the
+whole point of having the file here at all:
 
 ```yaml
     uses: ./.github/workflows/ci.reusable.yml

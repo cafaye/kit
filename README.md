@@ -867,6 +867,45 @@ organization.
 
 Two jobs for two languages? Call it twice with two different `language` values.
 
+**2. Publish the image.** CI proves the tree; it does not produce a deployable
+artifact, and `config/deploy.yml` deploys an image rather than a commit. So a
+service also calls the second reusable workflow, from its own
+`.github/workflows/publish.yml`:
+
+```yaml
+---
+name: publish
+on:
+  push:
+    branches: [master]
+permissions:
+  # The CALLER grants this. A reusable workflow can ask for a permission but
+  # cannot grant itself one, so a caller that omits it gets a read-only token
+  # and a 401 at the push that reads like a wrong password.
+  contents: read
+  packages: write
+jobs:
+  image:
+    uses: cafaye/kit/.github/workflows/image.reusable.yml@master
+    with:
+      push: true
+```
+
+There is **no image-name input, and that is the point.** The name is derived from
+`github.repository` and lowercased, so CI cannot push somewhere other than where
+`config/deploy.yml` pulls from. An input would be a string each service copies
+into its own repository, and a copied string drifts — the deploy then fails hours
+later, at the pull, on a release whose build was green.
+
+Publishing is **opt-in**: `push` defaults to `false`, so a workflow that only
+meant to check a Dockerfile still builds does not write to the registry. The tags
+are `sha-<full commit>`, `<branch>`, and `latest`; the sha tag is the immutable
+one and is what a deploy should be given. The registry is **GitHub Packages**
+and the only credential is the workflow's own `GITHUB_TOKEN` — no PAT, no
+`secrets:` entry, nothing to rotate. Provenance and an SBOM are attached, because
+a registry of launch artifacts that cannot be audited afterwards is not one you
+want to be holding those artifacts in.
+
 **Your first build may be red, and it is probably the secret scanner.** The
 `secrets` job has no opt-in, and it reads the **full history** of your
 repository. If a credential has ever been committed — even one you deleted in
@@ -1070,6 +1109,11 @@ bash <kit>/tests/validate.sh
 ### Adoption checklist
 
 - [ ] `.github/workflows/ci.yml` calls `cafaye/kit/.github/workflows/ci.reusable.yml@master`
+- [ ] `.github/workflows/publish.yml` calls `cafaye/kit/.github/workflows/image.reusable.yml@master`
+      with `push: true`, and the workflow grants `packages: write`. **Without it
+      nothing builds the image `config/deploy.yml` deploys**, and CI stays green
+      the whole time — a green CI and an unbuilt image are not in tension, they
+      are just both true.
 - [ ] `working-dir` points at the dir holding the manifest
 - [ ] Nothing copied from `lint/` — the workflow passes kit's config at run time.
       If your repo carries a `.golangci.yml`, it must AGREE with kit's; see

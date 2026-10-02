@@ -1,0 +1,282 @@
+---
+# kit — the image path every cafaye service repo runs.
+#
+# Consumers do not copy this file; they call it, exactly as they call
+# `.github/workflows/ci.reusable.yml`:
+#
+#   # .github/workflows/publish.yml
+#   name: publish
+#   on:
+#     push:
+#       branches: [master]
+#   permissions:
+#     contents: read
+#     packages: write          # REQUIRED, and the caller's to grant — see below
+#   jobs:
+#     image:
+#       uses: cafaye/kit/.github/workflows/image.reusable.yml@master
+#       with:
+#         push: true
+#
+# WHY THIS EXISTS, IN ONE SENTENCE. `config/deploy.yml` in every deployable
+# service says `image: <org>/<repo>` with `registry.server: ghcr.io`, and as of
+# kit-32 not one repository in the fleet built or pushed the image that file
+# deploys. The deploy config was a description of a deploy nothing produced, so
+# "ready to launch" was blocked on an artifact with no pipeline behind it.
+#
+# WHY A REUSABLE WORKFLOW AND NOT SIX COPIES. The same argument
+# `ci.reusable.yml` makes, and it is the same argument: a fix to how an image is
+# built has to reach every service without a per-repo pull request, or it
+# reaches none of them and the fleet drifts one deploy at a time.
+#
+# GITUB PACKAGES, NOT A REGISTRY ACCOUNT. The registry is
+# `ghcr.io` and the credential is the workflow's own `GITHUB_TOKEN`. There is no
+# PAT, no `secrets:` entry, no registry password to rotate, and no second
+# identity to grant and revoke. `docker/login-action` needs
+# `packages: write`, which the CALLER grants — a reusable workflow can ask for a
+# permission but cannot grant itself one, and a job that silently ends up with
+# the default read-only token fails at the push with a 401 that reads like a
+# wrong password rather than like a missing grant. That is why the example
+# above shows the permission on the caller.
+#
+# THE IMAGE NAME IS DERIVED, NEVER PASSED IN. It is
+# `ghcr.io/${{ github.repository }}`, lowercased, and there is deliberately no
+# `image-name` input. An input here is a string a service copies into its own
+# repository, and a copied string is a string that drifts from the repository it
+# names: the deploy would then `kamal build` and push to one place while CI
+# pushed to another, and the deploy would fail at the PULL, hours later, on a
+# release whose build was green. The repository that builds an image is the only
+# authority on what it is called. The one cost is an org rename, which orphans
+# the old images — recorded here rather than solved with a knob.
+#
+# LOWERCASED, AND NOT COSMETICALLY. GitHub Packages rejects an uppercase path
+# with a 404 at the push, and neither an org name nor a repository name is
+# required to be lowercase. `github.repository` is verbatim, so
+# `Cafaye/Site` pushes nothing and the error names a package rather than
+# naming a character. The `resolve image` step below is where the lowercasing
+# happens, and it is a real step rather than a claim in a comment because a
+# comment does not lowercase anything.
+#
+# THE TAG SET, AND WHY `sha-` IS THE ONE THAT MATTERS:
+#
+#   sha-<full 40 chars>   immutable. A commit's image never changes, so a
+#                         deploy can name it and mean it. This is the tag
+#                         `kamal deploy` should be given.
+#   <branch>              moving. What a human reads on the package page.
+#   latest                moving, and only on the default branch.
+#
+# NO SEMVER TAG. A release tag is a claim about a version of the software, and
+# cutting one is a decision. This workflow's whole output is "the commit's image
+# exists", and adding a semver tag to it would let a deploy pin `v1.0.0` to
+# whatever commit happened to be on master that week.
+#
+# `provenance: mode=max` and `sbom: true` are ON, and they cost one manifest
+# index entry each. A registry holding launch artifacts with no recorded
+# provenance is a registry nobody can audit after the fact, and the alternative
+# — adding provenance later — means it was never there for the images that
+# mattered.
+#
+# STRICTNESS NOTES (read before loosening anything):
+#   - `push` is an input and it DEFAULTS TO FALSE. A reusable workflow that
+#     pushes by default is a reusable workflow every caller publishes from by
+#     accident, including the one that was only meant to check the Dockerfile
+#     still builds. Publishing is opt-in, spelled out, at the call site.
+#   - The `push:` value the build action receives is `inputs.push &&
+#     github.event_name != 'pull_request'`, so even a caller that adds a
+#     `pull_request` trigger to its own workflow cannot publish from a fork. A
+#     fork's `GITHUB_TOKEN` is read-only and would 403 anyway; refusing before
+#     the attempt is better than failing after it.
+#   - `actions/checkout` sets `persist-credentials: false` for the same reason
+#     every job in `ci.reusable.yml` does: this job checks out a tree and then
+#     runs `docker build` over it, and a token left in `.git/config` outlives the
+#     job for no reason.
+#   - No `secrets:` are consumed beyond `GITHUB_TOKEN`, so a service adopting
+#     this needs no secret configured, and nothing here is worth rotating.
+name: image
+
+on:
+  workflow_call:
+    inputs:
+      push:
+        description: >-
+          Publish the image to ghcr.io. FALSE by default and it stays that way:
+          a caller that wants an image published says so at the call site, and
+          a workflow nobody opted into cannot write to the registry.
+        required: false
+        type: boolean
+        default: false
+      context:
+        description: >-
+          Build context, relative to the repository root. '.' unless a service
+          keeps its Dockerfile in a subdirectory with its own context.
+        required: false
+        type: string
+        default: '.'
+      dockerfile:
+        description: >-
+          Path to the Dockerfile, relative to the repository root. Read by
+          docker/build-push-action; the default is the conventional one.
+        required: false
+        type: string
+        default: './Dockerfile'
+      platforms:
+        description: >-
+          Comma-separated platforms for the manifest list. The default builds
+          BOTH amd64 and arm64, which is not a guess about this fleet's boxes:
+          every `config/deploy.yml` says `builder.arch: arm64` while GitHub's
+          runners are amd64, so an arm64-only build is only reachable through
+          QEMU emulation and an amd64-only build cannot run on the box that
+          deploy.yml names. Both is the one answer that is right either way.
+        required: false
+        type: string
+        default: 'linux/amd64,linux/arm64'
+      cache-from:
+        description: >-
+          BuildKit cache source. 'type=gha' by default, which is the Actions
+          cache service and needs no registry credential.
+        required: false
+        type: string
+        default: 'type=gha'
+      cache-to:
+        description: >-
+          BuildKit cache destination. 'type=gha' by default, for the same
+          reason. Note this is the ACTIONS cache, not the `registry` cache mode
+          in `config/deploy.yml`'s builder block — two different caches for two
+          different builders, and conflating them is a question this comment
+          exists to pre-empt.
+        required: false
+        type: string
+        default: 'type=gha'
+    outputs:
+      digest:
+        description: >-
+          The manifest list's sha256 digest, which is the only immutable name a
+          deploy can pin. Empty when `push` is false, because nothing was
+          written to read a digest from.
+        value: ${{ jobs.build.outputs.digest }}
+      image:
+        description: >-
+          The full image reference that was (or would have been) pushed, e.g.
+          ghcr.io/cafaye/site. A follow-on job that needs the image — a
+          smoke test, a deploy — should take this output rather than
+          reconstructing the string.
+        value: ${{ jobs.build.outputs.image }}
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: build (and publish, if asked)
+    runs-on: ubuntu-latest
+    # `packages: write` is DECLARED HERE AND GRANTED BY THE CALLER. In a
+    # reusable workflow this is a ceiling, not a grant: the effective
+    # permission is the caller's, intersected with this. A caller that omits
+    # it gets read-only and a 401 at the push, which is a genuinely confusing
+    # way to learn a line is missing from another repository.
+    permissions:
+      contents: read
+      packages: write
+    outputs:
+      digest: ${{ steps.meta.outputs.digest }}
+      image: ${{ steps.resolve.outputs.image }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+
+      # THE LOWERCASE, AS A STEP.
+      #
+      # Not a comment, and not an input. `github.repository` is
+      # `owner/repo` verbatim, `tr` is in coreutils on every runner, and the
+      # failure without this line is a 404 from the registry naming a package
+      # rather than a character.
+      - name: resolve image
+        id: resolve
+        # `github.repository` goes in through `env`, not into the script body.
+        # zizmor's `template-injection` audit is right in principle: a `${{ }}`
+        # interpolated into a `run:` block is a value the shell will execute,
+        # and the defense is to not do it. It is a two-line cost here and it
+        # keeps this workflow clean under the audit kit's CI already runs on
+        # every adopting repository.
+        env:
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          image="ghcr.io/$(printf '%s' "$REPOSITORY" | tr '[:upper:]' '[:lower:]')"
+          echo "image=$image" >>"$GITHUB_OUTPUT"
+          echo "pushing to $image" >>"$GITHUB_STEP_SUMMARY"
+
+      # arm64 on an amd64 runner. Registered before buildx so the emulators
+      # exist by the time a build asks for a foreign architecture, and not
+      # conditional on the platform list: a service that narrows `platforms`
+      # to amd64 would otherwise silently lose the setup when it later widens
+      # them back.
+      - uses: docker/setup-qemu-action@v3
+
+      - uses: docker/setup-buildx-action@v3
+
+      - name: log in to ghcr.io with this workflow's own token
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          # NOT an input and NOT a secret this repository defines. `GITHUB_TOKEN`
+          # is minted per run by GitHub, scoped to this repository, and dies
+          # with the job. There is nothing here to leak into another repository
+          # and nothing here to rotate.
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: work out the tags
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          # The derived name from the step above. See the header for why this is
+          # not an input.
+          images: ${{ steps.resolve.outputs.image }}
+          tags: |
+            type=sha,format=long
+            type=ref,event=branch
+            type=raw,value=latest,enable={{is_default_branch}}
+          # Labels only; nothing below reads a label back.
+          labels: |
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.revision=${{ github.sha }}
+
+      - name: build
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ inputs.context }}
+          file: ${{ inputs.dockerfile }}
+          platforms: ${{ inputs.platforms }}
+          push: ${{ inputs.push && github.event_name != 'pull_request' }}
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: ${{ inputs.cache-from }}
+          cache-to: ${{ inputs.cache-to }}
+          # Both on. The cost is two extra referrers on the manifest; the
+          # absence is an artifact nobody can audit later, which is the more
+          # expensive direction for anything we are about to sell.
+          provenance: mode=max
+          sbom: true
+
+      - name: say what landed
+        # The digest is the deployable artifact and a log line is the only
+        # place a person can copy it from without opening the Actions API.
+        # Skipped rather than printed empty when nothing was pushed, because a
+        # blank digest in a green job reads as "the build produced no image"
+        # when the truth is "the caller did not ask for one".
+        if: inputs.push && github.event_name != 'pull_request'
+        run: |
+          set -euo pipefail
+          {
+            echo '### image published'
+            echo
+            echo "image: \`$IMAGE\`"
+            echo
+            echo "digest: \`$DIGEST\`"
+          } >>"$GITHUB_STEP_SUMMARY"
+          echo "published $IMAGE at $DIGEST"
+        env:
+          IMAGE: ${{ steps.resolve.outputs.image }}
+          DIGEST: ${{ steps.meta.outputs.digest }}
