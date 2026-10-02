@@ -13,6 +13,45 @@ it without a copy (see kit-12 below).
 
 ## Unreleased
 
+### Added — a check for the one defect the static phase was structurally unable to see
+
+- **`tests/validate.sh` — `conflict_markers_absent`, run as the first check of the
+  static phase.** Found by this packet's own merge: two merge-conflict markers
+  reached `origin/master` here and in `billing`, and the residue in both was a
+  `CHANGELOG.md`.
+
+- **Why no existing check caught it.** Not oversight — a category the static
+  phase cannot cover. Every parse in that phase runs over YAML, JSON, shell, Go,
+  Ruby, Python and compose, and all of them were clean. Both markers were in
+  *prose*, which this suite reads for the presence of headings and never parses
+  for content. A half-resolved merge is still valid markdown: all three marker
+  forms at the start of a line render as ordinary text, so nothing downstream
+  objects and the suite reports green on a tree that is wrong.
+
+- **All three forms are matched, and that is the part worth having.** What
+  actually got through was the `||||||| base` line that `diff3` writes *beside*
+  the `<<<<<<<` / `=======` / `>>>>>>>` triple. Resolving a merge by hand
+  removes the triple and leaves the base marker, so the result *looks* resolved to
+  anyone skimming the diff — and `grep -c '<<<<<<<'` reports `0` on a tree that
+  is still wrong. A check for the classic pair alone would have stayed green
+  through exactly the case that reached master.
+
+- **The pattern is written `^<{7} `, not as seven literal angle brackets.** That
+  is load-bearing. A checker whose own source contains the literal marker line
+  flags itself, and both conventional escapes are worse than the problem:
+  excluding the checker from its own scan leaves a hole in the one file most
+  likely to hold residue, and suppressing the finding wholesale makes the check
+  unable to report the truth. The interval form is a *regex*, so the literal
+  sequence never appears in the file and the check is self-excluding by
+  construction rather than by exception.
+
+- **Measured, not assumed.** Proved green on the tree, red on the real tree with
+  a base-only marker injected (reported as `CHANGELOG.md:4249`, naming file and
+  line), and green again after the revert. Against a fixture it flags all three
+  forms and stays quiet on the four things that must stay quiet: its own source
+  line, prose that merely *discusses* markers mid-sentence, six angle brackets,
+  and a binary file carrying the bytes.
+
 ### Fixed — kit's own remediation advice was telling services to make themselves a cluster superuser
 
 - **`tests/fleet_check.py`, `README.md`, `templates/AGENTS.md`,

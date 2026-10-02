@@ -321,6 +321,45 @@ section() { printf '\n-- %s\n' "$1"; }
 
 have() { command -v "$1" >/dev/null 2>&1; }
 
+# No tracked file carries a merge-conflict marker.
+#
+# This check exists because two markers reached `origin/master` in two different
+# repositories, and no other check in this file could have seen either one.
+#
+# WHERE THEY SURVIVED is the whole reason a separate check was needed, and it is
+# not "nobody looked hard enough". Every parse in the static phase runs over
+# YAML, JSON, shell, Go, Ruby, Python and compose. All of those were clean.
+# Both markers were in a `CHANGELOG.md` — PROSE, which this suite reads for the
+# presence of headings and sections and never parses for content. A half-resolved
+# merge is still perfectly valid markdown: `<<<<<<<`, `|||||||` and `>>>>>>>` at
+# the start of a line render as text, so nothing downstream objects.
+#
+# The residue that actually got through was the subtle one. The `<<<<<<<` /
+# `=======` / `>>>>>>>` triple was removed, and the `||||||| base` line that diff3
+# writes BESIDE it was left behind — so the merge looked resolved to whoever
+# skimmed the diff, and `grep -c '<<<<<<<'` reports 0 on a tree that is still
+# wrong. That is why all three forms are matched here and not just the classic
+# pair.
+#
+# THE PATTERN IS WRITTEN AS `^<{7} `, not as seven literal angle brackets, and
+# that is load-bearing rather than a matter of taste. A checker whose own source
+# contains the literal marker line flags itself, and the two obvious ways out are
+# both worse than the problem: excluding the checker file from its own scan
+# leaves a real hole in the one file most likely to hold the residue, and
+# suppressing the finding wholesale makes the check unable to report the truth.
+# The interval form is a REGEX, so the literal sequence never appears in this
+# file, and the check is self-excluding by construction instead of by exception.
+conflict_markers_absent() {
+  local hits
+  hits="$(git -C "$ROOT" grep -I -n -E '^<{7} |^>{7} |^\|{7} ' -- . 2>/dev/null)" || true
+  if [ -n "$hits" ]; then
+    printf '%s\n' "$hits"
+    printf 'these lines are merge residue, not content; resolve and commit\n'
+    return 1
+  fi
+  return 0
+}
+
 # The ruby interpreter floor, read FROM THE TEMPLATE it applies to.
 #
 # `templates/otel/ruby` calls `Enumerable#filter_map`, which arrived in ruby 2.7.
@@ -660,6 +699,13 @@ if problems:
     sys.exit("; ".join(problems))
 PY
   }
+
+  # First, because it is the cheapest check in the phase and the one that makes
+  # the others trustworthy: a marker in a shell script or a YAML file will be
+  # caught downstream by a parser complaining about the residue, but a marker in
+  # a markdown file is caught by nothing, ever, and the suite reports green on a
+  # tree that is wrong. See `conflict_markers_absent`.
+  check 'no tracked file carries a merge-conflict marker' conflict_markers_absent
 
   section 'static: every artifact parses'
 
