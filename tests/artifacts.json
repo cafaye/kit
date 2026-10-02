@@ -241,6 +241,14 @@
       "optional": true
     },
     {
+      "id": "database/tenancy/advisor",
+      "_about": "The layer above substrate.sql, and the reason it is a separate file rather than more of the same one: substrate.sql and isolation.sql both grade what the templates SAY — as text, and as denials RUN. Neither can see a policy whose predicate is `true`, because a permissive predicate RETURNS ROWS and a denial cannot tell permitted-by-predicate from permitted-by-accident. advisor.sql grades the LIVE DATABASE, which is the only layer that can.",
+      "source": "templates/database/tenancy/advisor.sql",
+      "dest": "db/tenancy/advisor.sql",
+      "optional": true,
+      "_about_optional": "Optional because a service holding no customer rows has no policies for any of its rules to read, and because it is a REVIEW artifact rather than a runtime one: it is a migration-shaped function a service loads and queries from its own gate, never something on a request path. It is NOT the same as discouraged in the way substrate.sql's optional is — a service that scopes by account and does not carry this has no detector for the policies it hand-wrote, and every rule in it is load-bearing against exactly the mistake a reviewer does not see."
+    },
+    {
       "id": "database/tenancy/readme",
       "source": "templates/database/tenancy/README.md",
       "dest": "db/tenancy/README.md",

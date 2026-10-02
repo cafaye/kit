@@ -35,6 +35,15 @@
 #   6. an unprotected account-scoped table in a schema the substrate DOES own
 #      turns the proof red.                            (5: and scoping the sweep
 #      did not turn it into a green constant)
+#   7. THE DATABASE'S OWN ADVISOR, `templates/database/tenancy/advisor.sql`, run
+#      against this cluster, reports ZERO ERROR and zero WARN on the two tables
+#      the substrate wrote.                            (the one question the five
+#      above cannot ask: a policy that PERMITS everything satisfies every denial,
+#      because a denial cannot tell permitted-by-predicate from
+#      permitted-by-accident)
+#   8. every rule in that advisor FIRES on a fixture built to trip it, naming
+#      itself and the table it fired on.                (a detective that has
+#      never fired is a detective you cannot trust)
 #
 #   Assertion 2 is the expensive and the important one. It is the control this
 #   repository's rules insist on: a control that never runs differently proves
@@ -72,6 +81,7 @@ BETA=beta
 SUBSTRATE="$ROOT/templates/database/tenancy/substrate.sql"
 ISOLATION="$ROOT/templates/database/tenancy/isolation.sql"
 MANIFEST="$ROOT/templates/database/tenancy/assertions.txt"
+ADVISOR="$ROOT/templates/database/tenancy/advisor.sql"
 
 WORK="${TMPDIR:-/tmp}/kit-tenancy.$$"
 IMAGE_TAG="17"
@@ -103,7 +113,7 @@ cleanup() {
 }
 trap cleanup EXIT
 
-for f in "$SUBSTRATE" "$ISOLATION" "$MANIFEST"; do
+for f in "$SUBSTRATE" "$ISOLATION" "$MANIFEST" "$ADVISOR"; do
   [ -r "$f" ] || fail "$(basename "$f") is not readable, so there is nothing to prove"
 done
 
@@ -543,6 +553,325 @@ fi
 say "   the same policy and the same rows; only the wrapping differs."
 
 # ---------------------------------------------------------------------------
+# ASSERTION 6 — THE DATABASE GRADES ITSELF.
+#
+# Assertions 1-5 are the boundary RUN: they execute denials and read verdicts.
+# This one asks the opposite question, and it is the one the other five cannot
+# ask. Every assertion above is satisfied by a policy that PERMITS everything,
+# because a permissive predicate returns rows and a denial cannot tell
+# "permitted because the predicate said so" from "permitted by accident". Nor can
+# any file scanner see that two permissive policies on one (table, role, command)
+# combine with OR and the table is wider than either reads.
+#
+# So `templates/database/tenancy/advisor.sql` is installed here and RUN, against
+# the same cluster, over the same tables the substrate wrote. A rule that cannot
+# be executed is a comment.
+#
+# THE SCOPE IS DERIVED, never named, and for the reason `substrate.sql`'s sweep
+# derives its own: the schemas a `protect_table` call actually wrote into. A list
+# of schemas here would be a second thing to remember and a thing to forget on
+# the first service whose tables live somewhere else.
+#
+# THE TABLES ARE REAL ONES, and `api_keys` is the interesting one: it carries all
+# FIVE of `protect_credential_table`'s policies, so `(api_keys, alpha, SELECT)`
+# holds two permissive policies. MD24's fifth policy is therefore the live case
+# for `multiple_permissive_policies`, and the advisor is asked about it on every
+# run of this suite rather than in a comment claiming the answer.
+say ""
+say "== assertion 6: templates/database/tenancy/advisor.sql, against this cluster"
+
+docker cp "$ADVISOR" "$C:/tmp/advisor.sql" >/dev/null
+if ! docker exec -e PGPASSWORD=cafaye "$C" psql -U "$ALPHA" -d "$ALPHA" \
+  -v ON_ERROR_STOP=1 -q -f /tmp/advisor.sql >"$WORK/advisor.log" 2>&1; then
+  say "FAIL: advisor.sql did not install. Last lines:"
+  tail -20 "$WORK/advisor.log" | sed 's/^/       /'
+  fail "advisor install"
+fi
+say "   installed: cafaye.advisor_findings(p_schemas text[])"
+
+# Two tables, created exactly as a service's migrations create them: an
+# account-scoped one, and a credential one. The second is the whole point — it is
+# the only table in this fixture that gets a fifth policy, and it is what
+# `multiple_permissive_policies` is going to be asked about.
+psql_in "$ALPHA" "$ALPHA" "
+  set client_min_messages = warning;
+  drop table if exists public.api_keys;
+  drop table if exists public.account_users;
+  create table public.account_users (
+    id bigint generated always as identity primary key,
+    account_id uuid not null,
+    email text not null);
+  create table public.api_keys (
+    id bigint generated always as identity primary key,
+    account_id uuid not null,
+    token_digest text not null);
+" >/dev/null
+psql_in "$ALPHA" "$ALPHA" \
+  "set client_min_messages = warning; select cafaye.protect_table('public.account_users')" >/dev/null
+psql_in "$ALPHA" "$ALPHA" "
+  set client_min_messages = warning;
+  select cafaye.protect_credential_table('public.api_keys', 'token_digest')" >/dev/null
+
+# Four from protect_table and five from protect_credential_table. Counted, because
+# everything below is a claim about those nine policies and a fixture that had
+# silently installed eight would still produce a clean advisor run.
+policies_now="$(psql_in "$ALPHA" "$ALPHA" "
+  select count(*) from pg_policy p
+    join pg_class c on c.oid = p.polrelid
+    join pg_namespace n on n.oid = c.relnamespace
+   where n.nspname = 'public'")"
+[ "$policies_now" = "9" ] \
+  || fail "expected 9 policies on the substrate's two tables (4 + 5); found $policies_now. The advisor is about to be asked about tables that are not the ones a service would build."
+
+scoped="$(psql_in "$ALPHA" "$ALPHA" "
+  select coalesce(array_agg(distinct n.nspname), '{}'::name[])::text
+    from pg_namespace n
+    join pg_class c on c.relnamespace = n.oid
+    join pg_policy p on p.polrelid = c.oid
+   where p.polname ~ '_cafaye_(select|insert|update|delete)$'")"
+scoped="${scoped#\{}"
+scoped="${scoped%\}}"
+# The derived list is turned into an array by the SERVER rather than pasted into a
+# literal here. A hand-assembled `'{a, b}'` is a second place the scope can be
+# wrong, and it is wrong in the direction that matters: a malformed array literal
+# is an error, while a malformed one that happens to parse is a quiet scope.
+scoped="${scoped// /},cafaye"
+say "   scope, read back from the policies protect_table wrote: ${scoped//,/, }"
+
+adv="$(psql_in "$ALPHA" "$ALPHA" "
+  select level || '@' || name || '@' || coalesce(metadata->>'name', '') || '@' || detail
+    from cafaye.advisor_findings(string_to_array('$scoped', ',')::text[])
+   order by cache_key")"
+
+if [ -n "$adv" ]; then
+  say "   the advisor's complete output, every level including INFO:"
+  printf '%s\n' "$adv" | while IFS= read -r row; do
+    level="${row%%@*}"
+    rest="${row#*@}"
+    rule="${rest%%@*}"
+    rest2="${rest#*@}"
+    what="${rest2%%@*}"
+    detail="${rest2#*@}"
+    printf '     [%s] %s\n' "$level" "$rule"
+    printf '         on: %s\n' "$what"
+    printf '         %s\n' "$detail"
+  done
+fi
+
+adv_bad="$(printf '%s\n' "$adv" | grep -E '^(ERROR|WARN)@' || true)"
+if [ -n "$adv_bad" ]; then
+  say "FAIL: the advisor reported ERROR/WARN findings against tables the substrate"
+  say "      wrote. The substrate is the thing these rules are about, so a finding"
+  say "      here is a defect in the substrate or a defect in a rule — not a service's."
+  printf '%s\n' "$adv_bad" | awk -F@ '{print "       [" $1 "] " $2 " on " $3}' | head -12
+  fail "the substrate does not pass the substrate's own advisor"
+fi
+say "   zero ERROR and zero WARN findings against account_users and api_keys."
+say "   api_keys carries FIVE policies (4 from protect_table, 1 from"
+say "   protect_credential_table), so (api_keys, alpha, SELECT) holds two permissive"
+say "   policies and multiple_permissive_policies was asked about it directly."
+say "   It stayed silent because the group is all substrate-written — which is the"
+say "   rule's own exemption semantics."
+
+# ---------------------------------------------------------------------------
+# ASSERTION 6b — THE EXEMPTION'S OWN CONTROL, and it is the MD24 question rather
+# than a tidy-up.
+#
+# `multiple_permissive_policies` is the one rule that has to be exempt for MD24's
+# credential mechanism to be allowed to exist: `protect_credential_table` adds a
+# fifth policy whose predicate is the digest the CALLER presented, so
+# (api_keys, alpha, SELECT) permanently holds two permissive policies and they
+# combine with OR. The exemption is that the group is all substrate-written.
+#
+# An exemption with no control is a rule that has been switched off, and this is
+# where that would show: add ONE hand-written permissive policy to `api_keys` and
+# the group stops being all-of, so the rule must fire AND NAME the hand-written
+# policy specifically. A firing that named only the substrate's two would prove
+# the rule is on; a firing that does not name it proves nothing about which policy
+# it objected to.
+say ""
+say "== assertion 6b: the multiple_permissive_policies exemption does not absorb a hand-written policy"
+psql_in "$ALPHA" "$ALPHA" "
+  create policy hand_written_extra on public.api_keys
+    for select to public using (true)" >/dev/null
+
+md24="$(psql_in "$ALPHA" "$ALPHA" "
+  select detail from cafaye.advisor_findings(string_to_array('public,cafaye', ',')::text[])
+   where name = 'multiple_permissive_policies'
+     and metadata->>'name' = 'api_keys'")"
+[ -n "$md24" ] || {
+  say "FAIL: a hand-written permissive SELECT on api_keys did NOT trip"
+  say "      multiple_permissive_policies. The exemption is meant to cover MD24's OWN"
+  say "      fifth policy and nothing else, so this is either an exemption that has"
+  say "      become a switch, or a rule that stopped recognising a substrate policy."
+  fail "the multiple_permissive_policies exemption absorbs a hand-written policy"
+}
+case "$md24" in
+  *"Not written by the substrate: hand_written_extra"*) ;;
+  *)
+    say "FAIL: the rule fired on (api_keys, SELECT) but did not NAME the hand-written policy."
+    say "      A finding that lists both policies leaves the reader to work out which"
+    say "      one the rule objected to, which is the work the detail column exists to do."
+    say "      reported: $md24"
+    fail "the finding does not say which policy was hand-written"
+    ;;
+esac
+say "   one hand-written permissive SELECT added to api_keys, and the rule fired:"
+say "     $(printf '%s\n' "$md24")"
+say "   the substrate's own five policies were NOT the complaint, and the exemption"
+say "   that let them coexist is still letting exactly them coexist."
+
+psql_in "$ALPHA" "$ALPHA" \
+  "set client_min_messages = warning; drop policy hand_written_extra on public.api_keys" >/dev/null
+still="$(psql_in "$ALPHA" "$ALPHA" "
+  select count(*) from cafaye.advisor_findings(string_to_array('public,cafaye', ',')::text[])
+   where level in ('ERROR', 'WARN')")"
+[ "$still" = "0" ] || fail "removing the hand-written policy left $still finding(s); the control's cleanup did not restore a clean advisor run"
+say "   policy dropped, and the advisor is clean again: 0 ERROR, 0 WARN."
+
+# ---------------------------------------------------------------------------
+# ASSERTION 7 — THE HONEST NEGATIVES. A detective that has never fired is a
+# detective you cannot trust, so every rule is run against a fixture BUILT TO TRIP
+# IT, and each must name itself.
+#
+# Every fixture below is in its own schema, the substrate was never applied to it,
+# and the advisor is scoped to that schema alone. That is not tidiness: it is what
+# makes the control specific. Scoped to the whole database, a rule that fires
+# proves only that the advisor returned rows, and six of these eight could be
+# satisfied by any of the others. Named rule, named fixture, one rule proven able
+# to fire.
+#
+# AND IT IS ALSO WHAT PROVES THE ADVISOR STANDS ALONE. Nothing here calls a
+# `cafaye.*` function the substrate owns except the two identity seams a policy
+# has to be written against — so these fixtures are a schema on a database where
+# the substrate was applied to `public` and nothing else, which is the shape of
+# the service that has not finished adopting.
+cat >"$WORK/advisor_fixture.sql" <<'FIXTURE'
+create schema kit_advisor_fixture;
+  set client_min_messages = warning;
+
+-- (3) rls_policy_always_true, and (5) multiple_permissive_policies: the second
+-- policy is a SECOND PERMISSIVE policy on the same (table, role, command) as the
+-- first, which is what trips the second rule. One fixture, two rules, and the
+-- pairing is deliberate: these two are the shapes a single careless migration
+-- produces.
+create table kit_advisor_fixture.always_true (
+  id int primary key, account_id uuid not null);
+alter table kit_advisor_fixture.always_true enable row level security;
+create policy fixture_write_all on kit_advisor_fixture.always_true
+  for all to public using (true) with check (true);
+create policy fixture_read on kit_advisor_fixture.always_true
+  for select to public using (account_id = (select cafaye.current_account_id()));
+
+-- (1) policy_exists_rls_disabled: a policy that is inert. This reads as correct
+-- in review — the policies exist — and enforces nothing.
+create table kit_advisor_fixture.policies_without_rls (
+  id int primary key, account_id uuid not null);
+create policy fixture_only on kit_advisor_fixture.policies_without_rls
+  for select to public using (account_id = (select cafaye.current_account_id()));
+
+-- (2) rls_disabled_in_public: no RLS, and a login role can read it. The grant is
+-- part of the fixture, not a detail: without it the table is unreachable and
+-- there is nothing to report.
+create table kit_advisor_fixture.reachable_no_rls (
+  id int primary key, note text not null);
+grant select on kit_advisor_fixture.reachable_no_rls to public;
+
+-- (4) rls_references_user_metadata, the CATALOG half. `profile_flags` is the
+-- service's own `user_metadata`: a predicate that decides access from rows the
+-- caller can write. The word `user_metadata` appears nowhere in it, which is the
+-- point — the keyword half of the rule cannot find this and the catalog half can.
+create table kit_advisor_fixture.profile_flags (
+  account_id uuid not null, is_admin boolean not null default false);
+create table kit_advisor_fixture.admin_only (
+  id int primary key, account_id uuid not null);
+alter table kit_advisor_fixture.admin_only enable row level security;
+create policy fixture_admin on kit_advisor_fixture.admin_only for select to public
+  using (exists (select 1 from kit_advisor_fixture.profile_flags f
+                   where f.account_id = admin_only.account_id and f.is_admin));
+grant select, insert, update on kit_advisor_fixture.profile_flags to public;
+
+-- (6) login_role_security_definer_executable: SECURITY DEFINER, callable without
+-- signing in as anything in particular. The substrate writes none — every function
+-- it owns is an invoker — which is what assertion 6 measured.
+create function kit_advisor_fixture.escalate() returns int
+  language sql security definer as $$ select 1 $$;
+grant execute on function kit_advisor_fixture.escalate() to public;
+
+-- (7) auth_rls_initplan: the bare form of the call assertion 3 measured at five
+-- invocations per five rows. The same shape, written by hand instead of by
+-- protect_table, and correct — and slow.
+create table kit_advisor_fixture.bare_call (
+  id int primary key, account_id uuid not null);
+alter table kit_advisor_fixture.bare_call enable row level security;
+create policy fixture_bare on kit_advisor_fixture.bare_call for select to public
+  using (account_id = cafaye.current_account_id());
+
+-- (8) rls_enabled_no_policy: RLS on, no policy, every row hidden. INFO and not a
+-- breach — a fail-closed outage is still an outage, and the catalog is where it
+-- shows up first.
+create table kit_advisor_fixture.silent (
+  id int primary key, account_id uuid not null);
+alter table kit_advisor_fixture.silent enable row level security;
+FIXTURE
+
+say ""
+say "== assertion 7: every rule, on a fixture built to trip it"
+docker cp "$WORK/advisor_fixture.sql" "$C:/tmp/advisor_fixture.sql" >/dev/null
+if ! docker exec -e PGPASSWORD=cafaye "$C" psql -U "$ALPHA" -d "$ALPHA" \
+  -v ON_ERROR_STOP=1 -q -f /tmp/advisor_fixture.sql >"$WORK/fixture.log" 2>&1; then
+  say "FAIL: the advisor's negative fixtures did not install. Last lines:"
+  tail -20 "$WORK/fixture.log" | sed 's/^/       /'
+  fail "the negative fixtures did not install"
+fi
+
+neg="$(psql_in "$ALPHA" "$ALPHA" "
+  select name || '@' || coalesce(metadata->>'name', '')
+    from cafaye.advisor_findings(string_to_array('kit_advisor_fixture', ',')::text[])
+   order by cache_key")"
+
+# Every rule, and the fixture that must trip it. A rule that has gone quiet here
+# is a rule nobody can rely on, and the whole cost of this assertion is that it
+# is a list: a count would be satisfied by the same rule firing twice.
+tripped=""
+for pair in \
+  'policy_exists_rls_disabled:policies_without_rls' \
+  'rls_disabled_in_public:reachable_no_rls' \
+  'rls_policy_always_true:always_true' \
+  'rls_references_user_metadata:admin_only' \
+  'multiple_permissive_policies:always_true' \
+  'login_role_security_definer_executable:escalate' \
+  'auth_rls_initplan:bare_call' \
+  'rls_enabled_no_policy:silent'; do
+  rule="${pair%%:*}"
+  fixture="${pair#*:}"
+  if printf '%s\n' "$neg" | grep -q "^$rule@$fixture\$"; then
+    say "   $rule -> $fixture"
+    tripped="$tripped $rule"
+  else
+    say "FAIL: $rule did NOT fire on the fixture built to trip it ($fixture)."
+    say "      A rule that has never fired is a rule nobody can trust, and this one is"
+    say "      indistinguishable from a rule that does not work."
+    printf '%s\n' "$neg" | awk -F@ '{print "       reported instead: " $1 " on " $2}' | head -12
+    fail "an advisor rule cannot fire"
+  fi
+done
+say "   8 rules, 8 fixtures, every rule naming itself and the table it fired on."
+say "   scoped to kit_advisor_fixture alone, so each one is proven specific and not"
+say "   satisfied by whichever other rule happened to return a row."
+
+# The fixtures go, and their going is asserted rather than assumed: everything
+# after this point in a shared container should see the cluster the substrate
+# left, and a leftover `using (true)` policy is exactly the sort of thing that
+# makes a later run's numbers mean something else.
+psql_in "$ALPHA" "$ALPHA" \
+  "set client_min_messages = warning; drop schema kit_advisor_fixture cascade" >/dev/null
+left="$(psql_in "$ALPHA" "$ALPHA" \
+  "select count(*) from pg_namespace where nspname = 'kit_advisor_fixture'")"
+[ "$left" = "0" ] || fail "the fixture schema survived its drop, so the next assertion would run against it"
+say "   kit_advisor_fixture dropped, asserted gone."
+
+# ---------------------------------------------------------------------------
 say ""
 say "PASS: kit's account boundary is enforced by Postgres, and the enforcement is"
 say "      proven able to fail."
@@ -551,3 +880,6 @@ say "      FORCE ROW LEVEL SECURITY removed: $ctl_failures red, all of them owne
 say "      identity function calls over five rows: $wrapped_calls wrapped, $bare_calls bare."
 say "      an adopter's fixture schema present: 0 of 2 of its tables named."
 say "      an unprotected table in the substrate's own schema: named, proof red."
+say "      the database's own advisor on the substrate's own two tables: 0 ERROR, 0 WARN."
+say "      a hand-written permissive policy on api_keys: the exemption released it."
+say "      all 8 rules, each fired on a fixture built to trip it, each naming its table."

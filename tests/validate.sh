@@ -1330,7 +1330,8 @@ PY
         report_par PASS "$path  (markdown; the presence check is its check)"
         ;;
       "$ROOT"/templates/database/tenancy/substrate.sql | \
-      "$ROOT"/templates/database/tenancy/isolation.sql)
+      "$ROOT"/templates/database/tenancy/isolation.sql | \
+      "$ROOT"/templates/database/tenancy/advisor.sql)
         # No parser for this file type HERE, deliberately: see above. Reported
         # rather than silently passed, so a reader can see that the SQL is checked
         # by tests/tenancy_test.sh and not by this loop.
@@ -1620,7 +1621,7 @@ OTEL
 
   # -------------------------------------------------------------------------
   section 'static: templates/database/tenancy — every artifact is present'
-  # The account boundary is four files and six drivers, and the six are the reason
+  # The account boundary is five files and six drivers, and the six are the reason
   # this is a presence check rather than a note: kit templates six languages, and a
   # half-adopted account boundary is the same defect as a half-adopted language —
   # five services protected by Postgres and one protected by a WHERE clause a
@@ -1633,6 +1634,7 @@ OTEL
     'templates/database/tenancy/README.md' \
     'templates/database/tenancy/substrate.sql' \
     'templates/database/tenancy/isolation.sql' \
+    'templates/database/tenancy/advisor.sql' \
     'templates/database/tenancy/assertions.txt' \
     'templates/database/go/tenancy_test.go.snippet' \
     'templates/database/elixir/tenancy_test.exs.snippet' \
@@ -1640,9 +1642,9 @@ OTEL
     'templates/database/ruby/tenancy_test.rb.snippet' \
     'templates/database/node/tenancy_test.ts.snippet' \
     'templates/database/rust/tenancy_test.rs.snippet'; then
-    report PASS 'templates/database/tenancy/  (4 shared artifacts + 6 per-language drivers)'
+    report PASS 'templates/database/tenancy/  (5 shared artifacts + 6 per-language drivers)'
   else
-    report FAIL 'templates/database/tenancy/  (4 shared artifacts + 6 per-language drivers)'
+    report FAIL 'templates/database/tenancy/  (5 shared artifacts + 6 per-language drivers)'
   fi
 
   # -------------------------------------------------------------------------
