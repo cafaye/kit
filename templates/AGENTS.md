@@ -68,9 +68,9 @@ is in it wins and everything you did not mention still comes from kit.
   one machine and on no CI runner. `bin/dev` refuses a branch loudly, before any
   network call. `bin/dev pin <ref>` moves it deliberately and prints the stack diff
   first.
-- **Your `docker-compose.yml` may** set `image:`, add keys to `environment:`, add
-  a `depends_on`, declare your own services, and change a published port **by
-  changing the variable in `.env`**.
+- **Your `docker-compose.yml` may** set `image:`, add keys to **your own
+  service's** `environment:`, add a `depends_on`, declare your own services, and
+  change a published port **by changing the variable in `.env`**.
 - **Your `docker-compose.yml` may not** touch `otel-collector` — not its `image:`,
   not its `command:`, and above all not the `volumes:` entry that mounts
   `otel-collector.yml`. That file carries the redaction allowlist, and it is
@@ -81,9 +81,22 @@ is in it wins and everything you did not mention still comes from kit.
   **appends** a second file's `ports:` list rather than replacing it, so writing
   one publishes postgres on kit's port *and* on yours. Move the port in `.env`.
   This is measured, not folklore, and kit's gate fails on it.
-- **Pointing at your own database is an override, not a second container:**
-  `services.postgres.environment.POSTGRES_DB`. `environment:` merges by key, so
-  kit's healthcheck, volume and port survive.
+- **Your database is a `.env` line, not a compose override.** Add your service's
+  name to `KIT_POSTGRES_DATABASES`, comma-separated. The init script gives you a
+  `NOSUPERUSER` role and a database you own, and closes every other service's
+  database to you.
+- **`POSTGRES_USER`, `POSTGRES_DB` and `POSTGRES_PASSWORD` may not be set on
+  `services.postgres` — and this used to be kit's own advice, which is how one
+  fleet service ended up holding a cluster superuser role.** Measured against
+  the real cluster: the image creates `POSTGRES_USER` as a **superuser**, so the
+  override lets your service read every other service's database; and because the
+  image has already created that role and that database, `CREATE ROLE` and
+  `CREATE DATABASE` in the init script then fail **during initdb** and the whole
+  cluster refuses to start. `POSTGRES_PASSWORD` breaks neither — it is refused
+  because one service's file would decide the credential every other service on
+  the cluster authenticates with. For the cluster's own identity the variables
+  are `KIT_POSTGRES_USER` / `KIT_POSTGRES_DB` / `KIT_POSTGRES_PASSWORD`. kit's
+  gate fails on the three `POSTGRES_*` spellings.
 
 ## Observability
 

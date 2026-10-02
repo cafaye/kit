@@ -13,6 +13,110 @@ it without a copy (see kit-12 below).
 
 ## Unreleased
 
+### Fixed — kit's own remediation advice was telling services to make themselves a cluster superuser
+
+- **`tests/fleet_check.py`, `README.md`, `templates/AGENTS.md`,
+  `templates/database/README.md` and `templates/compose/docker-compose.yml`'s own
+  header — five copies of one wrong sentence, all corrected, and a check added
+  because correcting prose alone would have left the gap open from the other
+  side.** The stale-copy finding ended *"Point it at its own database by
+  overriding the `postgres` service's environment (POSTGRES_DB /
+  POSTGRES_USER)"*, and the adoption-path block printed the same instruction to
+  every unadopted repository in the fleet. It was wrong in a way that does not
+  merely fail to help.
+
+- **Measured, on a cluster built from this repository's own
+  `initdb/10-cluster.sh` against `postgres:17` — not inferred.** A service that
+  follows the advice and sets `POSTGRES_USER: <itself>` gets a role the official
+  image created, and the image creates it as a **superuser**. One cluster, with
+  one service provisioned the supported way and one the overridden way
+  (`KIT_POSTGRES_DATABASES=courier`, `POSTGRES_USER=identity`):
+
+  ```
+  $ psql -U identity -d identity -tAc \
+      "select rolname, rolsuper from pg_roles where rolname not like 'pg\_%'"
+   courier|f         <- made by the init script: NOSUPERUSER
+   identity|t        <- made by the image, for the service's own name
+  ```
+
+  That is the whole of `10-cluster.sh:108`'s `LOGIN NOSUPERUSER NOCREATEDB
+  NOCREATEROLE NOREPLICATION`, undone by the override the same repository
+  recommended. The consequence, from inside that cluster:
+
+  ```
+  $ psql -U identity -d courier -tAc "select count(*) from invoices"
+  2
+  $ psql -U courier  -d identity -tAc "select token from sessions"
+  psql: error: FATAL:  permission denied for database "identity"
+  DETAIL:  User does not have CONNECT privilege.
+  ```
+
+  The second is `MD21d`'s boundary refusing a service — at the door, before a
+  table is even named — and the first is the same query not being refused.
+
+- **The other two keys stop the CLUSTER, not just the service.** The image
+  creates `POSTGRES_USER` and `POSTGRES_DB` *before* any init script runs, so
+  `CREATE ROLE` / `CREATE DATABASE` in the script then find them already there.
+  `admin()` runs psql with `ON_ERROR_STOP=1` (`10-cluster.sh:78`), this happens
+  **during initdb**, and so the whole cluster refuses to start. Measured, both
+  shapes, exit status 3:
+
+  ```
+  $ docker run -e POSTGRES_USER=identity -e KIT_POSTGRES_DATABASES=identity,courier …
+    [cluster] provisioning identity
+    ERROR:  role "identity" already exists
+  $ docker run -e POSTGRES_DB=identity -e KIT_POSTGRES_DATABASES=identity,courier …
+    [cluster] provisioning identity
+    ERROR:  database "identity" already exists
+  ```
+
+- **`POSTGRES_PASSWORD` is refused for a third reason, and the finding says so
+  rather than borrowing the other two.** It breaks neither the cluster nor the
+  boundary. It is the credential every role is handed (`10-cluster.sh:107` passes
+  `$POSTGRES_PASSWORD` to each), so one service's file chooses it for all the
+  others — measured, a service overriding it authenticates `courier` with its
+  own password on a fresh volume. It is still refused, and the message says that
+  is *why*.
+
+- **The advice is now `KIT_POSTGRES_DATABASES` in `.env`**, which is the
+  mechanism the init script was always built around: each name becomes a
+  `NOSUPERUSER` role and a database it owns, and the `REVOKE CONNECT ... FROM
+  PUBLIC` boundary is applied to it. No compose file at all. The `down -v` that
+  goes with it is in the message too, because `docker-entrypoint-initdb.d` runs
+  once per volume and a developer who adds their name and runs `up` gets a
+  cluster that looks fine and a database that was never created.
+
+- **`check_override_surface` grew a check, and `tests/self_test.sh` grew
+  breakage 83.** A service that sets any of the three on kit's `postgres` is now
+  a finding, in the same family as the `otel-collector` `volumes:`/`command:`
+  rule — a service reaching into a boundary that belongs to the whole fleet.
+  Self-test breakage count 82 → 83.
+
+- **The false-positive analysis is written down in the check, because a check
+  that cries wolf gets deleted.** The rule fires only on an entry with **no
+  `image:` and no `build:`**, so a service shipping its own postgres under kit's
+  service name stays `check_stale_copy`'s finding alone — one defect, one
+  finding. It keys on the CLUSTER service name (derived from
+  `KIT_POSTGRES_DATABASES`, not written down as `"postgres"`), so a service
+  setting `POSTGRES_DB` on its **own** service — the ordinary connection-string
+  case — is untouched, and every existing self-test fixture is that green
+  control without a new one. `env_file:` is deliberately not read: `.env` is
+  git-ignored, and every legitimate way of setting any of the three is the
+  `KIT_POSTGRES_*` variable, which never appears as a `POSTGRES_*` key in a
+  service's compose file.
+
+- **Found in the fleet for real, by a worker doing an unrelated migration.**
+  `identity` carried precisely the override kit recommended. On re-measurement
+  it is not the only one: **`billing` and `courier` carry it too**, and all
+  three have a `kit.ref`, so this check turns three repositories from green to
+  FAIL against a standard they have already adopted. That is the check working,
+  not a regression — but it is a real change in what the fleet gate reports, and
+  it is called out here rather than discovered by whoever runs the gate next.
+
+- **`REPORT-kit-13.md` is left as it was.** Its line 95 is a verbatim copy of the
+  output as it was printed, and a dated report is a record of what a packet did.
+  Rewriting it would make the history lie about itself.
+
 ### Fixed — the postgres accessory no longer publishes its port on every interface
 
 - **`templates/kamal/deploy.yml.erb` — one line deleted, and what replaces it is a

@@ -75,8 +75,10 @@
 #
 #   MAY — set `image:` on a service (wholesale, and a different tag is a
 #         different postgres major, which is a real thing a service needs).
-#   MAY — add keys to `environment:` (a per-service database name is the case
-#         that matters; kit's `POSTGRES_USER` survives).
+#   MAY — add keys to YOUR OWN service's `environment:` (a connection string for
+#         the database the init script gave you is the case that matters). What
+#         is NOT yours is the `postgres` service's own `environment:` below —
+#         see the fourth MAY NOT.
 #   MAY — add a `depends_on` with `condition: service_healthy`, and declare a
 #         new service of your own.
 #   MAY — change a published port, BUT ONLY BY CHANGING THE VARIABLE in `.env`.
@@ -94,6 +96,34 @@
 #         it. The gate fails on any of the three.
 #   MAY NOT — override the four AGPL backends. `grafana/*` images unmodified is
 #         the licence condition, and a `build:` or a retag is a fork.
+#   MAY NOT — set POSTGRES_USER, POSTGRES_DB or POSTGRES_PASSWORD on this
+#         service. THIS USED TO BE THE RECOMMENDED FIX and it is the single most
+#         expensive piece of wrong advice this file has published, so the reason
+#         is written out rather than left to be rediscovered:
+#
+#           POSTGRES_USER    the official image creates it, and it creates it as
+#                            a SUPERUSER. Measured on this cluster's own init
+#                            script: a service that overrides it holds
+#                            `rolsuper = t` where every provisioned role holds
+#                            `f`, and reads another service's table while a
+#                            provisioned role is refused at the door. It undoes
+#                            `LOGIN NOSUPERUSER ...` in initdb/10-cluster.sh:108.
+#           POSTGRES_DB      the image creates that database too, before any init
+#                            script runs.
+#           Either of those  CREATE ROLE / CREATE DATABASE then fails, the init
+#                            script runs during initdb with ON_ERROR_STOP=1, and
+#                            THE WHOLE CLUSTER REFUSES TO START. Measured, exit
+#                            status 3, `ERROR:  role "identity" already exists`.
+#           POSTGRES_PASSWORD
+#                            does not do either of those and is still refused: it
+#                            is the password handed to EVERY role below, so one
+#                            service's file would decide it for all of them.
+#
+#         The way to get a database is the variable three lines below:
+#         `KIT_POSTGRES_DATABASES`, in `.env`. That is how a service gets a role,
+#         a database it owns, and the boundary, and it costs no compose file at
+#         all. `tests/fleet_check.py` fails a service that sets any of the three,
+#         and `templates/database/README.md`'s "Adopting this" is the procedure.
 #   MAY NOT — set `allow_all_keys`, or add an exporter, by any route. Same
 #         reason, and it is the same check that already fails on kit's own file.
 #

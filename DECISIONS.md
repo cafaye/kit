@@ -251,6 +251,82 @@ would also pass on a cluster with no isolation at all.
 
 ---
 
+## MD21e — **the cluster's identity is not a service's to override**
+
+**Not made:** letting a service set `POSTGRES_USER`, `POSTGRES_DB` or
+`POSTGRES_PASSWORD` on the shared `postgres` service — which is what kit's own
+gate recommended to every service that ran its own database, until this entry.
+
+**What it costs:** a service that needs its own database writes one line in
+`.env` instead of three in its compose file. That is not the cost; the cost is
+the one below.
+
+**Why not:** three failures, all measured on a cluster built from this
+directory's `initdb/10-cluster.sh`, and only the first is the interesting one.
+
+1. **`POSTGRES_USER` makes the overriding service a cluster superuser.** The
+   official image creates that role, and it creates it as a superuser. Measured
+   on a cluster built from this directory's `initdb/10-cluster.sh` with
+   `POSTGRES_USER=identity` and `KIT_POSTGRES_DATABASES=courier` — that is, one
+   service provisioned the supported way and one the overridden way, on the same
+   cluster:
+
+   ```
+   $ psql -U identity -d identity -tAc \
+       "select rolname, rolsuper from pg_roles where rolname not like 'pg\_%'"
+    courier|f
+    identity|t
+   ```
+
+   And the boundary stops being a boundary. `identity` reaches `courier`'s
+   table:
+
+   ```
+   $ psql -U identity -d courier -tAc "select count(*) from invoices"
+   2
+   ```
+
+   where `courier` reaching `identity`'s is refused **at the door**, by the
+   `REVOKE CONNECT` of **MD21d**, before a single table is named:
+
+   ```
+   $ psql -U courier -d identity -tAc "select token from sessions"
+   psql: error: ... FATAL:  permission denied for database "identity"
+   DETAIL:  User does not have CONNECT privilege.
+   ```
+
+   That refusal is the whole of MD21d, and this override deletes it for whoever
+   sets it — not for the service that set it, but for every service on the
+   cluster, whose rows become readable by a role that has no business naming
+   their database.
+2. **`POSTGRES_USER` and `POSTGRES_DB` also stop the cluster from starting.**
+   The image creates both before any init script runs, so `CREATE ROLE` /
+   `CREATE DATABASE` fail, `ON_ERROR_STOP=1` (`10-cluster.sh:78`) makes that
+   fatal, and it is fatal *during initdb*. Measured, exit status 3.
+3. **`POSTGRES_PASSWORD` breaks neither, and is still refused.** It is the
+   credential every role is handed (`10-cluster.sh:107`), so one service's file
+   would choose it for all the others. Refusing it is a judgement about who owns
+   a cluster-wide decision, not a claim that it is dangerous in the same way —
+   and the finding kit's gate prints says exactly that, rather than dressing it
+   up as one of the first two.
+
+**The thing this entry is actually about: the advice was the defect, and prose
+alone does not fix it.** The stale-copy finding and the adoption-path block both
+told a service to do (1), in two places, and the second is the one printed on
+every run that has findings. `identity` did it, inherited from following kit's
+own instruction, and it was found by a worker doing an unrelated migration —
+not by a gate, because a service that follows the advice has deleted the very
+thing `check_stale_copy` looks for. Correcting the sentence without adding a
+check would have left the gate blind in exactly the case the correction created.
+
+**Enforced by:** `check_override_surface` in `tests/fleet_check.py`, which fails
+an adopting service that sets any of the three on the shared cluster.
+`tests/self_test.sh` breakage 83 proves the check is still load-bearing, and the
+green control is every other fixture recipe in that file: they all set
+`POSTGRES_DB` on the service's **own** service and stay green.
+
+---
+
 ## MD22 — PostgreSQL 15 is the floor, and the floor is measured not assumed
 
 **Not made:** supporting PostgreSQL 14, which is what several services ran before

@@ -24,7 +24,12 @@ WHAT IT IS FOR
          allowlist, DERIVED from core's schemas, and a service that owns it is
          shipping a telemetry boundary nobody derived — so prompt content
          leaves the process inside a boundary that is supposed to stop exactly
-         that.
+         that. The SAME mode, for the same reason, now also covers overriding
+         the shared cluster's `POSTGRES_USER` / `POSTGRES_DB` /
+         `POSTGRES_PASSWORD`: that is the one override which used to be kit's
+         own documented advice, and it either makes the overriding service's
+         role a cluster SUPERUSER or stops initdb dead. See
+         `_SHARED_CLUSTER_ENV`.
       3. A COLLECTOR CONFIG NOBODY STARTS. An `otel-collector.yml` in the
          repository that no compose file mounts. A developer edits it believing
          they changed the boundary, and the running collector reads the pinned
@@ -153,6 +158,101 @@ COLLECTOR_CONFIG = "otel-collector.yml"
 # compose file was reorganised. A renamed service would still be the same
 # obligation.
 AGPL_BACKENDS = ("tempo", "loki", "mimir", "grafana")
+
+# The environment variables a service may NOT set on the shared cluster, and the
+# three-line reason each one is refused.
+#
+# THIS WAS KIT'S OWN ADVICE UNTIL THIS FILE SAID OTHERWISE. `check_stale_copy`
+# and the adoption-path block in main() both told a service that had its own
+# postgres to "point it at its own database by overriding the postgres service's
+# environment (POSTGRES_DB / POSTGRES_USER)". That sentence is the defect: it is
+# wrong in a way that does not merely fail, and it shipped. `identity` carries
+# precisely the override it recommended, inherited from following it.
+#
+# WHY IT IS DANGEROUS, MEASURED against `postgres:17` on this cluster's own
+# `initdb/10-cluster.sh`, and each result is the whole argument:
+#
+#   POSTGRES_USER   The official image creates that role, and it creates it as a
+#                   SUPERUSER — measured, `rolsuper = t` for a role a service
+#                   named for itself, against `f` for every role the init script
+#                   made. So the override hands one service a cluster superuser,
+#                   and the whole point of `10-cluster.sh:108`'s
+#                   `LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION`
+#                   is undone by the override that kit used to recommend. Measured
+#                   from inside that cluster, one service provisioned the supported
+#                   way and one the overridden way ON THE SAME CLUSTER
+#                   (`KIT_POSTGRES_DATABASES=courier`, `POSTGRES_USER=identity`):
+#                   the overriding role reads the other service's table
+#                   (`select count(*) from invoices` → `2`), while the properly
+#                   isolated role is refused at the door —
+#                   `FATAL: permission denied for database "identity"`,
+#                   `DETAIL: User does not have CONNECT privilege.` — which is
+#                   the control, and is the property being destroyed. The
+#                   refusal happens before a single table is named, so this is
+#                   MD21d's `REVOKE CONNECT` and not a missing GRANT.
+#   POSTGRES_DB     The image creates that database too, before any init script
+#                   runs, so `CREATE DATABASE` in `10-cluster.sh:118` finds it
+#                   already there.
+#   Either of those  `ON_ERROR_STOP=1` (10-cluster.sh:78) makes the failure
+#                   fatal, the failure happens DURING initdb, and the cluster
+#                   refuses to start. Measured both ways, exit status 3 and:
+#                       [cluster] provisioning identity
+#                       ERROR:  role "identity" already exists
+#                   and, for `POSTGRES_DB` alone with kit's own role left alone:
+#                       ERROR:  database "identity" already exists
+#                   That is a laptop that will not boot the stack, discovered by
+#                   a developer, from advice this repository published.
+#   POSTGRES_PASSWORD
+#                   The only one that does NOT break initdb, and it is here
+#                   anyway: it is the credential of every role on the cluster
+#                   (`10-cluster.sh:107` hands each one `$POSTGRES_PASSWORD`),
+#                   so one service choosing it decides the password for all the
+#                   others. Measured: with one service's `POSTGRES_PASSWORD`
+#                   overridden on a fresh volume, the init script completes and
+#                   another service's role — `courier`, which this repository
+#                   never mentioned — authenticates with the first service's
+#                   password. No isolation boundary is broken, and the reason it
+#                   is still refused is stated plainly in the finding rather than
+#                   dressed up as the other two.
+#
+# WHY ALL THREE ARE REFUSED RATHER THAN JUST THE TWO THAT BREAK. The check is
+# about a service reaching into a CLUSTER-WIDE decision from inside one service's
+# file. `KIT_POSTGRES_USER`, `KIT_POSTGRES_DB` and `KIT_POSTGRES_PASSWORD` are
+# the variables for those decisions, they are declared in kit's own compose
+# file, and they reach it through `.env` — which is where all three belong and
+# where all three are already documented.
+#
+# NOT `KIT_POSTGRES_DATABASES`, which is deliberately absent from this tuple and
+# is the whole point: naming a database there is how a service gets one, and it
+# goes through kit's own compose file rather than through an override. Its
+# presence in the service's own `environment:` block is harmless and is not
+# this finding.
+#
+# LITERAL KEYS IN A `environment:` BLOCK ONLY, and not `env_file:`. `.env` is
+# git-ignored, so a gate that read it would be reading a file that exists on one
+# laptop and on no CI runner — and every legitimate way of setting any of these
+# is the `KIT_*` variable, which does not appear as a `POSTGRES_*` key in a
+# service's compose file at all.
+_SHARED_CLUSTER_ENV = {
+    "POSTGRES_USER": (
+        "the official image creates that role as a SUPERUSER, so this override "
+        "makes your service a cluster superuser: it can read every other "
+        "service's database, which is the boundary "
+        "templates/compose/postgres/initdb/10-cluster.sh exists to draw"
+    ),
+    "POSTGRES_DB": (
+        "the image creates that database before any init script runs, so "
+        "CREATE DATABASE finds it already there"
+    ),
+    "POSTGRES_PASSWORD": (
+        "it is the credential of EVERY role on the cluster, so one service "
+        "choosing it decides the password for all the others"
+    ),
+}
+# ...and the single sentence explaining why each of the above stops the CLUSTER
+# rather than one service. Only true of the two CREATE statements; kept beside
+# the table so a future entry cannot inherit it by accident.
+_SHARED_CLUSTER_ENV_KILLS_INITDB = ("POSTGRES_USER", "POSTGRES_DB")
 
 
 def is_checkout(path: str) -> bool:
@@ -357,6 +457,21 @@ def check_stale_copy(repo: str, name: str, compose: dict, problems: list) -> Non
     `postgres:17-alpine`. Matching on the published name only, which is what this
     did until kit-21 renamed it, found nothing and reported a clean fleet - see
     `_UPSTREAM_BUILT_FROM` for the measurement.
+
+    THE REMEDIATION THIS CHECK PRINTS WAS ITSELF THE DEFECT, and this paragraph
+    exists so the next reader does not put it back. For years the finding ended
+    "Point it at its own database by overriding the `postgres` service's
+    environment (POSTGRES_DB / POSTGRES_USER)". That is not a fix; it is a
+    second, quieter copy of the same mistake, and `identity` carries the override
+    it recommends. The remedy is `_own_thing`, and for the cluster it is
+    `KIT_POSTGRES_DATABASES` in `.env`.
+
+    A check's remediation is load-bearing the same way its predicate is, and for
+    a stronger reason: a reader who follows the advice is now broken in a way
+    the gate never reports, because they have deleted the thing the gate looks
+    for. That is why the advice was corrected and `check_override_surface` grew
+    a check for the override at the same time — either alone leaves a gap the
+    other one fills.
     """
     services = compose.get("services") or {}
     for svc_name, svc in services.items():
@@ -379,10 +494,42 @@ def check_stale_copy(repo: str, name: str, compose: dict, problems: list) -> Non
                     f"stack already ships for {kit_name!r}. A service does not get "
                     f"its own copy of the shared infrastructure: it joins kit's, and "
                     f"its own file becomes an OVERRIDE beside the fetched stack. "
-                    f"Point it at its own database by overriding the {kit_name!r} "
-                    f"service's environment (POSTGRES_DB / POSTGRES_USER) rather "
-                    f"than by running a second {repo_name!r}."
+                    f"{_own_thing(kit_name, name)}"
                 )
+
+
+def _own_thing(kit_name: str, name: str) -> str:
+    """The last sentence of the stale-copy finding: what the service does instead.
+
+    BRANCHES, because the sentence is only true for the cluster and this loop
+    runs over every service kit ships. The version this replaced was one
+    sentence that said the same thing for all of them — "override the
+    `redis` service's environment (POSTGRES_DB / POSTGRES_USER)" — which is
+    both nonsense for every service except the cluster and, for the one where
+    it was not nonsense, the defect that shipped.
+
+    The cluster sentence names `KIT_POSTGRES_DATABASES` because that variable
+    is the entire mechanism: the init script turns each name in it into a
+    NOSUPERUSER role and a database that role owns, and then applies the
+    `REVOKE CONNECT ... FROM PUBLIC` boundary to it. The `down -v` is in the
+    sentence rather than left implicit because
+    `docker-entrypoint-initdb.d` runs once per VOLUME, so a developer who adds
+    their name and runs `bin/dev up` gets a cluster that looks fine and a
+    database that was never created.
+    """
+    if kit_name == _kit_cluster_service:
+        return (
+            f"Delete this service and add {name!r} to KIT_POSTGRES_DATABASES in "
+            f"your .env (comma-separated, alongside the names already there). "
+            f"The init script then gives {name!r} its own NOSUPERUSER role and a "
+            f"database that role owns, and applies the boundary that keeps the "
+            f"other services' databases closed to it. Once, because initdb runs "
+            f"once per VOLUME: `bin/dev down -v && bin/dev up`."
+        )
+    return (
+        f"Delete it and let {kit_name!r} come from the fetched stack — a second "
+        f"copy is two versions to keep in step and a second thing to be wrong."
+    )
 
 
 def check_override_surface(repo: str, name: str, compose: dict, problems: list) -> None:
@@ -403,6 +550,45 @@ def check_override_surface(repo: str, name: str, compose: dict, problems: list) 
     same claim: an `otel-collector.yml` IN THE SERVICE REPOSITORY is a copy of a
     derived file, and a copy of a derived file is a boundary nobody keeps in
     step with core's schemas. The gate compares it against the pinned kit's.
+
+    ...and a fifth, which is the same shape one layer down: overriding the shared
+    cluster's `POSTGRES_USER` / `POSTGRES_DB` / `POSTGRES_PASSWORD`. That one
+    belongs to this mode and not to a new one because it is literally the same
+    claim — a service has taken a boundary that belongs to the whole fleet — and
+    because it used to be kit's own remediation advice, which is the reason it
+    needed a check rather than better prose. `_SHARED_CLUSTER_ENV` carries the
+    measurements.
+
+    THE FALSE-POSITIVE CASE, because this is the half of the design that decides
+    whether the check survives. Could a legitimate override file set one of
+    these? Worked through rather than assumed:
+
+      `services.postgres` with no `image:` and no `build:` is an OVERRIDE of
+      kit's container — that is the only shape this fires on, and it is checked
+      explicitly, so a service shipping its own postgres under kit's name is
+      left to `check_stale_copy` alone. One defect, one finding, which is the
+      same reason `check_dead_collector_config` exists.
+
+      A service setting `POSTGRES_*` on ITS OWN service is the ordinary case —
+      `alpha:` in every self-test fixture carries `POSTGRES_DB: alpha` for its
+      application's connection string — and this check keys on the CLUSTER
+      service name, so it stays silent. Every existing fixture is therefore
+      already the green control for this check, which is why there is no new one.
+
+      A service wanting its own database names itself in
+      `KIT_POSTGRES_DATABASES`, which reaches the cluster through kit's own
+      compose file and is never a `POSTGRES_*` key in the service's file.
+
+      A service wanting a different admin role, a different admin database or a
+      different password sets `KIT_POSTGRES_USER` / `KIT_POSTGRES_DB` /
+      `KIT_POSTGRES_PASSWORD` in `.env`. All three are already declared in kit's
+      compose file, and on a shared cluster they are a decision for the cluster
+      rather than for one service.
+
+    So there is no case found where a correct override file sets one of the
+    three. If one appears, this is the wrong place to relax it — the claim
+    itself would have changed, and the measurements in `_SHARED_CLUSTER_ENV`
+    are what say so.
     """
     services = compose.get("services") or {}
     collector = services.get("otel-collector")
@@ -417,6 +603,44 @@ def check_override_surface(repo: str, name: str, compose: dict, problems: list) 
                     f"elsewhere is shipping a telemetry boundary nobody derived, and prompt "
                     f"content leaves the process inside it. To use your own backend, set "
                     f"<SERVICE>_OTEL_ENDPOINT, which is the only contract."
+                )
+
+    # The shared cluster's identity, decided by one service. Keyed on kit's own
+    # service name and only when the entry is an OVERRIDE — no `image:`, no
+    # `build:` — so this cannot double-report the stale copy a service ships
+    # under kit's own service name. That guard is the whole false-positive
+    # surface, and it is written as an explicit condition rather than left to
+    # "check_stale_copy will already have said so", because a check that relies
+    # on another check having run first is a check that stops working the day
+    # somebody narrows the other one.
+    cluster = services.get(_kit_cluster_service)
+    if isinstance(cluster, dict) and not (cluster.get("image") or cluster.get("build")):
+        env = cluster.get("environment") or {}
+        if isinstance(env, dict):
+            for key in _SHARED_CLUSTER_ENV:
+                if key not in env:
+                    continue
+                kills = (
+                    f"It also stops the CLUSTER starting, not just your service: "
+                    f"the image has already created that role/database, "
+                    f"CREATE ROLE / CREATE DATABASE then fails, `ON_ERROR_STOP=1` "
+                    f"makes it fatal, and it fails during initdb."
+                    if key in _SHARED_CLUSTER_ENV_KILLS_INITDB
+                    else
+                    f"It does not stop the cluster starting; what it does is make "
+                    f"one service's file decide a credential every other service "
+                    f"on the cluster authenticates with."
+                )
+                problems.append(
+                    f"{name}/{_kit_cluster_service}: overrides {key!r} on the "
+                    f"SHARED cluster — {_SHARED_CLUSTER_ENV[key]}. {kills} "
+                    f"Get a database of your own the way the init script expects: "
+                    f"delete this service and add {name!r} to "
+                    f"KIT_POSTGRES_DATABASES in your .env, which creates a "
+                    f"NOSUPERUSER role and a database it owns and applies the "
+                    f"boundary. To move the cluster's own identity or credential, "
+                    f"use the KIT_POSTGRES_* variables in .env, which is where "
+                    f"all of them are already declared."
                 )
 
     # A `ports:` on a service kit ALREADY SHIPS. Compose MERGES a second file
@@ -615,6 +839,19 @@ def check_pin(repo: str, name: str, problems: list) -> None:
 # could pass wrong, and this value has exactly one correct definition.
 _kit_images: dict = {}
 
+# ...and the name of the ONE service in that file which is the cluster, filled in
+# the same way and for the same reason.
+#
+# DERIVED, not written down as `"postgres"`, and the derivation is the service
+# that declares `KIT_POSTGRES_DATABASES`. That is the variable the init script
+# reads and the only way a service gets a database, so the service carrying it
+# IS the cluster by definition rather than by a name somebody chose. It matters
+# because `_own_thing` and the cluster-environment check both have to know which
+# service is the cluster, and a literal would be a second place to edit if kit
+# ever renamed it — the exact drift `_UPSTREAM_BUILT_FROM`'s comment records
+# happening to the image name.
+_kit_cluster_service: str = ""
+
 
 def discover(repos_dir: str) -> list:
     """Every immediate subdirectory that is its own repository.
@@ -677,6 +914,26 @@ def main(argv: list) -> int:
             f"fleet_check.py: no services with an `image:` in {kit_compose_path}. "
             f"That is a broken kit, and a check that silently compares against "
             f"nothing is how six copies of the platform stood unnoticed."
+        )
+
+    # Which service is the CLUSTER, and it is REFUSED loudly rather than
+    # defaulted, for the reason the `_kit_images` refusal above gives: a check
+    # that compares against nothing reports a clean fleet. This one is worse in
+    # a specific direction — with no cluster service, the override check below
+    # matches nothing, so the fleet would be reported clean precisely on the
+    # repositories carrying the override kit used to recommend.
+    global _kit_cluster_service
+    for svc_name, svc in (load_yaml(kit_compose_path).get("services") or {}).items():
+        if not isinstance(svc, dict):
+            continue
+        if "KIT_POSTGRES_DATABASES" in (svc.get("environment") or {}):
+            _kit_cluster_service = svc_name
+    if not _kit_cluster_service:
+        raise SystemExit(
+            f"fleet_check.py: no service in {kit_compose_path} declares "
+            f"KIT_POSTGRES_DATABASES. That is a broken kit: without it there is "
+            f"no shared cluster, and every advice message below loses the "
+            f"variable that is the whole mechanism."
         )
 
     repos_dir = args.repos_dir or os.path.join(kit, "..")
@@ -832,11 +1089,32 @@ def main(argv: list) -> int:
             "the only thing that decides which bytes of kit your machine runs",
             file=sys.stderr,
         )
+        # STEP 2 IS THE ONE THAT WAS WRONG, and the paragraph that replaced it
+        # said to override `POSTGRES_DB` / `POSTGRES_USER` on kit's postgres.
+        #
+        # This is the second copy of the defect `check_stale_copy` carried, and
+        # it is worth being precise about which of the two is more dangerous,
+        # because the answer is not the obvious one. The stale-copy finding is
+        # read by somebody who is already fixing a stale copy; this line is read
+        # by every unadopted repository in the fleet, every time one of them has
+        # anything to fix — so it is the line that actually gets followed, and
+        # `identity` followed it. It was printed by the very check that was
+        # telling people to stop copying the stack, which is why it survived: the
+        # recommendation and the detection came from the same program, and a
+        # reader checking that line had no reason to suspect it.
+        #
+        # `KIT_POSTGRES_DATABASES` replaces it, and `POSTGRES_USER` is now named
+        # as the thing NOT to do rather than as the thing to do. The measurements
+        # behind both halves are in `_SHARED_CLUSTER_ENV`.
         print(
             "    2. your docker-compose.yml becomes an OVERRIDE beside the fetched "
-            "stack, not a copy of it: delete your own postgres service and point at "
-            "kit's by overriding its environment (POSTGRES_DB / POSTGRES_USER). "
-            "The collector config is never yours to own.",
+            "stack, not a copy of it: delete your own postgres service and add your "
+            "name to KIT_POSTGRES_DATABASES in .env, which is what gives you a "
+            "NOSUPERUSER role and a database it owns. Do NOT override "
+            "POSTGRES_USER / POSTGRES_DB / POSTGRES_PASSWORD on kit's postgres: the "
+            "image creates POSTGRES_USER as a SUPERUSER, and the other two make "
+            "CREATE ROLE / CREATE DATABASE fail during initdb and stop the whole "
+            "cluster starting. The collector config is never yours to own.",
             file=sys.stderr,
         )
         print(

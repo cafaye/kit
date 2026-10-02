@@ -269,6 +269,42 @@
 #           fixture, so a change that softened the adopted side fails 60 and a
 #           change that hardened the unadopted side fails 59, and there is no
 #           third state in which both pass and the checks are weaker.
+# 83. A SERVICE OVERRIDING THE SHARED CLUSTER'S OWN POSTGRES IDENTITY -> the
+#         weakened-boundary check goes red, naming the override.
+#         The one breakage here whose defect was kit's own ADVICE. For years
+#         `check_stale_copy` and the adoption-path block both told a service to
+#         "override the postgres service's environment (POSTGRES_DB /
+#         POSTGRES_USER)", and that sentence is the whole defect: the official
+#         image creates `POSTGRES_USER` as a SUPERUSER, so the override makes
+#         the overriding service a cluster superuser; and the image has already
+#         created that role and database, so `CREATE ROLE` / `CREATE DATABASE`
+#         in `initdb/10-cluster.sh` fail during initdb and the whole cluster
+#         refuses to start. Measured both ways; see `_SHARED_CLUSTER_ENV`.
+#         `identity` carries the override, inherited from following it, and it
+#         was found by a worker doing an unrelated migration.
+#
+#         It is a breakage in this family and not a new section because
+#         correcting the prose alone would have left the gap open from the other
+#         side: a service that FOLLOWS the corrected advice deletes its own
+#         postgres service, which is precisely the thing `check_stale_copy`
+#         stops reporting. Advice and predicate have to move together or the
+#         fix walks into a check that no longer sees it.
+#
+#         The mutation is `POSTGRES_USER` alone, and that choice is the red
+#         proof rather than a shorthand. All three keys fire, but `POSTGRES_USER`
+#         is the one with BOTH failure modes, and it is the one a real service
+#         carries. `POSTGRES_PASSWORD` is the interesting exclusion: it breaks
+#         neither the cluster nor the boundary, and asserting on it would have
+#         meant asserting on the part of the check that is least like the thing
+#         it was written for.
+#
+#         The needle is the finding's own wording, and `check_override_surface`
+#         is named in the label, because a red from the ports rule or the
+#         stale-copy rule would satisfy a weaker assertion. The fixture carries
+#         `POSTGRES_DB: alpha` on `alpha:` — a service setting the variable on
+#         its OWN service, which is the legitimate case — so the check also
+#         proves it stays quiet about that, on every fixture recipe in this
+#         file, without a separate control.
 # 61-65. THE KAMAL CONFIG, which is the one place kit generates YAML that a
 #         THIRD-PARTY BINARY has to accept. Everything else kit hands out is
 #         read by the service's own toolchain; this is read by `kamal` and
@@ -2976,6 +3012,39 @@ sixty_fixture="$(fixture_fleet ceiling-adopted)"
 break_stale_copy "$sixty_fixture"
 export KIT_FLEET="$sixty_fixture"
 expect_red_check 'breakage 60: the same copy in an ADOPTING service is a hard FAIL' \
+  "$base" "$FLEETCHECK" --static-only
+
+# 83. A SERVICE OVERRIDING THE SHARED CLUSTER'S OWN POSTGRES IDENTITY. The
+#     breakage for the check added because kit's own remediation advice was
+#     wrong; see the header entry and `_SHARED_CLUSTER_ENV` for the
+#     measurements.
+#
+#     The mutation is the shape `identity` carries today, copied out of its
+#     docker-compose.yml rather than invented: a `postgres:` service with no
+#     `image:` — kit ships the container — and the three keys overridden on it.
+#
+#     The absence of `image:` is load-bearing rather than incidental, and it is
+#     the guard that keeps this a proof of the RIGHT check. With an `image:`
+#     there, the entry is a stale copy and `check_stale_copy` reports it — one
+#     defect, two findings, and this breakage would go red for a reason that has
+#     nothing to do with what it is proving. `check_override_surface` therefore
+#     fires only when there is no `image:` and no `build:`, which is what makes
+#     "an override of kit's cluster" and "a replacement of it" different checks.
+#
+#     Written to a fixture fleet rather than the real one, for the reason 52 is:
+#     the real fleet is red by design, and `expect_red_check` answers "did THAT
+#     NAMED check go red", so a dirty fleet makes the proof meaningless in the
+#     only direction that matters.
+eightythree_fixture="$(fixture_fleet cluster-env-override)"
+cat >>"$eightythree_fixture/alpha/docker-compose.yml" <<'YAML'
+  postgres:
+    environment:
+      POSTGRES_USER: alpha
+      POSTGRES_DB: alpha
+      POSTGRES_PASSWORD: alpha
+YAML
+export KIT_FLEET="$eightythree_fixture"
+expect_red_check 'breakage 83: a service overrides the shared cluster POSTGRES_USER' \
   "$base" "$FLEETCHECK" --static-only
 
 # Cleared, because `export` is not scoped to a command the way `VAR=v cmd` is, and

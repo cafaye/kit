@@ -414,15 +414,19 @@ version is worse than one that refuses to start.
 Your `docker-compose.yml` is the **second** `-f`, which makes it an **override**:
 what is in it wins, and everything you did not mention still comes from kit.
 
-**You may:** set `image:`; add keys to `environment:`; add a `depends_on`; declare
-your own services; change a published port **by changing the variable in `.env`**.
+**You may:** set `image:`; add keys to your own service's `environment:`; add a
+`depends_on`; declare your own services; change a published port **by changing
+the variable in `.env`**.
 
 **You may not:** touch `otel-collector` — not its `image:`, not its `command:`,
 and above all not the `volumes:` entry that mounts `otel-collector.yml`. That file
 carries the redaction allowlist, **derived from core's schemas**; a service that
 overrides the mount is shipping a telemetry boundary nobody derived, and prompt
 content leaves the process inside it. Nor may you override the four AGPL backends,
-or set `allow_all_keys`, or add an exporter, by any route.
+or set `allow_all_keys`, or add an exporter, by any route — nor set
+`POSTGRES_USER`, `POSTGRES_DB` or `POSTGRES_PASSWORD` on kit's `postgres`
+service, which is explained below and is the reason this list has a second
+boundary in it.
 
 **The trap: `ports:` APPENDS, it does not replace.** A second file's `ports:`
 list is concatenated with the first's, so this:
@@ -438,26 +442,57 @@ publishes postgres on **15500 _and_ 15433**. Move the port in `.env`
 assumed; the rule is in `templates/compose/docker-compose.yml`'s own header and
 the gate fails on a `ports:` entry in a service file.
 
-**Pointing at your own database** is one override, and it is the one override that
-is not your own service — `environment:` merges by key:
+**Pointing at your own database** is one line in `.env`, and it is not an
+override at all:
 
-```yaml
-services:
-  postgres:
-    environment:
-      POSTGRES_DB: yoursvc
-      POSTGRES_USER: yoursvc
+```sh
+# .env
+KIT_POSTGRES_DATABASES=courier,billing,yoursvc
 ```
 
-Kit's healthcheck, volume, port and user survive; only the database name is
-yours. **Measured on `muse`, the largest adopter: 52 non-comment lines became 22,
-and the 538-line stack it used to half-copy is now fetched.**
+The init script gives each name in that list its own `NOSUPERUSER` role and a
+database that role owns, and then applies the `REVOKE CONNECT ... FROM PUBLIC`
+that keeps the other services' databases closed to you. **Measured on `muse`,
+the largest adopter: 52 non-comment lines became 22, and the 538-line stack it
+used to half-copy is now fetched.**
+
+**Do not override `POSTGRES_USER`, `POSTGRES_DB` or `POSTGRES_PASSWORD` on
+kit's `postgres` service.** This section used to tell you to do exactly that.
+It is the reason `identity` carries an override that makes the fleet's auth
+service a cluster superuser, and it was found by a worker doing an unrelated
+migration. Measured on a cluster built from kit's own `initdb/10-cluster.sh`:
+
+- `POSTGRES_USER` is the role the official image creates, and it creates it as a
+  **superuser** — measured, `rolsuper = t` where every role the init script made
+  holds `f`. Override it and your service can read every other service's
+  database — measured, `select count(*) from invoices` against `courier`
+  returns `2`, where a properly-provisioned role is refused at the door with
+  `FATAL: permission denied for database "identity"`. That refusal is the whole
+  isolation contract; see `templates/database/README.md`.
+- `POSTGRES_DB` is created by the image too, before any init script runs. Either
+  override then makes `CREATE ROLE` / `CREATE DATABASE` in the init script fail,
+  and because that failure happens **during initdb**, the whole cluster refuses
+  to start — measured, exit status 3 and
+  `ERROR:  role "identity" already exists`.
+- `POSTGRES_PASSWORD` is the honest exception: it breaks neither the cluster nor
+  the boundary. It is the credential *every* role on the cluster is given, so
+  overriding it makes your file decide the password all the others authenticate
+  with. It is refused for that reason and not for one of the two above.
+
+If it is the cluster's own identity you are changing, the variables are
+`KIT_POSTGRES_USER`, `KIT_POSTGRES_DB` and `KIT_POSTGRES_PASSWORD`, and they
+are already declared in the compose file. `tests/fleet_check.py` fails a service
+that sets any of the three, for the reasons above.
+
+One thing about the `.env` line: `docker-entrypoint-initdb.d` runs **once per
+volume**, so after adding your name you need `bin/dev down -v && bin/dev up`.
+An existing volume keeps the list it was provisioned with.
 
 It is a **stack, fetched from a pinned ref**, not a template you copy. Every
 published port is `${KIT_*:default}` inside kit's claimed block, every image is
 pinned to an exact tag, and every service has a healthcheck so `up --wait` can
 mean something. A service joins by writing an **override** file — its own image,
-its own port, its own database name — which `bin/dev` merges with the fetched
+its own port, its own service entry — which `bin/dev` merges with the fetched
 stack.
 
 ### The gate on adoption, and the adoption ceiling
@@ -469,7 +504,7 @@ callee. Four claims, one check each:
 | claim | the defect it catches |
 |---|---|
 | no stale copy | the service runs its own `postgres` rather than joining kit's |
-| no weakened boundary | the service re-points the collector's config mount — the redaction allowlist, derived from core |
+| no weakened boundary | the service re-points the collector's config mount — the redaction allowlist, derived from core — or overrides `POSTGRES_*` on the shared cluster |
 | no dead config | an `otel-collector.yml` that nothing mounts, so editing it changes nothing |
 | every ref pinned | a `kit.ref` holding a branch |
 

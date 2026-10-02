@@ -249,6 +249,30 @@ Two consequences worth stating:
 3. Copy `templates/database/<lang>/` from the ref your `kit.ref` names, and change
    the service name in it.
 
+**Step 1 is the whole of step 1, and it is not an override.** `KIT_POSTGRES_DATABASES`
+is where a database and a `NOSUPERUSER` role come from, and reaching it through
+`.env` is what gets you both. kit used to tell services to get their database
+instead by overriding `POSTGRES_DB` / `POSTGRES_USER` on the shared `postgres`
+service, and that advice was wrong in two ways at once, measured on a cluster
+built from this directory's `initdb/10-cluster.sh`:
+
+- the official image creates `POSTGRES_USER` as a **superuser**, so the override
+  makes the overriding service's role a cluster superuser — measured, it reads
+  another service's table (`select count(*) from invoices` against `courier`
+  returns `2`) where a provisioned role is refused at the door with
+  `FATAL: permission denied for database "identity"`;
+- the image creates that role and that database before any init script runs, so
+  `CREATE ROLE` / `CREATE DATABASE` in `10-cluster.sh` then fail, `ON_ERROR_STOP=1`
+  makes it fatal, and it fails during initdb — the **whole cluster** refuses to
+  start. Measured, exit status 3 and `ERROR:  role "identity" already exists`.
+
+`POSTGRES_PASSWORD` is refused for the weaker reason that it is the credential
+every role on the cluster is handed, so one service's file would choose it for
+all the others. The cluster's own identity and credential are
+`KIT_POSTGRES_USER` / `KIT_POSTGRES_DB` / `KIT_POSTGRES_PASSWORD`, all declared
+in `templates/compose/docker-compose.yml`. `tests/fleet_check.py` fails an
+adopting service that sets any of the three on the shared cluster.
+
 **Step 2 is the one to read twice, because it prints a `REVOKE` and the revoke
 is the boundary.** A database created outside the init script gets Postgres's
 default, which grants `CONNECT` to `PUBLIC` — so a database added by hand and not
