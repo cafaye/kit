@@ -11,6 +11,13 @@
 #   3. Applies the redaction allowlist ONCE, before anything leaves the
 #      process. This is the enforcement point core's redaction.schema.json
 #      names as `enforcedAt: collector`.
+#   3a. DROPS THE HIGH-CARDINALITY DIMENSIONS AT INGEST, BY NAME. The
+#      allowlist above works by omission; `transform/cafaye_metrics_ingest_drop`
+#      writes the deny set down — `tenant_id`, `account_id`, `request_id`,
+#      `user_id`, `email`, `url.full`, `error.message` and their OpenTelemetry
+#      twins — so the coverage is legible and so a later widening is a line
+#      somebody read. Not one of those names is ever a metric label, on the
+#      cheap default path or the full one.
 #   4. Fans out: traces to Tempo, logs to Loki, metrics to Mimir. Metrics
 #      come from the `spanmetrics` connector, so they are derived from spans
 #      that have ALREADY been redacted.
@@ -512,6 +519,118 @@ processors:
           - 'set(attributes["otel.status_code"], attributes["status.code"]) where attributes["status.code"] != nil'
           - 'delete_key(attributes, "status.code")'
 
+  # -------------------------------------------------------------------------
+  # THE HIGH-CARDINALITY DIMENSIONS, DROPPED AT INGEST BY NAME.
+  #
+  # The shape this ports is the study clone's `signozspanmetrics/delta`
+  # (refs/signoz/.devenv/docker/signoz-otel-collector/otel-collector-config.yaml
+  # :29-72), and the SHAPE is the point, not the particular names: that config
+  # gives its span-metrics processor an explicit `dimensions:` ALLOWLIST — twelve
+  # names — and everything not on it never becomes a label. Cost is paid at
+  # STORAGE only for what a human chose to keep.
+  #
+  # So this collector has always been drop-by-default too, because
+  # `redaction/cafaye_metrics` is `allow_all_keys: false` with seven bounded
+  # `allowed_keys`. What it did not have is the DENY SET written out. That is not
+  # the same property, for a reason this file has already been bitten by twice: a
+  # filter that works by omission is a filter whose coverage is invisible, and a
+  # transform that silently deletes nothing is indistinguishable from one that
+  # works — see the `status.code` and the `IsMatch(name, "\\.calls$")` notes
+  # below, both of which shipped wired in, and both of which did nothing at all.
+  #
+  # Naming the drop is what makes it checkable, and what makes a future widening
+  # deliberate: a name added here, or to `spanmetrics.dimensions`, or to
+  # `redaction/cafaye_metrics.allowed_keys`, is now a line somebody read.
+  #
+  # WHY DATAPOINT CONTEXT AND NOT THE RESOURCE, which is the subtle bit. In this
+  # collector `tenant_id` is stashed onto the RESOURCE and restored onto the
+  # RESOURCE, deliberately: resource attributes sit outside the
+  # 2000-combination cap and survive on the overflow point, which is what keeps a
+  # per-tenant total answerable after the measurement has folded. `context:
+  # datapoint` does not visit the resource, so this deletes the DATA POINT's
+  # `tenant_id` and leaves the resource's alone. Deleting it everywhere would
+  # undo the mechanism the stash/restore pair exists to provide.
+  #
+  # `tenant_id` and `account_id` are the two this exists for. They are exactly
+  # the attributes the tenancy boundary must NOT become a metric label: a
+  # per-tenant series is a per-customer line item in a time-series database, and
+  # the whole reason `account_id` is a RESOURCE attribute is that the fleet can
+  # still answer "how much did account N send this month" without minting one
+  # series per account.
+  #
+  # THIRTEEN names plus SEVEN canonical twins, and the twins are not padding. A
+  # `delete_key` on a name no producer emits is a no-op wearing the costume of a
+  # working control, so where the fleet's spelling and OpenTelemetry's semantic
+  # convention name the same thing, both are listed:
+  #
+  #     tenant_id  account_id  user_id        request_id   trace_id   span_id
+  #     session_id message_id  email          error.message
+  #     error.stacktrace                     url.full     url.path
+  #
+  #   user_id             -> user.id               (the OTel name)
+  #   session_id          -> session.id
+  #   message_id          -> messaging.message.id
+  #   email               -> user.email
+  #   error.message       -> exception.message      (and exception.stacktrace)
+  #   url.full            -> http.url              (the pre-1.20 spelling)
+  #   url.path            -> http.target
+  #
+  # `url.full` and `url.path` are here on their own merits and not only as twins:
+  # a full URL carries the query string, and a query string is whatever the caller
+  # put in it. `http.route` is deliberately NOT on this list and stays on the
+  # metrics allowlist — it is the template, it is bounded, and it is the
+  # dimension that makes a fleet error panel readable.
+  #
+  # IT IS NOT THE ONLY LINE, and it is not being trusted as one. The three
+  # `redaction/*` processors already drop every one of these names by omission,
+  # and the `spanmetrics` connector sits at the END of the traces pipeline, so it
+  # only ever sees spans `redaction/cafaye_traces` has already emptied. This
+  # transform is the explicit, legible statement of a property the allowlist also
+  # provides, plus the coverage the allowlist cannot express: the OTel twins,
+  # which are on no schema here at all, and would be added to one by a future
+  # core change with nobody reading this file.
+  # -------------------------------------------------------------------------
+  transform/cafaye_metrics_ingest_drop:
+    error_mode: ignore
+    metric_statements:
+      - context: datapoint
+        statements:
+          # Identity — and the first two are a tenancy boundary rather than a
+          # convenience.
+          - 'delete_key(attributes, "tenant_id")'
+          - 'delete_key(attributes, "account_id")'
+          - 'delete_key(attributes, "user_id")'
+          - 'delete_key(attributes, "user.id")'
+          - 'delete_key(attributes, "user.email")'
+          - 'delete_key(attributes, "email")'
+          - 'delete_key(attributes, "session_id")'
+          - 'delete_key(attributes, "session.id")'
+          # Per-request / per-message identity. A dimension that is unique per
+          # request is not a dimension; it is the series count multiplied by the
+          # request count.
+          - 'delete_key(attributes, "request_id")'
+          - 'delete_key(attributes, "trace_id")'
+          - 'delete_key(attributes, "span_id")'
+          - 'delete_key(attributes, "message_id")'
+          - 'delete_key(attributes, "messaging.message.id")'
+          # Content-shaped. `exception.message` is a stack trace, and on muse a
+          # path straight to a prompt — the same reason `error.message` and
+          # `error.stacktrace` are on the span-event transform's delete list
+          # above. On a MEASUREMENT it is worse than on a span: a span is looked
+          # up by its own id, and a series is aggregated over everything sharing
+          # its labels.
+          - 'delete_key(attributes, "error.message")'
+          - 'delete_key(attributes, "error.stacktrace")'
+          - 'delete_key(attributes, "exception.message")'
+          - 'delete_key(attributes, "exception.stacktrace")'
+          # The URL and its pre-1.20 spellings. A query string is caller content
+          # by another route, which is the sentence this file keeps saying about
+          # a different attribute.
+          - 'delete_key(attributes, "url.full")'
+          - 'delete_key(attributes, "url.path")'
+          - 'delete_key(attributes, "http.url")'
+          - 'delete_key(attributes, "http.target")'
+
   # THE REDACTION PROCESSOR'S OWN DIAGNOSTIC ATTRIBUTES, removed AFTER it runs.
   #
   # The processor adds `redaction.redacted.count`, `redaction.redacted.keys` and
@@ -785,6 +904,14 @@ service:
       processors:
         - memory_limiter
         - transform/cafaye_metrics
+        # The high-cardinality deny set, BEFORE anything else in this pipeline
+        # sees a datapoint. `redaction/cafaye_metrics` below drops the same
+        # names by omission and is the load-bearing line; this one makes the
+        # drop explicit, names it, and covers the OpenTelemetry spellings core's
+        # schema has never heard of. Order relative to the redaction processor
+        # is therefore not load-bearing — both run before `batch`, therefore
+        # before every exporter, and that IS load-bearing.
+        - transform/cafaye_metrics_ingest_drop
         - transform/cafaye_resource_stash
         - redaction/cafaye_metrics
         - transform/cafaye_metrics_labels
