@@ -562,19 +562,38 @@ rather than half-starting: if the stack does not become healthy it prints what i
 unhealthy and its logs, and stops *before* migrating, so a failed `up` cannot
 leave a half-migrated database behind.
 
-### Observability is on by default
+### Telemetry is on by default; the stores to read it back from are not
 
-You did not have to install anything. `bin/dev up` brings up the collector and
-the four stores behind it, and a service with nothing configured exports into
-them, because `<SERVICE>_OTEL_ENDPOINT` **defaults to the collector that ships
-with this stack**. Open <http://localhost:15000> and the fleet error dashboard is
-already there.
+You did not have to install anything, and you still do not have to. `bin/dev up`
+brings up the collector, and a service with nothing configured exports into it,
+because `<SERVICE>_OTEL_ENDPOINT` **defaults to the collector that ships with this
+stack**. What it does *not* bring up by default is the stores behind it:
 
-That is on-by-default-and-worked-on-in-dev, not on-by-default-and-mandatory. The
-escape hatches are first-class:
+```sh
+bin/dev up                              # postgres, nats, redis, collector — fast
+KIT_DEV_PROFILES=observability bin/dev up   # …and tempo, loki, grafana
+```
+
+That is a reversal, and it is worth being explicit about why, because the old
+default was a measured decision that turned out to be the wrong one. As a
+default, the observability profile cost every developer's cold start: Grafana
+downloading a plugin zip on first boot (20s once, over 180s another time), 130s
+of Mimir's readiness budget, 65s of Tempo's, 16s of Loki's — against a 180s
+deadline for the whole stack and a 76s typical cold start. A default that taxes
+everyone's startup to serve a view they did not open is a default that gets
+switched off fleet-wide, and the telemetry goes with it. **The escape hatch was
+the documented good path the whole time; it is now the default.**
+
+**Nothing about the telemetry boundary changed.** The collector is not behind
+the profile, so spans, logs and metrics still arrive and still pass through the
+redaction allowlist — which drops high-cardinality dimensions at *ingest*, before
+anything would be stored. On the cheap path the data is then dropped because
+there is no store to hand it to, which is strictly better than paying 130 seconds
+to keep it. If you want to read traces back, ask for them:
 
 | You want | You do | What happens |
 |---|---|---|
+| **Traces, logs and metrics to read back** | `KIT_DEV_PROFILES=observability bin/dev up` | tempo, loki and grafana come up too; open <http://localhost:15000> and the fleet error dashboard is already there |
 | **Your own backend** | set `MUSE_OTEL_ENDPOINT` (or `CAF_OTEL_ENDPOINT`, `BILLING_OTEL_ENDPOINT`, … — `<SERVICE>_OTEL_ENDPOINT`, the name derived from the service) to your Datadog / Honeycomb / Grafana Cloud OTLP endpoint | this service exports there and the shipped stack goes quiet for it. **Bring your own backend is a supported deployment, not a degraded mode** |
 | **No telemetry at all** | unset the variable | a genuine no-op: no queue, no retry loop, no warning per request, no dial at boot |
 | **Still on, quieter** | `KIT_OTEL_DEBUG_VERBOSITY=basic` | the `debug` exporter stops printing every span to the terminal |

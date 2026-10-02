@@ -116,14 +116,17 @@ is in it wins and everything you did not mention still comes from kit.
 
 ## Observability
 
-On by default. Not opt-in, and not something a developer turns on to see traces
-(PLAN.md §7b, user directive 2026-09-30).
+Telemetry is on by default. The **stores to read it back from are not** — that
+is `KIT_DEV_PROFILES=observability bin/dev up`, and `bin/dev up` on its own gives
+you postgres/nats/redis plus the collector. The collector is not behind the
+profile, so a service with nothing configured still exports into it, and the
+redaction allowlist still runs before anything would be stored.
 
 - **`<SERVICE>_OTEL_ENDPOINT` is the only contract** — `MUSE_OTEL_ENDPOINT`,
   `CAF_OTEL_ENDPOINT`, `DARKSROOM_OTEL_ENDPOINT`, whatever this service is
   called, uppercase, no `OTEL_EXPORTER_` prefix and no `_EXPORTER_` infix. Its
   DEFAULT is the collector that ships with `bin/dev`, which is why a developer
-  sees real traces with nothing configured.
+  still gets real spans with nothing configured.
 - **A self-hoster who already runs Datadog, Honeycomb or Grafana Cloud sets that
   variable** and the shipped stack goes quiet for this service. Bring-your-own
   is a supported deployment, documented as carefully as the default, not a

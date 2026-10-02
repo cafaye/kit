@@ -3,6 +3,12 @@
 # kit template — the local developer loop. Copy to bin/dev in the service repo.
 #
 #   bin/dev            # compose up --wait, migrate, seed an admin, print URLs
+#                      #   postgres/nats/redis/the collector — the CHEAP stack,
+#                      #   because the four observability backends cost up to
+#                      #   130s of readiness each and nobody asked for them.
+#                      #   Telemetry still goes somewhere; there is just no
+#                      #   store to read it back from. For the whole stack:
+#                      #     KIT_DEV_PROFILES=observability bin/dev up
 #   bin/dev stack      # resolve the pinned kit ref and print where it landed
 #                      #   (no side effects; reaching the resolution needs no
 #                      #    docker, which is what tests/fetch_test.sh drives)
@@ -84,16 +90,21 @@
 #     point: the pin changes when a person says so, in a commit that says why.
 #   - Connection URLs are printed, never written anywhere else. A developer
 #     pasting one into a ticket is the developer's choice, not this script's.
-#   - The observability profile comes UP, and this is the load-bearing decision
-#     for the dev loop's speed. Observability is on by default (PLAN.md §7b), so
-#     `bin/dev` without arguments brings up the collector AND Tempo, Loki, Mimir
-#     and Grafana — five more containers than kit-02 shipped, and the difference
-#     between "a developer sees real traces" and "read the docs about installing
-#     a tracing backend".
-#   - It is still ONE command and still not slow, because the profile is opt-OUT
-#     via `KIT_DEV_PROFILES`, and the expensive stores are memory-bounded in the
-#     compose file. `bin/dev` prints the wall-clock it took, so "the dev loop is
-#     slow" is a number rather than a feeling.
+#   - The observability profile comes DOWN, and this is the load-bearing
+#     decision for the dev loop's speed. It used to come UP, and that made
+#     `bin/dev` without arguments start the collector AND Tempo, Loki and
+#     Grafana — three more containers than kit-02 shipped, and 130 seconds of
+#     Mimir readiness nobody had asked for. A default that taxes every
+#     developer's first five minutes to serve a view they did not open is a
+#     default that gets switched off globally, which costs the telemetry too.
+#     So the cheap stack is the default and the four backends are
+#     `KIT_DEV_PROFILES=observability bin/dev up` — deliberate, one line, and
+#     it says on the console which of the two you are running.
+#   - IT IS STILL ONE COMMAND, and telemetry is still ON. The collector is not
+#     behind the profile, so `<SERVICE>_OTEL_ENDPOINT` still has somewhere to
+#     send on the default path, and the redaction allowlist still runs before
+#     anything is stored. `bin/dev` prints the wall-clock it took, so "the dev
+#     loop is slow" is a number rather than a feeling.
 #   - NOTHING HERE WAITS ON TELEMETRY. Not `up --wait` (which gates on the
 #     collector's own health, and the collector's health does not depend on
 #     Tempo, Loki or Mimir), not migrate, not seed. A dev machine that cannot
@@ -123,23 +134,60 @@ cd "$(dirname "$SELF")/.."
 # believing it and say so.
 #
 # 180 rather than kit-02's 120, and the extra 60 is for the observability
-# profile: five more containers, four of them with a real initialisation
-# (Tempo's WAL, Loki's schema, Mimir's ingester, Grafana's migrations). The
-# deadline has to cover the default path, and a deadline that fires on a cold
-# start is a deadline that trains people to re-run.
+# profile: three more containers, each with a real initialisation (Tempo's WAL,
+# Loki's schema, Grafana's migrations). The deadline has to cover the DEFAULT
+# path when the profile is on, and a deadline that fires on a cold start is a
+# deadline that trains people to re-run. It is deliberately NOT lowered along
+# with the default: the deadline is what a developer raises on a loaded laptop,
+# and it costs nothing to leave generous.
 STACK_TIMEOUT="${KIT_DEV_TIMEOUT:-180}"
 
-# The compose profiles to bring up. The observability profile IS the default,
-# because observability is on by default and a stack that requires a flag to
-# show you its own errors is opt-in with extra steps.
+# The compose profiles to bring up. NOTHING BY DEFAULT, and this line is the
+# single most consequential token in the file, so the measurement is here
+# rather than in a report nobody opens.
 #
-# The escape hatch is one variable, and it is the same shape as
-# `<SERVICE>_OTEL_ENDPOINT`: a self-hoster on a constrained machine, or CI,
-# sets `KIT_DEV_PROFILES=` (empty) and gets postgres/nats/redis/collector alone.
-# The collector is NOT behind the profile — it is the default value of the
-# endpoint variable, so a service with nothing switched on needs somewhere to
-# send, and a dead endpoint with no retry costs spans rather than availability.
-KIT_DEV_PROFILES="${KIT_DEV_PROFILES-observability}"
+# It used to read `${KIT_DEV_PROFILES-observability}`. Every developer's
+# `bin/dev` therefore paid, on every cold start, for four backends that were on
+# the floor of nobody's mind:
+#
+#   grafana  20s once and >180s another time, downloading a plugin zip on
+#            FIRST BOOT — the slowest thing in the stack, and it is a network
+#            call nobody asked for (see GF_INSTALL_PLUGINS_PREINSTALL_DISABLED)
+#   mimir    130s of readiness budget: retries 12 x interval 10s
+#   tempo    65s of readiness budget: retries 12 x interval 5s, plus a WAL init
+#   loki     16s to first ready, measured, because it waits for its ring
+#
+# Against a 180s deadline and a 76s typical cold start (RESEARCH-fleet-velocity
+# P1, measured WITH the profile partially lazy), that is the dev loop paying a
+# tax for an observability stack the developer did not ask to look at — and the
+# documented way to avoid it, `KIT_DEV_PROFILES= bin/dev up`, was the escape
+# hatch. THE HATCH WAS THE GOOD PATH AND THE DEFAULT WAS THE TAX. That is
+# backwards, so this is now the highway.
+#
+# WHAT DOES NOT CHANGE WITH IT, and this is the part that matters:
+#
+#   * THE COLLECTOR IS NOT BEHIND THE PROFILE. It runs on the cheap path, so a
+#     service still has somewhere to send: `<SERVICE>_OTEL_ENDPOINT` defaults to
+#     it, and a dead endpoint with no retry costs spans rather than availability.
+#   * THE REDACTION ALLOWLIST STILL RUNS. `otel-collector.yml` drops
+#     high-cardinality dimensions at INGEST — before anything is stored — so
+#     there is no cheap path on which a `request_id` or a `user_id` becomes a
+#     metric label. Turning a backend off is not how this boundary is kept.
+#
+# Observability is one variable, and the other end of it is now the deliberate
+# spelling:
+#
+#     KIT_DEV_PROFILES=observability bin/dev up
+#
+# NOT READ FROM `.env`, and that is a decision rather than an omission. Every
+# other `KIT_*` here goes through `stack_setting`, which cannot distinguish
+# "unset" from "set to empty" — so a `.env` reader for this one variable would
+# be a second reader of the same fact with different semantics, and a `.env`
+# saying `observability` would silently re-impose the tax on every command that
+# starts a stack. A developer who wants the four backends on every run puts it
+# in their shell, where it is visible, rather than in a file the script cannot
+# honour in the direction that matters.
+KIT_DEV_PROFILES="${KIT_DEV_PROFILES-}"
 
 # --------------------------------------------------------------------------
 # the kit ref
@@ -776,11 +824,18 @@ up() {
 
   elapsed=$(( $(date +%s) - started ))
   step "up in ${elapsed}s"
+  # WHICH STACK YOU GOT, and the difference is not cosmetic: one of these two
+  # is four containers lighter and several minutes faster to become healthy, so
+  # a run that prints nothing about it leaves a developer guessing whether the
+  # slowness they are about to investigate is theirs or the profile's.
   if [ -n "$KIT_DEV_PROFILES" ]; then
-    info "observability is ON (compose profile: $KIT_DEV_PROFILES)"
-    info "to run the data services only: KIT_DEV_PROFILES= bin/dev up"
+    info "observability backends are ON (compose profile: $KIT_DEV_PROFILES)"
+    info "for the cheap stack instead:  bin/dev up   (no profiles, no backends)"
   else
-    info "observability is OFF (KIT_DEV_PROFILES is empty) — nothing is exporting anywhere"
+    info "the cheap stack: postgres/nats/redis + the collector, no observability"
+    info "backends. Telemetry is STILL ON — the collector is not behind the"
+    info "profile, and it still drops high-cardinality dimensions at ingest."
+    info "For traces/logs/metrics to read back:  KIT_DEV_PROFILES=observability bin/dev up"
   fi
 }
 
