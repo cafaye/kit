@@ -47,6 +47,11 @@
 --                                            Without it, the sweep's empty result
 --                                            is satisfied by a sweep that reports
 --                                            nothing.
+--                                            The control lives in `pg_temp`, which
+--                                            is why the sweep's scope includes this
+--                                            session's temporary schema: a control
+--                                            outside the thing it controls is not a
+--                                            control.
 --   `policies/written-for-the-init-plan`    every policy qualifier is a subquery,
 --                                            not a bare call. Measured on this
 --                                            kit, five rows, one query: the
@@ -472,19 +477,37 @@ select pg_temp.cafaye_assert(
   'cafaye.unprotected_tables() must actually report a table with an account_id column and no policies. If it does not, the assertion below is satisfied by a sweep that reports nothing at all'
 );
 
--- The sweep itself, over the whole database — every schema, not just this
--- fixture's. This is the assertion that keeps a service honest as it grows: a
--- table added next month with an account_id column and no policies is named here
--- on the next run.
+-- The sweep itself, over the schemas THE SUBSTRATE OWNS: every schema holding a
+-- table `cafaye.protect_table` protected, plus the `cafaye` schema and this
+-- session's temporary one. This is the assertion that keeps a service honest as
+-- it grows: a table added next month with an account_id column and no policies,
+-- IN A SCHEMA THE SERVICE ALREADY USES, is named here on the next run.
+--
+-- NOT the whole database, and the difference is measured rather than argued.
+-- identity's test helper builds a private fixture schema per test by cloning
+-- tables with `LIKE … INCLUDING ALL`, and `LIKE` does not copy row-level
+-- security — so every fixture carries an `account_id` column and no policies, and
+-- a whole-database sweep named all of them: a correct database, a red proof, and
+-- a count that moved with how many neighbouring tests were mid-flight (5 on one
+-- run, 21 on the next). The scope is the substrate's own, because the property
+-- this asserts is about the tables the SERVICE INSTALLED. See the block above
+-- `cafaye.unprotected_tables()` in substrate.sql for why the scope is derived
+-- from the catalog rather than recorded in a table this file's adopters would
+-- have had to migrate first.
 select pg_temp.cafaye_assert(
   'sweep/every-account-scoped-table-is-protected', '1',
   (select count(*)::text from cafaye.unprotected_tables()),
-  'every account-scoped table in this database must be enabled, FORCED and carrying policies. Exactly one is expected to be reported: the control table this file created on purpose'
+  'every account-scoped table in every schema the substrate was applied in must be enabled, FORCED and carrying policies. Exactly one is expected to be reported: the control table this file created on purpose'
 );
 
+-- `with order by` rather than trusting the sweep's own `order by` to survive the
+-- trip. The expected value below is a string, and a string built from an
+-- unordered aggregate is a red on a correct database whenever the planner is in
+-- a different mood — which is the same class of defect as an assertion whose
+-- tolerance hides another tenant's rows.
 select pg_temp.cafaye_assert(
   'sweep/the-only-finding-is-the-control', 'cafaye_probe_unprotected:row level security is not enabled',
-  (select string_agg(table_name || ':' || why, ',')
+  (select string_agg(table_name || ':' || why, ',' order by table_schema, table_name)
      from cafaye.unprotected_tables()),
   'the sweep must name the control table and nothing else, with a reason. A sweep that reported a real table as well would mean this file''s own fixture was not protected'
 );
