@@ -461,3 +461,127 @@ loudly and immediately, which is the good direction, and both are documented in
 a table, and forcing it on a table with no policies yet — which is every table
 between its `CREATE` and its `protect_table` call — makes that table unreadable by
 everybody including its owner. The init script therefore does not do it.
+
+---
+
+## MD24 — **a credential resolves by a POLICY, not by a bypass role and not by a `SECURITY DEFINER` function**
+
+**The problem this exists for.** A table whose access path is *"find the row by an
+unguessable secret and learn the account from it"* cannot be scoped by an account
+you do not have yet. The account **is** what the query is for. `identity` measured
+it against its real protected `api_keys` table, as the OWNER role:
+
+| | rows seen |
+|---|---|
+| **no identity — the state a request presenting a scoped token is in** | **0** |
+| identity = the credential's own account | 1 |
+| identity = another tenant's identity | 0 |
+
+The first line is the finding, and it is the quietest possible failure: the token
+does not resolve, `pgx.ErrNoRows` becomes `ErrNotFound`, and the HTTP layer turns
+that into **401 "not found"**. The same shape is `account_invitations` (redemption
+by token) and `oidc_clients` (lookup by `client_id`). Those are not three bugs;
+they are one property of the design.
+
+**The trade.** A credential table gets **one extra `for select` policy**, and the
+qualifier of that policy is the *digest the caller presented*:
+
+```sql
+select cafaye.protect_credential_table('api_keys', 'token_digest');
+```
+
+which installs, alongside `protect_table`'s four account-scoped policies, a fifth:
+
+```sql
+create policy api_keys_cafaye_resolve on api_keys
+  for select to <owner>, <service>_app
+  using (token_digest = (select cafaye.current_credential_digest()))
+```
+
+and the caller opens its resolution the way it opens its account:
+
+```sql
+begin;
+select cafaye.begin_credential($1);                        -- the digest it computed
+select … from api_keys where token_digest = $1;            -- the row returns
+commit;
+```
+
+**Why a policy, when three other mechanisms are available.** Each was measured or
+read in the reference trees first, and each is worse for *this* substrate:
+
+- **A role carrying `BYPASSRLS`** — which is Supabase's answer, and the answer is
+  right **for Supabase's topology**. `service_role` is created
+  `nologin noinherit bypassrls`
+  (`refs/supabase-postgres/migrations/db/init-scripts/00000000000000-initial-schema.sql:31`),
+  granted only to `authenticator` alongside `anon` and `authenticated`, and it
+  holds **no policies at all** — what bounds it is (a) who may assume the role and
+  (b) object **grants** (`alter default privileges … grant all … to service_role`,
+  same file, lines 40-42). kit has neither half of that structure: there is **one**
+  per-request role (`<service>_app`) and there is no separate service layer to run
+  as. A bypass role here would be a bypass over *the whole service database*, held
+  by the role every request already authenticates as. That is not a resolution
+  path. It is the ambient bypass this directory exists to prevent, wearing a
+  credential-shaped name.
+- **A `SECURITY DEFINER` function** — **does not work under `FORCE`**, which is the
+  trap this decision exists to close rather than to re-open. `FORCE` applies to the
+  *definer*, so a definer function on a forced table is subject to that table's
+  policies; only `BYPASSRLS` (or superuser) skips RLS, and no kit service role has
+  either. A proposal of exactly this shape should be read as the BYPASSRLS option
+  wearing a friendlier hat.
+- **Dropping `FORCE` on credential tables** — `MD23`'s measurement is the whole
+  answer: 1 row with it, 3 without, on the one table holding every machine
+  credential.
+- **Leaving `api_keys` unprotected** — the boundary stops covering credentials.
+
+**Why the predicate is in the POLICY and not only in the caller's query.** This is
+the requirement that decides the shape. RLS policies are combined permissively, so
+a `using` clause that said merely *"a credential session may select this table"*
+would be exactly the defect: the caller would hold a table-wide `SELECT` and could
+browse every key in the database with the one query the mechanism was built to
+avoid. So the policy carries the **same predicate the caller's query carries**,
+sourced from a GUC rather than from the `WHERE`. The consequence is the property
+this needs:
+
+> **A resolution session may read exactly the credential row whose digest it
+> presented, and nothing else in the database.**
+
+`select * from api_keys` inside a resolution session returns that one row, not the
+table. That is asserted, not argued: `credential/resolution-cannot-browse` and
+`credential/resolution-does-not-open-another-table` in
+`templates/database/tenancy/assertions.txt`.
+
+**What it costs, stated rather than drifted into.**
+
+1. **The mechanism cannot tell a secret from a label.** It widens a read to the row
+   whose value you presented, and whether that value is unguessable is the
+   service's knowledge, not the substrate's. On `oidc_clients`, where `client_id`
+   is an identifier rather than a secret, this mechanism is the wrong tool and the
+   README says so by name. The **invariant** is the reason the mechanism cannot
+   become a general bypass: you can only widen a read to a row you could already
+   name.
+2. **It is a `SELECT` widening and nothing else.** A resolution session cannot
+   insert, update or delete: the resolve policy is `for select`, and every write
+   policy still demands an account identity. A service cannot mint a credential
+   while resolving one.
+3. **It does not open the other tables.** The mechanism is a policy on a named
+   table. `account_users`, `assets`, everything else still read zero rows in a
+   resolution session, and that is asserted as its own row.
+4. **Two GUCs, not one.** `begin_credential/1` is a second seam. It is
+   transaction-local for the same reason `begin_account/1` is (a pool must not hand
+   one resolution's digest to the next connection) and it is set in exactly one
+   function, so a service has exactly one place that writes it.
+5. **Runtime audit is Postgres's job, not this one's.** What is auditable here is
+   the *scope*: `cafaye.credential_tables()` names every table carrying a
+   resolution path, so "which tables in this database can be read without an
+   account" is one query and not a code search. Auditing *who* resolved is not
+   claimed — the GUC is transaction-local and leaves nothing behind, and a claim
+   kit cannot honour is a comment pretending to be a control.
+
+**Enforced by:** `templates/database/tenancy/isolation.sql`, as new named rows in
+the existing dual-role loop, so the credential half is measured as the login role
+**and** as the owner; and by `tests/tenancy_test.sh`'s existing FORCE control,
+which goes red on `owner/credential-no-context-reads-no-rows` and
+`owner/credential-resolution-cannot-browse` when `FORCE` is deleted — the owner
+bypassing its own table is precisely how a resolution context turns into a
+browsing context.
