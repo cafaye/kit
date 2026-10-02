@@ -265,6 +265,7 @@ it without a copy (see kit-12 below).
   (`README.md`, `templates/AGENTS.md`, the compose file's header, and `bin/dev`'s
   own `--help` and completion message), because a doc that describes a default
   the script no longer has is drift the next reader pays for.
+
 ### Added — the account boundary, shipped once in kit
 
 - **`templates/database/tenancy/substrate.sql`.** The account boundary inside one
