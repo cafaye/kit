@@ -9,23 +9,29 @@ finished.
 ## Done and verified
 
 - **`--only` now reaches every recipe in `tests/self_test.sh` that it can reach**
-  (commit `c556dda`). Breakages 2, 2b, 3, 4, 5 and 6 moved from `expect_red` to
-  `expect_red_check`; `expect_green_check` (59) and `expect_skip_check` (23b)
-  grew the same four-line filter block. Gate-running recipes without a filter:
-  **9 → 3.**
-  - **Verified:** every candidate filter was probed against its own mutation on
-    its own tree first, and every one printed `FAIL <the named check>` — table in
-    the report §4b, with times.
+  (commits `c556dda`, `ab25775`). Breakages 2, 2b, 3, 4, 5 and 6 moved from
+  `expect_red` to `expect_red_check`; `expect_green_check` (59) grew the same
+  four-line filter block. Gate-running recipes without a filter: **9 → 4.**
+  - **The seventh conversion was reverted, and the run caught it.** `expect_skip_check`
+    (23b) cannot be filtered: its `$want` is the SKIP's **verdict text**, while
+    `--only` matches on the check's **label**, and filtering on the verdict text
+    selects no check — which `validate.sh` turns into `exit 1`, failing the
+    recipe's own first assertion. `expect_red_check` and `expect_green_check` are
+    safe because there `$want` *is* the label. Reasoning is in the file.
+  - **Verified:** every surviving candidate filter was probed against its own
+    mutation on its own tree first, and every one printed `FAIL <the named
+    check>` — table in the report §4b, with times.
   - **Verified:** the control. An unbroken tree under breakage 6's filter exits 0
     and prints `PASS .github/workflows/ci.reusable.yml  (opt-in telemetry job,
     defaults intact)`. A filter that only ever fails is not a proof.
   - **Verified:** `timeout 900 bash tests/self_test.sh`, run in the background.
-    23 recipes reached, **23 PASS, 0 FAIL** — including the unbroken-tree
-    control and all six conversions, each naming its check.
+    36 recipes reached. **35 PASS, 1 FAIL — the 23b regression above, since
+    reverted.** Every other recipe, including the unbroken-tree control and all
+    six conversions, passed; each conversion named its check.
   - **Verified:** `bash -n` clean, `shellcheck -S warning` clean, and the two
     counts `tests/validate.sh` derives from this file are **unchanged** (94
     breakages, 92 reds) because `expect_red_check` was already in both patterns.
-  - **Verified:** `tests/validate.sh` is **not modified** by this commit. The
+  - **Verified:** `tests/validate.sh` is **not modified** by this packet. The
     gate's printed output — the load-bearing part — is byte-for-byte what it was.
 - **Six proofs got stronger, not just faster.** `expect_red` asserted only "the
   gate went red"; each of the six now asserts `FAIL <the check it names>`, and
@@ -38,8 +44,21 @@ finished.
 | one child gate, unfiltered `--static-only` | **42.70 s** |
 | one child gate, `--only` one check | **7.88 s** |
 | the 6 converted recipes, each on its own mutated tree | **7.87 s mean** |
-| this packet's total saving | **~256 s (~4.3 min)** |
+| this packet's total saving | **~221 s (~3.7 min)** |
 | `self_test` | **~17 min before, ~13 min after** — not the 82 the handoff claimed |
+
+## Two things that will waste an hour if nobody says them
+
+1. **Do not edit `tests/self_test.sh` while an instance of it is running.** This
+   packet did, and the log ends `exit 127` at `line 2375: eck: command not
+   found` — bash reads a script incrementally by byte offset, so a rewrite
+   mid-run makes it resume mid-line. That is not a defect in the tree; every
+   recipe up to breakage 31b is valid evidence and everything after it is absent.
+2. **`$want` and the label are only the same string in two of the three
+   helpers.** `expect_red_check` and `expect_green_check` filter correctly
+   because there `$want` is the check's label. `expect_skip_check`'s is the
+   verdict text, and the mismatch fails a green proof (23b). If a fourth helper
+   ever wants a filter, check that first.
 
 ## Half-done, and why
 
