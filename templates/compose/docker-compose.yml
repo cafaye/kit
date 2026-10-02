@@ -170,7 +170,20 @@ services:
       # `POSTGRES_TAG` and `PGVECTOR_TAG` are ARGs, so a service raises them in
       # its own compose override rather than kit shipping one version for nine
       # services. Nothing is `:latest` and nothing floats.
-      context: ./postgres
+      #
+      # `${KIT_COMPOSE_DIR:-.}`, NOT `./`. This line and the initdb mount below
+      # were the only two bare-relative paths in this file, and the only two
+      # that were wrong, for the reason the other five services already carry:
+      # `bin/dev` runs compose with `--project-directory .` (the SERVICE root),
+      # and Docker Compose resolves a relative build context and bind source
+      # against the PROJECT DIRECTORY, not against the directory holding the
+      # compose file. `./postgres` therefore meant `<service>/postgres`.
+      # Measured, on identity, before this was fixed: the image still built -
+      # Docker creates a missing bind source as an empty DIRECTORY rather than
+      # failing - so the cluster came up, reported itself HEALTHY, and had run
+      # NO init script at all. No role, no database, no `REVOKE CONNECT`. The
+      # whole provisioning contract, absent behind a green health check.
+      context: ${KIT_COMPOSE_DIR:-.}/postgres
       dockerfile: Dockerfile
       args:
         POSTGRES_TAG: ${KIT_POSTGRES_TAG:-17}
@@ -193,7 +206,32 @@ services:
       # A service adds ITS OWN name here and nothing else. It does not get a
       # container, a port, or a volume — the point of one cluster is that the
       # nine services share all three.
-      KIT_POSTGRES_DATABASES: ${KIT_POSTGRES_DATABASES:-courier}
+      #
+      # NO `:-` FALLBACK, AND THAT IS THE POINT. This was
+      # `${KIT_POSTGRES_DATABASES:-courier}`, and `courier` is one service in this
+      # fleet, not a property of Postgres. A shared-infrastructure template that
+      # hardcodes a specific tenant's name as its default does two wrong things
+      # at once: every service that adopts kit without overriding this silently
+      # provisions COURIER'S database, and the value is then copied into every
+      # service's `.env` by `bin/dev`, which outranks the service's own committed
+      # declaration. Measured on identity: it asked for `identity` by name, the
+      # cluster provisioned `courier`, and identity had no database.
+      #
+      # The obvious repair — an EMPTY default — is also wrong, and the init
+      # script says so. Measured, by bringing this template up with the list
+      # empty: `10-cluster.sh:48` refuses it and the container exits 1 with
+      #   KIT_POSTGRES_DATABASES: KIT_POSTGRES_DATABASES is unset. Name the
+      #   services, comma-separated.
+      # which is the CORRECT outcome, because the alternative is a service whose
+      # migrations run against a database nobody created. The list is required,
+      # so compose passes it through with no default and the script's own
+      # message - which names the fix - is what a service that forgot to declare
+      # itself sees.
+      #
+      # Between the two bad defaults, this is the one that fails loudly and names
+      # the thing to change, instead of failing silently and pointing at a
+      # database belonging to somebody else.
+      KIT_POSTGRES_DATABASES: ${KIT_POSTGRES_DATABASES}
       # Extensions, created by the admin role into EVERY database above. They
       # are a CLUSTER decision rather than a per-service one because the
       # extension's binaries are in the image, so they are available to every
@@ -246,7 +284,20 @@ services:
       # KIT_POSTGRES_DATABASES does not provision its database until the volume
       # is recreated. `bin/dev`'s `db grant` prints the statements for a new
       # database rather than telling anybody to nuke their data.
-      - ./postgres/initdb:/docker-entrypoint-initdb.d:ro
+      #
+      # `${KIT_COMPOSE_DIR:-.}`, NOT `./`, and this one line is the whole
+      # difference between a cluster with per-service roles and databases in it
+      # and a cluster that has none. Read the failure rather than assuming it:
+      # with `./`, `bin/dev`'s `--project-directory .` (the service root) made
+      # this resolve to `<service>/postgres/initdb`, Docker created that as an
+      # EMPTY directory because a missing bind source is not an error, and the
+      # entrypoint logged one unread line and moved on. Measured on identity,
+      # unfixed: `/docker-entrypoint-initdb.d` empty inside a healthy container,
+      # `pg_roles` holding only the superuser, `pg_database` holding only
+      # `cafaye_platform`, and `docker compose up --wait` exiting 0. The
+      # service asked for a database by name and the cluster agreed, and no
+      # role, no database and no boundary was ever created.
+      - ${KIT_COMPOSE_DIR:-.}/postgres/initdb:/docker-entrypoint-initdb.d:ro
     healthcheck:
       # A REAL QUERY, against the database this container actually has.
       #

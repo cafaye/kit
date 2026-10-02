@@ -3002,6 +3002,24 @@ documented = dict(
     for m in re.finditer(r"^(KIT_[A-Z0-9_]+)=(.*)$", example, re.M)
 )
 
+# The `:-default` each variable falls back to in the stack itself. This is what
+# decides whether an EMPTY line in .env.example breaks a fresh clone, so it has
+# to be read rather than assumed - see the rule below.
+#
+# COMMENTS ARE STRIPPED FIRST, and that is not tidiness: this file documents the
+# old broken value in prose, so a scanner that reads the raw text finds
+# `${KIT_POSTGRES_DATABASES:-courier}` in a COMMENT and reports the defect it is
+# describing. A check that cannot tell a sentence about a value from the value
+# is not a check, and the first version of this rule failed on its own
+# explanation - caught by running it, not by reading it.
+compose_default = {}
+compose_src = open(f"{root}/templates/compose/docker-compose.yml", encoding="utf-8").read()
+compose_live = "\n".join(
+    ln for ln in compose_src.splitlines() if not ln.strip().startswith("#")
+)
+for m in re.finditer(r"\$\{(KIT_[A-Z0-9_]+):-([^}]*)\}", compose_live):
+    compose_default.setdefault(m.group(1), m.group(2))
+
 problems = []
 for name in ("docker-compose.yml", "otel-collector.yml"):
     source = open(f"{root}/templates/compose/{name}", encoding="utf-8").read()
@@ -3009,17 +3027,118 @@ for name in ("docker-compose.yml", "otel-collector.yml"):
         if var not in documented:
             problems.append(f"{name} uses ${{{var}}} which .env.example does not set")
 
-# A documented placeholder with no default is a placeholder that breaks a
-# fresh clone; `foo=` with an empty default is the same failure in YAML form.
+# A documented placeholder with no default AND no fallback in the compose file
+# breaks a fresh clone; `foo=` with an empty default is the same failure in YAML
+# form. But an empty line whose variable the compose file already defaults is
+# not a broken clone - it is the compose file's own default applying, which is
+# exactly what the line is FOR. The two are not the same defect and collapsing
+# them is what forced a real value into a file that must not carry one.
+#
+# AND A THIRD CASE, which is the one that matters most and the one this rule was
+# rewritten for after it caught the author: an empty value for a variable the
+# INIT SCRIPT REFUSES is not a silent breakage at all. It is the script stopping
+# the container and naming the fix.
+#
+# `KIT_POSTGRES_DATABASES` is exactly that, and the sequence is worth recording
+# because the first attempt at this fix got it backwards. The obvious repair for
+# "the default names a tenant" is an empty default; that was tried, and bringing
+# the template up with it produced, from `10-cluster.sh:48`:
+#   KIT_POSTGRES_DATABASES: KIT_POSTGRES_DATABASES is unset. Name the services,
+#   comma-separated.
+# and a container that exits 1. The empty default is therefore NOT a supported
+# state - but the FAILURE is the correct one, and it is strictly better than the
+# default it replaced, which provisioned a real service's database for whoever
+# adopted the template. So the rule is not "empty is allowed" and not "empty is
+# forbidden": it is that emptiness must be CAUGHT, and this checks that it is,
+# by looking for the guard rather than trusting a comment that says it exists.
+init_script = ""
+try:
+    init_script = open(
+        f"{root}/templates/compose/postgres/initdb/10-cluster.sh", encoding="utf-8"
+    ).read()
+except OSError:
+    pass
+
 for var, default in sorted(documented.items()):
-    if default == "":
-        problems.append(f".env.example sets {var}= with no default")
+    if default != "":
+        continue
+    if var in compose_default and compose_default[var] != "":
+        continue  # the compose file supplies it; nothing is empty in practice
+    if var in init_script and re.search(rf"{var}\s+is unset", init_script):
+        continue  # refused loudly, by name, with the fix in the message
+    problems.append(
+        f".env.example sets {var}= with no default, and nothing supplies one: "
+        f"docker-compose.yml has no :-fallback for it and initdb/10-cluster.sh "
+        f"does not refuse it either. So a fresh clone with no .env gets an empty "
+        f"value and NOTHING COMPLAINS - the value is consumed rather than "
+        f"rejected, which is the silent half of a broken default. Give it a "
+        f"fallback, or refuse it in the init script with a message naming the fix."
+    )
+
+# NO TENANT NAME AS A SHARED DEFAULT.
+#
+# This is the rule that would have caught the defect this file used to carry, and
+# it is here because the old rule could not: `KIT_POSTGRES_DATABASES=courier`
+# has a perfectly good non-empty default, so "every placeholder documented with
+# a default" was satisfied by exactly the wrong value. A default that names one
+# service in a template that NINE services fetch is a hardcoded tenant - every
+# adopter that does not override it provisions that service's database, and
+# `bin/dev` copies the value into each of their `.env` files, where it outranks
+# the adopting service's own committed declaration.
+#
+# Measured, twice, on identity: its compose file said `:-identity`, the copied
+# `.env` said `courier`, and the cluster provisioned `courier`. Then, with that
+# corrected, its committed `KIT_POSTGRES_ROLE_CONNECTIONS: 50` was defeated the
+# same way by this file's `10`, and 175 tests failed with `too many connections
+# for role "identity"`.
+#
+# So both variables a service legitimately declares FOR ITSELF are required to be
+# empty here, and empty is a supported state rather than a gap.
+SERVICE_OWNED = ("KIT_POSTGRES_DATABASES", "KIT_POSTGRES_ROLE_CONNECTIONS")
+for var in SERVICE_OWNED:
+    if documented.get(var, "") != "":
+        problems.append(
+            f".env.example sets {var}={documented[var]!r}. This is a value the "
+            f"service declares for ITSELF, in its own committed compose file, and "
+            f"`.env` outranks that file - `bin/dev` copies this one verbatim and "
+            f"Compose prefers it over the `:-default`. So this line does not "
+            f"provide a fallback, it CANCELS the service's declaration, on every "
+            f"machine where `bin/dev` has run, with nothing in any diff. Leave it "
+            f"empty: docker-compose.yml's own default then applies, and a service "
+            f"that needs a different one says so where it is reviewable."
+        )
+
+# And the same rule against the compose file's own default, but ONLY for the
+# variable whose value is a LIST OF TENANTS. `KIT_POSTGRES_DATABASES` holds
+# service names, so any non-empty fallback in a template nine services fetch is
+# a hardcoded tenant: every adopter that does not override it provisions that
+# service's database.
+#
+# `KIT_POSTGRES_ROLE_CONNECTIONS` is deliberately NOT in this half. `10` is a
+# blast-radius default, not a tenant - it is a number Postgres understands and
+# no service is named by it - so the compose default stays and only the
+# `.env.example` line above is emptied. Conflating "empty in .env.example" with
+# "empty as a fallback" is what would have had this check demanding that the
+# cluster stop having a connection limit at all.
+if compose_default.get("KIT_POSTGRES_DATABASES", "") != "":
+    problems.append(
+        f"docker-compose.yml defaults KIT_POSTGRES_DATABASES to "
+        f"{compose_default['KIT_POSTGRES_DATABASES']!r}. That variable holds "
+        f"SERVICE NAMES, and a template fetched by nine services must not name one "
+        f"of them as a default: every adopter that does not override it inherits "
+        f"that service's database. Measured on identity - it declared "
+        f"`KIT_POSTGRES_DATABASES: ${{KIT_POSTGRES_DATABASES:-identity}}` and the "
+        f"cluster still provisioned courier's database. An empty default is the "
+        f"honest one: a cluster nobody has declared a tenant on is a real, "
+        f"visible state, and a service says which database is its own in its own "
+        f"compose file, where it is in the diff."
+    )
 
 if problems:
     sys.exit("; ".join(problems))
 PY
   }
-  check 'templates/compose/.env.example  (every placeholder documented)' env_example_check
+  check 'templates/compose/.env.example  (every placeholder documented, no tenant named)' env_example_check
 
   # -------------------------------------------------------------------------
   # THE CONNECTION CONTRACT, ASSERTED AGAINST GENERATED OUTPUT, PER LANGUAGE.
@@ -3656,7 +3775,32 @@ svc = re.search(r"^  postgres:\n(.*?)(?=^  [a-z]|\Z)", compose, re.M | re.S)
 if not svc:
     sys.exit("docker-compose.yml has no postgres service")
 block = svc.group(1)
-provided = set(re.findall(r"KIT_POSTGRES_[A-Z0-9_]+", block))
+
+# COMMENTS ARE STRIPPED BEFORE ANY ASSERTION ABOUT CONTENT, and this is the
+# third time that has turned out to be load-bearing rather than tidiness — see
+# `.env.example`'s tenant rule, which failed on the sentence documenting the
+# value it was checking for. The mechanism is always the same: `in` over raw
+# YAML cannot tell a sentence about a string from the string, so a check
+# asserted against `block` is a check that a well-commented file satisfies by
+# being well-commented.
+#
+# MEASURED, on the fix that added `${KIT_COMPOSE_DIR:-.}` to the initdb mount,
+# which is to say on this packet's own change: the postgres block held the
+# literal `/docker-entrypoint-initdb.d` TWICE — once as the mount, and once
+# inside the comment explaining why the mount must be there. So when the real
+# mount was deleted, breakage 70's mutation went green: the comment was still
+# asserting the mount existed. A guard against the cluster provisioning nothing
+# was reading a comment about that guard.
+#
+# The lesson generalises past this line, and that is why the stripping is here
+# rather than inside the one assertion that happened to break: any check that
+# reads compose TEXT to decide whether a thing is WIRED can be satisfied by a
+# comment saying it is wired. The structured fix is to parse the YAML; until
+# that happens, a comment is not a wire.
+block_live = "\n".join(
+    ln for ln in block.splitlines() if not ln.strip().startswith("#")
+)
+provided = set(re.findall(r"KIT_POSTGRES_[A-Z0-9_]+", block_live))
 for name in sorted(read_vars - provided):
     problems.append(
         f"the init script reads ${{{name}}} but docker-compose.yml does not pass "
@@ -3668,8 +3812,8 @@ for name in sorted(read_vars - provided):
     )
 
 # (2) The mount. Without it the script never runs, and the symptom is again a
-# healthy cluster holding one database.
-if "/docker-entrypoint-initdb.d" not in block:
+# healthy cluster holding one database. `block_live`, per the note above.
+if "/docker-entrypoint-initdb.d" not in block_live:
     problems.append(
         "the postgres service does not mount anything at "
         "/docker-entrypoint-initdb.d, so initdb/10-cluster.sh never runs. The "
@@ -3715,6 +3859,77 @@ PY
   check 'the cluster  (one database + role per service, wired end to end)' cluster_topology_check
 
   # -------------------------------------------------------------------------
+  # KIT'S OWN HARNESSES DECLARE A TENANT, without needing a docker daemon.
+  #
+  # This check exists because of a regression that 214 static checks and 86
+  # self-test proofs all passed straight through. Removing the `:-` fallback from
+  # `KIT_POSTGRES_DATABASES` was correct — a template that defaults the tenant
+  # list to one of its own services hands every adopter that forgets to declare
+  # itself somebody else's database, and identity asked for `identity` and got
+  # `courier`. But `tests/stack_live_test.sh` is a CONSUMER of that template, and
+  # it had never declared one. Nothing static looked: every other check in this
+  # file reads the template or a service's committed files, and kit's own test
+  # harnesses are none of those.
+  #
+  # The live test caught it, in 10 minutes, with a docker daemon and eight
+  # containers. This catches the same mistake in about a second with neither.
+  #
+  # WHAT IT DOES NOT DO, because the version that did this was wrong twice. It
+  # does not grep for the string `KIT_POSTGRES_DATABASES` — `templates/compose/
+  # .env.example` mentions that name in prose, and `tests/stack_live_test.sh`
+  # mentions it in a comment, so a substring search is satisfied by text
+  # describing the variable rather than by an assignment of it. It finds the
+  # ASSIGNMENT, at the start of a line, with a value, and it reads the heredoc
+  # body rather than the whole file, because a real assignment outside the
+  # heredoc would not reach the `.env` either.
+  #
+  # The rule it enforces: any file under tests/ that writes a `.env` carrying a
+  # `KIT_` variable must declare a tenant in the same heredoc. That is derived
+  # from the files rather than listed, so a new harness is covered the day it is
+  # written instead of the day someone remembers to add it.
+  harness_tenant_check() {
+    python3 - <<'PY'
+import pathlib, re, sys
+
+problems = []
+checked = 0
+
+# A heredoc that writes a .env. The delimiter is captured so the BODY can be
+# read: an assignment outside the body is not in the file that gets written.
+heredoc = re.compile(r"cat\s*>\s*\"?\$?\{?SERVICE\}?/\.env\"?\s*<<-?\s*'?([A-Za-z_][A-Za-z0-9_]*)'?")
+
+for path in sorted(pathlib.Path("tests").glob("*.sh")):
+    text = path.read_text()
+    for match in heredoc.finditer(text):
+        delim = match.group(1)
+        rest = text[match.end():]
+        end = re.search(rf"^\s*{delim}\s*$", rest, re.M)
+        if not end:
+            continue
+        body = rest[:end.start()]
+        # Only harnesses that actually drive the compose template count. One
+        # that writes an .env with no KIT_ variable at all is not a stack
+        # consumer and is not this check's business.
+        if not re.search(r"^KIT_[A-Z0-9_]+=", body, re.M):
+            continue
+        checked += 1
+        if not re.search(r"^KIT_POSTGRES_DATABASES=\S", body, re.M):
+            problems.append(
+                f"{path} writes an .env with KIT_ variables but declares no "
+                f"KIT_POSTGRES_DATABASES; the cluster init script refuses an unset "
+                f"tenant list by name and the stack will not come up"
+            )
+
+if checked == 0:
+    sys.exit("no .env-writing harness found — the rule below is proving nothing")
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+  check 'kit harnesses  (every .env-writing harness declares its own tenant)' harness_tenant_check
+
+  # -------------------------------------------------------------------------
   # THE CONNECTION BUDGET, AS AN ARITHMETIC IDENTITY rather than a comment.
   #
   # The pooler decision is "no pooler, and a stated budget instead" — and a
@@ -3747,17 +3962,48 @@ init = open(
 
 problems = []
 
+# COMMENTS ARE STRIPPED before the fallback scan, for the same reason the
+# .env.example check strips them: this file quotes the old broken defaults in
+# prose, and a scanner that cannot tell a sentence about a value from the value
+# reports the defect it is documenting.
+compose_live = "\n".join(
+    ln for ln in compose.splitlines() if not ln.strip().startswith("#")
+)
+
 def env_value(name):
     m = re.search(rf"^{name}=(.*)$", example, re.M)
     return int(m.group(1)) if m and m.group(1).strip().isdigit() else None
+
+def compose_fallback(name):
+    m = re.search(rf"\$\{{{name}:-(\d+)\}}", compose_live)
+    return int(m.group(1)) if m else None
 
 def script_default(name):
     m = re.search(rf'^\s*{name}="\$\{{{name}:-(\d+)\}}"', init, re.M)
     return int(m.group(1)) if m else None
 
-max_conn = env_value("KIT_POSTGRES_MAX_CONNECTIONS")
-role_limit = env_value("KIT_POSTGRES_ROLE_CONNECTIONS")
-dbs_raw = re.search(r"^KIT_POSTGRES_DATABASES=(.*)$", example, re.M)
+# THE VALUE THAT ACTUALLY TAKES EFFECT, resolved through the whole chain rather
+# than read out of one file.
+#
+# This check used to read `.env.example` and nothing else, and that was correct
+# while `.env.example` carried a value for everything. It no longer does, on
+# purpose: a value in `.env.example` is COPIED into each service's `.env` by
+# `bin/dev` and outranks the service's own committed compose file, so those two
+# lines are now deliberately empty for anything a service declares for itself.
+# Reading only that file made this check stop describing the system - it began
+# reporting a cluster that cannot happen, over a default that was the defect.
+#
+# So: `.env.example` if it sets one, else the compose file's `:-` fallback, else
+# the init script's own fallback. That is the order the container sees, and
+# agreeing with it is the whole point of a budget check.
+def effective_int(name):
+    for source in (env_value(name), compose_fallback(name), script_default(name)):
+        if source is not None:
+            return source
+    return None
+
+max_conn = effective_int("KIT_POSTGRES_MAX_CONNECTIONS")
+role_limit = effective_int("KIT_POSTGRES_ROLE_CONNECTIONS")
 
 for name, value in (
     ("KIT_POSTGRES_MAX_CONNECTIONS", max_conn),
@@ -3765,31 +4011,60 @@ for name, value in (
 ):
     if value is None:
         problems.append(
-            f".env.example does not set {name} to an integer, so the connection "
-            f"budget cannot be checked and a service that raises one of them has "
-            f"no idea whether the cluster can absorb it"
+            f"nothing sets {name} to an integer - not .env.example, not "
+            f"docker-compose.yml's :-fallback, not initdb/10-cluster.sh's - so the "
+            f"connection budget cannot be checked and a service that raises one of "
+            f"them has no idea whether the cluster can absorb it"
         )
-if not dbs_raw or not dbs_raw.group(1).strip():
-    problems.append(
-        ".env.example sets no KIT_POSTGRES_DATABASES, so the example stack "
-        "provisions zero service databases. A default that exercises nothing "
-        "proves nothing on a developer's first `bin/dev up`."
-    )
 if problems:
     sys.exit("; ".join(problems))
 
-dbs = [d.strip() for d in dbs_raw.group(1).split(",") if d.strip()]
-service_dbs = [d for d in dbs if not d.startswith("KIT_")]
+# THE TENANT COUNT, and this is where an empty default stops being a gap.
+#
+# `KIT_POSTGRES_DATABASES` now defaults to empty on purpose - kit no longer names
+# one of its own services as the fleet's default tenant - so the example stack
+# provisions zero service databases and the arithmetic below would be
+# `0 x role_limit + 8`, which is true of every number ever written and so proves
+# nothing. A check that cannot fail is a check that has stopped working, which
+# is the failure this repository exists to refuse, so the count does not come
+# from the default: it comes from the size of the fleet the template claims to
+# serve.
+#
+# That claim is stated in this repository's own prose - "the nine services share
+# all three", "nine services at the per-role limit above exceed it" - so the
+# budget is asserted against nine tenants whether or not a given developer has
+# adopted nine of them. Lower `KIT_POSTGRES_MAX_CONNECTIONS` and this goes red
+# on the template alone, which is the point: the budget has to be right for the
+# fleet the template is FOR, not only for whoever happened to run it.
+FLEET_SERVICES = 9
 
-# The script's own default must not disagree with .env.example's, for the same
+declared = None
+for source in (example, compose_live):
+    m = re.search(r"^KIT_POSTGRES_DATABASES=(.*)$", source, re.M) or re.search(
+        r"KIT_POSTGRES_DATABASES:\s*\$\{KIT_POSTGRES_DATABASES:-([^}]*)\}", source
+    )
+    if m and m.group(1).strip():
+        declared = m.group(1)
+        break
+
+if declared is None:
+    tenants = FLEET_SERVICES
+    basis = f"no tenant is declared by default, so the fleet this template is for ({tenants} services) is used"
+else:
+    dbs = [d.strip() for d in declared.split(",") if d.strip()]
+    service_dbs = [d for d in dbs if not d.startswith("KIT_")]
+    tenants = len(service_dbs)
+    basis = f"{tenants} database(s) declared"
+
+# The script's own default must not disagree with the effective one, for the same
 # reason the tag check exists: two files, one fact, and the one that is silently
 # overridden is the one nobody sees.
-for name, from_env, from_script in (
+for name, effective, from_script in (
     ("KIT_POSTGRES_ROLE_CONNECTIONS", role_limit, script_default("KIT_POSTGRES_ROLE_CONNECTIONS")),
 ):
-    if from_script is not None and from_script != from_env:
+    if from_script is not None and from_script != effective:
         problems.append(
-            f"{name}: .env.example says {from_env} and initdb/10-cluster.sh's "
+            f"{name}: the effective default is {effective} and initdb/10-cluster.sh's "
             f"fallback says {from_script}. The script only reaches its fallback "
             f"when compose does not pass the variable, so the two disagreeing is "
             f"a shape that works on a developer's machine and not in CI."
@@ -3800,23 +4075,24 @@ for name, from_env, from_script in (
 # superuser-reserved slots during a heavy autovacuum. 8 is the measured-safe
 # margin and is asserted rather than assumed.
 RESERVED = 8
-needed = len(service_dbs) * role_limit + RESERVED
+needed = tenants * role_limit + RESERVED
 if max_conn < needed:
     problems.append(
-        f"KIT_POSTGRES_MAX_CONNECTIONS is {max_conn} but the declared topology "
-        f"needs {len(service_dbs)} databases x {role_limit} connections "
+        f"KIT_POSTGRES_MAX_CONNECTIONS is {max_conn} but the topology needs "
+        f"{tenants} databases x {role_limit} connections "
         f"(KIT_POSTGRES_ROLE_CONNECTIONS) + {RESERVED} for Postgres's own "
-        f"reserves = {needed}. With no pooler in the path, the connection budget "
-        f"IS the isolation story's other half: a service that cannot get a "
-        f"connection cannot reach another service's data, so an undersized "
-        f"budget shows up as a total outage rather than as a refused query."
+        f"reserves = {needed} ({basis}). With no pooler in the path, the "
+        f"connection budget IS the isolation story's other half: a service that "
+        f"cannot get a connection cannot reach another service's data, so an "
+        f"undersized budget shows up as a total outage rather than as a refused "
+        f"query."
     )
 
 if problems:
     sys.exit("; ".join(problems))
 print(
-    f"       budget: {max_conn} >= {len(service_dbs)} db x {role_limit} + "
-    f"{RESERVED} reserved = {needed}"
+    f"       budget: {max_conn} >= {tenants} db x {role_limit} + "
+    f"{RESERVED} reserved = {needed}  ({basis})"
 )
 PY
   }
@@ -4210,6 +4486,57 @@ for source, destination in VENDOR_MOUNTS.items():
             f"from the service root - where this file no longer is. Docker creates a "
             f"DIRECTORY at a missing bind source and the collector exits naming a "
             f"file type instead of the mount that is wrong."
+        )
+
+# 1b. AND NO HOST PATH IN THIS FILE IS BARE-RELATIVE, WHICHEVER SERVICE IT
+#     BELONGS TO.
+#
+#     The loop above is a HAND-WRITTEN LIST, and that is the whole reason the
+#     defect below survived it: the postgres service's two paths were never
+#     vendor configs, so they were never in the list, and a check over a list
+#     only ever says something about the list. Measured, on this tree, before
+#     the fix: `docker-compose.yml:173` (`build.context: ./postgres`) and
+#     `:249` (`- ./postgres/initdb:/docker-entrypoint-initdb.d:ro`) were the
+#     only two bare paths in the file, and the only two that were wrong.
+#
+#     What they cost, measured on identity rather than reasoned about: `bin/dev`
+#     runs compose with `--project-directory .`, the SERVICE root, and Docker
+#     Compose resolves a relative bind source and build context against the
+#     PROJECT DIRECTORY, not against the directory holding the compose file. So
+#     both resolved to `<service>/postgres/...`, which does not exist, and
+#     Docker's answer to a missing bind source is to CREATE IT AS A DIRECTORY.
+#     `/docker-entrypoint-initdb.d` was then empty inside a HEALTHY container:
+#     `10-cluster.sh` never ran, no service got a role, no service got a
+#     database, no `REVOKE CONNECT` was ever applied - and `docker compose up
+#     --wait` exited 0 and reported the cluster healthy. A green stack proving
+#     nothing is the exact failure this repository is built to refuse, so the
+#     rule below is derived from the FILE rather than from a list of what
+#     somebody remembered to list: adding an eighth service cannot escape it.
+for n, ln in enumerate(compose.splitlines(), 1):
+    stripped = ln.strip()
+    if stripped.startswith("#"):
+        continue
+    # short-syntax volume:  - <source>:<destination>[:ro]
+    host = None
+    if stripped.startswith("- "):
+        parts = stripped[2:].split(":")
+        # A windows-style drive letter or a bare name is not a relative path.
+        if len(parts) >= 2 and parts[0] not in ("", "/"):
+            host = parts[0]
+    elif stripped.startswith("context:"):
+        host = stripped.split(":", 1)[1].strip()
+    elif stripped.startswith("source:"):
+        host = stripped.split(":", 1)[1].strip()
+    if host and (host.startswith("./") or host.startswith("../")):
+        problems.append(
+            f"docker-compose.yml:{n} uses the bare relative path {host!r}. That is "
+            f"resolved against the compose PROJECT directory, which `bin/dev` sets to "
+            f"the service root - where this file's siblings do not live. Use "
+            f"${{KIT_COMPOSE_DIR:-.}}/{host.lstrip('./')}. If this is the build "
+            f"context or the initdb mount, getting it wrong is not a visible error: "
+            f"Docker creates the missing directory, `/docker-entrypoint-initdb.d` "
+            f"comes up EMPTY, no role or database is provisioned, no REVOKE is "
+            f"applied, and the cluster still reports healthy."
         )
 
 # 2. `bin/dev` sets it, to the FETCHED compose directory and not the kit root.

@@ -13,6 +13,272 @@ it without a copy (see kit-12 below).
 
 ## Unreleased
 
+### Fixed — the shared cluster provisioned nothing, and reported itself healthy
+
+Two defects, and the reason they survived is the same one: each was invisible to
+every check kit had, and together they meant **no service in this fleet has ever
+had a database on the shared cluster.** Both are fixed here, both are now
+checked, and the checks are derived from the files rather than from a list.
+
+**1. `docker-entrypoint-initdb.d` was mounted from an empty directory, always.**
+`templates/compose/docker-compose.yml` mounted the init scripts as
+`./postgres/initdb`, and `bin/dev` runs compose with `--project-directory .` — the
+**service** root. Docker Compose resolves a relative bind source and build context
+against the *project directory*, not against the directory holding the compose
+file, so `./postgres/initdb` meant `<service>/postgres/initdb`. No service has
+that directory. Docker's answer to a missing bind source is to **create it as an
+empty directory**, so there was no error to see.
+
+Measured, on `identity`, before this fix:
+
+    $ docker exec cafaye-postgres-1 ls /docker-entrypoint-initdb.d/
+    (nothing)
+    $ docker exec cafaye-postgres-1 psql -U cafaye -d postgres \
+        -tAc "select rolname,rolsuper from pg_roles where rolname not like 'pg\_%'"
+    cafaye|t
+    $ docker compose up -d --wait postgres ; echo $?
+    0        # and the container reports HEALTHY
+
+`10-cluster.sh` never ran. No service got a role, no service got a database, no
+`REVOKE CONNECT ... FROM PUBLIC` was ever applied — and the stack came up green,
+which is the one outcome a provisioning contract must never produce. The same
+wall was hit independently by the courier-27 worker, who worked around it rather
+than patching the stack it fetches.
+
+The fix is the one the other five services in that file already use:
+`${KIT_COMPOSE_DIR:-.}/postgres`, which `bin/dev` exports
+(`templates/bin/dev.sh:652`). After it, the same command shows `identity|f|50`
+and a database named `identity`, created by the script, with no override file and
+no manual SQL.
+
+**2. `.env.example` named one service as the whole fleet's default tenant.**
+`KIT_POSTGRES_DATABASES` defaulted to `courier` in the compose file *and* in
+`.env.example`, and `bin/dev` copies `.env.example` verbatim into each service's
+git-ignored `.env` — which Compose resolves **ahead of** a service's own
+committed `docker-compose.yml`. So the literal did not act as a default; it
+**cancelled** every adopting service's own declaration, on every machine where
+`bin/dev` had run, with nothing in any diff. Measured on `identity`: its compose
+file said `${KIT_POSTGRES_DATABASES:-identity}`, the copied `.env` said
+`courier`, and the cluster provisioned `courier`.
+
+The same mechanism made a *second* committed value inert in the same run.
+`identity`'s compose file raised `KIT_POSTGRES_ROLE_CONNECTIONS` to 50; the
+copied `.env` said 10; `pg_roles.rolconnlimit` was 10; and **175 tests failed**
+with `FATAL: too many connections for role "identity"` — a failure caused
+entirely by a value the repository had already raised, reviewed and merged. Both
+variables are now empty in `.env.example`, and the rule is written out there: *a
+value in this file defeats a service's committed compose file.*
+
+`KIT_POSTGRES_DATABASES` in the compose file loses its `:-courier` fallback
+entirely rather than gaining an empty one, and the reason is measured rather than
+preferred. An empty default is the obvious repair and it is wrong: bringing the
+template up with it produces, from `10-cluster.sh:48`,
+
+    KIT_POSTGRES_DATABASES: KIT_POSTGRES_DATABASES is unset. Name the services,
+    comma-separated. A service with no entry has no database, and its migrations
+    fail against a database that was never created.
+
+and a container that exits 1. That failure is the *correct* one — far better than
+the default it replaces, which handed a real service's database to whoever
+adopted the template — so the list stays required, compose passes it through
+unset, and a service that forgot to declare itself gets that message instead of
+somebody else's rows.
+
+**What now fails if either comes back.** Three rules, all derived from the files:
+
+- *No host path in `docker-compose.yml` may be bare-relative.* The pre-existing
+  guard listed five vendor configs by name, which is why it missed the postgres
+  service's two paths — a check over a list only ever says something about the
+  list. This one reads the file, so an eighth service cannot escape it.
+- *No tenant as a shared default.* `KIT_POSTGRES_DATABASES` holds service names,
+  so a non-empty fallback in a template nine services fetch is a hardcoded
+  tenant. The rule does **not** extend to `KIT_POSTGRES_ROLE_CONNECTIONS`:
+  `10` is a blast-radius default, not a tenant, and conflating the two would
+  have had the check demanding the cluster stop having a connection limit.
+- *An empty value must be CAUGHT, not merely absent.* Emptiness with no fallback
+  is a silent breakage; emptiness the init script refuses by name is a loud one
+  naming the fix. The rule checks for the guard in `10-cluster.sh` rather than
+  trusting a comment asserting it exists.
+
+Two of these three caught their own author. The `.env.example` rule rejected the
+empty `KIT_POSTGRES_DATABASES` default described above, which is why that default
+is gone rather than shipped; and the first version of the tenant rule failed on
+the *comment* documenting the old value, because it scanned raw text and could
+not tell a sentence about a value from the value. Comments are stripped before
+both scans now.
+
+The connection-budget check was reading `KIT_POSTGRES_DATABASES` and
+`KIT_POSTGRES_ROLE_CONNECTIONS` out of `.env.example`, which no longer carries
+them, so it began describing a cluster that cannot exist. It now resolves each
+value through the chain the container actually sees — `.env.example`, then the
+compose `:-` fallback, then the init script's own — and, with no tenant declared
+by default, asserts the budget against the nine services this template's prose
+claims to serve (`9 × 10 + 8 = 98 ≤ 200`) rather than against `0 × 10 + 8`, which
+is true of every number ever written and so proves nothing.
+
+### Fixed — `self_test_claims` was reporting six findings on an unrenumbered comment
+
+`tests/self_test.sh` has a check (`self_test_claims`, run by the gate) that
+cross-checks the file's **header** — every breakage it documents — against the
+**recipes** it actually carries, and fails when either side names a number the
+other does not. On `master` it was reporting six findings, in both directions:
+
+```
+header documents breakage 63 but no recipe carries it
+header documents breakage 64 but no recipe carries it
+header documents breakage 65 but no recipe carries it
+recipe proves breakage 78 but the header does not document it
+recipe proves breakage 79 but the header does not document it
+recipe proves breakage 80 but the header does not document it
+recipe proves breakage 81 but the header does not document it
+recipe proves breakage 82 but the header does not document it
+```
+
+One comment caused all of it. The Kamal block in the header was written as
+`61-65`; its five recipes were renumbered to `78-82` by `4a037f3` — whose own
+body note records the collision that forced the move — and the header was not
+carried along. The reason this was not a tidy-up but a real defect is that
+**61 and 62 were reused**: by that point they belonged to the licence
+breakages, which genuinely exist. So the header was describing two different
+sets of proofs under the same two numbers, and the integrity check was
+reporting the disagreement rather than causing it.
+
+The header block is renumbered to `78-82` and its prose follows its recipes.
+`self_test_claims` now reports agreement. Worth recording for the next person
+who renumbers anything in that file: the header is not documentation, it is
+**input to a check**, and the check is the only thing standing between a
+renumbered recipe and a set of proofs the file claims but does not run.
+
+### Fixed — a check that guarded the initdb mount was reading a comment about it
+
+This is a regression *introduced by the fix above*, found by that fix's own
+proof, and it is recorded because a check that cannot fail is worse than a
+missing check: it is a check that reports success.
+
+`cluster_topology_check` asserts that the postgres service mounts anything at
+`/docker-entrypoint-initdb.d`, and it did so with `if "<path>" not in block`
+over the raw YAML text of the service. Correct when the only mention of that
+path was the mount. The fix above adds a comment explaining why the mount must
+be `${KIT_COMPOSE_DIR:-.}/postgres/initdb` rather than `./postgres/initdb`, and
+that comment quotes the path.
+
+Measured, on this tree, with the mount deleted and nothing else changed:
+
+| | `/docker-entrypoint-initdb.d` occurrences in the postgres block |
+|---|---|
+| before the fix | 1 — the mount |
+| after the fix | 2 — the mount, and the comment about the mount |
+
+So deleting the mount left the comment, `in` returned true, and
+`cluster_topology_check` went **green**. Deleting the same line from `origin/master`
+turns it red, which is how the difference was isolated to this change rather than
+to the check having always been broken.
+
+This is the third time in this release that a check scanning YAML text has
+matched a sentence about a value instead of the value — the other two being the
+`.env.example` tenant rule and the connection-budget scan. All three are now the
+same shape, and the general statement is the one worth keeping: **a check that
+reads compose text to decide whether something is wired can be satisfied by a
+comment saying it is wired.** `cluster_topology_check` now strips comment lines
+before both of its assertions — the mount, and the set of `KIT_POSTGRES_*` the
+service passes into the container — so a well-commented file no longer passes for
+a well-wired one. The durable fix is to parse the YAML rather than scan it; that
+is not in this release, and until it lands every text-scanning check in this file
+carries the same hazard.
+
+### Fixed — a comment inside an unquoted heredoc ran as a command, and the gate stayed green
+
+Also a regression *introduced by the fix above*, and the second one in this
+release to be found by being wrong in the same place: the first was a check
+reading a comment, this one is a comment being read by a shell.
+
+`tests/stack_live_test.sh` writes its fixture `.env` with
+`cat >"$SERVICE/.env" <<ENV`. The delimiter is unquoted **on purpose** —
+`$REMOTE`, `$WORK` and the port arithmetic all have to expand. The price of that
+is that the heredoc body is a shell script, and the fix above's explanation of
+why `tests/stack_live_test.sh` now has to declare a tenant was written *inside*
+it, with backticks around the filenames.
+
+So bash ran every backticked word as a command. The first run after that edit
+printed:
+
+```
+tests/stack_live_test.sh: line 227: docker-compose.yml: command not found
+tests/stack_live_test.sh: line 227: KIT_POSTGRES_DATABASES: command not found
+tests/stack_live_test.sh: line 227: bin/dev: No such file or directory
+tests/stack_live_test.sh: line 227: kit_probe: command not found
+```
+
+…and then **exited 0 with all fifteen assertions PASS**, including "the fetched
+stack came up healthy". `KIT_POSTGRES_DATABASES=kit_probe` had been swallowed
+into a command substitution and never reached the `.env` at all, so the line
+every other assertion was relying on was not there.
+
+This is the fourth comment-as-data failure in this release and the first one
+where the comment *did something* rather than merely satisfying a substring test.
+The general statement is now sharper than the one recorded above: **prose
+written into a construct that expands is not prose.** The fix is placement, not
+wording — the explanation moved above the `<<ENV`, where it cannot execute, and
+the heredoc body is nothing but assignments. The general rule for every heredoc
+in this repository is that a comment explaining one belongs *outside* it.
+
+### Fixed — the live stack test caught a regression that 214 static checks and 86 proofs passed
+
+Removing the `:-` fallback from `KIT_POSTGRES_DATABASES` — which is the whole
+point of entry 1 above, and which breakages 85 and 86 exist to insist on — broke
+`tests/stack_live_test.sh`, which had never declared a tenant because for its
+whole life the fallback had been doing it for them.
+
+Nothing noticed. The static gate ran 214 checks and the self-test ran 86
+breakage proofs, and every one of them was green, because every one of them
+reads the template or a service's committed files — and kit's own test harnesses
+are none of those. The live test was the only thing that brought the cluster up,
+and it said so in ten minutes and eight containers:
+
+```
+/docker-entrypoint-initdb.d/10-cluster.sh: line 48: KIT_POSTGRES_DATABASES:
+KIT_POSTGRES_DATABASES is unset. Name the services, comma-separated.
+bin/dev: stack did not become healthy
+```
+
+The init script was right and the harness was wrong, and the reason is worth
+stating because it is the general shape of this bug: **kit's own harness
+consuming kit's own template looks exactly like "the template broke."** A test
+that is also a consumer cannot tell the difference from the inside.
+
+Three things landed here.
+
+**A static check, so it costs a second and not ten minutes.** Every file under
+`tests/` that writes a `.env` carrying a `KIT_` variable must declare a tenant in
+the same heredoc body — derived from the files, so a harness written tomorrow is
+covered the day it is written. It reads the heredoc body rather than the file,
+because an assignment outside the heredoc does not reach the `.env` either, and
+it matches an assignment at the start of a line with a value rather than the
+substring `KIT_POSTGRES_DATABASES`, because this file's own `.env.example`
+mentions that name in prose and the comment above the heredoc mentions it too.
+Breakage 87 is its red proof. It exits 1 if no harness is found at all, so it
+cannot pass by finding nothing.
+
+**Three live assertions, so the file now proves the cluster was provisioned.**
+`stack_live_test.sh` previously asserted that eight containers came up healthy
+and telemetry flowed — and an empty `/docker-entrypoint-initdb.d` produces
+exactly that. It now asks the running server: that database `kit_probe` exists
+and is owned by role `kit_probe`, that the role exists and is **not** a
+superuser, and that `datacl` grants `PUBLIC` nothing. That last one is read by
+its empty-grantee shape (`=c/cafaye`) rather than by a search for the word
+`PUBLIC`, which appears in no `datacl` at all, and a NULL `datacl` is a failure
+rather than a skip because NULL means Postgres's defaults still stand — and the
+default is CONNECT to PUBLIC. Red proof: dropping the database and the role from
+the running container turns all three red, which is the state an empty initdb
+directory produces. It deliberately does not assert the cross-tenant refusal;
+`tests/isolation_test.sh` owns that claim and owns it better, and a second
+weaker copy of a fact that already has a home helps nobody.
+
+**A general note.** The lesson is not "write more static checks." It is that a
+repository has consumers nobody enumerated — its own test harnesses among them —
+and a template that got stricter moved the burden onto all of them at once. The
+static gate was green because nothing in it looked at the thing that broke.
+
 ### Fixed — the postgres accessory no longer publishes its port on every interface
 
 - **`templates/kamal/deploy.yml.erb` — one line deleted, and what replaces it is a

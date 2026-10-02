@@ -224,12 +224,48 @@ services:
       - ./payload:/payload:ro
 YAML
 printf '%s\n' "$PIN" >"$SERVICE/kit.ref"
+# This heredoc is UNQUOTED on purpose — `$REMOTE`, `$WORK` and the port
+# arithmetic have to expand. The price of that is that it is also a script: a
+# backtick in anything written between `<<ENV` and the closing `ENV` is a
+# command substitution and bash will run it. An earlier version of this comment
+# sat INSIDE the heredoc and every backticked word in it was executed —
+# `docker-compose.yml`, `bin/dev`, `isolation_test.sh`, `kit_probe` all came
+# back "command not found", the test still exited 0, and the line that was
+# supposed to declare the tenant never reached the `.env` at all. So prose about
+# this file goes HERE, and the heredoc below stays nothing but assignments.
+#
+# The one line below is here because the template now REQUIRES it.
+# `docker-compose.yml` passes `KIT_POSTGRES_DATABASES` through with no `:-`
+# fallback at all, on purpose: a shared-infrastructure template that defaults the
+# tenant list to one of its own services silently hands every adopter that
+# forgets to declare itself somebody else's database (measured on identity: it
+# asked for `identity`, the cluster provisioned `courier`). So the init script
+# refuses an unset list by name rather than inventing one.
+#
+# That refusal is correct, and it caught this file. With the fallback removed,
+# `bin/dev up` here exited non-zero with
+#
+#     10-cluster.sh: line 48: KIT_POSTGRES_DATABASES: KIT_POSTGRES_DATABASES is
+#     unset. Name the services, comma-separated.
+#
+# and the container exited 1 — a stack that could not start, which is the right
+# outcome for a consumer that declared nothing. This test WAS such a consumer,
+# and the reason is worth stating plainly: this file is kit's own harness
+# consuming kit's own template, so a harness that forgot to declare itself looks
+# exactly like "the template broke". `isolation_test.sh` was always a correct
+# consumer and already declared `ALPHA,BETA`; this one did not, and the only
+# thing that found out was the test that actually brings the cluster up.
+#
+# A consumer declares what it wants. `kit_probe` is named for this test and
+# nothing else, which also means the init script runs — so this file now proves
+# one more thing than it used to: that a declared tenant is really created.
 cat >"$SERVICE/.env" <<ENV
 KIT_STACK_URL=file://$REMOTE
 KIT_STACK_HOME=$WORK/cache
 KIT_STACK_NAME=$STACK_NAME
 KIT_GRAFANA_PORT=$PORT_BASE
 KIT_POSTGRES_PORT=$((PORT_BASE + 500))
+KIT_POSTGRES_DATABASES=kit_probe
 KIT_NATS_CLIENT_PORT=$((PORT_BASE + 600))
 KIT_NATS_MONITOR_PORT=$((PORT_BASE + 700))
 KIT_REDIS_PORT=$((PORT_BASE + 800))
@@ -325,6 +361,84 @@ if [ -z "$unhealthy" ]; then
   pass "every service that declares a healthcheck reports healthy ($checked of them)"
 else
   fail "these services are not healthy: $unhealthy"
+fi
+
+# ---------------------------------------------------------------------------
+# 1b. the cluster actually PROVISIONED the tenant it was told about
+# ---------------------------------------------------------------------------
+# This is the assertion the P0 above most needed and this file did not have.
+#
+# The bug being fixed was a bind mount whose source was a bare relative path, so
+# it resolved against the wrong directory and `/docker-entrypoint-initdb.d` came
+# up EMPTY. Docker does not complain about an empty bind source: the mount
+# succeeds, `postgres` initialises from its own defaults, every container reports
+# healthy, and every assertion above this line passes. The cluster was up and
+# held zero of the fleet's databases. That is why "the stack came up healthy"
+# was never going to catch it and why the live test was the only thing that did
+# — the static gate reads YAML, and correct YAML mounted the wrong directory.
+#
+# So this asks the running server, not the file that was supposed to reach it.
+# A tenant list that reached the init script produces a DATABASE and a ROLE that
+# both carry the name, with the role as owner, and NOT a superuser — the last
+# part is the assertion that a service cannot have quietly become an admin,
+# which is what the per-service POSTGRES_* overrides in two repos did.
+#
+# It deliberately does NOT assert the cross-tenant refusal. `isolation_test.sh`
+# owns that claim and owns it properly, with two tenants and a real refused
+# connection; repeating it here would be a second, weaker copy of a fact that
+# already has a home.
+db_query() {
+  docker compose -p "$PROJECT" exec -T postgres \
+    psql --no-psqlrc --quiet --username "${KIT_POSTGRES_USER:-cafaye}" \
+    --dbname "${KIT_POSTGRES_DB:-cafaye_platform}" --tuples-only --no-align \
+    --set=ON_ERROR_STOP=1 --command="$1" 2>/dev/null | tr -d '[:space:]'
+}
+
+tenant_db="$(db_query "select count(*) from pg_database where datname = 'kit_probe'")"
+tenant_owner="$(db_query "select coalesce(pg_get_userbyid(datdba), '') from pg_database where datname = 'kit_probe'")"
+tenant_role="$(db_query "select count(*) from pg_roles where rolname = 'kit_probe'")"
+# `rolsuper::int`, not `rolsuper`, and this is not a style choice. psql prints a
+# boolean as `t`/`f`, so comparing against the word `false` fails on a role that
+# is correctly NOT a superuser — the first version of this line did exactly that,
+# and reported a working cluster as broken. `-1` rather than `0` is the
+# no-such-role sentinel, so "the role is missing" and "the role is a superuser"
+# cannot print the same answer.
+tenant_super="$(db_query "select coalesce(max(rolsuper::int), -1) from pg_roles where rolname = 'kit_probe'")"
+
+if [ "$tenant_db" = "1" ] && [ "$tenant_owner" = "kit_probe" ]; then
+  pass "the initdb mount reached the running server: database kit_probe exists, owned by role kit_probe"
+else
+  fail "database kit_probe is missing or not owned by kit_probe (found=$tenant_db owner=${tenant_owner:-none}). \
+An empty /docker-entrypoint-initdb.d produces exactly this: a healthy cluster with none of the fleet's databases."
+fi
+
+if [ "$tenant_role" = "1" ] && [ "$tenant_super" = "0" ]; then
+  pass "role kit_probe exists and is not a superuser (NOSUPERUSER, so a service cannot admin the cluster)"
+else
+  fail "role kit_probe is missing (count=$tenant_role) or is a superuser (rolsuper=$tenant_super)"
+fi
+
+# A cluster that provisioned the tenant but left PUBLIC able to CONNECT to it has
+# no isolation at all, and that is the failure mode the whole one-database-per-
+# service design exists to prevent.
+#
+# The trap in reading `datacl`: Postgres does not print the word PUBLIC. A PUBLIC
+# entry is one with an EMPTY grantee — `=c/cafaye` is "PUBLIC has CONNECT, granted
+# by cafaye", while `kit_probe=CT/cafaye` is the role's own two privileges. So
+# this matches on the empty-grantee shape (`=`, a privilege letter, `/`) and not
+# on a substring, because a substring check for "PUBLIC" would pass on a database
+# where PUBLIC holds everything.
+#
+# `datacl` is NULL exactly when no privilege has ever been granted or revoked,
+# which is Postgres's way of saying "the defaults still stand" — and the default
+# is CONNECT to PUBLIC. A NULL here is therefore a FAIL, not a skip.
+tenant_acl="$(db_query "select coalesce(array_to_string(datacl, ','), '') from pg_database where datname = 'kit_probe'")"
+if [ -z "$tenant_acl" ]; then
+  fail "database kit_probe carries no ACL at all (datacl is null), so it still has Postgres's defaults and PUBLIC may CONNECT"
+elif printf '%s' "$tenant_acl" | grep -qE '(^|,)=[A-Za-z]*/'; then
+  fail "PUBLIC still holds a privilege on database kit_probe: $tenant_acl"
+else
+  pass "PUBLIC holds no privilege on database kit_probe (datacl=$tenant_acl)"
 fi
 
 # ---------------------------------------------------------------------------
