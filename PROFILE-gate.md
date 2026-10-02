@@ -1,5 +1,27 @@
 # Where kit's gate spends its time — the profile
 
+> **READ THIS FIRST — this file's headline number was wrong, and a later packet
+> found out why.** Everything below is kept as the record it was, but the
+> "~96% of the run" and the "~4,905 s" are arithmetic from a bad mean: the four
+> child gates that finished before that run was killed were **breakages 1, 2, 2b
+> and 3**, and all four already paid the full static phase. The 51.63 s mean was
+> then applied to all 94 as though none were filtered — which is the thing §4 of
+> this file had already counted correctly and then not used.
+>
+> **The corrected populations, measured (kit-gate-speed-02):**
+
+> | | measured |
+> | --- | ---: |
+> | one child gate, unfiltered `--static-only` | **42.70 s** |
+> | one child gate, `--only` one check | **7.88 s** |
+> | `self_test` | **~17 min before the `--only` reach, ~13 min after** — not 82 |
+> | share of `self_test` in the 73 ALREADY-filtered gates | **~85%** |
+>
+> So the target was never the 21 unfiltered recipes; it is the 73 filtered ones,
+> and the fix for them is overlap, not filtering. **§4 below is correct and was
+> acted on. The table and answers 1–3 should be re-derived before anyone quotes
+> them.** The reasoning is in `REPORT-kit-gate-speed-02.md` §2 and §3.
+
 **What this is.** The measurement `KIT_PROFILE` takes, and the table it produces.
 **What this is not.** An optimization. Nothing in this file was made faster; the
 next packet fixes whatever this table names, and a fix designed without this

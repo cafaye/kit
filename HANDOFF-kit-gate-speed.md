@@ -1,92 +1,96 @@
-# HANDOFF — kit-gate-speed-01
+# HANDOFF — kit-gate-speed-02
 
-**Read `PROFILE-gate.md` first.** It is the deliverable: the timing table, the
-three answers, and the caveats. This file is only what a successor needs to know
-about the state of the work.
-
-## What the packet was for
-
-`bash tests/validate.sh` takes far longer than ten minutes. Nobody was going to
-make it faster until someone said **where the time goes**. This packet built the
-measurement and wrote the table. **It optimized nothing**, deliberately: a fix
-designed without the profile is a guess, and the profile is the next packet's
-input.
+**Read `REPORT-kit-gate-speed-02.md` for the numbers. This file is the state of
+the work.** The short version: the change landed and is verified, and the
+premise it was handed was wrong by a factor of six — so the next worker should
+read §2 of the report before spending an hour on the line of work this one
+finished.
 
 ## Done and verified
 
-- **`KIT_PROFILE=<file>` instrumentation in `tests/validate.sh`** (commit
-  `4ca039f`). Five row kinds — `check`, `cpu`, `tier`, `phase`, `verdict` — plus
-  a `total` on the EXIT trap. `report` is the measurement site, so every printed
-  verdict has a number beside it.
-  - **Verified:** `shellcheck -S warning` clean; `bash -n` clean; and a full
-    `--static-only` run's **stdout and stderr are byte-identical** with the
-    profiler on and off (`diff` empty in both). That is the load-bearing
-    property, because `--only` and `self_test.sh` both read the gate's output by
-    position.
-  - **Verified:** `bash tests/validate.sh --static-only` → **exit 0** with the
-    instrumentation in place.
-- **`PROFILE-gate.md`** (commit `b4c9772`) — the table, from one instrumented
-  run.
+- **`--only` now reaches every recipe in `tests/self_test.sh` that it can reach**
+  (commit `c556dda`). Breakages 2, 2b, 3, 4, 5 and 6 moved from `expect_red` to
+  `expect_red_check`; `expect_green_check` (59) and `expect_skip_check` (23b)
+  grew the same four-line filter block. Gate-running recipes without a filter:
+  **9 → 3.**
+  - **Verified:** every candidate filter was probed against its own mutation on
+    its own tree first, and every one printed `FAIL <the named check>` — table in
+    the report §4b, with times.
+  - **Verified:** the control. An unbroken tree under breakage 6's filter exits 0
+    and prints `PASS .github/workflows/ci.reusable.yml  (opt-in telemetry job,
+    defaults intact)`. A filter that only ever fails is not a proof.
+  - **Verified:** `timeout 900 bash tests/self_test.sh`, run in the background.
+    23 recipes reached, **23 PASS, 0 FAIL** — including the unbroken-tree
+    control and all six conversions, each naming its check.
+  - **Verified:** `bash -n` clean, `shellcheck -S warning` clean, and the two
+    counts `tests/validate.sh` derives from this file are **unchanged** (94
+    breakages, 92 reds) because `expect_red_check` was already in both patterns.
+  - **Verified:** `tests/validate.sh` is **not modified** by this commit. The
+    gate's printed output — the load-bearing part — is byte-for-byte what it was.
+- **Six proofs got stronger, not just faster.** `expect_red` asserted only "the
+  gate went red"; each of the six now asserts `FAIL <the check it names>`, and
+  each label is a variable so a rename on either side breaks the file loudly.
 
-## Half-done, and why
-
-- **The instrumented run was terminated at 569.0 s, inside `self_test` breakage 3
-  of 94.** Not a check failure and not a hang: `self_test` is 94 whole gates in
-  sequence at 51.63 s each, which is 82 minutes, and the packet's budget was one
-  hour. The termination was external (my own shell was killed and took the
-  process group with it), and there was no budget left to re-run.
-  **Consequence: the "biggest check", "top-three share" and "process count"
-  answers rest on a projection from the four child gates that finished**, and are
-  labelled as projections everywhere they appear.
-- **The next run needs an hour of wall clock and no interference.** The cheapest
-  way to get an un-truncated number is `KIT_PROFILE=… bash tests/self_test.sh`
-  on a quiet box — that measures the 96% directly instead of projecting it.
-- **`tests/self_test.sh` does not set `--only` for 21 of its 94 recipes.** Named
-  in the profile, **not fixed** — it is an optimization and this packet does no
-  optimizations.
-
-## The numbers that matter
+## Measured, and what it says about the plan
 
 | | |
 | --- | --- |
-| biggest single cost | **`tests/self_test.sh`, ~96% of the run** (~4,905 s of ~5,103 s) |
-| runner-up | `tests/no_telemetry_in_readiness.sh`, 63.2 s (1.24%) |
-| third | `tests/stack_live_test.sh`, 43.6 s (0.85%) |
-| top three together | **98.2%** projected, 84.0% on the truncated run |
-| processes per full run | **~19,650 forks** from the gate's own spawn sites; **~41,000 more** from the profiler when it is on |
-| one child gate | **51.63 s mean**, **113.6 timed checks** |
+| one child gate, unfiltered `--static-only` | **42.70 s** |
+| one child gate, `--only` one check | **7.88 s** |
+| the 6 converted recipes, each on its own mutated tree | **7.87 s mean** |
+| this packet's total saving | **~256 s (~4.3 min)** |
+| `self_test` | **~17 min before, ~13 min after** — not the 82 the handoff claimed |
+
+## Half-done, and why
+
+- **The full `bash tests/validate.sh` was not re-run.** It does not fit beside a
+  bounded `self_test` in one hour, and the packet allows the committed BEFORE
+  numbers as the comparison. The report's full-gate figure is **arithmetic on
+  measured parts** and is labelled that way in all four places it appears.
+  `logs-profile-after.tsv` was **not** written; there is no AFTER TSV in this
+  branch.
+- **The bounded `self_test` run did not reach the end.** It reached breakage ~23
+  of 94 in 900 s on a box running several gates at once — ~15 s per recipe there
+  against 7.87 s measured in isolation. Breakages 24–92 are **unexercised by this
+  packet**. They were not touched by the commit (only the three helpers' argument
+  handling changed, and `expect_red_check`, which carries 73 of them, is
+  untouched), but "unexercised" is the honest word. `AGENTS.md` says what to do
+  about a `BOUND` self_test: run the unreached recipes by hand.
+- **The worktree's own root gate exits 1**, on two FAILs that name
+  `wt-m39-core-rls-scan-01` — another session's live git worktree parked inside
+  this one (created 21:46, on `worker/core-rls-scan-01`, still being written to).
+  Not mine, not touched; `fresh_copy` copies a fixed path list that excludes it,
+  so every child gate and every proof in this packet ran on a clean tree. It
+  should disappear when that session ends. **If it is still there, the root gate
+  is red for that reason and nothing else.**
 
 ## The next worker's first move
 
-**Build the `--only` reach first, then parallelize `self_test` — in that order.**
+**Overlap the child gates. Do not touch `--only` again — it is done.**
 
-1. **`--only` for the other five recipe helpers.** It is a one-line change per
-   helper in `tests/self_test.sh` (append `--only=<the check the recipe names>`,
-   exactly as `expect_red_check` already does) and it takes the suite from ~47×
-   to the ~60× the comments already claim. **21 of 94 recipes pay the full static
-   phase today.** Cheapest, lowest-risk, and it needs no architectural argument.
-2. **Then overlap the child gates.** They are independent by construction —
-   `fresh_copy` already gives each breakage its own parent directory precisely so
-   they cannot see each other. That is the 82 minutes.
-3. **Only then** look at `no_telemetry_in_readiness.sh` (63 s) and
-   `stack_live_test.sh` (44 s). Together they are 2.1% of the run, so they are
-   worth doing last and not at all if 1 and 2 land.
+1. **The 73 already-filtered child gates are 85% of `self_test`** (73 × 7.87 s of
+   ~774 s), and they are independent by construction: `fresh_copy` gives every
+   breakage its own parent directory precisely so they cannot see each other.
+   `KIT_SELF_TEST_SHARD` already exists (`tests/self_test.sh`, `_shard_claims`)
+   and is the natural seam — a bounded pool of `n` parallel workers, one shard
+   each. **Four workers is the obvious first number to try**, and the honest
+   ceiling is `min(4, cores)`; measure cores before choosing it.
+2. **A shard run must not change the summary.** `_shard_ran` and
+   `_shard_claimed_total` already exist for this; the risk is a shard reporting
+   a number that is true for itself and false for the suite.
+3. Only then `no_telemetry_in_readiness.sh` (63 s) and `stack_live_test.sh`
+   (44 s) — 2.2% of the corrected run. Worth doing last, as planned.
 
-**Do not touch `check`/`check_par`/`bounded_check` to make the profiler
-cheaper** — the profiler costs ~41,000 processes on a run of ~19,650, which is
-the honest price of a measurement, and it is off by default.
+**Do not make `--only` reach `report`-based verdicts to serve breakage 1.** It
+would mean threading a filter through every `report` call site in a 10,554-line
+gate, for 35 s. Measured and left alone, and the report says so.
 
-## A collision to know about
+## The measurement to distrust in `PROFILE-gate.md`
 
-Three commits by **another session** landed on this branch and worktree while
-this packet was running: `66526f4` (added the `KIT_PROFILE` base **and**
-`tests/profile_report.py`, **and** the `KIT_PROFILE_TAG` exports in
-`tests/self_test.sh` that made per-breakage attribution possible), `38b2e14`
-(a `staleness_test.sh` change) and `d32b71c`. Only `4ca039f` and `b4c9772` are
-this packet's. `tests/validate.sh` was last modified at 21:09:37, before the
-profiled run launched at 21:13:01, so **the script under measurement was not
-edited mid-run**; but `tests/staleness_test.sh` changed at 21:15 and
-`tests/profile_report.py` appeared at 21:16, so child gates copied after 21:15
-ran a slightly different tree than the ones before. The effect is a few seconds
-per child gate against a 51.63 s mean, and it does not change any conclusion —
-but a successor re-measuring should know the tree was moving.
+Its headline — `self_test` is ~96% of the run, ~4,905 s — is **arithmetic from a
+bad mean**. The four child gates that finished before that run was killed were
+breakages 1, 2, 2b and 3, and **all four already paid the full static phase**;
+the 51.63 s mean was then applied to all 94 as though none were filtered. The
+corrected population is two numbers, 42.70 s and 7.88 s, and §2 of the report has
+the arithmetic. Its §4 is right and this packet acted on it; its table and its
+first three answers should be re-derived before anyone quotes them again.
