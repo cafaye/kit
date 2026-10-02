@@ -13,6 +13,67 @@ it without a copy (see kit-12 below).
 
 ## Unreleased
 
+### Added — the account boundary's own advisor: the database grades its own policies
+
+- **`templates/database/tenancy/advisor.sql`.** Eight row-level-security rules as
+  one SQL function, `cafaye.advisor_findings(p_schemas text[])`, answering with
+  one row per finding in the shape `(name, level, facing, categories,
+  description, detail, remediation, metadata, cache_key)`. The **database** is the
+  layer that can see what a migration-as-text and a set of denials cannot: a
+  policy whose predicate is `true` satisfies every assertion in `isolation.sql`,
+  because a permissive predicate RETURNS ROWS and a denial cannot tell
+  permitted-by-predicate from permitted-by-accident; and two permissive policies on
+  one (table, role, command) combine with **OR**, which no file scanner reads.
+  The rules are ported from the shape of Supabase's database advisor and are
+  **written from scratch against this fleet's catalogs** — nothing is vendored,
+  per that project's own MIT-licensed-advisor rule and this repository's
+  no-copy-from-`moon/refs/` rule. Every substitution is stated at the point it
+  happens: `anon`/`authenticated` → any non-owner LOGIN role (so the
+  source's anonymous-vs-signed-in distinction collapses and two rules become
+  four-word rules rather than four), `pgrst.db_schemas` → the `p_schemas`
+  argument, `auth.uid()` → `cafaye.current_account_id()`,
+  `pg_policies` → `pg_policy` + `pg_get_expr()` (the source reads a materialized
+  view their platform refreshes), `facing = EXTERNAL` dropped, and the
+  documentation-URL `remediation` replaced by the SQL that fixes the finding.
+- **`rls_references_user_metadata` gained a CATALOG half.** The source rule is that
+  `auth.users.user_metadata` is user-editable, and the source *admits* it cannot
+  do better than a string match. Postgres records a policy's dependencies, so
+  "does this predicate read a table a login role may `INSERT` or `UPDATE`" is a
+  question about `pg_depend`: a service keeping a `profile_flags` table and writing
+  `using (exists (select 1 from profile_flags f where f.is_admin))` has built its
+  own `user_metadata` and the keyword half can never find it. The keyword half is
+  kept, caveat intact.
+- **`multiple_permissive_policies` carries an exemption, and the exemption has a
+  control.** A credential table holds FIVE policies, so `(api_keys, <owner>,
+  SELECT)` holds two permissive ones permanently — that is MD24's mechanism, and
+  they combine as `account_id = the session's account OR token_digest = the digest
+  presented`. The rule stays at `WARN` and unsoftened; a group is exempt when
+  **every** policy in it was written by the substrate, which is an all-of
+  condition, so a hand-written sixth is not exempt. `tests/tenancy_test.sh` plants
+  one and requires the rule to fire *and name it*.
+- **`tests/tenancy_test.sh` runs it, three ways.** Zero `ERROR`/`WARN` against the
+  two tables a service's migration writes, over a scope **derived** from the
+  policies `protect_table` created; the exemption released by one hand-written
+  policy, asserted to clean up after itself; and every rule fired on a fixture
+  built to trip it, each naming itself and its table, scoped to the fixture schema
+  alone so no rule is satisfied by whichever other rule happened to return a row.
+- **Measured on the way in, and it shaped the file.** `pg_get_expr` deparses a
+  name unqualified whenever the **reader's** `search_path` resolves it, and
+  `"$user"` is a search_path entry: the same substrate policy reads as
+  `cafaye.current_account_id()` for role `alpha` and as `current_account_id()` for
+  role `cafaye`, whose `"$user"` schema is `cafaye`. Every regexp therefore accepts
+  both forms, and says why. Requiring the qualified form alone would make
+  `multiple_permissive_policies` report MD24's own policy as hand-written, and
+  make `auth_rls_initplan` silently miss a bare call, to exactly the reader least
+  likely to know why. `cafaye.credential_tables()` reads the qualified form only
+  and returns nothing at all in that second session — a latent substrate issue,
+  recorded rather than fixed here, because `substrate.sql` was out of scope.
+- `assertions.txt` is **unchanged**: the advisor answers a different question with a
+  different row shape, and the manifest names `isolation.sql`'s assertions.
+- Gate shape: `tests/validate.sh` (the `.sql` parse-loop arm and the presence
+  check) and `tests/artifacts.json` (`database/tenancy/advisor`, optional, with the
+  same "optional is not the same as unexamined" argument the substrate makes).
+
 ### Fixed — the `--only` conversion on breakage 59, which could not have held
 
 - **`expect_green_check` no longer appends `--only=<the check the recipe names>`,

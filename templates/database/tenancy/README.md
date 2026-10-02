@@ -21,6 +21,10 @@ substrate.sql     apply once, as the OWNER role.  the identity seam,
 assertions.txt    the manifest. What the proof is supposed to assert, by name.
 isolation.sql     the assertion set. Run it; it answers with one row per
                   assertion, and a driver compares the NAMES against the manifest.
+advisor.sql       the DATABASE grading itself. Load it; call
+                  cafaye.advisor_findings(); it answers with one row per
+                  finding, each naming a rule, the object it fired on, and the
+                  SQL that fixes it.
 README.md         this file.
 <lang>/tenancy_test.*   six drivers, one per language, that run the assertion
                   set and check it against the manifest.
@@ -337,8 +341,71 @@ about the account.
    expires at the end of the statement that set it, so a caller reaching the
    database in autocommit reads zero rows. That cannot leak and it is loud.
 
+## What the advisor is for, and what it is not
+
+`isolation.sql` and the six drivers ask **does the boundary HOLD**. `advisor.sql`
+asks the other question — **are these policies WRITTEN correctly** — and it is the
+only file here that can ask it.
+
+Every assertion in `isolation.sql` is satisfied by a policy that permits
+everything. A permissive predicate RETURNS ROWS, so a denial cannot tell
+"permitted because the predicate said so" from "permitted by accident". The same
+applies to a policy that is simply *inert*: `policy_exists_rls_disabled` is a table
+whose policies exist and whose `relrowsecurity` is false, and it reads as correct
+in review. Nor can a file scanner see that two permissive policies on one
+(table, role, command) combine with **OR** and the table is wider than either
+reads on its own.
+
+Eight rules, all run by `tests/tenancy_test.sh` against a real cluster:
+
+| rule | level | what it finds |
+|---|---|---|
+| `policy_exists_rls_disabled` | ERROR | policies that exist and enforce nothing |
+| `rls_disabled_in_public` | ERROR | no RLS on a table a login role can `SELECT` |
+| `rls_policy_always_true` | WARN | a permissive qualifier that is always `true`, or a NULL clause on a permissive write |
+| `rls_references_user_metadata` | ERROR | a policy deciding access from rows **the caller can write** |
+| `multiple_permissive_policies` | WARN | more than one permissive policy per (table, role, command) |
+| `login_role_security_definer_executable` | WARN | a `SECURITY DEFINER` function the login role can run |
+| `auth_rls_initplan` | WARN | an identity call not wrapped in `(select …)` |
+| `rls_enabled_no_policy` | INFO | RLS on with no policy: nothing leaks, nothing is readable either |
+
+Two of those need their reasoning read rather than skimmed.
+
+**`rls_references_user_metadata` is the reason the rule earns `ERROR`.** The
+original rule — the one this is ported from — is that
+`auth.users.user_metadata` is editable by the end user, so a policy consulting it
+consults something the user controls, and the original *admits it cannot do better
+than a string match*. This one does better on the half that matters: Postgres
+records a policy's dependencies, so "does this predicate read a table a login role
+may `INSERT` or `UPDATE`" is a question about `pg_depend` and not about the text.
+A service keeping a `profile_flags` table and writing `using (exists (select 1
+from profile_flags f where f.is_admin))` has built its own `user_metadata`; the
+word `user_metadata` appears nowhere in it. The keyword half is kept too, caveat
+intact, so the rule is the original's findings and one more.
+
+**`multiple_permissive_policies` and MD24.** A credential table carries FIVE
+policies, so `(api_keys, <owner>, SELECT)` holds two permissive ones *by design* —
+that is the mechanism, and they combine as
+`(account_id = the session's account) OR (token_digest = the digest presented)`.
+The rule stays at `WARN` and unsoftened, and the exemption is **its own semantics**:
+a (table, role, command) group is exempt when **every** policy in it was written
+by the substrate. That is an all-of condition, so a hand-written sixth policy on
+`api_keys` is not exempt — and `tests/tenancy_test.sh` plants exactly one and
+requires the rule to fire and name it. An allowlist of policy *names* would have
+been a ratchet instead of an exemption.
+
 ## What this does not prove
 
+- **That a policy's predicate is the RIGHT predicate.** The advisor finds `true`,
+  and it finds a table the caller can write. It cannot tell a policy that is
+  subtly too wide from one that is exactly right, because "right" is a property of
+  the service's data model and no catalog holds it.
+- **That the login role is not a member of the owner role**, that it holds no
+  `BYPASSRLS`, and that a protected table's `FORCE` is set. `advisor.sql` has no
+  rule for the last one **on purpose**: `unprotected_tables()` names it and
+  `isolation.sql` asserts it by RUNNING the denials as the owner, because a
+  catalog reading can be satisfied by a table nobody reads. One file claiming all
+  three would mean one file where a reader looks for the proof and finds a column.
 - **That a service sets the identity.** `begin_account/1` is one call in one place
   and nothing here can tell a service that never calls it from one that calls it
   in every request. A service that forgets reads zero rows: safe, and extremely
