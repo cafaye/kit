@@ -191,7 +191,11 @@ processors:
       - service.name
       - service.version
       - service.instance.id
+      - service.namespace
       - deployment.environment
+      - telemetry.sdk.name
+      - telemetry.sdk.language
+      - telemetry.sdk.version
       - cafaye.stashed.tenant_id
       - cafaye.stashed.account_id
     allowed_keys:
@@ -251,7 +255,11 @@ processors:
       - service.name
       - service.version
       - service.instance.id
+      - service.namespace
       - deployment.environment
+      - telemetry.sdk.name
+      - telemetry.sdk.language
+      - telemetry.sdk.version
       - cafaye.stashed.tenant_id
       - cafaye.stashed.account_id
     allowed_keys:
@@ -291,7 +299,11 @@ processors:
       - service.name
       - service.version
       - service.instance.id
+      - service.namespace
       - deployment.environment
+      - telemetry.sdk.name
+      - telemetry.sdk.language
+      - telemetry.sdk.version
       - cafaye.stashed.tenant_id
       - cafaye.stashed.account_id
     # The MEASUREMENT dimensions, and nothing else. This list is what core's
