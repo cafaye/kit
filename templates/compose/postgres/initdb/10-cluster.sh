@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #
-# One Postgres CLUSTER. One DATABASE per service. One ROLE per service.
+# One Postgres CLUSTER. One DATABASE per service. TWO ROLES per service: an owner,
+# and a login role that owns nothing.
 #
 # This is the whole of kit's isolation contract, and database-per-service is
 # why the cluster is shared rather than one-per-service: the DATABASE is the
@@ -13,7 +14,44 @@
 # every database in the cluster, so "cannot read another service's data" becomes
 # a GRANT somebody has to remember to withhold. One role per service makes the
 # refusal structural: there is no second credential to leak and no grant to get
-# right, because the ONLY role holding CONNECT on `billing` is `billing`.
+# right, because the ONLY role holding CONNECT on `billing` is `billing`'s.
+#
+# WHY TWO, AND WHY ONE OF THEM LOGS IN. This is the account boundary inside one
+# service's own database, and `templates/database/tenancy/` is what enforces it.
+# The only part of that which belongs here is the roles, because Postgres exempts
+# a table's OWNER from its own row-level-security policies and the owner of these
+# tables is the role the service's migrations run as — which, before this line
+# existed, was also the role the application logged in as. A login role that owns
+# its tables can `ALTER TABLE ... DISABLE ROW LEVEL SECURITY` and can `DROP
+# POLICY`, so a service's account policies were one privilege away from meaning
+# nothing, and nothing about them would have said so.
+#
+#   <service>       the OWNER. LOGIN, owns the database and every table, runs
+#                   migrations. UNCHANGED: adopting the tenancy templates does not
+#                   change how a service builds its schema.
+#   <service>_app   the LOGIN the application uses. Owns nothing. Granted DML per
+#                   account-scoped table by `cafaye.protect_table`, and nothing
+#                   else: no ownership, no DDL, no ability to alter a policy.
+#
+# `FORCE ROW LEVEL SECURITY` is the other half and it is deliberately NOT done
+# here, because it is a property of a table rather than of a cluster, and doing it
+# cluster-wide would enable it on tables that have no policies yet — a table whose
+# only privilege is then its owner's becomes unreadable by everybody, mid-migration.
+# `templates/database/tenancy/substrate.sql` does it per table, and
+# `isolation.sql` asserts it by running the denials AS THE OWNER, which is the
+# only way to assert it that a policy merely being present cannot satisfy.
+#
+# WHY THE REVOKE IS HERE AND NOT LEFT TO THE OPERATOR. Postgres grants CONNECT
+# on every database to PUBLIC by default, including ones created after this
+# script runs. A cluster provisioned without these lines therefore has, by
+# default, NO isolation: every role in the fleet can open every database. It
+# fails open and silently, and the symptom is a cross-service query that works
+# in development and is a report in production.
+#
+# It is also per-database and per-run. An operator who adds a database by hand
+# gets Postgres's default rather than this contract, which is why
+# `templates/bin/dev.sh`'s `db grant` prints the exact statements for one new
+# database instead of assuming they happened.
 #
 # WHY THE REVOKE IS HERE AND NOT LEFT TO THE OPERATOR. Postgres grants CONNECT
 # on every database to PUBLIC by default, including ones created after this
@@ -155,6 +193,12 @@ for entry in "${entries[@]}"; do
 
   service="$trimmed"
   require_identifier service "$service"
+  # The login role. A separate name rather than a flag, because it is derived from
+  # the service name and deriving it means there is no way for the two to disagree:
+  # a service that wanted an app role under a different name would need an
+  # override, and an override is a second thing to configure per service.
+  app_role="${service}_app"
+  require_identifier login-role "$app_role"
   note "provisioning $service"
 
   # ONE STATEMENT PER psql CALL for the two below, and this is measured rather
@@ -174,6 +218,35 @@ for entry in "${entries[@]}"; do
   admin --set=svc="$service" --set=pw="$POSTGRES_PASSWORD" <<'SQL' >/dev/null
 CREATE ROLE :"svc" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
   PASSWORD :'pw';
+SQL
+
+  # THE LOGIN ROLE, and the `GRANT` that makes the whole thing possible.
+  #
+  # It is created here, with everything else, because `templates/database/README.md`
+  # already says a role is created in exactly one place and this is that place. It
+  # has no privilege beyond CONNECT on its own database; `cafaye.protect_table`
+  # grants the DML, per table, in the service's own migrations.
+  #
+  # `GRANT "…"_app TO "…"` is the membership that lets the OWNER impersonate the
+  # weaker role, which is what `templates/database/tenancy/isolation.sql` and
+  # `tests/isolation_test.sh` both do to prove the boundary from the outside. The
+  # DIRECTION is the whole point and it is asymmetric by design:
+  #
+  #   owner -> app     allowed, and it is a strict weakening: the owner can become
+  #                    something that can do less. This is how a proof is written.
+  #   app -> owner     FORBIDDEN, and it is what the design is for. The reverse
+  #                    membership would hand the application every privilege the
+  #                    owner has, which is every privilege on every table.
+  #
+  # A service that is told "your login role cannot disable RLS on your own tables"
+  # has to be able to be believed, and that belief is only as good as the absence
+  # of this membership in the other direction. `tenancy.yml`'s declarations and the
+  # adoption packet check it; nothing in this script can, because a service may
+  # legitimately grant it.
+  admin --set=app="$app_role" --set=svc="$service" --set=pw="$POSTGRES_PASSWORD" <<'SQL' >/dev/null
+CREATE ROLE :"app" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
+  PASSWORD :'pw';
+GRANT :"app" TO :"svc";
 SQL
 
   # The database, OWNED by that role. Ownership is what makes the schema grants
@@ -205,13 +278,25 @@ SQL
   #                           cluster-wide and grows every table on the box. On
   #                           one database per machine this is one service's
   #                           problem; on one cluster it is nine services'.
-  admin --set=svc="$service" --set=conn_limit="$role_connection_limit" \
+  #
+  # The app role gets CONNECT and the same two timeouts, and deliberately NOT a
+  # CONNECTION LIMIT. `templates/database/README.md` states that the per-role limit
+  # is a service's SHARE of the cluster's connection budget, and the budget is nine
+  # services' worth rather than eighteen roles' worth — a service that has adopted
+  # the tenancy templates opens its connections as `<service>_app`, so the limit has
+  # to be reachable from there. A service that has not adopted them connects as
+  # `<service>` and is bounded exactly as before, which is the point: adding this
+  # role changes nothing at all for a service that does not use it.
+  admin --set=svc="$service" --set=app="$app_role" --set=conn_limit="$role_connection_limit" \
     --set=stmt_ms="$statement_timeout_ms" --set=idle_ms="$idle_in_transaction_ms" <<'SQL' >/dev/null
 REVOKE ALL ON DATABASE :"svc" FROM PUBLIC;
 GRANT CONNECT, TEMPORARY ON DATABASE :"svc" TO :"svc";
+GRANT CONNECT, TEMPORARY ON DATABASE :"svc" TO :"app";
 ALTER ROLE :"svc" CONNECTION LIMIT :conn_limit;
 ALTER ROLE :"svc" SET statement_timeout = :'stmt_ms';
 ALTER ROLE :"svc" SET idle_in_transaction_session_timeout = :'idle_ms';
+ALTER ROLE :"app" SET statement_timeout = :'stmt_ms';
+ALTER ROLE :"app" SET idle_in_transaction_session_timeout = :'idle_ms';
 SQL
 
   # PG15 REMOVED the default `CREATE` grant on the `public` schema, so a role
@@ -339,4 +424,4 @@ END
 $caf$;
 SQL
 
-note "done: $provisioned service database(s), one role each, PUBLIC holds CONNECT on none of them"
+note "done: $provisioned service database(s), an owner and a non-owner login role each, PUBLIC holds CONNECT on none of them"

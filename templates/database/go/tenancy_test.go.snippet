@@ -1,0 +1,254 @@
+//go:build tier_db
+
+// kit template — the account-isolation assertion set, as a Go test.
+//
+//	# go get github.com/jackc/pgx/v5
+//	# go test -tags tier_db -count=1 ./db/tenancy/
+//
+// WHAT THIS FILE IS, AND WHY IT IS THIN.
+//
+//	The assertion set is `isolation.sql`, beside this file. It is one file for
+//	all six languages because the assertions are about POSTGRES rather than about
+//	a language: the denial a request meets is a denial the server returns. What
+//	is language-specific is the plumbing — which driver, how a row set comes
+//	back, and where the DSN comes from — and that is what is below.
+//
+//	Thin is safe here for one reason and one reason only: this test compares the
+//	NAMES it got back against `assertions.txt`, also beside this file, and fails
+//	on a difference in either direction. An isolation.sql that quietly stopped
+//	asserting something is a red this test, not a green one. Without that
+//	comparison a thin driver is a decoration — it would happily report "no red
+//	rows" about a proof that had been reduced to three assertions.
+//
+// THE BUILD TAG. `//go:build tier_db` is the declaration `templates/tier/`
+// describes, and this file uses it for the same reason that file does: the
+// toolchain reads it, so the inventory `go test -tags tier_db -list` produces
+// cannot drift from the tests that exist. This test needs a real database, and a
+// test that needs one and is not tagged for it is a test that runs in a
+// developer's unit-test run and fails there.
+//
+// THE DSN. `TEST_DATABASE_URL`, and it must be the role that may `SET ROLE` —
+// the OWNER, whose password a service already has for migrations. kit's cluster
+// grants `<service>_app` to `<service>` precisely so the weaker role can be
+// impersonated, and impersonating a strictly weaker role cannot widen anything.
+//
+//	REQUIRED_DB=1   turns a missing DSN from a skip into a FAILURE. A skip is a
+//	                green run that never opened a connection, and a green run is
+//	                the exact thing this file exists to contradict.
+package tenancy
+
+import (
+	"context"
+	"fmt"
+	"os"
+	"path/filepath"
+	"runtime"
+	"sort"
+	"strings"
+	"testing"
+	"time"
+
+	"github.com/jackc/pgx/v5"
+)
+
+// result is one row of the proof's answer: what was asserted, what was expected,
+// what happened, and why the assertion exists at all.
+type result struct{ expected, actual, verdict, why string }
+
+// TIER is the tier this file belongs to, in the form `caf gate`'s collector
+// reads. A no-op at runtime: nothing imports it and no test depends on it.
+const TIER = "db"
+
+// oneMinute is the whole budget for the proof.
+//
+// Bounded rather than defaulted because a hang here is a hang in the service's
+// gate, and an unbounded database test is how a suite gets disabled. The script
+// runs in one transaction against a local cluster and touches three rows, so a
+// minute is generous by an order of magnitude; the number that matters is that
+// there IS one.
+const oneMinute = time.Minute
+
+func TestAccountIsolation(t *testing.T) {
+	dsn := os.Getenv("TEST_DATABASE_URL")
+	if dsn == "" {
+		if os.Getenv("REQUIRED_DB") == "1" {
+			t.Fatal("REQUIRED_DB=1 and TEST_DATABASE_URL is unset: the account-isolation " +
+				"proof cannot run, and a skipped proof is a green run that proved nothing. " +
+				"Start the database, or unset REQUIRED_DB to skip this tier on purpose.")
+		}
+		t.Skip("TEST_DATABASE_URL is unset; the db tier is not required in this run")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), oneMinute)
+	defer cancel()
+
+	conn, err := pgx.Connect(ctx, dsn)
+	if err != nil {
+		t.Fatalf("connect to TEST_DATABASE_URL: %v", err)
+	}
+	defer func() { _ = conn.Close(ctx) }()
+
+	// The proof, run whole and unexamined. It opens a transaction and leaves it
+	// open, because two of the things it does refuse to do outside one; every
+	// object it creates is TEMPORARY, so nothing survives the session either way.
+	//
+	// pgx sends a statement with no bind parameters over the simple protocol, which
+	// is the one that accepts a multi-statement batch — the extended protocol binds
+	// them into a single prepared statement and rejects a script.
+	script, err := os.ReadFile(here(t, "isolation.sql"))
+	if err != nil {
+		t.Fatalf("read isolation.sql: %v", err)
+	}
+	if _, err := conn.Exec(ctx, string(script)); err != nil {
+		t.Fatalf("isolation.sql did not complete: %v", err)
+	}
+
+	// The result table, read with ONE single-statement query rather than by asking
+	// the batch for its last result set. That is what lets this driver stay this
+	// short: every driver in every language can execute a script and then ask a
+	// question, and none of them has to know how its own driver reports the rows
+	// of a multi-statement batch — which differs in all six.
+	rows, err := conn.Query(ctx, `
+		select assertion, expected, actual, verdict, why
+		  from pg_temp.cafaye_probe_result
+		 order by assertion`)
+	if err != nil {
+		t.Fatalf("read the assertion results: %v", err)
+	}
+
+	got := map[string]result{}
+	for rows.Next() {
+		var name string
+		var r result
+		if err := rows.Scan(&name, &r.expected, &r.actual, &r.verdict, &r.why); err != nil {
+			t.Fatalf("scan an assertion result: %v", err)
+		}
+		got[name] = r
+	}
+	rows.Close()
+	if err := rows.Err(); err != nil {
+		t.Fatalf("iterate the assertion results: %v", err)
+	}
+
+	// Roll the proof's transaction back rather than leaving it open. Everything it
+	// created is temporary and would go with the session, but a test that leaves a
+	// transaction open makes every test after it run inside it.
+	if _, err := conn.Exec(ctx, "rollback"); err != nil {
+		t.Fatalf("roll back the proof's transaction: %v", err)
+	}
+
+	assertComplete(t, got)
+	assertAllPass(t, got)
+}
+
+// assertComplete — the assertion set is EXACTLY the one assertions.txt names.
+//
+// Both directions, and both are needed. A missing name means the proof stopped
+// asserting something, which a "no failures" assertion would report as a pass. An
+// extra name means the proof grew something the driver does not know about, which
+// means the driver and the proof have separated and the next edit to either is
+// made against a stale idea of the other.
+func assertComplete(t *testing.T, got map[string]result) {
+	t.Helper()
+	want := readManifest(t)
+
+	var missing, unexpected []string
+	for _, name := range want {
+		if _, ok := got[name]; !ok {
+			missing = append(missing, name)
+		}
+	}
+	for name := range got {
+		if !contains(want, name) {
+			unexpected = append(unexpected, name)
+		}
+	}
+	sort.Strings(missing)
+	sort.Strings(unexpected)
+
+	if len(missing) > 0 {
+		t.Errorf("the proof did not return %d of the %d assertions it is supposed to make: %s",
+			len(missing), len(want), strings.Join(missing, ", "))
+		t.Error("  A missing assertion is a green suite proving less than it says. isolation.sql and")
+		t.Error("  assertions.txt have drifted apart; isolation.sql is the one that moved.")
+	}
+	if len(unexpected) > 0 {
+		t.Errorf("the proof returned %d assertion(s) assertions.txt does not name: %s",
+			len(unexpected), strings.Join(unexpected, ", "))
+		t.Error("  A new assertion has to be listed in assertions.txt before it counts, or it is")
+		t.Error("  invisible to every service that adopted this.")
+	}
+}
+
+// assertAllPass — every assertion that came back, and its reason when it did not.
+//
+// The `why` is printed with the failure because it is the only place the shape of
+// the assertion is recorded. A report that says `owner/another-tenants-rows-read-as-none` and
+// stops is a filename; one that also says what that assertion is for is a
+// diagnosis.
+func assertAllPass(t *testing.T, got map[string]result) {
+	t.Helper()
+	var failed []string
+	for name, r := range got {
+		if r.verdict != "pass" {
+			failed = append(failed, fmt.Sprintf(
+				"\n  %s\n    expected %q\n    actual   %q\n    because   %s",
+				name, r.expected, r.actual, r.why))
+		}
+	}
+	if len(failed) > 0 {
+		sort.Strings(failed)
+		t.Errorf("%d of %d account-isolation assertions failed:%s",
+			len(failed), len(got), strings.Join(failed, ""))
+	}
+}
+
+// readManifest — the names assertions.txt lists, comments and blanks dropped.
+//
+// A comment is dropped rather than skipped because the file's own comments quote
+// assertion names to explain the shape; reading one as an assertion would report
+// a name the proof does not return, which is a red on a correct tree.
+func readManifest(t *testing.T) []string {
+	t.Helper()
+	raw, err := os.ReadFile(here(t, "assertions.txt"))
+	if err != nil {
+		t.Fatalf("read assertions.txt: %v", err)
+	}
+	var names []string
+	for _, line := range strings.Split(string(raw), "\n") {
+		line = strings.TrimSpace(line)
+		if line == "" || strings.HasPrefix(line, "#") {
+			continue
+		}
+		names = append(names, line)
+	}
+	if len(names) == 0 {
+		t.Fatal("assertions.txt lists no assertions, so completeness is satisfied by a proof that returns nothing")
+	}
+	return names
+}
+
+// here — the directory this source file is in.
+//
+// `runtime.Caller` rather than the working directory, because a test's working
+// directory is the package directory only for `go test` in the module root: run
+// from elsewhere, or under a runner that changes it, and a relative path silently
+// finds nothing. A test that cannot find its own fixtures should say so loudly,
+// which `here` makes it do.
+func here(t *testing.T, name string) string {
+	t.Helper()
+	_, self, _, ok := runtime.Caller(0)
+	if !ok {
+		t.Fatal("cannot locate this source file, so the templates beside it cannot be read")
+	}
+	return filepath.Join(filepath.Dir(self), name)
+}
+
+func contains(haystack []string, needle string) bool {
+	for _, s := range haystack {
+		if s == needle {
+			return true
+		}
+	}
+	return false
+}

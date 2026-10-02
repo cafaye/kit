@@ -21,11 +21,20 @@
 #
 # FOUR ASSERTIONS, and the last three are what make the first one mean something:
 #
+#   0. the cluster is the shape the contract claims: one database, an owner role
+#      and a non-owner LOGIN role per service, membership in one direction only.
 #   1. A reaches its own database.                     (positive control)
 #   2. A is refused B's database, with the query and the server's answer.
 #   3. B is refused A's database.                     (not one lucky direction)
 #   4. A is refused on a SECOND cluster built WITHOUT the REVOKE, and gets in.
 #      (negative control — proves assertion 2 is load-bearing)
+#
+#   The ACCOUNT boundary — two tenants of one service — is a different suite,
+#   `tests/tenancy_test.sh`, because it is a different subject: this one is about
+#   the database, that one is about the rows inside it. Assertion 0 carries the
+#   role topology here rather than leaving it entirely to that suite, because this
+#   suite is the one that proves the CLUSTER provisioned what
+#   templates/database/README.md says it provisions.
 #
 #   Assertion 4 is the expensive one, and it is the one this repository's rules
 #   insist on: a control that never runs differently proves nothing. Without it,
@@ -223,8 +232,27 @@ for svc in "$ALPHA" "$BETA"; do
   got="$(psql_in cafaye cafaye_platform \
     "SELECT count(*) FROM pg_roles WHERE rolname = '$svc' AND rolconnlimit > 0")"
   [ "$got" = "1" ] || fail "$svc has no per-role CONNECTION LIMIT; blast radius is unbounded"
+  # The LOGIN role, which is the other half of the account boundary and is not
+  # this suite's subject: templates/database/tenancy/ is. It is asserted here
+  # because this is the suite that proves the CLUSTER provisioned what
+  # templates/database/README.md says it provisions, and a `_app` role that does
+  # not exist is a migration that fails with a message naming no file.
+  #
+  # Three properties and the direction of the membership is the one that matters:
+  # a login role that is a member of the OWNOR holds every privilege the owner
+  # has, which is the whole of templates/database/tenancy/ undone by one GRANT.
+  got="$(psql_in cafaye cafaye_platform \
+    "SELECT count(*) FROM pg_roles WHERE rolname = '${svc}_app' AND rolcanlogin AND NOT rolsuper")"
+  [ "$got" = "1" ] || fail "expected one non-superuser LOGIN role named ${svc}_app; found $got"
+  got="$(psql_in cafaye cafaye_platform \
+    "SELECT count(*) FROM pg_auth_members m
+       JOIN pg_roles member ON member.oid = m.member
+       JOIN pg_roles granted ON granted.oid = m.roleid
+      WHERE member.rolname = '${svc}_app' AND granted.rolname = '$svc'")"
+  [ "$got" = "0" ] || fail "${svc}_app is a member of $svc. The account boundary is an owner that cannot be impersonated by the role that logs in; that membership hands it every privilege the owner has."
 done
-say "   topology: 2 databases, 2 non-superuser roles, both with a per-role connection limit"
+say "   topology: 2 databases, 2 owner roles with a per-role connection limit,"
+say "             2 non-owner LOGIN roles, membership in one direction only"
 
 # The extension, in each database. A real vector query rather than a count, for
 # the reason AGENTS.md gives about vendor configs: `CREATE EXTENSION` succeeding

@@ -22,7 +22,8 @@
 #                               documentation promises, 78-79 from the second
 #                               callable standard, 89 from the `options:` key
 #                               that took the fleet's CI down for two days
-#                               without a red check; 18 shared before the
+#                               without a red check, 90-92 from the account
+#                               boundary; 18 shared before the
 #                               lint packet)
 #   1. delete a language template   -> the artifact-presence check goes red
 #   68. .env.example's Postgres tag disagrees with compose's default -> the
@@ -56,6 +57,16 @@
 #   79. a callable workflow at a path kit does not DECLARE -> red. The new one:
 #        the widening must exempt declared paths and nothing else, or it has
 #        stopped being a check.
+#   90-92. from the account boundary. 90 removes `FORCE ROW LEVEL SECURITY` from
+#        the substrate — the setting that is in no guide and that no lint in this
+#        fleet checked for before `templates/database/tenancy/` existed, and the
+#        one whose absence leaves a service with policies, `relrowsecurity = true`
+#        and an owner that reads every account's rows. 91 makes a driver stop
+#        READING `assertions.txt`, which is the failure that turns six thin
+#        drivers into six decorations: the test still runs and still passes, and
+#        now asserts "no red rows" about an unknown number of assertions. 92 makes
+#        the manifest and the proof disagree, which is the whole reason the
+#        manifest exists as a SET rather than a count.
 #   2. add a collector exporter    -> the privacy check goes red
 #   2b. DELETE the tempo exporter   -> the same check goes red from the other
 #        side. A set difference only catches the extra; this catches the
@@ -3444,6 +3455,70 @@ expect_red_script 'breakage 88: two tenants separated by a space fuse into one d
 # `prepare: :unnamed` on a fleet with no pooler is slower and correct-looking,
 # and the ONLY way anyone finds out is a check that looks for it.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# THE ACCOUNT BOUNDARY. Three breakages, numbered from 90 because the
+# header/recipe check at the bottom of `validate.sh` requires every recipe to be
+# DOCUMENTED and every documented number to be CARRIED — so a packet that adds
+# checks has to add its own place in this list rather than renumbering ninety
+# recipes.
+#
+#   90. FORCE ROW LEVEL SECURITY removed from the substrate    -> red
+#   91. a driver stops READING the assertion manifest          -> red
+#   92. the manifest and the proof stop agreeing               -> red
+#
+# 90 is the one the whole packet exists for, and the reason it is here as well as
+# in `tests/tenancy_test.sh` is that the two are different claims about different
+# layers. THAT suite proves the templates work against a real Postgres, with the
+# live proof going red. THIS one proves kit's STATIC gate would notice the
+# templates being edited into an unenforced state — which is the claim about a
+# reviewer with no database, and it is the one that keeps the property alive
+# between runs of the expensive suite.
+#
+# All three name the check, because "the gate went red" is a weak proof when a
+# hundred checks can make it red: a breakage caught by the wrong check still reads
+# as a pass, and the check it was written for can then be dead code forever.
+# ---------------------------------------------------------------------------
+TENANCY='templates/database/tenancy/*  (the account boundary, in the templates that enforce it)'
+
+# 90. The one no guide mentions and no lint in this fleet checked for. Deleting
+# the EXECUTABLE statement rather than the word is the whole mutation: the
+# substrate's comments quote `force row level security` twice while explaining why
+# it exists, so a mutation that removed the word would satisfy a check that reads
+# the file as text — and the tenancy contract check strips SQL comments first
+# precisely because of that.
+base90="$(fresh_copy kit-90)"
+edit "$base90/templates/database/tenancy/substrate.sql" \
+  "  execute format('alter table %s force row level security', p_table);
+" ""
+expect_red_check 'breakage 90: FORCE ROW LEVEL SECURITY is removed from the substrate' \
+  "$base90" "$TENANCY" --static-only
+
+# 91. A driver that reads isolation.sql and stops reading assertions.txt. It
+# still runs, still passes, and now asserts "no red rows" about an unknown number
+# of assertions — a green suite proving less than it says. The mutation replaces
+# the manifest read with a SECOND read of the file the driver still reads, which
+# is the honest version of the mistake: the token is still in the file, the
+# comment above the helper still explains the comparison, and the only thing that
+# changed is the argument.
+base91="$(fresh_copy kit-91)"
+edit "$base91/templates/database/go/tenancy_test.go.snippet" \
+  'os.ReadFile(here(t, "assertions.txt"))' 'os.ReadFile(here(t, "isolation.sql"))'
+expect_red_check 'breakage 91: a driver reads the proof but no longer the assertion manifest' \
+  "$base91" "$TENANCY" --static-only
+
+# 92. The manifest and the proof disagree. One line removed from assertions.txt is
+# enough: the driver that reads it then compares against a shorter list than the
+# proof produces, which is the failure the file exists to stop. The reverse
+# direction — a name in the manifest the proof never makes — is the same check on
+# the same token, and one recipe covers it, because the check reports both and a
+# check reporting only one would be half a contract.
+base92="$(fresh_copy kit-92)"
+edit "$base92/templates/database/tenancy/assertions.txt" \
+  'owner/another-tenants-rows-read-as-none
+' ''
+expect_red_check 'breakage 92: the assertion manifest and the proof stop agreeing' \
+  "$base92" "$TENANCY" --static-only
 
 base68="$(fresh_copy kit-68)"
 edit "$base68/templates/compose/.env.example" \

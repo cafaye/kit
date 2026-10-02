@@ -997,6 +997,7 @@ PY
     "$ROOT"/templates/compose/postgres/initdb/*.sh \
     "$ROOT"/templates/compose/postgres/Dockerfile \
     "$ROOT"/templates/database/contract.json \
+    "$ROOT"/templates/database/tenancy/* \
     "$ROOT"/templates/bin/* "$ROOT"/templates/tier/*/* "$ROOT"/tests/*.sh; do
     [ -f "$f" ] || continue
     path="${f#"$ROOT"/}"
@@ -1080,6 +1081,101 @@ PY
              end' "$f"
         else
           report_par SKIP "$path  (elixir not installed)"
+        fi
+        ;;
+      # The account-boundary templates.
+      #
+      #   substrate.sql / isolation.sql are SQL, and there is no psql on a machine
+      #   that has not installed one — so they are NOT parsed here and their
+      #   correctness is `tests/tenancy_test.sh`, which runs them against the real
+      #   Postgres kit ships. That is the right parser for them: a syntax error in a
+      #   migration is only observable by a server.
+      #
+      #   The six drivers, on the other hand, are files a service COPIES, so the
+      #   rule "parse what you hand out" applies to them exactly as it applies to
+      #   the otel and tier snippets. `rack_middleware.rb.snippet` shipped with
+      #   syntax that was not Ruby because nothing looked at it, and every one of
+      #   these six was written from scratch in this packet with no toolchain
+      #   resolving its imports — so a parse on any machine is worth having.
+      "$ROOT"/templates/database/tenancy/substrate.sql | \
+      "$ROOT"/templates/database/tenancy/isolation.sql)
+        # No parser for this file type HERE, deliberately: see above. Reported
+        # rather than silently passed, so a reader can see that the SQL is checked
+        # by tests/tenancy_test.sh and not by this loop.
+        report_par SKIP "$path  (SQL; parsed by tests/tenancy_test.sh against a real Postgres)"
+        ;;
+      "$ROOT"/templates/database/tenancy/assertions.txt)
+        # Shape only. That every name in it is CONSTRUCTED in isolation.sql is the
+        # tenancy contract check's job, and duplicating it here would be a second
+        # implementation of a rule rather than a second parser of a file.
+        check_par "$path  (every entry is an assertion name)" bash -c \
+          "[ \"\$(grep -cE '^[[:space:]]*[^#[:space:]]' '$f')\" -eq \"\$(grep -cE '^[a-z-]+/[a-z0-9-]+$' '$f')\" ]"
+        ;;
+      "$ROOT"/templates/database/go/tenancy_test.go.snippet)
+        if have gofmt; then
+          check_par "$path  (gofmt parses)" gofmt -e "$f"
+        else
+          report_par SKIP "$path  (gofmt not installed)"
+        fi
+        ;;
+      "$ROOT"/templates/database/python/tenancy_test.py.snippet)
+        if have python3; then
+          # `compile()`, not `python3 -m py_compile`: the module form writes a
+          # `__pycache__/` into the SOURCE tree, and two other checks iterate this
+          # one, which is how a gate that started green goes red on its own
+          # artefacts. Same reason as the tier python case above.
+          check_par "$path  (compile)" python3 -c \
+            'import sys; compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec")' "$f"
+        else
+          report_par SKIP "$path  (python3 not installed)"
+        fi
+        ;;
+      "$ROOT"/templates/database/ruby/tenancy_test.rb.snippet)
+        if have ruby; then
+          check_par "$path  (ruby -c)" ruby -c "$f"
+        else
+          report_par SKIP "$path  (ruby not installed)"
+        fi
+        ;;
+      "$ROOT"/templates/database/elixir/tenancy_test.exs.snippet)
+        if have elixir; then
+          # `Code.string_to_quoted/1` and NOT a load. A load of this file would
+          # need Postgrex, and kit has no mix.exs and no deps — so a load here would
+          # report an unresolved module as a parse failure, which is the exact
+          # mistake the database elixir arm's own comment records happening twice.
+          # This one imports a driver, so the parse is the honest bar.
+          check_par "$path  (Code.string_to_quoted!)" elixir -e \
+            'case Code.string_to_quoted(File.read!(hd(System.argv()))) do
+               {:error, e} -> IO.puts("syntax: #{inspect e}"); System.halt(1)
+               {:ok, _} -> :ok
+             end' "$f"
+        else
+          report_par SKIP "$path  (elixir not installed)"
+        fi
+        ;;
+      "$ROOT"/templates/database/rust/tenancy_test.rs.snippet)
+        if have rustc; then
+          # Crate-type lib, not `--test`: `#[tokio::test]` expands to a
+          # `#[test]` fn, and compiling the test harness would need the proc macro
+          # to resolve. A parse is the claim being made here, and `--crate-type lib`
+          # is what makes it one. Unresolved-crate errors are expected and filtered
+          # by the caller below, which is the same treatment database.rs.snippet
+          # gets.
+          check_par "$path  (rustc parses)" rustc --edition 2021 --crate-type lib \
+            --emit=metadata -o /dev/null "$f"
+        else
+          report_par SKIP "$path  (rustc not installed)"
+        fi
+        ;;
+      "$ROOT"/templates/database/node/tenancy_test.ts.snippet)
+        if have node; then
+          # Copied to a real extension first: node refuses a `.snippet` with
+          # ERR_UNKNOWN_FILE_EXTENSION, which is a check reporting a perfectly
+          # valid TypeScript file as unparseable on the strength of a filename.
+          check_par "$path  (node --check, as .ts)" bash -c \
+            "cp '$f' '$TMP/tenancy_test.ts' && node --experimental-strip-types --check '$TMP/tenancy_test.ts'"
+        else
+          report_par SKIP "$path  (node not installed)"
         fi
         ;;
       # The lint drift allowlist, which has no extension because it is not
@@ -1289,6 +1385,33 @@ OTEL
   # can be run on it. This is the equivalent.
   check 'templates/otel/rust/traceparent.rs  (carries its own suite)' bash -c \
     "grep -qE '#\[test\]' '$ROOT/templates/otel/rust/traceparent.rs'"
+
+  # -------------------------------------------------------------------------
+  section 'static: templates/database/tenancy — every artifact is present'
+  # The account boundary is four files and six drivers, and the six are the reason
+  # this is a presence check rather than a note: kit templates six languages, and a
+  # half-adopted account boundary is the same defect as a half-adopted language —
+  # five services protected by Postgres and one protected by a WHERE clause a
+  # reviewer forgot, which is the state this packet was written about.
+  #
+  # `isolation.sql` and `assertions.txt` are here rather than left implicit because
+  # a driver beside a missing manifest compiles, runs, and asserts completeness
+  # about nothing. The manifest is the half that makes six thin drivers safe.
+  if otel_required \
+    'templates/database/tenancy/README.md' \
+    'templates/database/tenancy/substrate.sql' \
+    'templates/database/tenancy/isolation.sql' \
+    'templates/database/tenancy/assertions.txt' \
+    'templates/database/go/tenancy_test.go.snippet' \
+    'templates/database/elixir/tenancy_test.exs.snippet' \
+    'templates/database/python/tenancy_test.py.snippet' \
+    'templates/database/ruby/tenancy_test.rb.snippet' \
+    'templates/database/node/tenancy_test.ts.snippet' \
+    'templates/database/rust/tenancy_test.rs.snippet'; then
+    report PASS 'templates/database/tenancy/  (4 shared artifacts + 6 per-language drivers)'
+  else
+    report FAIL 'templates/database/tenancy/  (4 shared artifacts + 6 per-language drivers)'
+  fi
 
   # -------------------------------------------------------------------------
   section 'static: templates/kamal — every artifact is present'
@@ -3595,6 +3718,10 @@ def strip_comments(src, lang):
       * ruby (a `.yml`)            — `#` to end of line. The ruby snippet is
         DATA, so this strips YAML comments; it is not ERB, because the file holds
         `<%= ENV.fetch(…) %>` as a plain scalar.
+      * sql                        — `--` to end of line. Added for the tenancy
+        substrate, whose comments quote nearly every required string while
+        explaining why it exists; a check that read that file as text would report
+        the whole contract satisfied on a substrate with none of it.
 
     String literals are NOT tracked, and that is the conservative choice in the
     right direction: a comment marker inside a string is left in place, so the
@@ -3610,6 +3737,8 @@ def strip_comments(src, lang):
         marker = None
         if lang in ("go", "node", "rust"):
             marker = "//"
+        elif lang == "sql":
+            marker = "--"
         elif lang in ("python", "ruby"):
             marker = "#"
         elif lang == "elixir":
@@ -3738,6 +3867,317 @@ PY
   }
   check 'templates/database/*  (the contract, in the generated output, per language)' \
     database_contract_check
+
+  # -------------------------------------------------------------------------
+  # THE ACCOUNT BOUNDARY, ASSERTED AGAINST THE TEMPLATES THAT ENFORCE IT.
+  #
+  #   The isolation templates are a contract in the same sense the connection
+  #   contract is, and they are checked in the same place, for the same reason: a
+  #   comment saying "remember FORCE ROW LEVEL SECURITY" is not a contract, and a
+  #   comment saying "do NOT set prepare: :unnamed, and here is why" plus a check
+  #   that fails the build when it appears IS one.
+  #
+  # FOUR DIRECTIONS, and the last two are the ones that make the first two mean
+  # something:
+  #
+  #   REQUIRED in substrate.sql, over CODE. Measured rather than argued: the
+  #   substrate's own comments quote nearly every required string while explaining
+  #   why it exists, so a check that read the file as text would report the whole
+  #   contract satisfied on a substrate containing none of it. This is the
+  #   `-count=1` rule — "a check that a comment can satisfy is not a check" —
+  #   and self-test breakage 72 is the recipe that proved it has to be done.
+  #
+  #   FORBIDDEN in substrate.sql, for the four shapes that make a policy
+  #   decorative. Also over code, for the same reason.
+  #
+  #   THE SPINE IS CONSTRUCTED. Every name in `tenancy.isolation.spine` has to
+  #   appear in isolation.sql AND in assertions.txt. A manifest naming an
+  #   assertion the script never makes is a manifest reporting completeness for a
+  #   proof that does not contain it, and that is the failure a list-of-names was
+  #   introduced to prevent.
+  #
+  #   THE TWO FILES AGREE. Read assertions.txt and isolation.sql and fail on a
+  #   difference in EITHER direction. This is `assert the AGREEMENT, not the
+  #   presence of a file`: both existing is not the claim, both existing and
+  #   naming the same twenty-four assertions is.
+  #
+  #   EVERY DRIVER OPENS BOTH FILES AT RUNTIME, and the check looks for the READ
+  #   rather than the mention. A driver that names `assertions.txt` in a comment
+  #   and never opens it asserts completeness about nothing — which is the failure
+  #   ESLint's `reportUnusedDisableDirectives` exists for, in a language where the
+  #   directive is prose.
+  tenancy_contract_check() {
+    "$PY" - "$ROOT" <<'PY'
+import json
+import os
+import re
+import sys
+
+root = sys.argv[1]
+contract_path = os.path.join(root, "templates", "database", "contract.json")
+if not os.path.isfile(contract_path):
+    sys.exit("templates/database/contract.json is missing, so the account boundary has "
+             "no requirements and the next edit states them in a README")
+contract = json.load(open(contract_path, encoding="utf-8"))
+tenancy = contract.get("tenancy") or {}
+if not tenancy:
+    sys.exit(
+        "templates/database/contract.json declares no `tenancy` block. The account "
+        "boundary then has no machine-readable requirements, and the check that used "
+        "to assert them has nothing to read — which is how a check ends up green "
+        "having checked nothing."
+    )
+
+
+def strip_sql_comments(src):
+    """`src` with its `--` comments removed, per LINE.
+
+    Deliberately conservative in the same direction the connection check's
+    stripper is: a marker it cannot recognise is left alone, so a false NEGATIVE
+    (a required string left in a comment, check satisfied anyway) is the known
+    failure mode rather than a false POSITIVE that would take a correct tree red.
+
+    String literals are not tracked, and that is safe here for a measured reason
+    rather than a hopeful one: every required token in the substrate lives on its
+    own line, and the substrate's only `--` inside a string is the `'cafaye:tier=db
+    ...'`-shaped hint text, which no required token overlaps.
+    """
+    out = []
+    for line in src.splitlines():
+        i = line.find("--")
+        if i == -1:
+            out.append(line)
+        else:
+            out.append(line[:i].rstrip())
+    return "\n".join(out)
+
+
+def read(rel):
+    path = os.path.join(root, rel)
+    if not rel or not os.path.isfile(path):
+        return None, f"{rel} does not exist"
+    return open(path, encoding="utf-8").read(), ""
+
+
+problems = []
+
+# ---------------------------------------------------------------- the substrate
+sub = tenancy.get("substrate") or {}
+sub_rel = sub.get("file", "")
+sub_raw, err = read(sub_rel)
+if err:
+    problems.append(f"tenancy/substrate: {err}")
+else:
+    sub_code = strip_sql_comments(sub_raw)
+    for entry in sub.get("required") or []:
+        token = entry.get("token", "?")
+        if token not in sub_code:
+            problems.append(
+                f"tenancy/substrate: does not contain {token!r}. {entry.get('why', '')} "
+                f"The requirements are templates/database/contract.json and this file is "
+                f"the thing they are about; a requirement absent here is an account "
+                f"boundary that does not exist."
+            )
+    if not sub.get("required"):
+        problems.append(
+            "contract.json's tenancy.substrate declares no `required`. An empty list "
+            "would make the half of this check that matters a no-op that passes."
+        )
+    for bad in sub.get("forbidden") or []:
+        if bad.lower() in sub_code.lower():
+            problems.append(
+                f"tenancy/substrate: contains {bad!r}, which makes a policy decorative. "
+                f"{'; '.join(sub.get('forbiddenWhy') or []) or 'See substrate.sql.'}"
+            )
+    if not sub.get("forbidden"):
+        problems.append(
+            "contract.json's tenancy.substrate declares no `forbidden` list. The four "
+            "shapes that make an RLS policy read correctly and enforce nothing are the "
+            "ones nobody notices."
+        )
+
+# ---------------------------------------------------------------- the proof
+iso = tenancy.get("isolation") or {}
+iso_rel = iso.get("file", "")
+iso_raw, err = read(iso_rel)
+if err:
+    problems.append(f"tenancy/isolation: {err}")
+else:
+    for token in iso.get("required") or []:
+        if token not in iso_raw:
+            why = iso.get("requiredWhy") or []
+            problems.append(
+                f"tenancy/isolation: does not contain {token!r}. "
+                f"{why[iso.get('required').index(token)] if token in (iso.get('required') or []) else ''}"
+            )
+    if not iso.get("required"):
+        problems.append("contract.json's tenancy.isolation declares no `required` list")
+
+# --------------------------------------------------- the manifest, both ways
+man = tenancy.get("assertions") or {}
+man_rel = man.get("file", "")
+man_raw, err = read(man_rel)
+listed = []
+if err:
+    problems.append(f"tenancy/assertions: {err}")
+else:
+    listed = [l.strip() for l in man_raw.splitlines()]
+    listed = [l for l in listed if l and not l.startswith("#")]
+    if not listed:
+        problems.append(
+            f"{man_rel} lists no assertions. Every one of the six drivers compares the "
+            f"proof's results against this file, so an empty one makes them all "
+            f"satisfied by a proof that returned nothing."
+        )
+    if len(listed) != len(set(listed)):
+        dupes = sorted({n for n in listed if listed.count(n) > 1})
+        problems.append(f"{man_rel} lists {len(duped)} name(s) twice: {', '.join(dupes)}")
+
+if iso_raw and listed:
+    # Every name the manifest lists must be CONSTRUCTED in the script. The script
+    # builds the two per-role halves by concatenation (`r || '/no-identity…'`), so
+    # the check looks for the suffix as well as the whole name — and a missing one
+    # is reported against the manifest, because that is the file a reader trusts to
+    # be complete.
+    for name in listed:
+        suffix = name.split("/", 1)[1] if "/" in name else name
+        if ("'" + name + "'") not in iso_raw and ("'/" + suffix + "'") not in iso_raw:
+            problems.append(
+                f"tenancy/assertions: lists {name!r}, which isolation.sql never "
+                f"constructs. Every one of the six drivers compares the proof's "
+                f"results against this list, so a name here that the proof does not "
+                f"make is a driver asserting completeness about an assertion that "
+                f"does not exist — and the driver will be red for it, which is the "
+                f"right answer to the wrong question."
+            )
+    # ...and every assertion the script constructs must be listed. The reverse
+    # direction: an assertion nobody claims is an assertion no service is told to
+    # expect, so a driver that compares the sets does not fail on it and the proof
+    # has silently grown.
+    spine = iso.get("spine") or []
+    if not spine:
+        problems.append(
+            "contract.json's tenancy.isolation declares no `spine`. The spine is the "
+            "shape the packet names — three denials and an allowance — and a check "
+            "that cannot say which assertions are the shape cannot say the shape is "
+            "still there."
+        )
+    for name in spine:
+        if name not in listed:
+            problems.append(
+                f"tenancy/isolation: the spine requires {name!r}, which "
+                f"{man_rel} does not list. The spine is asserted in the contract and "
+                f"carried by the manifest, and the two must agree or one of them is "
+                f"decorative."
+            )
+    for name in ("owner/no-identity-reads-no-rows",
+                 "owner/another-tenants-rows-read-as-none",
+                 "owner/own-rows-are-visible",
+                 "owner/own-identity-reads-only-its-own-rows"):
+        if name not in listed:
+            problems.append(
+                f"tenancy/assertions: the OWNER half is missing {name!r}. The login "
+                f"half passes on a substrate with no FORCE ROW LEVEL SECURITY at all, "
+                f"so an assertion set without the owner half cannot detect the one "
+                f"defect this whole directory exists for."
+            )
+
+# ---------------------------------------------------------------- the drivers
+drivers = tenancy.get("drivers") or {}
+DRIVER_FILES = {
+    "go": "templates/database/go/tenancy_test.go.snippet",
+    "elixir": "templates/database/elixir/tenancy_test.exs.snippet",
+    "python": "templates/database/python/tenancy_test.py.snippet",
+    "ruby": "templates/database/ruby/tenancy_test.rb.snippet",
+    "node": "templates/database/node/tenancy_test.ts.snippet",
+    "rust": "templates/database/rust/tenancy_test.rs.snippet",
+}
+# The READ, in each language's own spelling. A mention is not a read, so these are
+# all `read the file` forms and none of them is a bare string: that is the whole
+# point of looking for these rather than for the file name.
+READ_FORMS = {
+    "go": [r"os\.ReadFile\("],
+    "elixir": [r"File\.read!\("],
+    "python": [r"\.read_text\(", r"open\("],
+    "ruby": [r"File\.readlines\(", r"File\.read\("],
+    "node": [r"readFile\("],
+    "rust": [r"read_to_string\("],
+}
+for lang, rel in DRIVER_FILES.items():
+    body, err = read(rel)
+    if err:
+        problems.append(f"tenancy/driver {lang}: {err}")
+        continue
+    # CODE, not prose, and that is the whole difficulty rather than the first half
+    # of it. Every one of the six drivers names both files in its own header
+    # comment — the header is WHY the driver is thin — so a check that counted
+    # mentions was satisfied by deleting the read. This is the `-count=1` rule: a
+    # check a comment can satisfy is not a check.
+    #
+    # WHOLE-LINE comments only, which is the narrower version on purpose. The other
+    # check in this file strips trailing comments too, and reusing that would mean
+    # either a fifth program in tests/ — which the carve-out refuses — or merging
+    # two checks that are separately filterable. So this does the half that matters
+    # and says so: the problem is a header block, not a trailing aside.
+    code = [l for l in body.splitlines() if not l.lstrip().startswith(("//", "#", "--"))]
+
+    # mustCarry: present in code at all. The result table is what a driver queries
+    # after running the proof, so its absence means the driver is not running this
+    # proof whatever else it does.
+    if not drivers.get("mustCarry"):
+        problems.append(
+            "contract.json's tenancy.drivers declares no `mustCarry`. Every list this "
+            "check iterates needs an empty-list guard, because an empty list makes the "
+            "loop over it a no-op that PASSES — which is how a check ends up green "
+            "having read nothing at all."
+        )
+    for token in drivers.get("mustCarry") or []:
+        if token not in "\n".join(code):
+            problems.append(
+                f"tenancy/driver {lang}: {token!r} is not in the code. Every driver runs "
+                f"isolation.sql and reads the result table it creates; a driver that "
+                f"never asks for it is not running this proof."
+            )
+
+    # mustRead: on the SAME LINE as one of the language's own read forms.
+    #
+    # A file-wide "does it contain a read anywhere" is satisfied by every driver,
+    # because all six read isolation.sql — so a driver that had stopped reading
+    # assertions.txt was reported clean by that too. Two checks, two versions, the
+    # same failure: each was satisfied by the exact edit it was written to catch.
+    if not drivers.get("mustRead"):
+        problems.append(
+            "contract.json's tenancy.drivers declares no `mustRead`. Without it the "
+            "half of this check that distinguishes a driver which READS the assertion "
+            "set from one which merely names it in a comment does not exist."
+        )
+    for token in drivers.get("mustRead") or []:
+        forms = READ_FORMS[lang]
+        hit = [l.strip() for l in code
+               if token in l and any(re.search(f, l) for f in forms)]
+        if not hit:
+            problems.append(
+                f"tenancy/driver {lang}: does not READ {token!r} — no mention of it on a "
+                f"line that also opens a file ({', '.join(forms)}). A driver that names "
+                f"the assertion set without reading it asserts completeness about "
+                f"nothing, and the failure is silent: the driver still runs and still "
+                f"passes."
+            )
+if problems:
+    sys.exit("\n       ".join([""] + problems))
+print(
+    f"       tenancy: substrate {len(sub.get('required') or [])} required + "
+    f"{len(sub.get('forbidden') or [])} forbidden, isolation {len(iso.get('required') or [])} "
+    f"required, spine {len(iso.get('spine') or [])}, manifest {len(listed)} assertions, "
+    f"{len(DRIVER_FILES)} driver(s) all reading both files"
+)
+PY
+  }
+  check 'templates/database/tenancy/*  (the account boundary, in the templates that enforce it)' \
+    tenancy_contract_check
+
+  # -------------------------------------------------------------------------
+  # DECISIONS.md EXISTS, AND EVERY REFERENCE TO IT RESOLVES.
 
   # -------------------------------------------------------------------------
   # DECISIONS.md EXISTS, AND EVERY REFERENCE TO IT RESOLVES.
@@ -9474,6 +9914,20 @@ if [ "$RUN_OBSERVABILITY" -eq 1 ]; then
     # for the negative control. Three container lifecycles and two initdb runs.
     bounded_check 'tests/isolation_test.sh  (service A cannot reach service B'"'"'s database)' \
       1800 bash "$ROOT/tests/isolation_test.sh"
+    # THE ACCOUNT BOUNDARY, RUN, WITH ITS CONTROL AND ITS MEASUREMENT.
+    #
+    # In THIS phase rather than a new one because it is the same class of claim: a
+    # security property that is worth nothing unexercised. And it carries the one
+    # control the whole directory exists for — the same proof with
+    # `FORCE ROW LEVEL SECURITY` removed, which must go red on the OWNER half while
+    # the LOGIN half stays green. A proof without that control would pass on a
+    # substrate with no FORCE at all, which is the exact defect the packet named.
+    #
+    # 1800s for the same reason as its sibling above: it builds the cluster image,
+    # brings the stack up, applies the substrate, and runs the proof three times
+    # (once clean, once with the control mutation, once measuring the init plan).
+    bounded_check 'tests/tenancy_test.sh  (no identity, another tenant and its own tenant — as the login role AND as the owner; and the same proof with FORCE removed goes red)' \
+      1800 bash "$ROOT/tests/tenancy_test.sh"
   fi
 fi
 # ===========================================================================

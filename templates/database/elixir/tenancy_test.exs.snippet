@@ -1,0 +1,198 @@
+# kit template — the account-isolation assertion set, as an Elixir test.
+#
+#     # mix deps.get
+#     #   {:postgrex, "~> 0.22"}
+#     # mix test test/tenancy/tenancy_test.exs
+#
+# WHAT THIS FILE IS, AND WHY IT IS THIN.
+#
+#   The assertion set is `isolation.sql`, beside this file. It is one file for all
+#   six languages because the assertions are about POSTGRES rather than about a
+#   language: the denial a request meets is a denial the server returns. What is
+#   language-specific is the plumbing — which driver, how a row set comes back, and
+#   where the DSN comes from — and that is what is below.
+#
+#   Thin is safe here for one reason and one reason only: this test compares the
+#   NAMES it got back against `assertions.txt`, also beside this file, and fails on
+#   a difference in either direction. An isolation.sql that quietly stopped
+#   asserting something is a red this test, not a green one. Without that
+#   comparison a thin driver is a decoration — it would happily report "no red
+#   rows" about a proof that had been reduced to three assertions.
+#
+# THE TIER. `@tier :db` is the declaration `templates/tier/` describes for Elixir:
+# ExUnit has no tier channel, so a module attribute is the shape an adapter can
+# read without parsing. `@tag :db` and `@tag :tier_db` are ExUnit's own vocabulary
+# and are set as well, so a filter is a filter over tags ExUnit already reports.
+#
+# THE DSN. `TEST_DATABASE_URL`, and it must be the role that may `SET ROLE` — the
+# OWNER, whose credential a service already has for migrations. kit's cluster grants
+# `<service>_app` to `<service>` precisely so the weaker role can be impersonated,
+# and impersonating a strictly weaker role cannot widen anything.
+#
+#   REQUIRED_DB=1   turns a missing DSN from a skip into a FAILURE. A skip is a
+#                   green run that never opened a connection, and a green run is
+#                   the exact thing this file exists to contradict.
+defmodule TenancyTest do
+  use ExUnit.Case, async: false
+
+  @tier :db
+
+  @doc "The dependency class this module's tests need. The value in a normalised result line's `tier` field, and the suffix of the gate variable: `REQUIRED_DB=1`."
+  def tier, do: @tier
+
+  # The proof, run whole and unexamined. It opens a transaction and leaves it open,
+  # because two of the things it does refuse to do outside one; every object it
+  # creates is TEMPORARY, so nothing survives the session either way.
+  #
+  # Read on the line that names it rather than through a module attribute bound
+  # earlier: the path and the read are then the same sentence, which is what a
+  # reader checking "does this driver actually open the file, or only name it"
+  # needs, and it is the shape the other five drivers already have.
+  @script File.read!(Path.join(__DIR__, "isolation.sql"))
+
+  # One single-statement query rather than asking the batch for its last result set.
+  # That is what lets this driver stay short: every driver in every language can
+  # execute a script and then ask a question, and none of them has to know how its
+  # own driver reports the rows of a multi-statement batch, which differs in all six.
+  @results """
+  SELECT assertion, expected, actual, verdict, why
+    FROM pg_temp.cafaye_probe_result
+   ORDER BY assertion
+  """
+
+  @tag :db
+  @tag :tier_db
+  test "account_isolation" do
+    dsn = System.get_env("TEST_DATABASE_URL")
+
+    is_nil =
+      case dsn do
+        nil ->
+          if System.get_env("REQUIRED_DB") == "1" do
+            flunk(
+              "REQUIRED_DB=1 and TEST_DATABASE_URL is unset: the account-isolation " <>
+                "proof cannot run, and a skipped proof is a green run that proved " <>
+                "nothing. Start the database, or unset REQUIRED_DB to skip this tier " <>
+                "on purpose."
+            )
+          end
+
+          true
+
+        "" ->
+          true
+
+        _ ->
+          false
+      end
+
+    if is_nil do
+      # A skip, deliberately, and only because REQUIRED_DB is not demanding this
+      # tier. The flunk above is what stops that skip from being a green run.
+      :ok
+    else
+      {:ok, conn} = Postgrex.start_link(dsn: dsn)
+
+      # Postgrex sends a multi-statement string as a simple query, which is the
+      # protocol that accepts one.
+      Postgrex.query!(conn, @script, [])
+
+      %{rows: rows} = Postgrex.query!(conn, @results, [])
+
+      # Roll the proof's transaction back rather than leaving it open. Everything it
+      # created is temporary and would go with the session, but a test that leaves a
+      # transaction open makes every test after it run inside it.
+      Postgrex.query!(conn, "ROLLBACK", [])
+      GenServer.stop(conn)
+
+      results = Map.new(rows, fn [assertion, expected, actual, verdict, why] ->
+        {assertion, %{expected: expected, actual: actual, verdict: verdict, why: why}}
+      end)
+
+      assert_complete(results)
+      assert_all_pass(results)
+    end
+  end
+
+  # The names assertions.txt lists, comments and blanks dropped.
+  #
+  # A comment is dropped rather than skipped because the file's own comments quote
+  # assertion names to explain the shape; reading one as an assertion would report a
+  # name the proof does not return, which is a red on a correct tree.
+  defp manifest do
+    # The path and the read are ONE line, which is what a reader checking "does this
+    # driver actually open the assertion set, or only name it" needs — and what
+    # `tests/validate.sh`'s tenancy check reads, on the same line as the read, rather
+    # than anywhere in the file. Every other language here reads on the line that
+    # names the path too; this one did not until the check asked.
+    @assertions File.read!(Path.join(__DIR__, "assertions.txt"))
+
+    @assertions
+    |> String.split("\n")
+    |> Enum.map(&String.trim/1)
+    |> Enum.reject(&(&1 == "" or String.starts_with?(&1, "#")))
+  end
+
+  # The assertion set is EXACTLY the one assertions.txt names.
+  #
+  # Both directions, and both are needed. A missing name means the proof stopped
+  # asserting something, which a "no failures" assertion would report as a pass. An
+  # extra name means the proof grew something this driver does not know about, so the
+  # two have separated and the next edit to either is made against a stale idea of the
+  # other.
+  defp assert_complete(results) do
+    want = manifest()
+
+    if want == [] do
+      flunk("assertions.txt lists no assertions, so completeness is satisfied by a proof that returns nothing")
+    end
+
+    got = Map.keys(results)
+
+    missing = Enum.sort(want -- got)
+    unexpected = Enum.sort(got -- want)
+
+    if missing != [] do
+      flunk(
+        "the proof did not return #{length(missing)} of the #{length(want)} assertions it is " <>
+          "supposed to make: #{Enum.join(missing, ", ")}\n" <>
+          "  A missing assertion is a green suite proving less than it says. isolation.sql " <>
+          "and assertions.txt have drifted apart; isolation.sql is the one that moved."
+      )
+    end
+
+    if unexpected != [] do
+      flunk(
+        "the proof returned #{length(unexpected)} assertion(s) assertions.txt does not name: " <>
+          "#{Enum.join(unexpected, ", ")}\n" <>
+          "  A new assertion has to be listed in assertions.txt before it counts, or it is " <>
+          "invisible to every service that adopted this."
+      )
+    end
+  end
+
+  # Every assertion that came back, and its reason when it did not.
+  #
+  # The `why` is printed with the failure because it is the only place the shape of
+  # the assertion is recorded. A report that says
+  # `owner/another-tenants-rows-read-as-none` and stops is a filename; one that also
+  # says what that assertion is for is a diagnosis.
+  defp assert_all_pass(results) do
+    failed =
+      results
+      |> Enum.filter(fn {_name, r} -> r.verdict != "pass" end)
+      |> Enum.sort_by(fn {name, _r} -> name end)
+
+    detail =
+      Enum.map_join(failed, fn {name, r} ->
+        "\n  #{name}\n    expected #{inspect(r.expected)}\n" <>
+          "    actual   #{inspect(r.actual)}\n    because   #{r.why}"
+      end)
+
+    if failed != [] do
+      flunk(
+        "#{length(failed)} of #{map_size(results)} account-isolation assertions failed:#{detail}"
+      )
+    end
+  end
+end

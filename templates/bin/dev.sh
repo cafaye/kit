@@ -857,7 +857,7 @@ db_grant() {
   # how one service ends up owning another's database.
   case "$svc" in
     [!a-z_]* | *[!a-z0-9_]*)
-      die "'$svc' is not a bare identifier. It must match [a-z_][a-z0-9_]*, and it has to be the SAME name as your database, your role and your application_name."
+      die "'$svc' is not a bare identifier. It must match [a-z_][a-z0-9_]*, and it has to be the SAME name as your database, your owner role and your application_name."
       ;;
   esac
 
@@ -886,15 +886,27 @@ in the same order, and every statement in it is load-bearing:
     PASSWORD '$pass';
   CREATE DATABASE "$svc" OWNER "$svc";
 
+  -- the LOGIN role, which owns nothing. A login role that owns its tables can
+  -- ALTER TABLE ... DISABLE ROW LEVEL SECURITY and DROP POLICY, so the account
+  -- boundary in templates/database/tenancy/ needs this second role to be real.
+  -- It exists whether or not this service has adopted those templates, which is
+  -- why it is here and not in a migration.
+  CREATE ROLE "${svc}_app" LOGIN NOSUPERUSER NOCREATEDB NOCREATEROLE NOREPLICATION
+    PASSWORD '$pass';
+  GRANT "${svc}_app" TO "$svc";
+
   -- the boundary. Without this line EVERY role in the cluster can CONNECT to
   -- $svc, and isolation becomes "nobody happened to grant you SELECT".
   REVOKE ALL ON DATABASE "$svc" FROM PUBLIC;
   GRANT CONNECT, TEMPORARY ON DATABASE "$svc" TO "$svc";
+  GRANT CONNECT, TEMPORARY ON DATABASE "$svc" TO "${svc}_app";
 
   -- blast radius, so this service cannot take the connections the other eight need
   ALTER ROLE "$svc" CONNECTION LIMIT ${KIT_POSTGRES_ROLE_CONNECTIONS:-10};
   ALTER ROLE "$svc" SET statement_timeout = '${KIT_POSTGRES_STATEMENT_TIMEOUT_MS:-15000}';
   ALTER ROLE "$svc" SET idle_in_transaction_session_timeout = '${KIT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS:-30000}';
+  ALTER ROLE "${svc}_app" SET statement_timeout = '${KIT_POSTGRES_STATEMENT_TIMEOUT_MS:-15000}';
+  ALTER ROLE "${svc}_app" SET idle_in_transaction_session_timeout = '${KIT_POSTGRES_IDLE_IN_TRANSACTION_TIMEOUT_MS:-30000}';
 
 Then, in that database:
 

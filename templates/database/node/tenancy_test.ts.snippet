@@ -1,0 +1,182 @@
+// kit template — the account-isolation assertion set, as a TypeScript test.
+//
+//     npm add pg@8.13.1
+//     node --test db/tenancy/tenancy_test.ts
+//
+// WHAT THIS FILE IS, AND WHY IT IS THIN.
+//
+//   The assertion set is `isolation.sql`, beside this file. It is one file for all
+//   six languages because the assertions are about POSTGRES rather than about a
+//   language: the denial a request meets is a denial the server returns. What is
+//   language-specific is the plumbing — which driver, how a row set comes back, and
+//   where the DSN comes from — and that is what is below.
+//
+//   Thin is safe here for one reason and one reason only: this test compares the
+//   NAMES it got back against `assertions.txt`, also beside this file, and fails on
+//   a difference in either direction. An isolation.sql that quietly stopped
+//   asserting something is a red this test, not a green one. Without that
+//   comparison a thin driver is a decoration — it would happily report "no red
+//   rows" about a proof that had been reduced to three assertions.
+//
+// THE TIER. `TIER` below is the declaration `templates/tier/node/` describes: an
+// exported const a ~15-line adapter reads, rather than a sentinel a grep can miss.
+// `node --test` has no tier channel of its own, so exporting rather than commenting
+// is what makes it readable at all. It is a no-op at runtime.
+//
+// THE DSN. `TEST_DATABASE_URL`, and it must be the role that may `SET ROLE` — the
+// OWNER, whose credential a service already has for migrations. kit's cluster grants
+// `<service>_app` to `<service>` precisely so the weaker role can be impersonated,
+// and impersonating a strictly weaker role cannot widen anything.
+//
+//   REQUIRED_DB=1   turns a missing DSN from a skip into a FAILURE. A skip is a
+//                   green run that never opened a connection, and a green run is
+//                   the exact thing this file exists to contradict.
+import assert from 'node:assert/strict';
+import { readFile } from 'node:fs/promises';
+import { dirname, join } from 'node:path';
+import { test } from 'node:test';
+import { fileURLToPath } from 'node:url';
+
+import { Client } from 'pg';
+
+/** The tier these tests belong to. The value in a normalised result line's `tier`
+ * field, and the suffix of the gate variable: `REQUIRED_DB=1`. */
+export const TIER = 'db' as const;
+
+const HERE = dirname(fileURLToPath(import.meta.url));
+
+/** One single-statement query rather than asking the batch for its last result set.
+ * That is what lets this driver stay short: every driver in every language can
+ * execute a script and then ask a question, and none of them has to know how its
+ * own driver reports the rows of a multi-statement batch, which differs in all six. */
+const RESULTS = `
+  SELECT assertion, expected, actual, verdict, why
+    FROM pg_temp.cafaye_probe_result
+   ORDER BY assertion`;
+
+interface Result {
+  assertion: string;
+  expected: string;
+  actual: string;
+  verdict: string;
+  why: string;
+}
+
+test('account_isolation', async () => {
+  const dsn = process.env.TEST_DATABASE_URL;
+  if (!dsn) {
+    assert.equal(
+      process.env.REQUIRED_DB,
+      '1',
+      'REQUIRED_DB=1 and TEST_DATABASE_URL is unset: the account-isolation proof ' +
+        'cannot run, and a skipped proof is a green run that proved nothing. Start ' +
+        'the database, or unset REQUIRED_DB to skip this tier on purpose.',
+    );
+    return;
+  }
+
+  // Read inside the test rather than at module scope. A top-level `await` makes the
+  // file an ES module that only loads where top-level await is available, which is a
+  // constraint a service's tsconfig should not have to know about; `readFile` is
+  // microseconds.
+  //
+  // The proof is run whole and unexamined. It opens a transaction and leaves it
+  // open, because two of the things it does refuse to do outside one; every object
+  // it creates is TEMPORARY, so nothing survives the session either way.
+  const script = await readFile(join(HERE, 'isolation.sql'), 'utf8');
+
+  const client = new Client({ connectionString: dsn });
+  await client.connect();
+  try {
+    // node-postgres sends a multi-statement string as a simple query, which is the
+    // protocol that accepts one.
+    await client.query(script);
+    const read = await client.query<Pick<Result, 'assertion' | 'expected' | 'actual' | 'verdict' | 'why'>>(RESULTS);
+    // Roll the proof's transaction back rather than leaving it open. Everything it
+    // created is temporary and would go with the session, but a test that leaves a
+    // transaction open makes every test after it run inside it.
+    await client.query('ROLLBACK');
+
+    const results = new Map<string, Result>();
+    for (const row of read.rows) results.set(row.assertion, row as Result);
+
+    assertComplete(results);
+    assertAllPass(results);
+  } finally {
+    await client.end();
+  }
+});
+
+/** The names `assertions.txt` lists, comments and blanks dropped.
+ *
+ * A comment is dropped rather than skipped because the file's own comments quote
+ * assertion names to explain the shape; reading one as an assertion would report a
+ * name the proof does not return, which is a red on a correct tree.
+ */
+async function manifest(): Promise<string[]> {
+  const raw = await readFile(join(HERE, 'assertions.txt'), 'utf8');
+  return raw
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => line !== '' && !line.startsWith('#'));
+}
+
+/** The assertion set is EXACTLY the one `assertions.txt` names.
+ *
+ * Both directions, and both are needed. A missing name means the proof stopped
+ * asserting something, which a "no failures" assertion would report as a pass. An
+ * extra name means the proof grew something this driver does not know about, so the
+ * two have separated and the next edit to either is made against a stale idea of the
+ * other.
+ */
+async function assertComplete(results: Map<string, Result>): Promise<void> {
+  const want = await manifest();
+  assert.ok(want.length > 0, 'assertions.txt lists no assertions, so completeness is satisfied by a proof that returns nothing');
+
+  const got = [...results.keys()];
+  const missing = want.filter((name) => !results.has(name)).sort();
+  const unexpected = got.filter((name) => !want.includes(name)).sort();
+
+  assert.equal(
+    missing.length,
+    0,
+    `the proof did not return ${missing.length} of the ${want.length} assertions it is ` +
+      `supposed to make: ${missing.join(', ')}\n` +
+      '  A missing assertion is a green suite proving less than it says. isolation.sql ' +
+      'and assertions.txt have drifted apart; isolation.sql is the one that moved.',
+  );
+  assert.equal(
+    unexpected.length,
+    0,
+    `the proof returned ${unexpected.length} assertion(s) assertions.txt does not name: ` +
+      `${unexpected.join(', ')}\n` +
+      '  A new assertion has to be listed in assertions.txt before it counts, or it is ' +
+      'invisible to every service that adopted this.',
+  );
+}
+
+/** Every assertion that came back, and its reason when it did not.
+ *
+ * The `why` is printed with the failure because it is the only place the shape of
+ * the assertion is recorded. A report that says
+ * `owner/another-tenants-rows-read-as-none` and stops is a filename; one that also
+ * says what that assertion is for is a diagnosis.
+ */
+function assertAllPass(results: Map<string, Result>): void {
+  const failed = [...results.entries()]
+    .filter(([, r]) => r.verdict !== 'pass')
+    .sort(([a], [b]) => (a < b ? -1 : 1));
+  if (failed.length === 0) return;
+
+  const detail = failed
+    .map(
+      ([name, r]) =>
+        `\n  ${name}\n    expected ${JSON.stringify(r.expected)}` +
+        `\n    actual   ${JSON.stringify(r.actual)}` +
+        `\n    because   ${r.why}`,
+    )
+    .join('');
+  assert.fail(
+    `${failed.length} of ${results.size} account-isolation assertions failed:${detail}`,
+  );
+}

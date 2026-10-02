@@ -1,0 +1,160 @@
+# frozen_string_literal: true
+
+# kit template — the account-isolation assertion set, as a Ruby test.
+#
+#     bundle add "pg" "~> 1.5"
+#     bundle exec ruby -Itest test/tenancy/tenancy_test.rb
+#
+# WHAT THIS FILE IS, AND WHY IT IS THIN.
+#
+#   The assertion set is `isolation.sql`, beside this file. It is one file for all
+#   six languages because the assertions are about POSTGRES rather than about a
+#   language: the denial a request meets is a denial the server returns. What is
+#   language-specific is the plumbing — which driver, how a row set comes back,
+#   and where the DSN comes from — and that is what is below.
+#
+#   Thin is safe here for one reason and one reason only: this test compares the
+#   NAMES it got back against `assertions.txt`, also beside this file, and fails
+#   on a difference in either direction. An isolation.sql that quietly stopped
+#   asserting something is a red this test, not a green one. Without that
+#   comparison a thin driver is a decoration — it would happily report "no red
+#   rows" about a proof that had been reduced to three assertions.
+#
+# THE TIER DECLARATION. `tier :db` is the macro `templates/tier/ruby/tier.rb`
+# defines, and it is why that file says "copy this file beside your database
+# tests": this file needs the module to be required. It is a no-op at runtime —
+# declaring a tier changes no test's behaviour — and it is what makes this test
+# part of the `REQUIRED_DB` set rather than a test that happens to be near the
+# database code.
+#
+# THE DSN. `TEST_DATABASE_URL`, and it must be the role that may `SET ROLE` — the
+# OWNER, whose password a service already has for migrations. kit's cluster grants
+# `<service>_app` to `<service>` precisely so the weaker role can be impersonated,
+# and impersonating a strictly weaker role cannot widen anything.
+#
+#   REQUIRED_DB=1   turns a missing DSN from a skip into a FAILURE. A skip is a
+#                   green run that never opened a connection, and a green run is
+#                   the exact thing this file exists to contradict.
+require "minitest/autorun"
+require "pg"
+require_relative "tier" # templates/tier/ruby/tier.rb — for `tier :db`
+
+class AccountIsolationTest < Minitest::Test
+  extend Cafaye::Tier
+
+  # The tier this file belongs to. The value in a normalised result line's `tier`
+  # field, and the suffix of the gate variable: REQUIRED_DB=1.
+  tier :db
+
+  # The proof, run whole and unexamined. It opens a transaction and leaves it open,
+  # because two of the things it does refuse to do outside one; every object it
+  # creates is TEMPORARY, so nothing survives the session either way.
+  #
+  # `PG::Connection#exec` sends a multi-statement batch over the simple query
+  # protocol, which is the one that accepts one — the extended protocol binds a
+  # script into a single prepared statement and rejects it.
+  SCRIPT = File.read(File.join(__dir__, "isolation.sql")).freeze
+
+  # One single-statement query rather than asking the batch for its last result
+  # set. That is what lets this driver stay this short: every driver in every
+  # language can execute a script and then ask a question, and none of them has to
+  # know how its own driver reports the rows of a multi-statement batch, which
+  # differs in all six.
+  RESULTS = <<~SQL
+    SELECT assertion, expected, actual, verdict, why
+      FROM pg_temp.cafaye_probe_result
+     ORDER BY assertion
+  SQL
+
+  def test_account_isolation
+    dsn = ENV["TEST_DATABASE_URL"]
+    if dsn.nil? || dsn.empty?
+      if ENV["REQUIRED_DB"] == "1"
+        flunk("REQUIRED_DB=1 and TEST_DATABASE_URL is unset: the account-isolation " \
+              "proof cannot run, and a skipped proof is a green run that proved " \
+              "nothing. Start the database, or unset REQUIRED_DB to skip this tier " \
+              "on purpose.")
+      end
+      skip("TEST_DATABASE_URL is unset; the db tier is not required in this run")
+    end
+
+    connection = PG.connect(dsn)
+    begin
+      connection.exec(SCRIPT)
+
+      results = connection.exec(RESULTS).to_a
+      # Roll the proof's transaction back rather than leaving it open. Everything
+      # it created is temporary and would go with the session, but a test that
+      # leaves a transaction open makes every test after it run inside it.
+      connection.exec("ROLLBACK")
+
+      assert_complete(results)
+      assert_all_pass(results)
+    ensure
+      connection.close
+    end
+  end
+
+  private
+
+  # The assertion set is EXACTLY the one assertions.txt names.
+  #
+  # Both directions, and both are needed. A missing name means the proof stopped
+  # asserting something, which a "no failures" assertion would report as a pass. An
+  # extra name means the proof grew something this driver does not know about, so
+  # the two have separated and the next edit to either is made against a stale idea
+  # of the other.
+  def assert_complete(results)
+    got = results.map { |r| r["assertion"] }
+    want = manifest
+
+    missing = want - got
+    unexpected = got - want
+
+    refute_empty want, "assertions.txt lists no assertions, so completeness is " \
+                       "satisfied by a proof that returns nothing"
+
+    unless missing.empty?
+      flunk("the proof did not return #{missing.size} of the #{want.size} assertions " \
+            "it is supposed to make: #{missing.join(', ')}\n" \
+            "  A missing assertion is a green suite proving less than it says. " \
+            "isolation.sql and assertions.txt have drifted apart; isolation.sql is " \
+            "the one that moved.")
+    end
+    return if unexpected.empty?
+
+    flunk("the proof returned #{unexpected.size} assertion(s) assertions.txt does " \
+          "not name: #{unexpected.join(', ')}\n" \
+          "  A new assertion has to be listed in assertions.txt before it counts, " \
+          "or it is invisible to every service that adopted this.")
+  end
+
+  # Every assertion that came back, and its reason when it did not.
+  #
+  # The `why` is printed with the failure because it is the only place the shape of
+  # the assertion is recorded. A report that says
+  # `owner/another-tenants-rows-read-as-none` and stops is a filename; one that also
+  # says what that assertion is for is a diagnosis.
+  def assert_all_pass(results)
+    failed = results.reject { |r| r["verdict"] == "pass" }
+    return if failed.empty?
+
+    detail = failed.map do |r|
+      "\n  #{r['assertion']}\n    expected #{r['expected'].inspect}" \
+        "\n    actual   #{r['actual'].inspect}\n    because   #{r['why']}"
+    end
+    flunk("#{failed.size} of #{results.size} account-isolation assertions " \
+          "failed:#{detail.join}")
+  end
+
+  # The names assertions.txt lists, comments and blanks dropped.
+  #
+  # A comment is dropped rather than skipped because the file's own comments quote
+  # assertion names to explain the shape; reading one as an assertion would report
+  # a name the proof does not return, which is a red on a correct tree.
+  def manifest
+    @manifest ||= File.readlines(File.join(__dir__, "assertions.txt"), chomp: true)
+                   .map(&:strip)
+                   .reject { |line| line.empty? || line.start_with?("#") }
+  end
+end

@@ -8,11 +8,20 @@
 | | |
 |---|---|
 | Clusters | **one**, shared |
-| Isolation boundary | **the database**, not the machine |
+| Isolation boundary (between services) | **the database**, not the machine |
+| Isolation boundary (between accounts) | **row-level security**, forced. [`tenancy/`](tenancy/README.md) |
 | Databases | one per service, named after it |
-| Roles | one per service, `NOSUPERUSER`, named the same |
+| Roles | two per service: an owner, and a `<service>_app` LOGIN that owns nothing |
 | Pooler | **none.** Direct connections, a stated budget, per-role blast radius |
 | Extensions | in the image (pglayers), created by the admin role into every service database |
+
+**There are two boundaries, and they are different subjects.** This file is the
+first one: a service cannot reach another service's database. The second is two
+accounts of the *same* service, which is `tenancy/` and was, until that directory
+existed, enforced entirely by hand-written `WHERE account_id = ?` in six
+languages — zero `ROW LEVEL SECURITY` and zero `CREATE POLICY` across all nine
+account-scoped services. Read both; a service that reads only this one believes
+it is isolated when it has only closed half the boundary.
 
 ## Where the pieces live, and why they are in different places
 
@@ -23,6 +32,7 @@ because that is what the existing conventions already do.
 |---|---|---|
 | the cluster | `templates/compose/postgres/` | **fetched** with the stack, from the `kit.ref` pin |
 | the connection config | `templates/database/<lang>/` | **copied** into the service, per language |
+| the account boundary | `templates/database/tenancy/` | **copied** into the service: SQL for its migrations, a driver for its tests |
 
 The cluster is shared and identical for all nine services, so it belongs with the
 shared stack. The connection config differs per service and per language, so it
@@ -65,6 +75,31 @@ grant makes it fail, and nothing warns you at the time.
 
 So: **the `REVOKE` is the boundary, and the table grants are the accident it does
 not rely on.**
+
+## Two roles per service, and which one your application logs in as
+
+| role | logs in | owns | may |
+|---|---|---|---|
+| `<service>` | yes — **for migrations** | the database, and every table in it | anything, including switching RLS off on its own tables |
+| `<service>_app` | yes — **this is your application** | nothing | `select`/`insert`/`update`/`delete` on the tables `cafaye.protect_table` has protected |
+
+`<service>` is unchanged, and a service that adopts nothing here is unaffected.
+`<service>_app` exists because **Postgres exempts a table's owner from its own
+row-level-security policies**: a login role that owns its tables can
+`ALTER TABLE … DISABLE ROW LEVEL SECURITY` and can `DROP POLICY`, so an account
+boundary enforced only by policies is one privilege away from meaning nothing. The
+cluster grants `<service>_app` **to** `<service>` and never the reverse, so a
+migration — and `tests/tenancy_test.sh` — can impersonate the weaker role to prove
+the boundary from outside it.
+
+`bin/dev db grant` prints both roles. A service that was provisioned before this
+existed gets `<service>_app` by running those statements; the init script only
+runs on a fresh volume.
+
+`templates/database/tenancy/README.md` is the other half, and it carries the
+`FORCE ROW LEVEL SECURITY` measurement: without it, `<service>` — the role your
+migrations run as — reads every account's rows while the policies read as though
+they were in place.
 
 ## The pooler decision: NO
 
@@ -248,6 +283,13 @@ Two consequences worth stating:
    rather than telling you to delete your data.
 3. Copy `templates/database/<lang>/` from the ref your `kit.ref` names, and change
    the service name in it.
+4. If you hold customer rows, adopt `templates/database/tenancy/`: apply
+   `substrate.sql`, call `cafaye.protect_table` from each account-scoped table's
+   migration, point the application at `<service>_app`, and copy the
+   per-language `tenancy_test.*` beside `isolation.sql` and `assertions.txt` with
+   `REQUIRED_DB=1`. A service holding **no** customer rows is core's honest zero
+   and needs none of it — `tenancy.yml` says `accountScoped: false` and that is
+   the whole declaration.
 
 **Step 1 is the whole of step 1, and it is not an override.** `KIT_POSTGRES_DATABASES`
 is where a database and a `NOSUPERUSER` role come from, and reaching it through
@@ -291,6 +333,13 @@ initdb runs once and cannot sweep a database that does not exist yet.
   re-applied by recreating the volume, and nothing above is re-applied by
   restarting a container. A cluster that was provisioned before a service existed
   will not gain that service's database on `bin/dev up`.
+- **The init script's role topology is asserted, in both directions.**
+  `<service>_app` existing is checked, `<service>` being able to impersonate it is
+  checked, and **`<service>_app` NOT being a member of `<service>` is checked** —
+  because a claim that a membership direction is allowed is worth nothing without
+  the claim that the other one is not, and the other one hands the application
+  every privilege the owner has. `tests/isolation_test.sh` asserts all three.
+
 - **The init script fails loudly, and it is designed to.** A cluster that cannot
   apply the boundary does not start. This was learned the hard way: an earlier
   version tested for a database's existence with a command substitution inside an

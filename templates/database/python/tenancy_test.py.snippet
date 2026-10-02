@@ -1,0 +1,164 @@
+# kit template — the account-isolation assertion set, as a Python test.
+#
+#     pip install "psycopg[binary]>=3.2.3" pytest
+#     pytest -q db/tenancy/tenancy_test.py
+#
+# WHAT THIS FILE IS, AND WHY IT IS THIN.
+#
+#   The assertion set is `isolation.sql`, beside this file. It is one file for all
+#   six languages because the assertions are about POSTGRES rather than about a
+#   language: the denial a request meets is a denial the server returns. What is
+#   language-specific is the plumbing — which driver, how a row set comes back, and
+#   where the DSN comes from — and that is what is below.
+#
+#   Thin is safe here for one reason and one reason only: this test compares the
+#   NAMES it got back against `assertions.txt`, also beside this file, and fails on
+#   a difference in either direction. An isolation.sql that quietly stopped
+#   asserting something is a red this test, not a green one. Without that comparison
+#   a thin driver is a decoration — it would happily report "no red rows" about a
+#   proof that had been reduced to three assertions.
+#
+# THE TIER MARKER. `@pytest.mark.tier_db` is the declaration `templates/tier/`
+# describes, and this file uses it for the same reason: the runner's own collector
+# reads it, so the inventory `pytest --collect-only -q -m tier_db` produces cannot
+# drift from the tests that exist. This test needs a real database, and a test that
+# needs one and is not marked for it is a test that runs in a developer's unit-test
+# run and fails there.
+#
+# THE DSN. `TEST_DATABASE_URL`, and it must be the role that may `set role` — the
+# OWNER, whose password a service already has for migrations. kit's cluster grants
+# `<service>_app` to `<service>` precisely so the weaker role can be impersonated,
+# and impersonating a strictly weaker role cannot widen anything.
+#
+#   REQUIRED_DB=1   turns a missing DSN from a skip into a FAILURE. A skip is a
+#                   green run that never opened a connection, and a green run is
+#                   the exact thing this file exists to contradict.
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import psycopg
+import pytest
+
+#: The tier these tests belong to. The value in a normalised result line's `tier`
+#: field, and the suffix of the gate variable: ``REQUIRED_DB=1``.
+TIER = "db"
+
+HERE = Path(__file__).resolve().parent
+
+#: The proof, run whole and unexamined. It opens a transaction and leaves it open,
+#: because two of the things it does refuse to do outside one; every object it
+#: creates is TEMPORARY, so nothing survives the session either way.
+SCRIPT = (HERE / "isolation.sql").read_text(encoding="utf-8")
+
+#: One single-statement query rather than asking the batch for its last result set.
+#: That is what lets this driver stay short: every driver in every language can
+#: execute a script and then ask a question, and none of them has to know how its
+#: own driver reports the rows of a multi-statement batch, which differs in all six.
+RESULTS = """
+    SELECT assertion, expected, actual, verdict, why
+      FROM pg_temp.cafaye_probe_result
+     ORDER BY assertion
+"""
+
+pytestmark = pytest.mark.tier_db
+
+
+@pytest.mark.tier_db
+def test_account_isolation() -> None:
+    dsn = os.environ.get("TEST_DATABASE_URL")
+    if not dsn:
+        if os.environ.get("REQUIRED_DB") == "1":
+            pytest.fail(
+                "REQUIRED_DB=1 and TEST_DATABASE_URL is unset: the account-isolation "
+                "proof cannot run, and a skipped proof is a green run that proved "
+                "nothing. Start the database, or unset REQUIRED_DB to skip this tier "
+                "on purpose."
+            )
+        pytest.skip("TEST_DATABASE_URL is unset; the db tier is not required in this run")
+
+    with psycopg.connect(dsn) as conn:
+        conn.execute(SCRIPT)
+        rows = conn.execute(RESULTS).fetchall()
+        # Roll the proof's transaction back rather than leaving it open. Everything
+        # it created is temporary and would go with the session, but a test that
+        # leaves a transaction open makes every test after it run inside it.
+        conn.rollback()
+
+    results = {row[0]: row for row in rows}
+    assert_complete(results)
+    assert_all_pass(results)
+
+
+def manifest() -> list[str]:
+    """The names ``assertions.txt`` lists, comments and blanks dropped.
+
+    A comment is dropped rather than skipped because the file's own comments quote
+    assertion names to explain the shape; reading one as an assertion would report a
+    name the proof does not return, which is a red on a correct tree.
+    """
+    names = [
+        line.strip()
+        for line in (HERE / "assertions.txt").read_text(encoding="utf-8").splitlines()
+    ]
+    return [n for n in names if n and not n.startswith("#")]
+
+
+def assert_complete(results: dict) -> None:
+    """The assertion set is EXACTLY the one ``assertions.txt`` names.
+
+    Both directions, and both are needed. A missing name means the proof stopped
+    asserting something, which a "no failures" assertion would report as a pass. An
+    extra name means the proof grew something this driver does not know about, so
+    the two have separated and the next edit to either is made against a stale idea
+    of the other.
+    """
+    want = manifest()
+    assert want, (
+        "assertions.txt lists no assertions, so completeness is satisfied by a "
+        "proof that returns nothing"
+    )
+
+    got = set(results)
+    missing = sorted(set(want) - got)
+    unexpected = sorted(got - set(want))
+
+    if missing:
+        pytest.fail(
+            f"the proof did not return {len(missing)} of the {len(want)} assertions it "
+            f"is supposed to make: {', '.join(missing)}\n"
+            "  A missing assertion is a green suite proving less than it says. "
+            "isolation.sql and assertions.txt have drifted apart; isolation.sql is "
+            "the one that moved."
+        )
+    if unexpected:
+        pytest.fail(
+            f"the proof returned {len(unexpected)} assertion(s) assertions.txt does "
+            f"not name: {', '.join(unexpected)}\n"
+            "  A new assertion has to be listed in assertions.txt before it counts, "
+            "or it is invisible to every service that adopted this."
+        )
+
+
+def assert_all_pass(results: dict) -> None:
+    """Every assertion that came back, and its reason when it did not.
+
+    The ``why`` is printed with the failure because it is the only place the shape
+    of the assertion is recorded. A report that says
+    ``owner/another-tenants-rows-read-as-none`` and stops is a filename; one that
+    also says what that assertion is for is a diagnosis.
+    """
+    failed = sorted(
+        (name, row) for name, row in results.items() if row[3] != "pass"
+    )
+    if not failed:
+        return
+    detail = "\n".join(
+        f"\n  {name}\n    expected {row[1]!r}\n    actual   {row[2]!r}\n"
+        f"    because   {row[4]}"
+        for name, row in failed
+    )
+    pytest.fail(
+        f"{len(failed)} of {len(results)} account-isolation assertions failed:{detail}"
+    )

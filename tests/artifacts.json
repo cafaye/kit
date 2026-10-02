@@ -220,6 +220,80 @@
       "optional": true
     },
     {
+      "id": "database/tenancy/substrate",
+      "_about": "The account boundary, and the ONE artefact in this table that is not per-language: substrate.sql is SQL, so it is the same file for every service in every language. That is the argument database/contract.json makes about itself — a requirement restated six times is six things to disagree — and it is what lets ONE live proof (tests/tenancy_test.sh) prove the substance of all six drivers rather than six copies of it.",
+      "source": "templates/database/tenancy/substrate.sql",
+      "dest": "db/tenancy/substrate.sql",
+      "optional": true,
+      "_about_optional": "Optional, because a service holding no customer rows is core's HONEST ZERO and must be able to say accountScoped: false without carrying a row-level security substrate it has nothing to scope. Optional is NOT the same as discouraged: a service that scopes by account and does not copy this is the state the whole packet exists to end, and its tenancy.yml is where that becomes a finding rather than an omission."
+    },
+    {
+      "id": "database/tenancy/isolation",
+      "_about": "isolation.sql and assertions.txt are ONE artefact because the six drivers read them TOGETHER: the script is run, and the manifest is what its answers are compared against. A service that copied one without the other has a driver that either asserts completeness about nothing (no manifest) or reads a file it never compares (no script), and neither failure is visible from the tree. The destination is one directory holding all three, and each driver resolves its siblings relative to its own source file rather than to the working directory.",
+      "source": "templates/database/tenancy/isolation.sql",
+      "dest": "db/tenancy/isolation.sql",
+      "bundle": [
+        ["templates/database/tenancy/isolation.sql", "db/tenancy/isolation.sql"],
+        ["templates/database/tenancy/assertions.txt", "db/tenancy/assertions.txt"]
+      ],
+      "optional": true
+    },
+    {
+      "id": "database/tenancy/readme",
+      "source": "templates/database/tenancy/README.md",
+      "dest": "db/tenancy/README.md",
+      "optional": true,
+      "_about_optional": "Shipped rather than left out because it is the file that answers why does the owner read zero rows now, which is the question the first migration asks and the one a service holding only the SQL cannot answer."
+    },
+    {
+      "id": "database/tenancy/test-go",
+      "_about": "Six rows for one shape, exactly as the six connection snippets above are: the filename carries the language's own extension and the destination is the same directory for all six, so {lang} interpolation cannot express it and inventing a perLanguage field would be a change to what tests/staleness.py models. Also declared OPTIONAL, because a service with no customer rows carries no account boundary — and optional is not the same as unexamined: tests/validate.sh asserts all six exist in THIS repository, so a language losing its driver is a red build here rather than a silent half-adoption in a service. language: go.",
+      "source": "templates/database/go/tenancy_test.go.snippet",
+      "dest": "db/tenancy/tenancy_test.go",
+      "languages": ["go"],
+      "optional": true
+    },
+    {
+      "id": "database/tenancy/test-elixir",
+      "_about": "Six rows for one shape, exactly as the six connection snippets above are: the filename carries the language's own extension and the destination is the same directory for all six, so {lang} interpolation cannot express it and inventing a perLanguage field would be a change to what tests/staleness.py models. Also declared OPTIONAL, because a service with no customer rows carries no account boundary — and optional is not the same as unexamined: tests/validate.sh asserts all six exist in THIS repository, so a language losing its driver is a red build here rather than a silent half-adoption in a service. language: elixir.",
+      "source": "templates/database/elixir/tenancy_test.exs.snippet",
+      "dest": "db/tenancy/tenancy_test.exs",
+      "languages": ["elixir"],
+      "optional": true
+    },
+    {
+      "id": "database/tenancy/test-python",
+      "_about": "Six rows for one shape, exactly as the six connection snippets above are: the filename carries the language's own extension and the destination is the same directory for all six, so {lang} interpolation cannot express it and inventing a perLanguage field would be a change to what tests/staleness.py models. Also declared OPTIONAL, because a service with no customer rows carries no account boundary — and optional is not the same as unexamined: tests/validate.sh asserts all six exist in THIS repository, so a language losing its driver is a red build here rather than a silent half-adoption in a service. language: python.",
+      "source": "templates/database/python/tenancy_test.py.snippet",
+      "dest": "db/tenancy/tenancy_test.py",
+      "languages": ["python"],
+      "optional": true
+    },
+    {
+      "id": "database/tenancy/test-ruby",
+      "_about": "Six rows for one shape, exactly as the six connection snippets above are: the filename carries the language's own extension and the destination is the same directory for all six, so {lang} interpolation cannot express it and inventing a perLanguage field would be a change to what tests/staleness.py models. Also declared OPTIONAL, because a service with no customer rows carries no account boundary — and optional is not the same as unexamined: tests/validate.sh asserts all six exist in THIS repository, so a language losing its driver is a red build here rather than a silent half-adoption in a service. language: ruby.",
+      "source": "templates/database/ruby/tenancy_test.rb.snippet",
+      "dest": "db/tenancy/tenancy_test.rb",
+      "languages": ["ruby"],
+      "optional": true
+    },
+    {
+      "id": "database/tenancy/test-node",
+      "_about": "Six rows for one shape, exactly as the six connection snippets above are: the filename carries the language's own extension and the destination is the same directory for all six, so {lang} interpolation cannot express it and inventing a perLanguage field would be a change to what tests/staleness.py models. Also declared OPTIONAL, because a service with no customer rows carries no account boundary — and optional is not the same as unexamined: tests/validate.sh asserts all six exist in THIS repository, so a language losing its driver is a red build here rather than a silent half-adoption in a service. language: node, and language: bun — bun runs the same node-postgres driver, so it ships THIS file rather than a second one.",
+      "source": "templates/database/node/tenancy_test.ts.snippet",
+      "dest": "db/tenancy/tenancy_test.ts",
+      "languages": ["node", "bun"],
+      "optional": true
+    },
+    {
+      "id": "database/tenancy/test-rust",
+      "_about": "Six rows for one shape, exactly as the six connection snippets above are: the filename carries the language's own extension and the destination is the same directory for all six, so {lang} interpolation cannot express it and inventing a perLanguage field would be a change to what tests/staleness.py models. Also declared OPTIONAL, because a service with no customer rows carries no account boundary — and optional is not the same as unexamined: tests/validate.sh asserts all six exist in THIS repository, so a language losing its driver is a red build here rather than a silent half-adoption in a service. language: rust.",
+      "source": "templates/database/rust/tenancy_test.rs.snippet",
+      "dest": "db/tenancy/tenancy_test.rs",
+      "languages": ["rust"],
+      "optional": true
+    },
+    {
       "id": "database/contract.json",
       "source": "templates/database/contract.json",
       "dest": "docs/database-contract.json",

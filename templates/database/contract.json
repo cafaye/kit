@@ -34,6 +34,130 @@
     "  file is an argument nobody reads and a check that only checks a string."
   ],
 
+  "tenancy": {
+    "_about": [
+      "THE ACCOUNT BOUNDARY, IN THE FORM THE GATE CAN READ.",
+      "",
+      "  A third block in the one contract file rather than a second contract file,",
+      "  and that is this file's own argument applied: `requiredSettings` says what",
+      "  every generated per-language config must CARRY, and this says what the",
+      "  row-level-security substrate must CONTAIN. Two subjects, one file, one check.",
+      "",
+      "  Every string below is checked against the file with SQL COMMENTS STRIPPED.",
+      "  That is the rule this repository already states about `-count=1` — a check a",
+      "  comment can satisfy is not a check — and it bites harder here than anywhere",
+      "  else in the tree, because substrate.sql's comments quote nearly every one of",
+      "  these strings while explaining why each exists. A check that read the file as",
+      "  text would report the whole contract satisfied on a substrate with none of it."
+    ],
+
+    "substrate": {
+      "file": "templates/database/tenancy/substrate.sql",
+      "required": [
+        {
+          "token": "force row level security",
+          "why": "THE ONE THAT IS IN NOBODY'S GUIDE. Postgres exempts a table's OWNER from its own policies, and every service in this fleet runs its migrations as its own role. Without FORCE the owner reads every account's rows while the policies read as if they were in place, and no lint in the fleet checks for it. Measured on this kit, a protected three-row table read as the owner with another tenant's identity: 1 row with FORCE, 3 without. tests/tenancy_test.sh deletes this statement and requires the OWNER half of the assertion set to go red while the LOGIN half stays green."
+        },
+        {
+          "token": "enable row level security",
+          "why": "FORCE without ENABLE is a no-op and ENABLE without FORCE is the trap. Both, in this order, each asserted rather than assumed — and the two are asserted by the same statement list, so a substrate that enabled without forcing is caught by the token above rather than by a rule about which came first."
+        },
+        {
+          "token": "(select cafaye.current_account_id())",
+          "why": "The `(select ...)` wrapping: one call per statement against one per candidate row. Measured on this kit, five rows and one query, 1 call wrapped and 5 bare. It is a required STRING rather than a rule because the correct spelling is one literal in one function, and a rule about parsing rendered policy qualifiers would be a second parser for a value this repository already owns."
+        },
+        {
+          "token": "create or replace function cafaye.protect_table",
+          "why": "One entry point. A substrate that also offered a weaker way to protect a table is a substrate the weaker way gets chosen from, and nothing about the weaker one would look weaker."
+        },
+        {
+          "token": "create or replace function cafaye.begin_account",
+          "why": "The seam, and the half that is transaction-local. One function a service calls once per request means one place in a codebase writes the identity GUC, and `is_local = true` is what makes a pooled connection safe: a session-level tenant variable survives the pool and hands one tenant's rows to another."
+        },
+        {
+          "token": "create or replace function cafaye.current_account_id",
+          "why": "The read side of the seam, and the half whose NULL is load-bearing. No identity and an identity that owns nothing must be indistinguishable, or the boundary is an enumeration oracle — core's D33 arriving from the other end."
+        },
+        {
+          "token": "create index if not exists",
+          "why": "A policy is a filter on every candidate row, so an account-scoped table read through its primary key is still a sequential scan without an index on the column the policy filters on. Creating it inside protect_table is what stops that being a separate thing to remember."
+        },
+        {
+          "token": "revoke all on table",
+          "why": "PUBLIC holds no table privilege by default, and one statement makes the answer to \"who can read this\" not be \"whoever the last migration remembered\"."
+        },
+        {
+          "token": "create or replace function cafaye.unprotected_tables",
+          "why": "The sweep, and the only thing that keeps a service honest as it grows: a table added next month with an account_id column and no policies is named on the next run, which is the moment before it matters."
+        },
+        {
+          "token": "not c.relforcerowsecurity",
+          "why": "The sweep reads pg_class itself rather than trusting that protect_table ran. A sweep that only knew about tables it had created itself would be satisfied by a sweep that creates nothing."
+        }
+      ],
+      "forbidden": [
+        "auth.uid()",
+        "to public using",
+        "for all to",
+        "USING (true)",
+        "with check (true)"
+      ],
+      "forbiddenWhy": [
+        "`auth.uid()` is Supabase's helper, not ours. It reads a JWT claim out of a GUC, which is ONE authentication shape out of six languages — identity issues opaque session tokens, guard verifies JWKS bearer JWTs — and a substrate that hardcoded one would be silently wrong for the other five. The seam is `begin_account/1`, and a service fills it from whatever it already authenticates. That is also why this substrate does not parse tokens: a template that guessed would be right once.",
+        "",
+        "The other four are the shapes that make a policy decorative. `to public` is an unnamed role, and an unnamed policy is evaluated for every role on the cluster including the eight other services'. `for all` collapses four commands into one qualifier that can then never be widened for one of them without widening all of them. `USING (true)` and `with check (true)` are an always-permissive policy that reads in review exactly like a real one, and they are the shape every \"permissive RLS policy\" lint is written to flag."
+      ]
+    },
+
+    "isolation": {
+      "file": "templates/database/tenancy/isolation.sql",
+      "required": [
+        "set local role",
+        "cafaye.begin_account",
+        "cafaye.unprotected_tables()",
+        "pg_temp.cafaye_assert"
+      ],
+      "requiredWhy": [
+        "`set local role` is how the two halves of the assertion set are reached — the login role and the owner — and both halves are load-bearing and neither is obvious. Without the LOCAL form the role change refuses to run at all. Inside a transaction it is undone by any `exception` block it was issued from, which is a harness that silently tests the wrong role and reports a green proof; the first version of this file made exactly that mistake, by wrapping the refusals in a SECURITY DEFINER recorder that ran them as the OWNER and so succeeded at disabling the boundary it was asserting nobody could disable.",
+        "",
+        "`cafaye.begin_account` is the identity seam being USED rather than read about. Every read denial in the file is meaningless without it: with no identity set, every row is hidden and every denial assertion passes.",
+        "",
+        "`cafaye.unprotected_tables()` is the sweep being exercised rather than trusted, and it carries the assertion set's only POSITIVE CONTROL: that the sweep really does report a table with an account_id column and no policies. Without it the sweep's empty result is satisfied by a sweep that reports nothing at all, which is the same shape as an isolation test that only asserts \"no identity reads zero rows\".",
+        "",
+        "`pg_temp.cafaye_assert` is the file's own recorder. Required by name because the results are collected by a function this file defines in `pg_temp`, and a proof whose results are collected by something else is a proof whose result format is whatever that something else produces — which is precisely what the six drivers would then have to know about."
+      ],
+      "spine": [
+        "login/no-identity-reads-no-rows",
+        "login/another-tenants-rows-read-as-none",
+        "login/own-rows-are-visible",
+        "login/own-identity-reads-only-its-own-rows",
+        "owner/no-identity-reads-no-rows",
+        "owner/another-tenants-rows-read-as-none",
+        "owner/own-rows-are-visible",
+        "owner/own-identity-reads-only-its-own-rows"
+      ],
+      "spineWhy": "THE SHAPE, and it is four assertions per role rather than one. A request with no identity reading zero rows is satisfied by a table with no policy at all, which is the bug. A request with its own identity reading its own rows is satisfied by a policy that permits everything. Only together are they the property. Every one of these eight names must be CONSTRUCTED in the script as well as listed in assertions.txt — a manifest naming an assertion the script never makes is a manifest reporting completeness for a proof that does not contain it — and the owner/ four exist because the login/ four pass on a substrate with no FORCE at all."
+    },
+
+    "assertions": {
+      "file": "templates/database/tenancy/assertions.txt",
+      "why": "The manifest all six drivers compare against, and the reason completeness is a SET rather than a COUNT. A count of 24 is compatible with 24 of the wrong 24, and a driver asserting only \"no red rows\" is satisfied by a proof that had been cut down to three assertions by an earlier commit nobody read. The check below reads this file and isolation.sql and fails on a difference in EITHER direction."
+    },
+
+    "drivers": {
+      "why": "The six per-language tests. Each runs isolation.sql, reads the result table it creates, and then asserts that the assertion NAMES it got back are EXACTLY assertions.txt. They are thin on purpose — the assertions are about Postgres, not about a language — and thin is safe ONLY because of that comparison, so the check below requires every language kit templates to carry a driver, requires each driver to actually READ both files, and requires the result-table name to appear in code.",
+      "mustRead": [
+        "assertions.txt",
+        "isolation.sql"
+      ],
+      "mustReadWhy": "Checked on the SAME LINE as one of the language's own read forms, which is the whole difficulty. A first version asked only whether the file mentioned the name, and every driver mentions both in its own header comment — the header is WHY the driver is thin — so a driver whose read had been deleted was reported clean. A second version asked whether the file contained a read ANYWHERE, and every driver satisfies that by reading isolation.sql, so a driver that had stopped reading assertions.txt was still clean. Both were satisfied by the exact edit they exist to catch. What this check cannot show is that the driver EXECUTES the script it read rather than reading it and running its own query; that limit is recorded in the report rather than papered over.",
+      "mustCarry": [
+        "pg_temp.cafaye_probe_result"
+      ],
+      "mustCarryWhy": "The result table isolation.sql creates. It is in code rather than in a comment because it is the thing a driver queries AFTER running the proof, and a driver that never asks for it is not running this proof at all. Every other list this check iterates has an empty-list guard for the same reason: a list that is empty makes the loop over it a no-op that passes, which is how a check ends up green having read nothing."
+    }
+  },
+
   "pooler": {
     "decision": "none",
     "summary": "One cluster, direct connections, a stated connection budget, and per-role blast-radius limits. No transaction-mode pooler.",

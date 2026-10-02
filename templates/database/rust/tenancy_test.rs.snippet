@@ -1,0 +1,236 @@
+// kit template — the account-isolation assertion set, as a Rust test.
+//
+//     cargo add tokio-postgres --features with-serde_json-1
+//     cargo test --test tenancy -- --ignored
+//
+// WHAT THIS FILE IS, AND WHY IT IS THIN.
+//
+//   The assertion set is `isolation.sql`, beside this file. It is one file for all
+//   six languages because the assertions are about POSTGRES rather than about a
+//   language: the denial a request meets is a denial the server returns. What is
+//   language-specific is the plumbing — which driver, how a row set comes back, and
+//   where the DSN comes from — and that is what is below.
+//
+//   Thin is safe here for one reason and one reason only: this test compares the
+//   NAMES it got back against `assertions.txt`, also beside this file, and fails on
+//   a difference in either direction. An isolation.sql that quietly stopped
+//   asserting something is a red this test, not a green one. Without that
+//   comparison a thin driver is a decoration — it would happily report "no red
+//   rows" about a proof that had been reduced to three assertions.
+//
+// THE TIER. `#[ignore = "..."]` is the model for this language and the reason is
+// in `templates/tier/rust/tier.rs`: the attribute's message is a documented field
+// of `ignore`, it is carried all the way to the test output, and
+// `cargo test -- --list` enumerates ignored tests INCLUDED — so the inventory the
+// gate diffs against cannot drift from the tests that exist. It also means this
+// test does not run in a plain `cargo test`, which is correct: it needs a database.
+//
+// THE DSN. `TEST_DATABASE_URL`, and it must be the role that may `SET ROLE` — the
+// OWNER, whose credential a service already has for migrations. kit's cluster grants
+// `<service>_app` to `<service>` precisely so the weaker role can be impersonated,
+// and impersonating a strictly weaker role cannot widen anything.
+//
+//   REQUIRED_DB=1   turns a missing DSN from a skip into a FAILURE. A skip is a
+//                   green run that never opened a connection, and a green run is
+//                   the exact thing this file exists to contradict.
+use std::env;
+use std::fs;
+use std::path::PathBuf;
+
+use tokio_postgres::{Client, NoTls};
+
+/// The tier these tests belong to. The value in a normalised result line's `tier`
+/// field, and the suffix of the gate variable: `REQUIRED_DB=1`.
+pub const TIER: &str = "db";
+
+/// One row of the proof's answer: what was asserted, what was expected, what
+/// happened, and why the assertion exists at all.
+struct Assertion {
+    expected: String,
+    actual: String,
+    verdict: String,
+    why: String,
+}
+
+/// `file!()` rather than the working directory.
+///
+/// A test's working directory is the crate root only by convention, and a runner
+/// that changes it makes a relative path silently find nothing. A test that cannot
+/// find its own fixtures should say so loudly, which this makes it do.
+fn here() -> PathBuf {
+    PathBuf::from(file!()).parent().expect("this file has a parent").to_path_buf()
+}
+
+/// The proof, run whole and unexamined. It opens a transaction and leaves it open,
+/// because two of the things it does refuse to do outside one; every object it
+/// creates is TEMPORARY, so nothing survives the session either way.
+async fn run_script(client: &Client) -> Result<(), tokio_postgres::Error> {
+    let script = fs::read_to_string(here().join("isolation.sql"))?;
+    // tokio-postgres' `simple_query` is the simple query protocol, which is the one
+    // that accepts a multi-statement batch — `query` binds them into a single
+    // prepared statement and rejects a script.
+    client.simple_query(&script).await?;
+    Ok(())
+}
+
+/// One single-statement query rather than asking the batch for its last result set.
+/// That is what lets this driver stay short: every driver in every language can
+/// execute a script and then ask a question, and none of them has to know how its
+/// own driver reports the rows of a multi-statement batch, which differs in all six.
+async fn read_results(
+    client: &Client,
+) -> Result<Vec<(String, Assertion)>, tokio_postgres::Error> {
+    client
+        .simple_query(
+            "SELECT assertion, expected, actual, verdict, why \
+             FROM pg_temp.cafaye_probe_result ORDER BY assertion",
+        )
+        .await?
+        .into_iter()
+        .filter_map(|row| match row {
+            tokio_postgres::SimpleQueryMessage::Row(r) => Some((
+                r.get(0).unwrap_or_default().to_string(),
+                Assertion {
+                    expected: r.get(1).unwrap_or_default().to_string(),
+                    actual: r.get(2).unwrap_or_default().to_string(),
+                    verdict: r.get(3).unwrap_or_default().to_string(),
+                    why: r.get(4).unwrap_or_default().to_string(),
+                },
+            )),
+            _ => None,
+        })
+        .collect()
+}
+
+/// The names `assertions.txt` lists, comments and blanks dropped.
+///
+/// A comment is dropped rather than skipped because the file's own comments quote
+/// assertion names to explain the shape; reading one as an assertion would report a
+/// name the proof does not return, which is a red on a correct tree.
+fn manifest() -> Vec<String> {
+    let raw = fs::read_to_string(here().join("assertions.txt")).expect(
+        "assertions.txt must sit beside this test; without it the proof has no declared shape",
+    );
+    raw.lines()
+        .map(str::trim)
+        .filter(|l| !l.is_empty() && !l.starts_with('#'))
+        .map(String::from)
+        .collect()
+}
+
+/// The assertion set is EXACTLY the one `assertions.txt` names.
+///
+/// Both directions, and both are needed. A missing name means the proof stopped
+/// asserting something, which a "no failures" assertion would report as a pass. An
+/// extra name means the proof grew something this driver does not know about, so the
+/// two have separated and the next edit to either is made against a stale idea of the
+/// other.
+fn assert_complete(results: &[(String, Assertion)]) {
+    let want = manifest();
+    assert!(
+        !want.is_empty(),
+        "assertions.txt lists no assertions, so completeness is satisfied by a proof that returns nothing"
+    );
+
+    // `got` is cloned rather than borrowed so every comparison below is between two
+    // `&String` and not between a `String` and a `&String`, which compiles to
+    // something else entirely and is the sort of thing that only shows up when the
+    // crates resolve.
+    let got: Vec<String> = results.iter().map(|(name, _)| name.clone()).collect();
+    let mut missing: Vec<String> = want.iter().filter(|n| !got.contains(n)).cloned().collect();
+    missing.sort();
+    let mut unexpected: Vec<String> = got.iter().filter(|g| !want.contains(g)).cloned().collect();
+    unexpected.sort();
+
+    assert!(
+        missing.is_empty(),
+        "the proof did not return {} of the {} assertions it is supposed to make: {}\n  \
+         A missing assertion is a green suite proving less than it says. isolation.sql and \
+         assertions.txt have drifted apart; isolation.sql is the one that moved.",
+        missing.len(),
+        want.len(),
+        missing.join(", ")
+    );
+    assert!(
+        unexpected.is_empty(),
+        "the proof returned {} assertion(s) assertions.txt does not name: {}\n  A new \
+         assertion has to be listed in assertions.txt before it counts, or it is invisible to \
+         every service that adopted this.",
+        unexpected.len(),
+        unexpected.join(", ")
+    );
+}
+
+/// Every assertion that came back, and its reason when it did not.
+///
+/// The `why` is printed with the failure because it is the only place the shape of
+/// the assertion is recorded. A report that says
+/// `owner/another-tenants-rows-read-as-none` and stops is a filename; one that also
+/// says what that assertion is for is a diagnosis.
+fn assert_all_pass(results: &[(String, Assertion)]) {
+    let mut failed: Vec<&(String, Assertion)> =
+        results.iter().filter(|(_, r)| r.verdict != "pass").collect();
+    failed.sort_by(|a, b| a.0.cmp(&b.0));
+
+    if failed.is_empty() {
+        return;
+    }
+    let detail: String = failed
+        .iter()
+        .map(|(name, r)| {
+            format!(
+                "\n  {}\n    expected {:?}\n    actual   {:?}\n    because   {}",
+                name, r.expected, r.actual, r.why
+            )
+        })
+        .collect();
+    panic!(
+        "{} of {} account-isolation assertions failed:{}",
+        failed.len(),
+        results.len(),
+        detail
+    );
+}
+
+#[tokio::test]
+#[ignore = "cafaye:tier=db reason=needs a live Postgres with the tenancy substrate applied"]
+async fn account_isolation() {
+    let dsn = env::var("TEST_DATABASE_URL").unwrap_or_default();
+
+    if dsn.is_empty() {
+        if env::var("REQUIRED_DB").as_deref() == Ok("1") {
+            panic!(
+                "REQUIRED_DB=1 and TEST_DATABASE_URL is unset: the account-isolation proof \
+                 cannot run, and a skipped proof is a green run that proved nothing. Start the \
+                 database, or unset REQUIRED_DB to skip this tier on purpose."
+            );
+        }
+        // A skip, deliberately, and only because REQUIRED_DB is not demanding this tier.
+        // The panic above is what stops that skip from being a green run.
+        return;
+    }
+
+    let (client, connection) = tokio_postgres::connect(dsn, NoTls)
+        .await
+        .expect("connect to TEST_DATABASE_URL");
+
+    // The connection future must be driven or the client is inert. This is the whole
+    // of it, and it is worth stating because the alternative — awaiting it —
+    // deadlocks at the first query.
+    tokio::spawn(async move {
+        if let Err(e) = connection.await {
+            eprintln!("[tenancy] connection task ended: {e}");
+        }
+    });
+
+    run_script(&client).await.expect("isolation.sql did not complete");
+    let results = read_results(&client).await.expect("read the assertion results");
+
+    // Roll the proof's transaction back rather than leaving it open. Everything it
+    // created is temporary and would go with the session, but a test that leaves a
+    // transaction open makes every test after it run inside it.
+    let _ = client.simple_query("ROLLBACK").await;
+
+    assert_complete(&results);
+    assert_all_pass(&results);
+}
