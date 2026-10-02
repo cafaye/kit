@@ -1,7 +1,61 @@
-# HANDOFF — kit-migrate-entrypoint-01
+# HANDOFF — kit-migrate-entrypoint-01 (relayed by -02)
 
 Branch `worker/kit-migrate-entrypoint-01`, worktree
-`moon/cafaye/wt-m39-kit-migrate-entrypoint-01`. Three commits, nothing pushed.
+`moon/cafaye/wt-m39-kit-migrate-entrypoint-01`. Five commits (three
+implementation, one manager recovery, one `-02` fix), nothing pushed.
+**`-02` supersedes "Successor's first move" below — read this section first.**
+Full attribution in `REPORT-kit-migrate-entrypoint-02.md`.
+
+## What `-02` found (both manager reds attributed; one real defect fixed)
+
+- **`FAIL tests/tenancy_test.sh` — the machine, not the branch.** Proven at the
+  code level: `git diff --name-only master...HEAD | grep -E
+  'tenancy|database|compose'` is **empty**, and the branch's `validate.sh` diff
+  touches nothing in the tenancy/isolation path. The proof passes standalone on
+  the tip (`EXIT=0`, 24 assertions, FORCE control 6 red). Measured fragilities,
+  left unfixed on purpose: `tests/tenancy_test.sh` pins the container name and
+  the compose project (`kit-tenancy-postgres-1`, `--project-name kit-tenancy`),
+  so two concurrent runs **share one cluster**, and provisioning has a 90-second
+  budget against a box carrying four other Postgres clusters.
+- **`line 1956: e: command not found` — not recipe 23b.** 23b passes on the tip
+  (in a `KIT_SELF_TEST_SHARD=0/23` run and in the live unsharded run); `bash -n`
+  is clean; no `eval`; no recipe mutates the root tree. Bash reads scripts by
+  byte offset, and `tests/self_test.sh` grew **20 lines above line 1956** in the
+  two commits made around that run (9 in `0ce22e6`, 11 in `802f87b`). A stale
+  offset then parses the tail of a word as a command. Not reproduced — flagged as
+  an argument, not a measurement.
+- **The real defect was one recipe earlier: breakage 12 was mutating a COMMENT.**
+  `edit` replaces the FIRST occurrence, and both Dockerfile notes quoted
+  `USER 65532:65532` verbatim above the instruction, so the mutation removed the
+  quote and the gate stayed green. Fixed in `802f87b` by rewording the notes;
+  breakage 12 now passes in every self-test run.
+
+## What the successor for site/adoption must know
+
+1. **A full `bash tests/self_test.sh` takes ~66 minutes on this box** (96
+   breakages, *n* whole gates in sequence), not the 13 the packet assumed. Plan
+   for that or use `KIT_SELF_TEST_SHARD=i/n`; a shard reports honestly what it did
+   not run. An unsharded run **was in flight on this worktree from 00:15:47**,
+   green through breakage 31, output
+   `/private/var/folders/3b/kt90wy3d66lftws_dwtxxglm0000gn/T/opencode/selftest2.txt`
+   (temp path). **Never edit `tests/self_test.sh` while a run is live** — that is
+   the byte-offset accident in §1 above.
+2. **`--static-only` is the fast gate here** (~90s, `PASS: every check passed.`,
+   5 reported skips) and it covers the entrypoint checks:
+   `docker/entrypoint.sh (bash -n / executable / shellcheck -S warning)` and
+   `static: every image starts through the migration entrypoint`. Use it while
+   iterating; use the full self-test to claim the suite.
+3. **Adoption is still blocked the way `-01` said**: `identity` ships only the
+   compiled binary, so it needs a static migrate binary built in the builder
+   before `KIT_MIGRATE_CMD` points at anything. `docker/entrypoint.sh` is still
+   absent from `tests/artifacts.json`, and adding it opens nine `absent` findings
+   that need `templates/parity-allowlist` entries.
+4. **The self-test registration for the entrypoint checks exists** (added by the
+   manager's `0ce22e6`, retargeted correctly by `802f87b`), so `-01`'s "add a
+   breakage for `docker_entrypoint`" is done for breakage 12's neighbour; verify
+   the count still matches what `validate.sh` derives rather than trusting it.
+
+## Original `-01` notes, kept as written
 
 ## Done and verified
 
