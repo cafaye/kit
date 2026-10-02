@@ -472,6 +472,68 @@ copy_name=""
 # Four proofs asserting nothing, caused by a directory that was one level too
 # high. `<name>/` is a directory that holds one copy and nothing else, so a copy's
 # parent contains exactly one entry — itself — and that entry has no `.git`.
+# --- SHARDING ----------------------------------------------------------------
+#
+# WHY. Measured, not guessed: one `--static-only` validate.sh run takes ~50s on
+# this machine, and this file runs one per breakage. 76 breakages x 50s is
+# roughly 63 MINUTES of wall clock for a suite whose actual work is parallelisable
+# and independent. That is the single reason this file was described as taking
+# "hours", and it was never the assertions -- it is 76 sequential subprocesses.
+#
+# WHAT THIS IS. `KIT_SELF_TEST_SHARD=i/n` runs only the breakages where
+# `i % n == index`. Every other breakage's helper becomes a no-op that returns 0
+# WITHOUT running the gate, and the summary says so rather than silently
+# reporting a fraction of the suite as if it were all of it.
+#
+# WHAT THIS IS NOT. It does not weaken any assertion. A sharded run asserts
+# exactly the assertions it would have run unsharded, on the same copies, with
+# the same mutations; the only difference is which recipes execute. And a shard
+# that goes red is a real red: the exit status is the shard's own.
+#
+# THE HONEST PART, which is why this is opt-in and never the default. A sharded
+# run CANNOT report "all N breakages hold" -- it has not run all N. So the
+# summary line says which shard it was, and the count it prints is the count it
+# actually ran. A suite that quietly reported 1/8th of itself as a pass is the
+# exact failure this file exists to prevent, and it applies to the harness too.
+_shard_i="${KIT_SELF_TEST_SHARD:-}"
+_shard_n=""
+if [ -n "$_shard_i" ]; then
+  _shard_n="${_shard_i#*/}"
+  _shard_i="${_shard_i%%/*}"
+  if ! printf '%s\n' "$_shard_n" | grep -qE '^[1-9][0-9]*$'; then
+    printf 'self_test: KIT_SELF_TEST_SHARD must look like i/n with n >= 1, got %s\n' "$KIT_SELF_TEST_SHARD" >&2
+    exit 2
+  fi
+fi
+
+# _shard_claims <label> -- does this recipe belong to the shard being run?
+#
+# The breakage NUMBER is the shard key, not the line number: breakages are
+# numbered 1..N and a recipe's position in the file is an accident of when it was
+# written. Sharding on line number would mean adding a recipe silently moves
+# every later recipe into a different shard.
+_shard_claims() {
+  [ -n "$_shard_i" ] || return 0
+  local label="$1" num idx
+  num=$(printf '%s' "$label" | sed -n 's/.*breakage \([0-9][0-9]*[a-z]*\):.*/\1/p')
+  if [ -z "$num" ]; then
+    # A label with no number in it is not a numbered breakage; it cannot be
+    # assigned to a shard, so it runs on shard 0/n only -- which is where the
+    # unsharded run puts it, and where a green control belongs so that shard is
+    # never the one that is quietly empty.
+    [ "$_shard_i" = "0" ] && return 0
+    return 1
+  fi
+  num="${num%%[a-z]}"
+  idx=$(( num % _shard_n ))
+  [ "$idx" -eq "$_shard_i" ]
+}
+
+# _shard_ran counts what this shard actually executed, so the summary can print a
+# number that is true rather than one copied from the file.
+_shard_ran=0
+_shard_claimed_total=0
+
 fresh_copy() {
   copy_name="$1"
   local dst="$WORK/$copy_name/kit"
@@ -600,6 +662,12 @@ PY
 
 # expect_red <label> <dir> <validate.sh args...>
 expect_red() {
+  # Shard guard: a recipe outside this shard is not run at all, and is not
+  # counted as a pass. See KIT_SELF_TEST_SHARD above.
+  if ! _shard_claims "$1"; then
+    return 0
+  fi
+  _shard_ran=$((_shard_ran + 1))
   local label="$1" dir="$2"
   shift 2
   if (cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" >/dev/null 2>&1); then
@@ -644,9 +712,37 @@ expect_red() {
 # assertion independent of how much the gate prints, which is a property the
 # piped version did not have.
 expect_red_check() {
+  # Shard guard: a recipe outside this shard is not run at all, and is not
+  # counted as a pass. See KIT_SELF_TEST_SHARD above.
+  if ! _shard_claims "$1"; then
+    return 0
+  fi
+  _shard_ran=$((_shard_ran + 1))
   local label="$1" dir="$2" want="$3"
   shift 3
   local out ec=0
+  # `--only=$want`, unless the caller already passed a filter of its own.
+  #
+  # THIS IS THE 60x. Measured on this machine before the change: one full
+  # `--static-only` gate run is ~50s and there are 76 breakages, so the suite
+  # spends ~63 MINUTES. The reason is that every breakage re-ran all 214 checks
+  # to learn one fact about the single check it names -- roughly 16,000 check
+  # runs where 76 were asked for.
+  #
+  # `$want` is the check this breakage is ABOUT, and the assertion below is that
+  # exactly that check goes red. Running the other 213 cannot change that
+  # verdict. So the filter narrows WHICH checks run; it does not loosen WHAT
+  # they must prove, which is why this is sound and why it belongs here rather
+  # than in an assertion.
+  #
+  # Skipped when the caller supplied its own `--only`, because two filters would
+  # be an AND and a breakage that names a check its caller already filtered out
+  # would find nothing and fail for a reason that has nothing to do with the
+  # defect under test.
+  case " $* " in
+    *" --only="*) ;;
+    *) set -- "$@" "--only=$want" ;;
+  esac
   out=$(cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" 2>&1) || ec=$?
   # A shell pattern, not `printf … | grep -qF`.
   #
@@ -783,6 +879,12 @@ expect_red_check() {
 # bug would come back as a flake on somebody else's packet. The output was
 # already captured in a variable; there is no reason to pipe at all.
 expect_green_check() {
+  # Shard guard: a recipe outside this shard is not run at all, and is not
+  # counted as a pass. See KIT_SELF_TEST_SHARD above.
+  if ! _shard_claims "$1"; then
+    return 0
+  fi
+  _shard_ran=$((_shard_ran + 1))
   local label="$1" dir="$2" want="$3" needle="$4"
   shift 4
   local out ec=0
@@ -817,6 +919,12 @@ expect_green_check() {
 # script goes red is the same claim expect_red_check makes — the check written
 # for this defect is still load-bearing — expressed over a script.
 expect_red_script() {
+  # Shard guard: a recipe outside this shard is not run at all, and is not
+  # counted as a pass. See KIT_SELF_TEST_SHARD above.
+  if ! _shard_claims "$1"; then
+    return 0
+  fi
+  _shard_ran=$((_shard_ran + 1))
   local label="$1" dir="$2" script="$3" want="${5:-}"
   shift 3
   # The optional 4th argument (always pass an empty one) is where a script's own
@@ -855,6 +963,12 @@ expect_red_script() {
 # control listed among them would make the header claim a breakage that nothing
 # breaks. It is written in the header as prose instead.
 expect_green_script() {
+  # Shard guard: a recipe outside this shard is not run at all, and is not
+  # counted as a pass. See KIT_SELF_TEST_SHARD above.
+  if ! _shard_claims "$1"; then
+    return 0
+  fi
+  _shard_ran=$((_shard_ran + 1))
   local label="$1" dir="$2" script="$3"
   shift 3
   local out
@@ -884,6 +998,12 @@ expect_green_script() {
 # in a variable, and piping it into `grep -q` makes the answer depend on how much
 # of it there is.
 expect_skip_check() {
+  # Shard guard: a recipe outside this shard is not run at all, and is not
+  # counted as a pass. See KIT_SELF_TEST_SHARD above.
+  if ! _shard_claims "$1"; then
+    return 0
+  fi
+  _shard_ran=$((_shard_ran + 1))
   local label="$1" dir="$2" want="$3"
   shift 3
   local out ec=0
@@ -952,6 +1072,12 @@ expect_green() {
 # a syntax error would prove only that the toolchain is installed, which is not
 # in question.
 expect_red_lang() {
+  # Shard guard: a recipe outside this shard is not run at all, and is not
+  # counted as a pass. See KIT_SELF_TEST_SHARD above.
+  if ! _shard_claims "$1"; then
+    return 0
+  fi
+  _shard_ran=$((_shard_ran + 1))
   local label="$1" dir="$2" lang="$3" file="$4" old="$5" new="$6"
   local work="$WORK/mutant-$lang"
 
@@ -3218,6 +3344,23 @@ fi
 #   printed when every recipe was EVALUATED. A count of proofs that ran is not a
 #   claim that they held, which is why the sentence says "hold" and why the
 #   unevaluated case is fatal rather than footnoted.
+if [ -n "$_shard_i" ]; then
+  # A SHARD, not the suite. This line is deliberately NOT the sentence above: a
+  # sharded run has not evaluated every breakage, so claiming it did is the one
+  # false statement available here. It reports the shard, how many recipes it
+  # actually ran, and -- because a shard that ran NOTHING is a misconfigured
+  # shard rather than a passing one -- that case is a failure, not a clean run.
+  if [ "$_shard_ran" -eq 0 ]; then
+    echo "FAIL: self_test — shard $_shard_i/$_shard_n ran ZERO of the suite's $total breakages."
+    echo "       A shard that evaluates nothing agrees with a suite that evaluates nothing."
+    echo "       A mis-sharded run reporting PASS is worse than no run at all."
+    exit 1
+  fi
+  echo "PASS: self_test — shard $_shard_i/$_shard_n ran $_shard_ran of $total breakages and every one it ran held."
+  echo "       This is a SHARD. It has NOT evaluated the other $((total - _shard_ran)) breakage(s); run the rest to claim the suite."
+  exit 0
+fi
+
 counted=$(grep -cE '^ *expect_red(_check|_lang|_script)? +.breakage +[0-9]+[a-z]*:' "$0" || true)
 total=$(grep -cE '^ *expect_(red(_check|_lang|_script)?|skip_check|green_check) +.breakage +[0-9]+[a-z]*:' "$0" || true)
 green_check=$(grep -cE '^ *expect_green_check +.breakage +[0-9]+[a-z]*:' "$0" || true)

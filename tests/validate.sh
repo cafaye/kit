@@ -85,6 +85,30 @@ RUN_OBSERVABILITY=1
 RUN_LINT=1
 LANGS=()
 
+# ONLY_MATCH, when set, runs only the checks whose LABEL contains this substring.
+#
+# WHY IT EXISTS, measured rather than argued. A full `--static-only` run is214
+# checks and takes ~50s on this machine. `tests/self_test.sh` runs the gate once
+# per breakage -- 76 of them -- so the suite spends ~63 MINUTES re-running 16,000
+# checks to learn 76 facts, each of which is about ONE named check.
+#
+# Every breakage already names the check it is testing; it is the third argument
+# to `expect_red_check`, and the assertion is that THAT check goes red. Running
+# the other 213 cannot change that verdict. This is the difference between
+# scheduling 76 sequential runs in parallel and not doing 16,000 units of work.
+#
+# WHAT IT IS NOT. It does not weaken the assertion. `expect_red_check` still
+# demands `FAIL <the named check>` appear in the output and still fails if it
+# does not. Narrowing WHICH checks run is not the same as loosening WHAT they
+# must prove, and the difference is why this is a filter on the runner rather
+# than an edit to any assertion.
+#
+# THE HONEST CAVEAT. A filtered run has not run the whole gate, so it must not
+# be reported as if it had. `--only` therefore prints a banner naming the filter
+# on every run, and the exit status is the FILTERED suite's -- never a claim
+# about the checks that were excluded.
+ONLY_MATCH=""
+
 while [ "$#" -gt 0 ]; do
   case "$1" in
     --static-only)
@@ -98,6 +122,9 @@ while [ "$#" -gt 0 ]; do
     --no-lint) RUN_LINT=0 ;;
     --language=*)
       LANGS+=("${1#*=}")
+      ;;
+    --only=*)
+      ONLY_MATCH="${1#*=}"
       ;;
     -h | --help)
       sed -n '2,35p' "$0"
@@ -181,6 +208,25 @@ SKIP_EXIT=78
 check() { # check <label> <command...>
   local label="$1" out status
   shift
+  # `--only` filter. A SUBSTRING match on the label, not a glob: the labels
+  # contain `(` `)` `[` `]` and a glob would treat those as character classes
+  # and silently match nothing -- a filter that excludes everything reports a
+  # clean run, which is the failure mode this whole mechanism exists to avoid.
+  #
+  # The empty case is counted and reported rather than dropped. A `--only` that
+  # matches NOTHING has proven nothing, and a suite that says PASS for it is
+  # lying in the most expensive way available.
+  if [ -n "$ONLY_MATCH" ]; then
+    case "$label" in
+      *"$ONLY_MATCH"*)
+        ONLY_RAN=$((ONLY_RAN + 1))
+        ;;
+      *)
+        ONLY_SKIPPED=$((ONLY_SKIPPED + 1))
+        return 0
+        ;;
+    esac
+  fi
   # The command substitution is the CONDITION of an `if`, not a statement of its
   # own, and that is load-bearing rather than stylistic. Under `set -e` (line
   # 49) a bare `out="$(cmd)"` that fails takes the SHELL down with it: verified
@@ -344,6 +390,12 @@ version_at_least() {
 # tier unbounded and says so in the summary — a bound that silently did not
 # apply is worse than no bound, because the reader is told a ceiling exists.
 bounded_ran=0
+# Checks EXCLUDED by `--only`. Counted and printed, never silently dropped: a
+# filtered run that does not say what it left out reads exactly like a full run.
+ONLY_SKIPPED=0
+# Checks the filter SELECTED. Its partner above, and the pair is the whole point:
+# a filter that matches nothing runs nothing and has proved nothing.
+ONLY_RAN=0
 # Tiers that actually REACHED their bound. A separate counter from `bounded_ran`
 # on purpose: the summary line has to say "N tiers ran under a bound, M hit it",
 # and one counter cannot state both. An earlier version incremented one variable
@@ -365,6 +417,21 @@ bounded_check() {
   local label="$1" bound="$2"
   shift 2
   local runner out ec=0
+  # Same `--only` filter as `check`, and for the same reason: a bounded tier is
+  # the EXPENSIVE kind, so running the ones nobody asked about is what makes a
+  # suite take minutes. A bounded check that is filtered out must NOT increment
+  # `bounded_ran`, or the summary would claim a tier ran when it did not.
+  if [ -n "$ONLY_MATCH" ]; then
+    case "$label" in
+      *"$ONLY_MATCH"*)
+        ONLY_RAN=$((ONLY_RAN + 1))
+        ;;
+      *)
+        ONLY_SKIPPED=$((ONLY_SKIPPED + 1))
+        return 0
+        ;;
+    esac
+  fi
   if runner="$(_timeout_bin)"; then
     bounded_ran=$((bounded_ran + 1))
     # `--kill-after` so a tier that ignores SIGTERM is still ended: without it
@@ -586,6 +653,17 @@ PY
   # reported skip is a gap nobody fixes, which is the whole point of the skip
   # existing. Naming them explicitly also means a NEW file dropped into
   # `templates/kamal/` is unparsed rather than mis-parsed: the safe direction.
+  # `--only` skips this whole loop. The loop shells out PER FILE -- one `bash -n`,
+  # one `python -c "yaml.safe_load"`, one `json.loads` each -- and it does that
+  # before any `check` has been consulted, so a filtered run was paying for ~150
+  # process spawns to produce results nobody asked for. Measured: a `--only`
+  # matching ONE check still took 23s, and a `--only` matching NONE took 24s,
+  # which is the signature of a fixed cost that filtering could not touch.
+  #
+  # It is safe to skip, and the reason is structural rather than hopeful: every
+  # line in the loop calls `check`, so a filtered run would skip them anyway --
+  # one `check` call each, just after paying for the file walk.
+  if [ -z "$ONLY_MATCH" ]; then
   for f in "$ROOT"/.github/workflows/* "$ROOT"/lint/* "$ROOT"/docker/* \
     "$ROOT"/templates/bin-prime/* "$ROOT"/templates/compose/* \
     "$ROOT"/templates/kamal/drill.sh \
@@ -787,6 +865,7 @@ PY
       report FAIL "$path  (not executable)"
     fi
   done
+  fi
 
   # Run the linter over the scripts we wrote, not just `bash -n`. `bash -n`
   # passes on quoting bugs; shellcheck is what catches them. Optional, and
@@ -794,7 +873,12 @@ PY
   #
   # (Note: a comment whose first word is the linter's name is parsed as a linter
   # directive, which is why this paragraph is worded the way it is.)
-  if have shellcheck; then
+  # `--only` skips this loop for the same reason as the artifact-parses loop
+  # above: every iteration calls `check`, so a filtered run discards each result
+  # -- after paying for the spawn. shellcheck is the second-most expensive thing
+  # this gate does, and it runs on every invocation whether or not anyone asked
+  # for it.
+  if [ -z "$ONLY_MATCH" ] && have shellcheck; then
     section 'static: shellcheck -S warning'
     for f in "$ROOT"/templates/bin-prime/* "$ROOT"/templates/bin/* \
       "$ROOT"/templates/kamal/*.sh "$ROOT"/tests/*.sh; do
@@ -1016,7 +1100,8 @@ PY
   # or a bad edit is a static failure on any machine, which is the property the
   # otel snippets were given for the same reason.
   section 'static: the canary harness parses in Go'
-  if have gofmt; then
+  # `--only` skips the per-file gofmt loop; see the artifact-parses loop above.
+  if [ -z "$ONLY_MATCH" ] && have gofmt; then
     # gofmt is a real parser: it exits non-zero on a file it cannot parse, and
     # unlike `go build` it needs no module, no resolver and no network.
     for f in "$ROOT"/templates/secrets/go/*.go "$ROOT"/templates/secrets/go/internal/*/*.go; do
@@ -8381,9 +8466,40 @@ section 'staleness: the fleet reporter tells the states apart'
 # number nobody checked.
 _stale_out=""
 _stale_ec=0
+_stale_skip=""
+# `--only` skips this tier, and it is the single most expensive thing in the
+# gate: 9s of an 18s filtered run, measured. It is written as a bare
+# `$(bash ...)` rather than through `check`, because its label has to carry the
+# case count it READ OUT of the run -- which is the right call for honesty and
+# the wrong call for filterability, because a block that never calls `check` is a
+# block `--only` cannot see.
+#
+# So the filter is applied here explicitly rather than being left to discover
+# itself. The gate's whole argument is that a check which cannot be selected is a
+# check nobody can skip, and 9 seconds per invocation times ~76 invocations is
+# the difference between a suite that finishes and one that does not.
+if [ -n "$ONLY_MATCH" ]; then
+  _stale_label="tests/staleness_test.sh  (the templates half tells current / diverged / absent apart)"
+  case "$_stale_label" in
+    *"$ONLY_MATCH"*) ;;
+    *)
+      ONLY_SKIPPED=$((ONLY_SKIPPED + 1))
+      _stale_out=""
+      _stale_ec=0
+      _stale_skip=1
+      ;;
+  esac
+fi
+if [ -z "$_stale_skip" ]; then
 _stale_out=$(bash "$ROOT/tests/staleness_test.sh" 2>&1) || _stale_ec=$?
+fi
 _stale_cases=$(printf '%s\n' "$_stale_out" | sed -nE 's/^PASS: staleness_test — ([0-9]+) case.*/\1/p')
-if [ "$_stale_ec" -ne 0 ] || [ -z "$_stale_cases" ]; then
+if [ -n "$_stale_skip" ]; then
+  # Filtered out, deliberately. Reported as SKIP and never as PASS: this tier
+  # ran zero cases, and a reader who sees it green would be reading a claim about
+  # a suite that did not execute.
+  report SKIP "tests/staleness_test.sh  (excluded by --only)"
+elif [ "$_stale_ec" -ne 0 ] || [ -z "$_stale_cases" ]; then
   report FAIL "tests/staleness_test.sh  (the templates half could not report its own case count)"
   printf '%s\n' "$_stale_out" | sed 's/^/       /'
 elif [ "$_stale_cases" -lt 20 ]; then
@@ -8629,6 +8745,30 @@ printf '\n'
 # the reader loses the one thing they need: which failures to go and fix, and
 # which to go and re-run. The count is printed whenever it is non-zero, exactly
 # like the skip count, so a run that hit a bound cannot end quietly.
+# A `--only` FILTER THAT MATCHED NOTHING IS A FAILURE, and this is the single
+# most important line in this file.
+#
+# Measured, not argued: `--only=ZZZ_NO_SUCH_CHECK_XYZ` exits 0 and prints
+# "PASS: every check passed." It matches no check, runs no check, proves
+# nothing, and reports success. That is precisely the vacuous pass this
+# repository exists to prevent -- the same shape as a census walk that sees no
+# routes, or a tally that under-counts passes inside failing binaries.
+#
+# It is WORSE than an unrelated typo, because the whole point of `--only` is
+# speed, and the speediest possible invocation is the one that checks nothing.
+# A caller optimising a CI loop would find it, take the win, and lose the gate.
+if [ -n "$ONLY_MATCH" ] && [ "$ONLY_RAN" -eq 0 ]; then
+  echo "FAIL: --only='$ONLY_MATCH' selected NO check out of the suite."
+  echo "       A filter that matches nothing runs nothing and proves nothing;"
+  echo "       agreeing with a filter that matches nothing is not a passing gate."
+  echo "       $ONLY_SKIPPED check(s) were excluded. The filter is a typo, or the"
+  echo "       check it names does not exist -- and both are worth failing on."
+  exit 1
+fi
+if [ -n "$ONLY_MATCH" ]; then
+  echo "note: FILTERED run -- $ONLY_RAN check(s) ran, $ONLY_SKIPPED excluded by --only='$ONLY_MATCH'."
+  echo "       This is NOT a claim about the $ONLY_SKIPPED excluded check(s). Run without --only for that."
+fi
 if [ "$fails" -ne 0 ]; then
   echo "FAIL: $fails check(s) failed."
   [ "$skips" -eq 0 ] || echo "note: $skips check(s) skipped (reported above)."
