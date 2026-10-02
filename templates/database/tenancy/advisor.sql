@@ -507,7 +507,27 @@ view_reads as (
       -- whose innermost link is already fixed.
       select r.view_oid, t.oid, r.depth + 1
       from reached r
-      join pg_class mid on mid.oid = r.rel_oid
+      -- `mid` is read through the `views` CTE rather than `pg_class`, which is
+      -- what makes this hop agree with the rule's OWN definition of an invoker.
+      -- Writing the test a second time against `reloptions` is how the two
+      -- disagree, and they did: an equality test against the literal string
+      -- `security_invoker=true` misses `security_invoker = on`.
+      --
+      -- MEASURED, and this is not hypothetical. Postgres stores reloptions
+      -- VERBATIM — it does not canonicalise the boolean — so all three spellings
+      -- survive as written:
+      --
+      --     security_invoker = true   ->  {security_invoker=true}
+      --     security_invoker = on     ->  {security_invoker=on}
+      --     security_invoker = false  ->  {security_invoker=off}   (for `off`)
+      --
+      -- and `core`'s own fixture at
+      -- `harness/tests/fixtures/tenancy/conforming/migrations/0002_rls.sql:89`
+      -- writes `with (security_invoker = on)`. So the spelling that is idiomatic
+      -- in this very fleet is the one an equality test does not match, and the
+      -- walk would have carried on past a view whose policies are already in
+      -- force — reporting a chain as broken that is not.
+      join views mid on mid.view_oid = r.rel_oid
       join pg_rewrite rw on rw.ev_class = r.rel_oid
       join pg_depend d
         on d.classid = 'pg_rewrite'::regclass
@@ -516,7 +536,7 @@ view_reads as (
       join pg_class t on t.oid = d.refobjid
       where t.relkind in ('r', 'p', 'v', 'm')
         and t.oid <> r.view_oid
-        and not (mid.relkind = 'v' and coalesce(mid.reloptions, '{}'::text[]) @> array['security_invoker=true'])
+        and mid.is_definer
         -- `pg_depend` is finite and the chain stops at an invoker, but the depth
         -- bound is here anyway: a cycle is not something a checker should hang
         -- on, and a bound that is never reached costs nothing when it is not
@@ -951,6 +971,25 @@ rule_rls_no_policy as (
 --    this does not find", and the second is the same trade rule 4's keyword half
 --    makes: narrowing it means parsing `pg_get_viewdef`, and a parse's misses are
 --    silent.
+--
+--    THE VERSION FLOOR, because it changes what the rule MEANS rather than what
+--    it matches. `security_invoker` arrived in Postgres 15. On 14 or older the
+--    option does not exist, so `CREATE VIEW ... WITH (security_invoker = true)`
+--    is refused and EVERY view in the database is a definer view — which means
+--    this rule fires on every view over an RLS'd table, and every one of those
+--    findings is TRUE. There is no flag to set and no way to silence one, so a
+--    service on an old server sees an ERROR it cannot fix by remediation. That is
+--    reported in the `remediation` column rather than in this comment, because a
+--    reader who acts on the finding is the one who needs it:
+--
+--        When current_setting('server_version_num')::int < 150000 the remediation
+--        names the version rather than printing an ALTER that would be refused.
+--
+--    This fleet's floor is PG15 (`templates/compose/postgres/Dockerfile`, and
+--    MD21b's PG17), so on kit's own cluster the branch is unreachable — which is
+--    exactly why it is written rather than left implicit. A checker that means
+--    something different on two supported server versions is not a checker that
+--    can be trusted on either.
 -- ===========================================================================
 rule_security_definer_view as (
   select 'security_definer_view'::text as name,
@@ -972,9 +1011,22 @@ rule_security_definer_view as (
                             from api_roles r
                            where has_table_privilege(r.rolname, min(view_reads.view_oid), 'SELECT')),
                          '(none — no login role can SELECT this view)'))::text as detail,
-         format('ALTER VIEW %I.%I SET (security_invoker = true); then run this advisor again. That makes the view run its queries as the caller, so the policies on %s apply to the caller rather than to the owner. It needs Postgres 15, which is this fleet''s floor; on an older server the option does not exist and the remedy is to GRANT SELECT on the table and read it directly.',
-                nspname, relname,
-                coalesce(string_agg(distinct table_schema || '.' || table_name, ', ') filter (where relrowsecurity), '(none)'))::text as remediation,
+         -- THE REMEDIATION IS VERSION-SENSITIVE, and it is branched rather than
+         -- footnoted because a reader who acts on this column is the one who
+         -- needs to know. `ALTER VIEW ... SET (security_invoker = true)` is
+         -- refused outright below PG15, and on that server EVERY view is a
+         -- definer view, so every finding this rule reports is true and none of
+         -- them is fixable with the flag. Printing the ALTER there would hand
+         -- out a remediation that cannot execute — which is the one thing a
+         -- remediation column must never do.
+         case when current_setting('server_version_num')::int < 150000
+              then format('This server is Postgres %s, which predates `security_invoker` (added in 15), so there is no flag that makes a view enforce the caller''s policies and this finding cannot be cleared by an ALTER. It is reported anyway, because on this version the bypass is real and unavoidable. The remedy is to stop exposing the view: GRANT SELECT on %s to the roles that need it and read the table directly, or drop the view.',
+                          current_setting('server_version'),
+                          coalesce(string_agg(distinct table_schema || '.' || table_name, ', ') filter (where relrowsecurity), '(none)'))
+              else format('ALTER VIEW %I.%I SET (security_invoker = true); then run this advisor again. That makes the view run its queries as the caller, so the policies on %s apply to the caller rather than to the owner.',
+                          nspname, relname,
+                          coalesce(string_agg(distinct table_schema || '.' || table_name, ', ') filter (where relrowsecurity), '(none)'))
+         end::text as remediation,
          jsonb_build_object('schema', nspname, 'name', relname, 'type', 'view',
                             'owner', owner,
                             'security_invoker', false,

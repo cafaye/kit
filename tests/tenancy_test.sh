@@ -42,8 +42,10 @@
 #      because a denial cannot tell permitted-by-predicate from
 #      permitted-by-accident)
 #   8. every rule in that advisor FIRES on a fixture built to trip it, naming
-#      itself and the table it fired on.                (a detective that has
-#      never fired is a detective you cannot trust)
+#      itself and the object it fired on, AND stays silent on four views built to
+#      prove it is selective.                (a detective that has never fired is
+#      a detective you cannot trust; one that fires on everything is a detective
+#      nobody reads)
 #   9. THE AUDIT ANSWERS EVERY ROLE THE SAME. `cafaye.credential_tables()` is
 #      read as the owner, as the cluster's admin role and as the non-owner LOGIN
 #      role; the three answers must be identical AND non-empty.  (8: an audit
@@ -743,9 +745,16 @@ say "   policy dropped, and the advisor is clean again: 0 ERROR, 0 WARN."
 # Every fixture below is in its own schema, the substrate was never applied to it,
 # and the advisor is scoped to that schema alone. That is not tidiness: it is what
 # makes the control specific. Scoped to the whole database, a rule that fires
-# proves only that the advisor returned rows, and six of these eight could be
+# proves only that the advisor returned rows, and seven of these nine could be
 # satisfied by any of the others. Named rule, named fixture, one rule proven able
 # to fire.
+#
+# AND WHAT IT STILL CANNOT PROVE, which is why 7b exists below: that any of them
+# is SELECTIVE. A rule that fires on every view, every policy or every table is
+# satisfied by this assertion as completely as a rule that fires on exactly the
+# right one. `security_definer_view` is the rule where that matters most, because
+# the two ways to write it badly are "fires on nothing" and "fires on everything",
+# and only one of them is a control.
 #
 # AND IT IS ALSO WHAT PROVES THE ADVISOR STANDS ALONE. Nothing here calls a
 # `cafaye.*` function the substrate owns except the two identity seams a policy
@@ -819,6 +828,88 @@ create policy fixture_bare on kit_advisor_fixture.bare_call for select to public
 create table kit_advisor_fixture.silent (
   id int primary key, account_id uuid not null);
 alter table kit_advisor_fixture.silent enable row level security;
+
+-- (9) security_definer_view. FOUR fixtures, not one, because a rule that fires
+-- on everything and a rule that fires on nothing both satisfy a single positive
+-- assertion, and this rule has two ways to be useless:
+--
+--   definer_view     POSITIVE. A plain view over the substrate-written
+--                    account-scoped table, which IS the hole: its queries run
+--                    as its owner, so the policies on `protected_accounts` are
+--                    evaluated against a role that is exempt from them.
+--   invoker_view     THE NEGATIVE THAT MATTERS. The SAME view over the SAME
+--                    table with `security_invoker = true`, which is the whole
+--                    remediation. A rule that reports this one is reporting its
+--                    own fix as the disease, and a reader who saw both rows
+--                    would stop reading both.
+--   plain_reads      THE Misfire GUARD. A view over a table with NO row-level
+--                    security at all. There is no policy to bypass, so this is
+--                    not the finding — and if the rule fired here it would fire
+--                    on every reporting view in every schema, which is how a
+--                    security rule gets switched off.
+--   definer_no_grant A view nobody can reach. The bypass is real and no caller
+--                    can reach it, so it is not this rule's finding.
+--
+-- AND THE TRANSITIVE ONE, because a view over a view is the same hole: Postgres
+-- evaluates the outer view with the outer view's owner's privileges and the
+-- inner one with the inner one's, and no hop in that chain puts a caller's
+-- policies back in force. `nested_definer_view` reads ONLY another view and no
+-- table, so a rule that stopped at the first hop would miss it — and it is the
+-- view a caller actually queries.
+--
+-- `over_invoker_view` is the converse and is the guard on the fix: it reads only
+-- an invoker view, so the walk must STOP at that hop rather than walking past
+-- it and reporting a chain whose innermost link is already correct.
+create table kit_advisor_fixture.protected_accounts (
+  id int primary key, account_id uuid not null);
+alter table kit_advisor_fixture.protected_accounts enable row level security;
+alter table kit_advisor_fixture.protected_accounts force row level security;
+create policy fixture_scoped on kit_advisor_fixture.protected_accounts
+  for select to public
+  using (account_id = (select cafaye.current_account_id()));
+
+create table kit_advisor_fixture.unprotected_reads (id int primary key);
+
+create view kit_advisor_fixture.definer_view as
+  select id, account_id from kit_advisor_fixture.protected_accounts;
+create view kit_advisor_fixture.invoker_view
+  with (security_invoker = true) as
+  select id, account_id from kit_advisor_fixture.protected_accounts;
+create view kit_advisor_fixture.plain_reads as
+  select id from kit_advisor_fixture.unprotected_reads;
+create view kit_advisor_fixture.definer_no_grant as
+  select id, account_id from kit_advisor_fixture.protected_accounts;
+create view kit_advisor_fixture.nested_definer_view as
+  select id from kit_advisor_fixture.definer_view;
+create view kit_advisor_fixture.over_invoker_view as
+  select id from kit_advisor_fixture.invoker_view;
+-- THE SPELLING THIS FLEET ACTUALLY WRITES. Postgres stores reloptions
+-- VERBATIM and does not canonicalise the boolean, so `security_invoker = on`
+-- is stored as `on`, not as `true` — measured, on PG17. `core`'s own conforming
+-- fixture uses `on`
+-- (`harness/tests/fixtures/tenancy/conforming/migrations/0002_rls.sql:89`), so
+-- an equality test against the literal `security_invoker=true` passes kit's own
+-- suite and misses the fleet's own idiom. This view is over an `on`-spelled
+-- invoker, so the transitive walk must stop there too.
+create view kit_advisor_fixture.on_spelled_invoker with (security_invoker = on) as
+  select id, account_id from kit_advisor_fixture.protected_accounts;
+create view kit_advisor_fixture.over_on_spelled_invoker as
+  select id from kit_advisor_fixture.on_spelled_invoker;
+
+-- The GRANT is the fixture, not a detail. `has_table_privilege` includes
+-- privileges held through PUBLIC, and the rule asks about capability rather than
+-- about grants, so a grant to `public` reaches this view for every login role on
+-- the cluster. `definer_no_grant` is created without one and `revoke`d, so the
+-- "nobody can reach it" case is actually unreachable rather than merely
+-- unwritten.
+grant select on kit_advisor_fixture.definer_view to public;
+grant select on kit_advisor_fixture.invoker_view to public;
+grant select on kit_advisor_fixture.plain_reads to public;
+grant select on kit_advisor_fixture.nested_definer_view to public;
+grant select on kit_advisor_fixture.over_invoker_view to public;
+grant select on kit_advisor_fixture.on_spelled_invoker to public;
+grant select on kit_advisor_fixture.over_on_spelled_invoker to public;
+revoke all on kit_advisor_fixture.definer_no_grant from public;
 FIXTURE
 
 say ""
@@ -848,7 +939,9 @@ for pair in \
   'multiple_permissive_policies:always_true' \
   'login_role_security_definer_executable:escalate' \
   'auth_rls_initplan:bare_call' \
-  'rls_enabled_no_policy:silent'; do
+  'rls_enabled_no_policy:silent' \
+  'security_definer_view:definer_view' \
+  'security_definer_view:nested_definer_view'; do
   rule="${pair%%:*}"
   fixture="${pair#*:}"
   if printf '%s\n' "$neg" | grep -q "^$rule@$fixture\$"; then
@@ -862,9 +955,59 @@ for pair in \
     fail "an advisor rule cannot fire"
   fi
 done
-say "   8 rules, 8 fixtures, every rule naming itself and the table it fired on."
+say "   9 rules, 10 fixtures, every rule naming itself and the object it fired on."
 say "   scoped to kit_advisor_fixture alone, so each one is proven specific and not"
 say "   satisfied by whichever other rule happened to return a row."
+
+# ---------------------------------------------------------------------------
+# ASSERTION 7b — THE HONEST NEGATIVES OF ASSERTION 7.
+#
+# The list above proves every rule CAN fire. It cannot prove any rule is
+# SELECTIVE, and for `security_definer_view` selectivity is the entire value of
+# the rule: the two ways to write it are "fires on every view in the schema" and
+# "fires on nothing", and only one of those is a security control. The other is
+# a report nobody reads — or a detective that has never fired.
+#
+# Four views in the fixture schema are here to be SILENT, and each one is silent
+# for a different reason, so satisfying all four means the rule is reading
+# something rather than counting something:
+#
+#   invoker_view        the same view over the same table, fixed. A rule that
+#                       reports its own remedy would print both rows.
+#   plain_reads         a view over a table with NO row-level security. Nothing
+#                       to bypass, so nothing to report.
+#   definer_no_grant    the hole is real and no login role can reach it.
+#   over_invoker_view   reads only an invoker view, so the transitive walk must
+#                       STOP at that hop rather than walking past it.
+#
+# The last one is the one that can pass by accident. A walk that ignored the
+# invoker flag would report `over_invoker_view`, and a reader would see that as a
+# true positive — because the chain below it really is a definer view. It is
+# reported here as a misfire because the finding is about a view that is
+# reachable only THROUGH an invoker view, and there the caller's policies are
+# already in force.
+for quiet in invoker_view plain_reads definer_no_grant over_invoker_view \
+             on_spelled_invoker over_on_spelled_invoker; do
+  if printf '%s\n' "$neg" | grep -q "^security_definer_view@$quiet\$"; then
+    say "FAIL: security_definer_view fired on $quiet, and must not."
+    say "      That view is one of the four the rule is required to stay silent on:"
+    say "      it is either its own remedy, reads no protected table, is unreachable,"
+    say "      or is reachable only through a security_invoker view. A rule that fires"
+    say "      on all four is not a selective rule; it is a rule that reports every"
+    say "      view in the schema, which is how a security rule gets switched off."
+    printf '%s\n' "$neg" | grep '^security_definer_view@' \
+      | awk -F@ '{print "       reported anyway: " $2}' | head -12
+    fail "security_definer_view is not selective"
+  fi
+  say "   $quiet -> silent, as required."
+done
+say "   six views, six reasons, all silent: the rule reads whether the view is an"
+say "   invoker, whether anything it reaches has policies, and whether a caller can"
+say "   reach it -- rather than counting views."
+say "   the last two are the same view with the option spelled \`on\` rather than"
+say "   \`true\`. Postgres stores reloptions verbatim and core's own fixture writes"
+say "   \`on\`, so a rule matching only one spelling would pass this suite while"
+say "   missing the fleet's idiom."
 
 # The fixtures go, and their going is asserted rather than assumed: everything
 # after this point in a shared container should see the cluster the substrate
@@ -1004,5 +1147,6 @@ say "      an adopter's fixture schema present: 0 of 2 of its tables named."
 say "      an unprotected table in the substrate's own schema: named, proof red."
 say "      the database's own advisor on the substrate's own two tables: 0 ERROR, 0 WARN."
 say "      a hand-written permissive policy on api_keys: the exemption released it."
-say "      all 8 rules, each fired on a fixture built to trip it, each naming its table."
+say "      all 9 rules, each fired on a fixture built to trip it, each naming its object."
+say "      security_definer_view's 4 negatives: silent, for 4 different reasons."
 say "      the credential audit, read as three roles: one answer, and not an empty one."
