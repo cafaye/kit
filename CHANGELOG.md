@@ -13,6 +13,34 @@ it without a copy (see kit-12 below).
 
 ## Unreleased
 
+### Changed — `--only` now reaches every recipe it can reach, and two helpers
+  prove less than they did
+
+- **`tests/self_test.sh`: breakages 2, 2b, 3, 4, 5 and 6 now run
+  `expect_red_check`, and `expect_green_check` (59) and `expect_skip_check`
+  (23b) append `--only=<the check the recipe names>`** — the mechanism that was
+  already in `expect_red_check` and in nothing else. Measured on this machine: a
+  full `--static-only` gate run is **42.70 s** and a run filtered to one check is
+  **7.88 s**, so each converted recipe saves ~35 s.
+
+- **Six proofs got STRONGER, not just faster.** `expect_red` asserts only "the
+  gate went red", which is a weak claim when forty checks can make it red; all
+  six now assert `FAIL <the named check>`, and each names the check it is about
+  as a variable, so a rename on either side breaks the file loudly.
+
+- **Breakage 1 deliberately still runs the unfiltered gate, and says why.** The
+  verdict that catches a deleted `templates/otel/go/traceparent.go` is
+  `templates/otel/go/  (4 artifacts present)`, which is a `report`. `--only` is
+  applied inside `check`, `check_par`, `bounded_check` and `tier` — the four that
+  spawn work — so a `report` is printed on a filtered run and still paid for.
+  Measured: that copy under `--only=ZZZ_NO_SUCH_CHECK_XYZ` printed exactly that
+  one `FAIL` and nothing else.
+
+- **The two green controls are unfiltered on purpose** (`expect_green`: the
+  unbroken tree, and breakage 31b). Their whole claim is that the gate is green
+  on a tree it did not break, and a filter would narrow the claim to the named
+  check instead of the tree.
+
 ### Added — the profile, and what it says
 
 - **`PROFILE-gate.md` — where this gate's time actually goes, measured rather

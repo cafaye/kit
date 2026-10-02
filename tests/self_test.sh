@@ -1024,6 +1024,25 @@ expect_green_check() {
   local label="$1" dir="$2" want="$3" needle="$4"
   shift 4
   local out ec=0
+  # `--only=$want`, for the reason given in full at `expect_red_check`: this run is
+  # here to learn one fact about ONE named check, and the other ~213 cannot change
+  # its verdict. Measured on this machine, a full `--static-only` run is 42.70s
+  # and a run filtered to one check is 7.88s, so the filter is worth ~35s per
+  # recipe.
+  #
+  # It does not weaken the assertion BELOW, which still demands the gate exit 0,
+  # that the named check report PASS, and that it name the specific finding.
+  # Narrowing WHICH checks run is not loosening WHAT they must prove.
+  #
+  # Skipped when the caller supplied its own `--only`, because two filters would
+  # be an AND and a breakage naming a check its caller already filtered out would
+  # find nothing — and then this recipe would agree with a run that checked
+  # nothing, which is the vacuous pass `--only`'s own no-match rule exists to
+  # refuse.
+  case " $* " in
+    *" --only="*) ;;
+    *) set -- "$@" "--only=$want" ;;
+  esac
   out=$(cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" 2>&1) || ec=$?
   if [ "$ec" -ne 0 ]; then
     printf 'FAIL self_test: %s — the gate went RED (exit %s), so the ceiling is not in force\n' \
@@ -1170,6 +1189,16 @@ expect_skip_check() {
   local label="$1" dir="$2" want="$3"
   shift 3
   local out ec=0
+  # `--only=$want`, for the reason given in full at `expect_red_check` and again
+  # at `expect_green_check`. It is safe here for the same reason it is there: the
+  # assertion below is unchanged and still demands BOTH halves — the gate exited
+  # 0, and the named check is what said SKIP. A filter that matched nothing would
+  # make the first half true and the second false, so `validate.sh`'s own
+  # no-match FAIL cannot be mistaken for a clean skip here.
+  case " $* " in
+    *" --only="*) ;;
+    *) set -- "$@" "--only=$want" ;;
+  esac
   out=$(cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" 2>&1) || ec=$?
   if [ "$ec" -ne 0 ]; then
     printf 'FAIL self_test: %s — the gate exited %s, so the skip was not clean\n' "$label" "$ec"
@@ -1617,9 +1646,32 @@ expect_green 'unbroken tree' "$base" --static-only
 # 1. a deleted language template. Caught by the artifact-presence check, which
 #    runs with no toolchains at all — so "nobody had Go installed" can never be
 #    the reason a missing template passes.
+#
+#    THE ONE RECIPE `--only` CANNOT REACH, and it is worth saying why rather than
+#    leaving it looking like an oversight. The verdict that catches this deletion
+#    is `templates/otel/go/  (4 artifacts present)`, and that is a `report`, not a
+#    `check`. `--only` is applied inside `check`, `check_par`, `bounded_check`
+#    and `tier` — the four things that spawn work — and `report` is called
+#    directly by the phase, so a filtered run still prints every `report`
+#    verdict and still pays for it.
+#
+#    Measured, not assumed: this copy run with `--only=ZZZ_NO_SUCH_CHECK_XYZ` (a
+#    filter that matches nothing) printed `FAIL templates/otel/go/  (4 artifacts
+#    present)` and nothing else. There is no `--only` value that selects it,
+#    because it is not selected by anything. So this recipe keeps the unfiltered
+#    gate, and pays the full static phase for a verdict no filter can narrow.
 one="$(fresh_copy missing-template)"
 rm -f "$one/templates/otel/go/traceparent.go"
 expect_red 'breakage 1: templates/otel/go/traceparent.go deleted' "$one" --static-only
+
+# The labels the recipes below pass to `expect_red_check`, which appends
+# `--only=<label>` to the child gate's command line. They are variables because a
+# label a self-test asserts is a contract (see AGENTS.md): a rename on either
+# side has to break this file loudly, and a label typed twice is two chances not
+# to.
+COLLECTOR='templates/compose/otel-collector.yml  (redaction first, env endpoints, no URL)'
+PORTS='docker-compose.yml  (host ports all in the 15000-15999 block, no reuse)'
+CI_OPTIN='.github/workflows/ci.reusable.yml  (opt-in telemetry job, defaults intact)'
 
 # 2. the privacy boundary, in the shape the check actually forbids. This recipe
 #    mutated `exporters: [debug]` -> `exporters: [debug, otlp]`, which was the
@@ -1643,7 +1695,8 @@ edit "$two/templates/compose/otel-collector.yml" \
 edit "$two/templates/compose/otel-collector.yml" \
   'exporters: [spanmetrics, otlp/tempo, debug]' \
   'exporters: [spanmetrics, otlp/tempo, debug, otlp]'
-expect_red 'breakage 2: collector gains an exporter nobody read' "$two" --static-only
+expect_red_check 'breakage 2: collector gains an exporter nobody read' \
+  "$two" "$COLLECTOR" --static-only
 
 # 2b. THE OTHER HALF OF THE SAME CLAIM, and the one a set difference never
 #     checked. Breakage 2 above proves the gate objects to an exporter that
@@ -1672,15 +1725,16 @@ while end < len(lines) and (not lines[end].strip() or lines[end].startswith("   
     end += 1
 open(path, "w", encoding="utf-8").write("".join(lines[:start] + lines[end:]))
 PY
-expect_red 'breakage 2b: the collector ships no exporter for tempo at all' "$two_b" --static-only
+expect_red_check 'breakage 2b: the collector ships no exporter for tempo at all' \
+  "$two_b" "$COLLECTOR" --static-only
 
 # 3. a template that compiles, parses, and silently drops the sampled flag.
 #    Only an executed suite catches this; no grep would.
 three="$(fresh_copy broken-codec)"
 edit "$three/templates/otel/python/traceparent.py" \
   'flags & SAMPLED' '0 & SAMPLED'
-expect_red 'breakage 3: python codec stops preserving trace-flags' "$three" \
-  --language=python --no-self-test
+expect_red_check 'breakage 3: python codec stops preserving trace-flags' "$three" \
+  'templates/otel/python' --language=python --no-self-test
 
 # 4. a hardcoded host port. The kind of edit nobody notices in review and every
 #    second service on a laptop hits.
@@ -1695,13 +1749,15 @@ expect_red 'breakage 3: python codec stops preserving trace-flags' "$three" \
 four="$(fresh_copy hardcoded-port)"
 edit "$four/templates/compose/docker-compose.yml" \
   '"${KIT_POSTGRES_PORT:-15500}:5432"' '"5432:5432"'
-expect_red 'breakage 4: docker-compose.yml hardcodes a published port' "$four" --static-only
+expect_red_check 'breakage 4: docker-compose.yml hardcodes a published port' \
+  "$four" "$PORTS" --static-only
 
 # 5. a kit change that would break every consumer's CI. The opt-in job must stay
 #    opt-in and the six original jobs must stay gated on their language.
 five="$(fresh_copy ci-not-opt-in)"
 edit "$five/.github/workflows/ci.reusable.yml" "default: 'false'" "default: 'true'"
-expect_red "breakage 5: the telemetry CI job is no longer opt-in" "$five" --static-only
+expect_red_check "breakage 5: the telemetry CI job is no longer opt-in" \
+  "$five" "$CI_OPTIN" --static-only
 
 # 6. the option with no job. A caller can pass `language: none` — the value
 #    that lets a repository with no service manifest (kit among them) call this
@@ -1713,7 +1769,8 @@ six="$(fresh_copy ungated-config-job)"
 edit "$six/.github/workflows/ci.reusable.yml" \
   "if: \${{ inputs.language == 'none' }}" \
   "if: \${{ inputs.language == 'go' }}"
-expect_red 'breakage 6: the `none` job is no longer gated on its own input' "$six" --static-only
+expect_red_check 'breakage 6: the `none` job is no longer gated on its own input' \
+  "$six" "$CI_OPTIN" --static-only
 
 # 7-10. The four ways the layout and the documentation can drift apart. These
 #      are the class of defect this packet exists to make detectable: a stated
