@@ -81,6 +81,22 @@ is in it wins and everything you did not mention still comes from kit.
   **appends** a second file's `ports:` list rather than replacing it, so writing
   one publishes postgres on kit's port *and* on yours. Move the port in `.env`.
   This is measured, not folklore, and kit's gate fails on it.
+- **Your account boundary is Postgres, not your `WHERE` clauses.** If this service
+  holds rows belonging to a customer, `templates/database/tenancy/` applies:
+  `cafaye.protect_table('<table>')` in each account-scoped table's migration,
+  `cafaye.begin_account/1` once per request inside your transaction, and the
+  application connecting as **`<service>_app`** rather than `<service>`. The
+  `<service>_app` role is provisioned for you and owns nothing, which is what
+  stops it turning its own policies off.
+- **`FORCE ROW LEVEL SECURITY` is not optional and nothing will remind you.** It
+  is applied by `protect_table`, and without it the role your migrations run as
+  reads every account's rows while the policies read as if they were in place.
+  **Keep your `where account_id = ?`** — it is what makes the query indexable and
+  what `core`'s `tenancy.yml` requires. RLS is the second line, not the first.
+- **`templates/database/<lang>/tenancy_test.*` must run in your gate.** Copy it
+  beside `isolation.sql` and `assertions.txt` and demand the tier with
+  `REQUIRED_DB=1`. That turns a missing `TEST_DATABASE_URL` into a **failure**
+  rather than a skip, because a skip here is a green run that proved nothing.
 - **Your database is a `.env` line, not a compose override.** Add your service's
   name to `KIT_POSTGRES_DATABASES`, comma-separated. The init script gives you a
   `NOSUPERUSER` role and a database you own, and closes every other service's

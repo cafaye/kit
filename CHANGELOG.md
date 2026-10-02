@@ -13,6 +13,104 @@ it without a copy (see kit-12 below).
 
 ## Unreleased
 
+### Added — the account boundary, shipped once in kit
+
+- **`templates/database/tenancy/substrate.sql`.** The account boundary inside one
+  service's own database: the identity seam (`cafaye.begin_account/1`,
+  `cafaye.current_account_id/0`), `cafaye.protect_table/2`, and the sweep
+  (`cafaye.unprotected_tables/0`). Measured, before and after.
+
+- **`templates/database/tenancy/isolation.sql` + `assertions.txt`.** The assertion
+  set — **24 assertions**, run twice, once as the login role and once as the
+  owner — and the manifest they are compared against. `templates/database/<lang>/
+  tenancy_test.*` drives it in all six languages kit templates.
+
+- **`FORCE ROW LEVEL SECURITY`, and a proof it is load-bearing.** It is in no
+  guide and **no lint in this fleet checked for it** — measured across all nine
+  account-scoped services: zero `ROW LEVEL SECURITY`, zero `CREATE POLICY`, zero
+  non-owner login roles. On a protected three-row table, read as the owner
+  carrying another tenant's identity: **1 row with FORCE, 3 without.**
+  `tests/tenancy_test.sh` deletes the statement and requires six assertions to go
+  red — all of them `owner/` or `sweep/`, with the `login/` half staying green,
+  which is what makes the control specific rather than merely present.
+
+- **`(select …)` around the identity call, measured rather than asserted.**
+  `tests/tenancy_test.sh` counts invocations over five rows on every run:
+  **1 wrapped, 5 bare.**
+
+- **`tests/tenancy_test.sh`** — a real cluster from the stack kit ships, the
+  substrate applied, the proof run three times (clean, with the FORCE control
+  mutated in, and measuring the init plan). Bounded at 1800s in the observability
+  phase, next to `tests/isolation_test.sh`.
+
+- **`tests/validate.sh` — `templates/database/tenancy/*  (the account boundary,
+  in the templates that enforce it)`.** Ten required strings and five forbidden
+  ones in the substrate, **over SQL comments stripped** (the substrate's own
+  comments quote every required string while explaining why it exists); four
+  required strings in the proof; the eight-name spine asserted to be CONSTRUCTED;
+  the manifest and the proof compared **in both directions**; and every one of the
+  six drivers required to READ both files on the same line as a read call rather
+  than merely mention them. Every list it iterates has an empty-list guard.
+
+- **`tests/validate.sh` — six parse checks for the six drivers**, on the rule
+  "parse what you hand out". `templates/database/tenancy/*.sql` are reported as
+  parsed by `tests/tenancy_test.sh` rather than by this loop, because a migration's
+  syntax is only observable by a server.
+
+- **Self-test breakages 90-92**: `FORCE ROW LEVEL SECURITY` removed from the
+  substrate; a driver that reads the proof but no longer the manifest; the
+  manifest and the proof disagreeing.
+
+### Changed — a second role per service, which changes nothing for a service that has not adopted it
+
+- **`templates/compose/postgres/initdb/10-cluster.sh` provisions `<service>_app`
+  beside `<service>`,** grants it CONNECT and the two per-role timeouts, and grants
+  it **TO** `<service>` — never the reverse. `<service>` is unchanged: it still owns
+  the database and every table, still runs migrations, and still carries the
+  `CONNECTION LIMIT`. The app role deliberately does **not** carry one: the budget
+  is nine services' worth, and a service that adopts the tenancy templates opens
+  its connections as `<service>_app`.
+
+- **Why the role is not optional decoration.** Postgres exempts a table's **owner**
+  from its own row-level-security policies, and every service in this fleet runs
+  its migrations as its own role. A login role that owns its tables can
+  `ALTER TABLE … DISABLE ROW LEVEL SECURITY` and can `DROP POLICY`, so an account
+  boundary enforced only by policies is one privilege away from meaning nothing.
+
+- **`bin/dev db grant` prints both roles** and both sets of grants, because
+  `docker-entrypoint-initdb.d` only runs on a fresh volume and a service
+  provisioned before this existed would otherwise have no app role at all.
+
+- **`tests/isolation_test.sh` asserts the role topology**, including the direction
+  that is NOT allowed: `<service>_app` must not be a member of `<service>`.
+
+- **`tests/artifacts.json` gains ten rows** — the substrate, the isolation script
+  and manifest as one bundle, the README, and one driver per language. All marked
+  `optional`, because a service holding no customer rows is core's **honest
+  zero** and must be able to say `accountScoped: false` without carrying a
+  row-level-security substrate it has nothing to scope. Optional is not the same
+  as unexamined: `tests/validate.sh` asserts all ten exist in this repository.
+
+- **`templates/database/contract.json` gains a `tenancy` block**, rather than a
+  second contract file: `requiredSettings` says what a generated config must
+  carry, `tenancy` says what the substrate must contain, and two subjects belong
+  in one machine-readable place rather than two that can disagree.
+
+### Not changed, deliberately
+
+- **`core`.** `schemas/tenant-isolation.schema.json`, `docs/tenancy.md` and
+  `harness/tenancy_check.py` are untouched. `tenancy.yml` remains a service's
+  DECLARATION of where its scoping happens and which test proves it; what ships
+  here is the ENFORCEMENT that makes the declaration honest. A service still
+  carries its own `where account_id = ?` on every query, and `core` still requires
+  it — RLS is defence in depth, not a licence to delete the predicate, which is
+  also what makes the query indexable.
+
+- **Any service.** Nothing was adopted anywhere. The nine services keep their
+  hand-written predicates until the adoption wave, and `templates/parity-allowlist`
+  is unchanged rather than padded with nine new `absent` rows this packet cannot
+  verify.
+
 ### Added — a check for the one defect the static phase was structurally unable to see
 
 - **`tests/validate.sh` — `conflict_markers_absent`, run as the first check of the

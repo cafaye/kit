@@ -377,3 +377,87 @@ major.
 - **Backup and restore.** Owned by `templates/kamal/` (kamal + kamal-backup), not
   by this packet. The topology here is one cluster with N databases, and
   kamal-backup's `databases:` is a list, so one job covers all of them.
+
+## MD23 — **the account boundary is Postgres row-level security, forced; application predicates stay**
+
+**The trade.** kit enforces two boundaries and neither is a `WHERE` clause. Between
+services, the database (`MD21d`). Between two accounts of the same service,
+**row-level security on every account-scoped table, with `FORCE ROW LEVEL
+SECURITY`**, and a **login role that owns nothing**.
+
+**What is NOT taken.** The application's own `where account_id = ?` is not
+removed, and this is the load-bearing half of the decision rather than a
+half-measure. Three reasons:
+
+1. **The predicate is what makes the query indexable.** Postgres evaluates a
+   policy per candidate row; a query that relies on the policy alone is a
+   sequential scan the moment the planner cannot push the qual down. Measured:
+   `cafaye.protect_table` creates an index on the policy column precisely because
+   of this, and the predicate is the second half of the same problem.
+2. **The predicate is what catches a mistake in the policy expression.** A `with
+   check` written against the wrong column is refused by no test that does not
+   look for it.
+3. **`core`'s `schemas/tenant-isolation.schema.json` requires it.** `enforced.line`
+   must carry the tenancy key. This decision changes nothing in `core`; it adds the
+   enforcement `core`'s declaration half was written to be honest about.
+
+**Why `FORCE`, and the measurement.** Postgres exempts a table's OWNER from its
+own policies. Every service in this fleet runs its migrations as its own role, so
+the owner is the role that builds every table in its database — and, in
+development, the role the application logs in as. Measured on this kit, a
+protected three-row table, read as the owner carrying another tenant's identity:
+
+| | rows returned |
+|---|---|
+| with `FORCE ROW LEVEL SECURITY` | **1** — its own |
+| without it | **3** — every tenant's |
+
+`FORCE` is not documented in Supabase's row-level-security guide, and **before
+this packet no lint anywhere in cafaye checked for it** — verified across all nine
+account-scoped services: zero `ROW LEVEL SECURITY`, zero `CREATE POLICY`, zero
+non-owner login roles. A team that ships policies, enables RLS, declares victory,
+and is silently wrong on exactly the tables it owns is the failure this decision
+exists to prevent. `tests/tenancy_test.sh` deletes the statement and requires the
+**owner** half of the assertion set to go red while the **login** half stays green:
+that asymmetry is the whole control, and an isolation suite written only against
+the application role passes on a substrate with no FORCE at all.
+
+**Why a non-owner login role, when FORCE is already there.** They are different
+attacks. FORCE makes the owner **subject to** the policies; it does nothing about
+the owner being able to **remove** them. A login role that owns its tables can
+`ALTER TABLE … DISABLE ROW LEVEL SECURITY` and `DROP POLICY`, so the second line
+is `<service>_app`, provisioned by the cluster's init script — the one place in
+this repository where a role is created.
+
+**Why the membership is one-directional.** `GRANT "<svc>_app" TO "<svc>"` and
+never the reverse. The allowed direction lets a migration and
+`tests/tenancy_test.sh` impersonate the strictly weaker role, which is how a proof
+is written from outside the boundary. The forbidden direction hands the
+application every privilege the owner has, which is the entire design undone by
+one `GRANT`. `tests/isolation_test.sh` asserts both halves.
+
+**Why the identity is a transaction-local GUC and not a session variable.** Every
+one of kit's six drivers holds a **pool**. A session-level tenant variable
+survives the pool: the connection goes back still carrying tenant A's identity,
+tenant B is handed it, and tenant B reads tenant A's rows. Transaction-local
+cannot outlive the request, so a leak needs the caller to forget a transaction,
+which is a different bug with a different symptom.
+
+**Why the seam is a function and not a token format.** `cafaye.begin_account/1`
+takes a uuid. How a service turns the credential in its hand into an account is
+that service's business — `identity` issues opaque session tokens and `guard`
+verifies JWKS bearer JWTs — and a template that picked one of those would be
+silently wrong for the other five. `auth.uid()` is therefore **forbidden** in the
+substrate, and the gate fails the build on it.
+
+**The cost, stated.** A protected table's owner reads **zero** rows from it until it
+sets an identity, so a backfill migration has to set one or use a `SECURITY
+DEFINER` function. And `begin_account/1` outside an explicit transaction expires
+at the end of the statement, so a caller in autocommit reads nothing. Both fail
+loudly and immediately, which is the good direction, and both are documented in
+`templates/database/tenancy/README.md` rather than discovered.
+
+**What was NOT taken: `FORCE` on every table in the cluster.** It is a property of
+a table, and forcing it on a table with no policies yet — which is every table
+between its `CREATE` and its `protect_table` call — makes that table unreadable by
+everybody including its owner. The init script therefore does not do it.

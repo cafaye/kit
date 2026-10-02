@@ -63,12 +63,55 @@ reaches a service**, not by subject:
   `templates/secrets/`, `templates/database/` — **COPIED** into the service, per
   language.
 - `templates/compose/postgres/` — the cluster image and its init script, and the
-  only place a database, a role or an extension is created.
+  only place a database, a role or an extension is created. A **role** is now
+  plural: `<service>` (the owner, which runs migrations) and `<service>_app` (the
+  LOGIN the application uses, which owns nothing), granted to each other in ONE
+  direction only.
 
-**One cluster, one database per service, one role per service.** The DATABASE is
+**One cluster, one database per service, two roles per service.** The DATABASE is
 the isolation boundary rather than the machine, and there is **no pooler** — see
 `templates/database/README.md` for the argument and `DECISIONS.md` (MD21) for the
 measurements behind it.
+
+**There are TWO boundaries, and the second one is the one this packet was written
+about.** The database boundary stops `courier` reading `billing`'s rows. It says
+nothing about two accounts of the *same* service, and across all nine
+account-scoped services that boundary was enforced entirely by hand-written
+`WHERE account_id = ?` in six languages: **zero `ROW LEVEL SECURITY`, zero
+`CREATE POLICY`, zero non-owner login roles, and no service declaring a
+`tenancy.yml`.** `templates/database/tenancy/` is the enforcement:
+
+| | what stops it | how |
+|---|---|---|
+| service A reading service B | the database | one database per service, `REVOKE … FROM PUBLIC` |
+| account 1 reading account 2 | **row-level security, FORCED** | `cafaye.protect_table`, a `<service>_app` login role that owns nothing, and `cafaye.begin_account/1` once per request |
+
+**`FORCE ROW LEVEL SECURITY` is not optional and nothing else in the tree will
+tell you so.** Postgres exempts a table's OWNER from its own policies, and every
+service runs its migrations as its own role. Measured on this kit, a protected
+three-row table read as the owner carrying another tenant's identity: **1 row
+with FORCE, 3 without.** It is not in Supabase's guide and **no lint in this
+fleet checked for it** before that directory existed.
+`tests/tenancy_test.sh` deletes the statement and requires the OWNER half of the
+assertion set to go red while the LOGIN half stays green — and that asymmetry is
+the point: an isolation suite written only against the application role passes on
+a substrate with no FORCE at all.
+
+**And the assertion set is THREE denials and one allowance, never one.** A request
+with **no** identity reads zero rows; a request carrying **another tenant's valid**
+identity reads zero rows; a request carrying **its own** identity reads its own
+rows, and not the other tenant's. The first is satisfied by a table with no policy
+at all — which is the bug — and the third by a policy that permits everything.
+`templates/database/<lang>/tenancy_test.*` is that set, in each of the six
+languages, and each compares the assertion NAMES it got back against
+`templates/database/tenancy/assertions.txt` **in both directions**: a count would
+be satisfiable by 24 of the wrong 24.
+
+**A service's own `where account_id = ?` stays.** RLS is defence in depth, not a
+licence to delete the predicate — the predicate is what makes the query indexable,
+it is what catches a `with check` written against the wrong column, and
+`core`'s `tenant-isolation.schema.json` still requires it. See `DECISIONS.md`
+(MD23).
 
 Flat on purpose. `grep -r` finds everything; there is no plugin system to
 learn.
