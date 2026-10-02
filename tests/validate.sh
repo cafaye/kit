@@ -319,6 +319,256 @@ check_verbose() { # check_verbose <label> <proof-regex> <command...>
 
 section() { printf '\n-- %s\n' "$1"; }
 
+# ---------------------------------------------------------------------------
+# parallel checks — bounded, ordered, and provably the same verdict
+# ---------------------------------------------------------------------------
+#
+# WHY. Profiled, not guessed. Timing every `check` call individually (each one
+# wrapped with a `date` before and after) put the whole `--static-only` run at
+# ~35s of which the three per-file loops were 9.6s and NOTHING else was close:
+#
+#     25 files, one shellcheck spawn each    4.8s
+#     23 files, one yamllint spawn each      2.5s
+#     42 files, one parser spawn each        2.3s
+#
+# Every one of those is a spawn whose cost is interpreter start-up, not work:
+# 25 shellcheck invocations cost 4.8s and the tree it reads is 1.2MB. The loop
+# is serial because `check` is, and `check` is serial because it prints as it
+# goes.
+#
+# WHY BOUNDED, AND WHY THIS NUMBER. Not `&` per iteration. kit's own history is
+# the argument: an unbounded fan-out here previously produced load-induced
+# failures — self-test shard 57 and the PG-container isolation check both went
+# red under 4-way parallel load and passed serially — and a gate that fails on a
+# busy machine is a gate people learn to re-run until it agrees with them. So
+# concurrency is capped, and the cap is a variable rather than a constant so a
+# loaded box can be dialled DOWN instead of being told it was wrong.
+#
+#   KIT_PARALLEL_CHECKS=<n>   1 = strictly serial (the pre-change behaviour)
+#                             0 = auto: nproc, capped at 4
+#
+# The cap is 4 and not nproc on purpose. These are short CPU-bound spawns, so
+# the win flattens well before the core count, while the RISK does not: every
+# extra concurrent process is load the rest of the suite — and every other kit
+# worker sharing this box — has to live with. A check that got faster by making
+# the machine worse is not a speedup.
+#
+# WHY IT IS STILL THE SAME SUITE. Three properties, all deliberate:
+#
+#   1. ORDER OF REPORTING IS UNCHANGED. Results are written to one file per
+#      check and replayed in submission order, so a reader sees byte-identical
+#      output to the serial run. That matters because self_test.sh greps gate
+#      OUTPUT for `FAIL <the named check>`, and a report that reordered itself
+#      would be a report whose diffs lie.
+#   2. THE EXIT STATUS OF EACH CHECK IS CAPTURED, NOT INHERITED. A background
+#      job's status is read from the same file its output went to, so a red
+#      check is still red and `fails` still counts it. The alternative — letting
+#      `wait` decide — would make every check pass.
+#   3. `--only` IS APPLIED BEFORE THE SPAWN, not after. A filtered run must not
+#      pay for work it is about to discard, which is the same reason the loops
+#      are skipped wholesale in a filtered run.
+#
+# WHAT IT IS NOT. It does not make any check weaker, skip any file, or change
+# any verdict. It runs the same commands with the same arguments and reports the
+# same statuses in the same order; `KIT_PARALLEL_CHECKS=1` is the old code path.
+par_n="${KIT_PARALLEL_CHECKS:-0}"
+if [ "$par_n" -eq 0 ] 2>/dev/null; then
+  par_n="$( (nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4) )"
+  [ "$par_n" -gt 4 ] && par_n=4
+fi
+case "$par_n" in
+  '' | *[!0-9]*) par_n=4 ;;
+esac
+par_dir="$TMP/parallel"
+mkdir -p "$par_dir"
+par_count=0
+
+# check_par <label> <command...> — `check`, but the work may overlap.
+#
+# The label and the command are recorded, the command is backgrounded, and the
+# RESULT is left for `par_flush` to report in order. The `--only` filter is
+# evaluated HERE, before the spawn, and it counts exactly as `check` counts it —
+# a filtered-out check still increments ONLY_SKIPPED, so the summary's
+# "N ran, M excluded" is the same number the serial path prints.
+check_par() {
+  local label="$1"
+  shift
+  if [ -n "$ONLY_MATCH" ]; then
+    case "$label" in
+      *"$ONLY_MATCH"*) ONLY_RAN=$((ONLY_RAN + 1)) ;;
+      *)
+        ONLY_SKIPPED=$((ONLY_SKIPPED + 1))
+        return 0
+        ;;
+    esac
+  fi
+  par_count=$((par_count + 1))
+  local slot="$par_dir/$par_count"
+  printf '%s\n' "$label" >"$slot.label"
+  # The status is written by the same child that writes the output, as its LAST
+  # act, so a file that exists with a status beside it is a finished check rather
+  # than one caught mid-write. Reading output and status from one place also
+  # removes the possibility of reporting one check's output against another's.
+  #
+  # `set +e` FIRST, and it is load-bearing rather than defensive. This file runs
+  # under `set -e` (line 49), and a background subshell inherits it: a failing
+  # `"$@"` as a standalone statement would take the subshell down before the
+  # `printf` ever ran, so the slot would get an output file and NO status — and
+  # `par_flush`'s answer to that is the one thing this helper must never do,
+  # which is call a check that did not finish a pass. Turning errexit off INSIDE
+  # the child scopes the change to the three lines that need it.
+  ( set +e; "$@" >"$slot.out" 2>&1; printf '%s\n' "$?" >"$slot.status" ) &
+  par_pids="$par_pids $!"
+  par_slots="$par_slots $slot"
+  # The bound. `wait` on the OLDEST pid rather than `wait -n` (bash 4.3+; kit's
+  # gate runs on whatever bash a slim container ships, and this file already
+  # refuses `mapfile` for exactly that reason).
+  par_running=$((par_running + 1))
+  if [ "$par_running" -ge "$par_n" ]; then
+    par_reap
+  fi
+}
+
+# par_reap — block until the oldest outstanding check finishes.
+#
+# It waits for ONE pid and reports NOTHING. Reporting happens in `par_flush`, in
+# submission order, because a gate whose output order depends on which check
+# finished first cannot be diffed and cannot be grepped by position.
+par_reap() {
+  [ -n "$par_pids" ] || return 0
+  # shellcheck disable=SC2086 # deliberate word-splitting: $par_pids is a list
+  set -- $par_pids
+  wait "$1" 2>/dev/null || true
+  # Rebuild the tail from the shifted positional parameters rather than with
+  # `${par_pids#* }`. That prefix strip is a no-op when the list holds exactly
+  # one pid -- there is no space in `"999"` for `* ` to match -- so reaping the
+  # LAST outstanding check left the list unchanged and `par_flush`'s
+  # `while [ -n "$par_pids" ]` spun forever on a queue it had already emptied.
+  # `"$*"` rejoins the remainder with a space, and is the empty string for the
+  # empty list, which is the termination the caller is actually testing for.
+  shift
+  par_pids="$*"
+  par_running=$((par_running - 1))
+  return 0
+}
+
+# report_par <verdict> <label> — queue a verdict the loop already knows, so a
+# mixed loop still prints in file order.
+#
+# The parse loop does not only run commands: several of its arms reach a verdict
+# from a `[ -x ]` test or a missing toolchain and call `report` directly. Mixing
+# those with `check_par` would print the direct ones immediately while the
+# spawned ones waited for the flush, so the ORDER of the report would depend on
+# which check finished first — and self_test.sh greps this output by position
+# far more often than it looks.
+#
+# So a loop in a parallel region reports everything through here: a verdict is
+# written into the same slot stream as a spawned check, in the order the loop
+# produced it, and `par_flush` prints the whole run in that order. This arm also
+# honours `--only` exactly as `check_par` does, which is what keeps the
+# "N ran, M excluded" count identical between the serial and parallel paths.
+report_par() {
+  local verdict="$1" label="$2"
+  if [ -n "$ONLY_MATCH" ]; then
+    case "$label" in
+      *"$ONLY_MATCH"*) ONLY_RAN=$((ONLY_RAN + 1)) ;;
+      *)
+        ONLY_SKIPPED=$((ONLY_SKIPPED + 1))
+        return 0
+        ;;
+    esac
+  fi
+  par_count=$((par_count + 1))
+  local slot="$par_dir/$par_count"
+  printf '%s\n' "$label" >"$slot.label"
+  # The slot's status file holds an EXIT CODE, not a verdict name, because that
+  # is the one thing `par_flush` knows how to read back. Writing "SKIP" there
+  # instead of a number reads as a non-numeric status and is reported as a FAIL,
+  # which is the correct answer to the wrong question — the same wrong answer
+  # twice. So the verdict is translated to the code `par_flush` will map back:
+  # SKIP becomes the sysexits EX_CONFIG this file already uses for a missing
+  # toolchain, FAIL becomes any non-zero. `par_flush` then re-derives the name
+  # with the same `report` call the serial path would have made.
+  case "$verdict" in
+    PASS) printf '0\n' >"$slot.status" ;;
+    SKIP) printf '%s\n' "$SKIP_EXIT" >"$slot.status" ;;
+    *) printf '1\n' >"$slot.status" ;;
+  esac
+  : >"$slot.out"
+}
+
+# par_flush — wait for every outstanding check, then report them in order.
+par_flush() {
+  while [ -n "$par_pids" ]; do
+    par_reap
+  done
+  local i=1 label status out
+  while [ "$i" -le "$par_count" ]; do
+    local slot="$par_dir/$i"
+    label="$(cat "$slot.label" 2>/dev/null || printf '')"
+    if [ ! -f "$slot.status" ]; then
+      # A check whose child never wrote a status did not finish, and reporting
+      # it as a pass would be the one lie this helper is forbidden to tell.
+      report FAIL "$label"
+      printf '       the check did not report a status; it was killed rather than finished\n'
+      i=$((i + 1))
+      continue
+    fi
+    status="$(cat "$slot.status")"
+    out="$(cat "$slot.out" 2>/dev/null || printf '')"
+    # A status file that exists but is not a number means the child was cut off
+    # between creating it and finishing the write. `[ "" -eq 0 ]` under `set -e`
+    # would abort the whole gate there, and an aborted gate is not a green one,
+    # but a FAIL is the honest verdict and it keeps the run going.
+    case "$status" in
+      '' | *[!0-9]*)
+        report FAIL "$label"
+        printf '       the check did not finish writing a status; it was killed rather than finished\n'
+        i=$((i + 1))
+        continue
+        ;;
+    esac
+    if [ "$status" -eq 0 ]; then
+      report PASS "$label"
+      [ -z "$out" ] || printf '%s\n' "$out" | sed 's/^/       /'
+    elif [ "$status" -eq "$SKIP_EXIT" ]; then
+      report SKIP "$label"
+      [ -z "$out" ] || printf '%s\n' "$out" | sed 's/^/       /'
+    else
+      report FAIL "$label"
+      printf '%s\n' "$out" | sed 's/^/       /'
+    fi
+    i=$((i + 1))
+  done
+  par_count=0
+  par_pids=""
+  par_slots=""
+  par_running=0
+}
+
+# Start a parallel region. `par_begin` resets the slot counter AND clears the
+# slots, so each loop gets its own 1..n numbering and no section can read a
+# previous section's verdict.
+#
+# The clear is not tidiness. Slot numbering restarts at 1 in every region while
+# the files under `$TMP/parallel` are named by that number, so without it
+# section two's first check would find section one's `1.status` already on disk
+# and `par_flush` would happily report section one's verdict under section two's
+# label. A green line for a check that never ran is the exact failure this whole
+# helper exists to avoid, and it would only appear when a loop got SHORTER than
+# the one before it.
+par_begin() {
+  par_pids=""
+  par_slots=""
+  par_running=0
+  par_count=0
+  rm -f "$par_dir"/*.label "$par_dir"/*.out "$par_dir"/*.status 2>/dev/null || true
+}
+
+par_pids=""
+par_slots=""
+par_running=0
+
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # No tracked file carries a merge-conflict marker.
@@ -733,7 +983,14 @@ PY
   # It is safe to skip, and the reason is structural rather than hopeful: every
   # line in the loop calls `check`, so a filtered run would skip them anyway --
   # one `check` call each, just after paying for the file walk.
+  #
+  # `check_par`, not `check`: 42 files and one spawn each, 2.3s measured, and
+  # nearly all of it interpreter start-up. Each iteration reads one file and
+  # shares nothing with the next, which is what makes them safe to overlap. The
+  # arms that reach a verdict WITHOUT spawning go through `report_par` so the
+  # section still prints one line per file in file order.
   if [ -z "$ONLY_MATCH" ]; then
+  par_begin
   for f in "$ROOT"/.github/workflows/* "$ROOT"/lint/* "$ROOT"/docker/* \
     "$ROOT"/templates/bin-prime/* "$ROOT"/templates/compose/* \
     "$ROOT"/templates/kamal/drill.sh \
@@ -744,15 +1001,15 @@ PY
     [ -f "$f" ] || continue
     path="${f#"$ROOT"/}"
     case "$f" in
-      *.sh) check "$path  (bash -n)" bash -n "$f" ;;
-      *.yml | *.yaml) check "$path  (yaml.safe_load)" yaml_ok "$f" ;;
+      *.sh) check_par "$path  (bash -n)" bash -n "$f" ;;
+      *.yml | *.yaml) check_par "$path  (yaml.safe_load)" yaml_ok "$f" ;;
       *.json)
         # contract.json is where the connection check reads its requirements
         # from, so a syntax error in it would be a check reading nothing rather
         # than a red line. Parsed here so a malformed file fails on every
         # machine — including one with no docker, which is the rest of the
         # topology's dependency.
-        check "$path  (json.loads)" "$PY" -c \
+        check_par "$path  (json.loads)" "$PY" -c \
           'import json,sys; json.load(open(sys.argv[1], encoding="utf-8"))' "$f"
         ;;
       # The cluster image. hadolint is its parser and runs below — reported
@@ -762,9 +1019,9 @@ PY
       "$ROOT"/templates/compose/postgres/Dockerfile) ;;
       *.mjs)
         if have node; then
-          check "$path  (node --check)" node --check "$f"
+          check_par "$path  (node --check)" node --check "$f"
         else
-          report SKIP "$path  (node not installed)"
+          report_par SKIP "$path  (node not installed)"
         fi
         ;;
       "$ROOT"/docker/Dockerfile.*)
@@ -785,10 +1042,10 @@ PY
       # without inventing a module layout kit has no use for.
       "$ROOT"/templates/tier/rust/*.rs)
         if have rustc; then
-          check "$path  (rustc --test)" bash -c \
+          check_par "$path  (rustc --test)" bash -c \
             "rustc --test --edition 2021 -o \"$TMP/kit-tier-rust\" '$f' && '$TMP/kit-tier-rust' --list >/dev/null"
         else
-          report SKIP "$path  (rustc not installed)"
+          report_par SKIP "$path  (rustc not installed)"
         fi
         ;;
       "$ROOT"/templates/tier/python/*.py)
@@ -798,17 +1055,17 @@ PY
           # picked up by two other checks that iterate this one — which is how a
           # gate that started green went red on its own artefacts. `compile()`
           # is the same parse with no filesystem side effect at all.
-          check "$path  (compile)" python3 -c \
+          check_par "$path  (compile)" python3 -c \
             'import sys; compile(open(sys.argv[1], encoding="utf-8").read(), sys.argv[1], "exec")' "$f"
         else
-          report SKIP "$path  (python3 not installed)"
+          report_par SKIP "$path  (python3 not installed)"
         fi
         ;;
       "$ROOT"/templates/tier/ruby/*.rb)
         if have ruby; then
-          check "$path  (ruby -c)" ruby -c "$f"
+          check_par "$path  (ruby -c)" ruby -c "$f"
         else
-          report SKIP "$path  (ruby not installed)"
+          report_par SKIP "$path  (ruby not installed)"
         fi
         ;;
       "$ROOT"/templates/tier/elixir/*.ex)
@@ -816,13 +1073,13 @@ PY
           # `elixir -c` is not a thing. `Code.string_to_quoted/1` is the
           # stdlib parse, it is offline, and it reports the same syntax errors
           # the compiler would — which is the property being asserted.
-          check "$path  (Code.string_to_quoted!)" elixir -e \
+          check_par "$path  (Code.string_to_quoted!)" elixir -e \
             'case Code.string_to_quoted(File.read!(hd(System.argv()))) do
                {:error, e} -> IO.puts("syntax: #{inspect e}"); System.halt(1)
                {:ok, _} -> :ok
              end' "$f"
         else
-          report SKIP "$path  (elixir not installed)"
+          report_par SKIP "$path  (elixir not installed)"
         fi
         ;;
       # The lint drift allowlist, which has no extension because it is not
@@ -853,7 +1110,7 @@ PY
         # rather than the one the author is thinking about — so it passed on a
         # file with a wrapped entry, which is the exact case it was written for.
         # Two counts and an equality have no stage to get wrong.
-        check "$path  (every content line starts one entry)" bash -c \
+        check_par "$path  (every content line starts one entry)" bash -c \
           "[ \"\$(grep -cE '^[[:space:]]*[^#[:space:]]' '$f')\" \
              -eq \"\$(grep -c '^diverged ' '$f')\" ]"
         ;;
@@ -877,7 +1134,7 @@ PY
       # assertion that it does not is in tests/kamal_test.sh, which runs the real
       # binary and greps its real output for the real values.
       "$ROOT"/templates/kamal/deploy.yml.erb | "$ROOT"/templates/kamal/kamal-backup.yml.erb)
-        check "$path  (renders, and the rendered YAML parses)" erb_yaml_ok "$f"
+        check_par "$path  (renders, and the rendered YAML parses)" erb_yaml_ok "$f"
         ;;
       "$ROOT"/templates/tier/go/*.go)
         # gofmt is run over the whole tree's Go templates in the telemetry phase
@@ -892,17 +1149,18 @@ PY
         # than passed over: a skip nobody can see is a gap nobody fixes, and the
         # summary line is how this class of gap is found. The fix is a
         # type-stripping parser, which is a dependency, and kit is config-only.
-        report SKIP "$path  (node --check cannot read TypeScript; needs a type-stripping parser)"
+        report_par SKIP "$path  (node --check cannot read TypeScript; needs a type-stripping parser)"
         ;;
       *)
         # A new file type with no parser is a gap, so it is loud rather than
         # quiet. It is still a SKIP, because the honest report matters more
         # than a red gate on an unknown extension — but a SKIP is counted and
         # printed in the summary, which is how the seven Dockerfiles were found.
-        report SKIP "$path  (no parser for this file type)"
+        report_par SKIP "$path  (no parser for this file type)"
         ;;
     esac
   done
+  par_flush
 
   # Every script kit hands out is executable. `chmod -x bin/dev` in a commit is
   # a one-character diff that silently breaks six repos the next they adopt.
@@ -950,6 +1208,7 @@ PY
   # for it.
   if [ -z "$ONLY_MATCH" ] && have shellcheck; then
     section 'static: shellcheck -S warning'
+    par_begin
     for f in "$ROOT"/templates/bin-prime/* "$ROOT"/templates/bin/* \
       "$ROOT"/templates/kamal/*.sh "$ROOT"/tests/*.sh; do
       [ -f "$f" ] || continue
@@ -957,8 +1216,15 @@ PY
       # SC2317 (unreachable command) is excluded deliberately: the `check`
       # helper builds a command list that shellcheck's flow analysis cannot see
       # through. Every other warning is a real finding.
-      check "$path  (shellcheck -S warning)" shellcheck -S warning -e SC2317 "$f"
+      #
+      # `check_par`, not `check`: this loop is the single most expensive thing
+      # the static phase does (measured: 4.8s over 25 files, almost all of it
+      # the linter's own start-up), and each iteration is an independent spawn
+      # over one file with no shared state. The bound and the ordering
+      # guarantees are documented at `check_par`.
+      check_par "$path  (shellcheck -S warning)" shellcheck -S warning -e SC2317 "$f"
     done
+    par_flush
   else
     report SKIP 'shellcheck (not installed)'
   fi
@@ -4857,12 +5123,16 @@ PY
           sed 's|^\./||' | sort)
       fi
     }
+    par_begin
     while IFS= read -r rel; do
       [ -n "$rel" ] || continue
       [ -f "$ROOT/$rel" ] || continue
-      check "$rel  (yamllint -c lint/yamllint.yml)" \
+      # `check_par`: 23 independent single-file spawns, 2.5s measured, and the
+      # same bounded-and-ordered guarantee as the shellcheck loop above.
+      check_par "$rel  (yamllint -c lint/yamllint.yml)" \
         "$YAMLLINT" -c "$ROOT/lint/yamllint.yml" "$ROOT/$rel"
     done < <(yamls_of_the_tree)
+    par_flush
 
     # The glob above only reaches `*.yml` and `*.yaml`, and kit now ships YAML
     # under other names: the vendir templates are `vendir.yml.<service>` so that
