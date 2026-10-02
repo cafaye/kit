@@ -1601,9 +1601,30 @@ the static ones go further and assert that one *named* check reported `FAIL`, so
 the check written for a given defect is proven still load-bearing rather than
 being one of fifty checks that could have gone red for an unrelated reason.
 
+**The harness shards, and the shard partition is itself checked.**
+`KIT_SELF_TEST_SHARD=i/n` runs only the breakages congruent to `i`, with `i` in
+`1..n`. `tests/shard_test.sh` proves the property rather than describing it: it
+evaluates the real `_shard_claims` out of `tests/self_test.sh` — a second copy of
+the modulo would be a second thing to be wrong — and asserts that the `n` shards
+partition the suite **exactly once**, that no shard is empty (shard `n/n` named
+first, because that is the one an off-by-one empties), and that a shard which
+*cannot* be placed is **refused at the door** with both numbers rather than run.
+
+It is in the gate because the harness is the one component no other recipe can
+reach: every other breakage proves the *gate* goes red, and the gate is not what
+shards. Breakages **94 and 95** are the only two that mutate `self_test.sh`
+itself, and they are why the check is load-bearing rather than decorative.
+
+**`n` is bounded by the suite's highest breakage NUMBER, not its count.** The
+labels are sparse — they run `1..62` and `68..93`, with `63..67` left by a
+renumbering — so the largest `n` with no empty shard is **62**, and for any `n` in
+`64..93` shard 64 asks for a residue class no breakage is in. That case is
+reported as a `FAIL` by the summary rather than a `PASS`, which is the whole
+point: an empty shard must never be indistinguishable from a shard the arithmetic
+emptied by mistake.
+
 Breakage 19 is the allowlist one: an entry naming a test that does not exist,
-well-formed in every other respect. It is the rule most able to be decorative —
-a hygiene rule in a data file is exactly the shape of a check nobody has ever
+well-formed in every other respect. It is the rule most able to be decorative —a hygiene rule in a data file is exactly the shape of a check nobody has ever
 seen fail.
 
 Breakage 23b is the other end of that problem. A check that converts a red into a

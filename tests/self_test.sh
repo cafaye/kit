@@ -515,6 +515,18 @@
 #   alphabet that quietly grows a second case, a limit raised until it never
 #   fires. One mutant per language proves the suite bites; it does not prove the
 #   suite is complete, and nothing here should be read as claiming that is.
+#
+# 94 and 95 are the only two that break THIS FILE rather than the gate, and they
+# are here because the harness is the one component no other recipe can reach.
+#   94. the shard key is 0-based again         -> `shard_test` goes red, naming shard n/n
+#   95. an over-provisioned shard stops being refused at the door -> red
+#
+# Both are `expect_red_script` against `tests/shard_test.sh`, which is a proof
+# rather than a gate over a tree for the same reason `classify_test.sh` is: the
+# property is about the suite's own arithmetic, so there is nothing for a check
+# over the tree to look at. The mutation is the defect that shipped — a 0-based
+# residue compared against a 1-based shard index — and it is why a four-shard merge
+# gate once reported all four green with the fourth having verified nothing.
 
 set -euo pipefail
 
@@ -4064,6 +4076,40 @@ printf -- '---\nname: image\non:\n  workflow_call:\njobs:\n  build:\n    runs-on
 rm "$base79/.github/workflows/image.reusable.yml"
 expect_red_check 'breakage 79: a callable workflow ships at a path kit does not declare, so nothing polls it' \
   "$base79" "$CALLABLE" --static-only
+
+# 94 and 95. THE HARNESS'S OWN SHARDING, in the two directions it can be wrong.
+#
+# Neither is reachable by an `expect_red_check`, and that is the whole reason they
+# exist: every other recipe in this file proves that the GATE goes red, and the
+# gate is not what shards. What went wrong was arithmetic in this file — a 0-based
+# residue compared against a 1-based shard index — so shard `n/n` asked for a
+# class nobody is in, ran nothing, and reported PASS. Four shards as a merge gate
+# covered three quarters of the suite and said all four were green. A recipe that
+# mutated a check could not have found it; there was no check.
+#
+# `tests/shard_test.sh` is the check, and it evaluates the real `_shard_claims`
+# out of this file rather than restating it — a second copy of the modulo would be
+# a second thing to be wrong, which is the shape of defect this pair is about.
+#
+# 94 is the defect itself, in one line. 95 is the half that is easy to delete by
+# accident: the refusal that makes an OVER-PROVISIONED shard loud. It is a
+# separate recipe because a check proved able to catch the arithmetic and unable
+# to notice that the safety net was gone would still have shipped a shard that
+# silently verified nothing.
+base94="$(fresh_copy kit-94)"
+edit "$base94/tests/self_test.sh" \
+  'idx=$(( (num - 1) % _shard_n + 1 ))' 'idx=$(( num % _shard_n ))'
+# The needle is the sentence that names shard n/n, not the word FAIL: this check
+# reports the empty shards it found, and a recipe that asserted only "went red"
+# would pass on a mutation that emptied a DIFFERENT shard.
+expect_red_script 'breakage 94: the shard key is 0-based again, so shard n/n verifies nothing' \
+  "$base94" tests/shard_test.sh '' 'THE SHIPPED DEFECT'
+
+base95="$(fresh_copy kit-95)"
+edit "$base95/tests/self_test.sh" \
+  'if [ "$_shard_n" -gt "$_shard_suite_max" ]; then' 'if false; then'
+expect_red_script 'breakage 95: an over-provisioned shard is no longer refused at the door' \
+  "$base95" tests/shard_test.sh '' 'an over-provisioned shard count'
 
 printf '\n'
 # TWO skip kinds, counted apart, because they are two different problems and one

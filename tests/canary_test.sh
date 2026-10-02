@@ -163,6 +163,37 @@ targets = [
 if not targets:
     sys.exit("canary: no backend exporters found; the shipped config changed shape")
 
+# THE METRICS PIPELINE HAS NO BACKEND TO SUBSTITUTE, and that is not a gap in the
+# substitution -- it is a decision in the shipped config. kit's dev profile removed
+# the metrics store (it cost 130s of readiness budget and 384m per cold start for
+# a fleet with no series to put in it), so `templates/compose/otel-collector.yml`
+# ships NO metrics exporter and the metrics pipeline runs on `debug` alone: this
+# process's own stdout, on the machine already running it, which cannot reach the
+# network.
+#
+# THIS TEST WAS WRITTEN WHEN THAT PIPELINE NAMED A STORE, and it went red the day
+# the store left rather than saying so. `BACKENDS` is a filter over what may be
+# SUBSTITUTED, so a name nobody can substitute is inert by design -- which is
+# exactly why the failure was silent until the assertion at the bottom, four
+# hundred lines later, reported `the metrics pipeline points at ['debug'],
+# expected ['file/capture']` and said nothing about why. A red with no cause is
+# how a security check gets deleted.
+#
+# SO THE SUBSTITUTION COVERS EVERY PIPELINE, and the rule is derived rather than
+# listed: an exporter in a pipeline is replaced by `file/capture` when it is one
+# of the backends above, OR when it is the pipeline's ONLY exporter. The second
+# clause is the one that matters. `debug` writes to stdout, which this test never
+# reads, so on the shipped config the metrics signal was NEVER OBSERVED: the
+# `llm.prompt`, `error.message` and `tenant_id`-on-a-measurement assertions below
+# were all passing vacuously on a path nothing had ever sent to a file. Swapping
+# `debug` for `file/capture` puts those metrics into the capture where they can be
+# checked, which is a STRENGTHENING and not a relaxation: the canary now proves
+# what it claims to prove about all three signals instead of two.
+#
+# `debug` is left in place on a pipeline that has a backend of its own (traces),
+# because there it is the shipped local escape hatch and removing it would drop
+# the collector's stdout path rather than redirect one.
+
 
 def drop_exporter(body, name):
     """Remove one exporter block, by indentation rather than by regex.
@@ -210,14 +241,38 @@ for name in targets:
 # exporter names AND the exact list formatting of each pipeline, so a fourth
 # pipeline, or a reordering, would have silently stopped matching and left the
 # test asserting against a config that still pointed at a dead Tempo.
+#
+# The mapping is per PIPELINE, not global: a name is captured when it is one of
+# `targets`, and additionally when it is the only exporter its pipeline has. The
+# list is de-duplicated because substituting both `otlp/tempo` and `debug` on one
+# pipeline would otherwise produce `file/capture` twice and the collector refuses
+# a pipeline that names the same exporter twice -- a substitution that cannot be
+# loaded is a substitution nobody would debug.
+pipelines = (shipped.get("service") or {}).get("pipelines") or {}
+if not pipelines:
+    sys.exit("canary: the shipped config declares no pipelines")
+
+
+def substitute(match):
+    body = match.group(2)
+    parts = [part.strip() for part in body.split(",") if part.strip()]
+    if len(parts) == 1 and parts[0] not in targets:
+        # A pipeline with a single exporter and nothing to substitute it for: this
+        # is the metrics pipeline after the dev profile removed the store. Capture
+        # it, or the signal is never observed at all.
+        parts = ["file/capture"]
+    else:
+        parts = ["file/capture" if part in targets else part for part in parts]
+    seen = []
+    for part in parts:
+        if part not in seen:
+            seen.append(part)
+    return match.group(1) + ", ".join(seen) + match.group(3)
+
+
 source = re.sub(
     r"(?m)^(      exporters: \[)([^\]]*)(\])",
-    lambda m: m.group(1)
-    + ", ".join(
-        "file/capture" if part.strip() in targets else part.strip()
-        for part in m.group(2).split(",")
-    )
-    + m.group(3),
+    substitute,
     source,
 )
 
@@ -258,14 +313,33 @@ if set(doc.get("exporters") or {}) - {"file/capture", "debug"}:
         "canary: unexpected exporters survived: "
         + ", ".join(sorted(set(doc["exporters"]) - {"file/capture", "debug"}))
     )
-for signal, expected in (
-    ("traces", ["spanmetrics", "file/capture", "debug"]),
-    ("metrics", ["file/capture"]),
-    ("logs", ["file/capture"]),
+# EVERY PIPELINE MUST BE OBSERVABLE, and that is a stronger claim than the three
+# literal expectations this used to assert. The old check said `metrics` must be
+# `["file/capture"]` -- a statement about the pipeline kit happened to ship -- and
+# it is what went red when the dev profile removed the metrics store, four hundred
+# lines below the substitution that could no longer do anything for it.
+#
+# What the canary actually needs is not that the metrics pipeline names a
+# particular exporter; it is that EVERY signal it sends reaches `file/capture`,
+# the one exporter this test reads. A pipeline exporting only to `debug` -- to the
+# collector's own stdout, which nothing here inspects -- is a signal the canary
+# does not test, and a canary that silently does not test a signal reports its
+# green over all three. So the assertion is the property, and the shape of the
+# shipped config is free to change underneath it.
+for signal, pipeline in sorted(
+    ((doc.get("service") or {}).get("pipelines") or {}).items()
 ):
-    got = ((doc.get("service") or {}).get("pipelines") or {}).get(signal, {}).get("exporters")
-    if got != expected:
-        sys.exit(f"canary: the {signal} pipeline points at {got}, expected {expected}")
+    got = pipeline.get("exporters")
+    if not got:
+        sys.exit(f"canary: the {signal} pipeline exports to nothing")
+    if "file/capture" not in got:
+        sys.exit(
+            f"canary: the {signal} pipeline points at {got}, none of which this test can "
+            f"read; a leak on {signal} would pass silently. Every pipeline must export to "
+            f"file/capture."
+        )
+    if len(set(got)) != len(got):
+        sys.exit(f"canary: the {signal} pipeline names an exporter twice: {got}")
 
 open(f"{work}/otel-collector.yml", "w", encoding="utf-8").write(source)
 PY

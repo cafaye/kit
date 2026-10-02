@@ -376,7 +376,7 @@ if [ -z "$TO" ]; then
 else
   _out_file="$(mktemp "${TMPDIR:-/tmp}/kit-shard-refuse.XXXXXX")"
   _rc=0
-  KIT_SELF_TEST_SHARD="1/$((SUITE_MAX + 1))" "$TO" 60 bash "$SELF" >"$_out_file" 2>&1 || _rc=$?
+  KIT_SELF_TEST_SHARD="1/$((SUITE_MAX + 1))" "$TO" 20 bash "$SELF" >"$_out_file" 2>&1 || _rc=$?
   if [ "$_rc" -eq 2 ] && grep -q 'cannot partition a suite numbered up to' "$_out_file"; then
     pass "an over-provisioned run of tests/self_test.sh refuses at the door: $(head -1 "$_out_file")"
   else
