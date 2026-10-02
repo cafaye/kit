@@ -1287,8 +1287,16 @@ PY
   # OUT: an operator runs it, exactly as they run entrypoint.sh. A non-executable
   # drill.sh is a drill nobody can start, and the message is "permission denied"
   # without saying which file.
+  # `docker/entrypoint.sh` is here because the comment above already named it:
+  # every one of the seven Dockerfiles now `COPY`s it and `exec`s it, and a
+  # developer running it against a local database needs it executable too. The
+  # image itself does not depend on the mode — the ENTRYPOINT is
+  # `["/bin/sh", "/app/kit-entrypoint", …]` — so this is about the person, not
+  # the container. That is still a contract worth asserting, because
+  # `chmod -x` is a one-character diff.
   for f in "$ROOT"/templates/bin-prime/* "$ROOT"/templates/bin/* \
     "$ROOT"/templates/kamal/drill.sh \
+    "$ROOT"/docker/entrypoint.sh \
     "$ROOT/$GITLEAKS_GATE" "$ROOT/tests/zizmor_gate.sh"; do
     [ -f "$f" ] || continue
     path="${f#"$ROOT"/}"
@@ -1315,7 +1323,7 @@ PY
     section 'static: shellcheck -S warning'
     par_begin
     for f in "$ROOT"/templates/bin-prime/* "$ROOT"/templates/bin/* \
-      "$ROOT"/templates/kamal/*.sh "$ROOT"/tests/*.sh; do
+      "$ROOT"/templates/kamal/*.sh "$ROOT"/docker/*.sh "$ROOT"/tests/*.sh; do
       [ -f "$f" ] || continue
       path="${f#"$ROOT"/}"
       # SC2317 (unreachable command) is excluded deliberately: the `check`

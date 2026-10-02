@@ -130,6 +130,17 @@
 # wrapper that does not exec. The cost of this one is that PID 1 is a shell for
 # the duration of the migration only: no orphaned children to reap before the
 # exec, and after the exec there is no shell left to swallow anything.
+# WHY `set -eu` AND NOT `set -euo pipefail`. kit's style rule says `pipefail` in
+# every shell script, and this one is the exception it has to be. This file runs
+# as `/bin/sh` inside a `python:*-slim`, an `oven/bun:*-slim`, a `debian:*-slim`
+# and a `distroless`-alike — dash on Debian, ash on Alpine-derived bases — and
+# `set -o pipefail` is a bash/ksh addition that those shells reject, so the
+# script would die on line one in every image it exists to serve. The cost is
+# real and small: there is no pipeline on any load-bearing path. The one place
+# output is examined, the lock acknowledgement, is `grep -q` reading a FILE and
+# not a pipe — which is the distinction kit's own rule draws, since the broken
+# shape there is `printf … | grep -q` and the working shape is a search over
+# something already on disk.
 set -eu
 
 log() { printf 'kit-entrypoint: %s\n' "$*" >&2; }

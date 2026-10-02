@@ -21,6 +21,25 @@
 #     uv ships a release, which makes the image unreproducible for a reason
 #     that has nothing to do with the service. Kept in step with the `uv` pin
 #     in templates/mise.toml; hadolint's DL3013 is what found this.
+#   - THE ENTRYPOINT MIGRATES FIRST. `docker/entrypoint.sh` resolves this
+#     repository's migration command, runs it against DATABASE_URL, and only then
+#     `exec`s python. A migration that fails refuses to start the service, which
+#     is the point: it deletes the "service is healthy, schema is stale"
+#     cold-start class that a bare `ENTRYPOINT ["…", "python", "-m", "app"]`
+#     leaves open. Set `KIT_MIGRATE=required` for a service that owns a schema,
+#     so a misconfigured image fails loudly instead of serving the old one.
+#     `docker/entrypoint.sh` finds `./bin/migrate` on its own; an Alembic service
+#     sets `KIT_MIGRATE_CMD='alembic upgrade head'`, and Django sets
+#     `KIT_MIGRATE_CMD='python manage.py migrate'`. Both run through the venv on
+#     PATH, so neither needs an absolute path.
+#   - `alembic upgrade head` is idempotent by construction — it compares the
+#     `alembic_version` table to the files on disk — so replicas booting together
+#     converge rather than collide. If you want that guaranteed rather than
+#     likely, set `KIT_MIGRATE_ADVISORY_LOCK` and install `postgresql-client` in
+#     the runtime stage; the entrypoint refuses to start if it is asked for a
+#     lock it cannot take.
+#   - `exec "$@"` inside that script, so after the migration python replaces the
+#     shell and is PID 1: SIGTERM still reaches it.
 ARG PYTHON_VERSION=3.13
 ARG UV_VERSION=0.5.11
 
@@ -54,6 +73,7 @@ RUN /app/.venv/bin/pip install --no-cache-dir --no-index --find-links=/wheels -r
 # importable from outside the workdir, add
 #   RUN /app/.venv/bin/pip install --no-index --no-deps /app
 COPY --chown=app:app . /app
+COPY --chown=app:app docker/entrypoint.sh /app/kit-entrypoint
 USER app
 EXPOSE 8000
-ENTRYPOINT ["/app/.venv/bin/python", "-m", "app"]
+ENTRYPOINT ["/bin/sh", "/app/kit-entrypoint", "/app/.venv/bin/python", "-m", "app"]

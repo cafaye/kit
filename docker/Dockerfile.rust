@@ -11,12 +11,59 @@
 #   - `--locked` is not optional: without it cargo silently updates Cargo.lock in
 #     the build, so two builds of the same commit are not the same binary.
 #   - The runtime copies CA certificates in because a service that calls Stripe
-#     or an OIDC provider fails TLS without them; distroless ships none.
-#   - The final stage runs non-root, as `nonroot:nonroot` (uid 65532) — the user
-#     the distroless image ships. A container running as root is a container
-#     where a bug is a host compromise, and a static binary gains nothing from
-#     root.
+#     or an OIDC provider fails TLS without them.
+#   - The final stage runs non-root, as uid/gid 65532. There is no passwd entry
+#     for that uid in this base, which is fine and is the point: `USER 65532:65532`
+#     is numeric, so the kernel enforces it and nothing in the image can widen
+#     it. A container running as root is a container where a bug is a host
+#     compromise.
+#
+#   - THE RUNTIME BASE IS DEBIAN-SLIM AND NOT DISTROLESS, and that is a change
+#     this file used to argue the other way. It is here because the image now
+#     starts through `docker/entrypoint.sh`, which migrates before it serves,
+#     and a script needs a shell.
+#
+#     The claim that motivated distroless was measured rather than assumed, and
+#     the measurement went the way nobody expected. Neither distroless variant
+#     carries a shell — not `static`, and not `base`:
+#
+#         $ docker run --rm --entrypoint /bin/sh gcr.io/distroless/base-debian12:nonroot -c 'echo hi'
+#         exec: "/bin/sh": stat /bin/sh: no such file or directory
+#         $ docker export $(docker create gcr.io/distroless/base-debian12:nonroot) | tar -tf - | grep '^bin/'
+#         bin/                       # empty
+#
+#     So "there is no shell in this image, so a compromised process cannot curl
+#     and pipe" and "the entrypoint migrates" cannot both be true. Migrating at
+#     boot is the feature (it is what deletes the boot-against-a-stale-schema
+#     class); the shell is its price. The price is stated here rather than
+#     discovered.
+#
+#     IF YOU WANT DISTROLESS BACK, the honest way is not a trick: set
+#     `ENV KIT_MIGRATE=off`, run migrations from a job (Kamal's `pre-deploy`
+#     accessory), and change the final stage back to
+#     `gcr.io/distroless/static-debian12:nonroot`. You are choosing
+#     "migrate once, out of band" over "migrate at every boot".
+#
+#   - WHERE THE MIGRATE COMMAND COMES FROM, and why it is set explicitly. This
+#     image copies the compiled binary and nothing else, so the repository's SQL
+#     files are not in it. A Rust service that migrates at boot points the
+#     entrypoint at its own static migrator:
+#
+#         RUN cargo build --release --locked --bin "${SERVICE_NAME}-migrate" \
+#             && cp "target/x86_64-unknown-linux-musl/release/${SERVICE_NAME}-migrate" /out/migrate
+#         COPY --from=build /out/migrate /app/migrate
+#         ENV KIT_MIGRATE_CMD=/app/migrate
+#
+#     `templates/bin/dev.sh` deliberately does NOT migrate for Rust either — it
+#     runs `bin/prime --fast` and prints a note saying so — so an image cannot
+#     inherit a migrate step from the dev loop. If your service has no
+#     `bin/migrate` and no `-migrate` binary, the entrypoint logs one line and
+#     serves; set `KIT_MIGRATE=required` to turn that into a boot failure instead,
+#     which is the right setting for a service that owns a schema.
+#   - `exec "$@"` in the entrypoint, so after the migration the binary replaces
+#     the shell and is PID 1. SIGTERM still reaches the service.
 ARG RUST_VERSION=1.84
+ARG RUNTIME_DEBIAN_VERSION=12
 
 FROM rust:${RUST_VERSION}-slim-bookworm AS build
 RUN rustup target add x86_64-unknown-linux-musl
@@ -33,10 +80,12 @@ RUN cargo build --release --locked --bin "${SERVICE_NAME}" \
     && cp "target/x86_64-unknown-linux-musl/release/${SERVICE_NAME}" /out/service \
     && strip "target/x86_64-unknown-linux-musl/release/${SERVICE_NAME}"
 
-FROM gcr.io/distroless/static-debian12:nonroot AS runtime
+FROM debian:${RUNTIME_DEBIAN_VERSION}-slim AS runtime
 WORKDIR /app
 COPY --from=build /etc/ssl/certs/ca-certificates.crt /etc/ssl/certs/
 COPY --from=build /out/service /app/service
-USER nonroot:nonroot
+COPY docker/entrypoint.sh /app/kit-entrypoint
+# Numeric, not a named user: this base ships no unprivileged account.
+USER 65532:65532
 EXPOSE 8080
-ENTRYPOINT ["/app/service"]
+ENTRYPOINT ["/bin/sh", "/app/kit-entrypoint", "/app/service"]

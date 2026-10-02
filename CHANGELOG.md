@@ -13,6 +13,77 @@ it without a copy (see kit-12 below).
 
 ## Unreleased
 
+### Added — the service entrypoint migrates before it serves
+
+- **`docker/entrypoint.sh`, and all seven Dockerfiles wired to it.** Every image
+  template shipped a bare `ENTRYPOINT ["/app/service"]`, so the schema a service
+  booted against was whatever the last deploy or the last developer left behind,
+  and a second replica booting beside the first met the cold-start failure:
+  the service is up, the schema is not. `RESEARCH-fleet-velocity.md` P0-6.
+  Both references that get this right do it in one shape — migrate first, serve
+  last, chained so a failure refuses the start
+  (`refs/signoz/…/compose.yaml:7-12`, `refs/bugsink/Dockerfile:54`) — so that
+  shape is one script rather than seven hand-written wrappers.
+
+- **THE DEPLOY STORY CHANGED, and this is the feature.** A failed migration now
+  means a **failed container**: the service crash-loops instead of serving
+  requests against a schema it does not understand. Two consequences a service
+  has to decide about: **every replica migrates at boot**, and an image can no
+  longer be `docker run` for a side purpose (`--help`, a debug shell) without
+  `KIT_MIGRATE=off`.
+
+- **`KIT_MIGRATE=auto|required|off`, `KIT_MIGRATE_CMD`, and
+  `KIT_MIGRATE_ADVISORY_LOCK`.** The resolution order — `KIT_MIGRATE_CMD`, then
+  `./bin/migrate`, then `./bin/rails db:prepare` — is deliberately the same probe
+  `templates/bin/dev.sh` performs, in the same order, minus `mix ecto.create &&
+  mix ecto.migrate`, which is a developer sequence against a database it may
+  have to create. `auto` is the default because a service with no database is a
+  real member of this fleet and must not be made unbootable; `required` is for a
+  service that owns a schema.
+
+- **CONCURRENCY, stated rather than papered over.** Every replica migrates at
+  boot and the entrypoint does **not** serialize them by default — it prints
+  that fact on every boot with no lock set. The delegation is explicit: the
+  fleet's `bin/migrate` has **no lock at all** (no version table, no advisory
+  lock, no transaction around the set) and relies on idempotent replay.
+  `KIT_MIGRATE_ADVISORY_LOCK=<int>` holds a Postgres **session**-level
+  `pg_advisory_lock` around the migration. Verified against a real `postgres:17`:
+  two replicas with the lock do not overlap and the same two without it do, a
+  failing migration releases it, and a replica `SIGKILL`ed mid-migration
+  releases it because the session dies. It is opt-in because it needs `psql`.
+
+- **AND NOT `psql -c "\! <cmd>"`.** Measured on PostgreSQL 17: psql does not
+  propagate a `\!` command's exit status — `\! sh -c 'exit 7'` exits 0. A lock
+  wrapper that swallowed the failure would serve against exactly the schema it
+  just failed to apply. So the lock is held by a dedicated `psql` session driven
+  over a FIFO, and the migration's exit status is the shell's own.
+
+### Changed — `go` and `rust` images finish on `debian:*-slim`, not distroless
+
+- **Measured, not assumed, and the measurement reversed the expectation.** The
+  reason those two templates used distroless was that it carries no shell, and
+  the entrypoint is a script. **Neither distroless variant ships a shell** — not
+  `static`, and not `base` either:
+
+  ```console
+  $ docker run --rm --entrypoint /bin/sh gcr.io/distroless/base-debian12:nonroot -c 'echo hi'
+  exec: "/bin/sh": stat /bin/sh: no such file or directory
+  $ docker export $(docker create gcr.io/distroless/base-debian12:nonroot) | tar -tf - | grep '^bin/'
+  bin/                       # empty
+  ```
+
+  So "no shell, so a compromised process cannot curl and pipe" and "the
+  entrypoint migrates" cannot both be true. Migrating at boot wins; the price is
+  named in each file, and the escape hatch is written down: `KIT_MIGRATE=off`, a
+  `pre-deploy` job, distroless back. Non-root is preserved as numeric
+  `65532:65532`, which needs no passwd entry, and manifest-before-source
+  ordering and the layer structure are unchanged.
+
+- **`docker/entrypoint.sh` joins the shellcheck loop and the executable-files
+  check.** `$ROOT/docker/*` was already in the artifact-parses loop, so the
+  script got `bash -n` for free; shellcheck and the `chmod +x` assertion are the
+  two the gate's shape did not reach on its own.
+
 ### Added — the account boundary, shipped once in kit
 
 - **`templates/database/tenancy/substrate.sql`.** The account boundary inside one

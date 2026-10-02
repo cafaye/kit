@@ -14,6 +14,32 @@
 #     container where a bug is a host compromise.
 #   - hex/rebar are installed as the app user, in the runtime stage, writing to
 #     /app/.mix — never as root into /root/.mix, which the app user cannot read.
+#   - THE ENTRYPOINT MIGRATES FIRST. `docker/entrypoint.sh` resolves this
+#     repository's migration command, runs it against DATABASE_URL, and only then
+#     `exec`s the release. A migration that fails refuses to start the service,
+#     which is the point: it deletes the "service is healthy, schema is stale"
+#     cold-start class that a bare `ENTRYPOINT ["/app/bin/app", "start"]` leaves
+#     open.
+#
+#     ELIXIR SETS `KIT_MIGRATE_CMD` EXPLICITLY, and that is the one language
+#     where it is not optional. `templates/bin/dev.sh` probes for `bin/ecto.setup`
+#     and runs `mix ecto.create && mix ecto.migrate` — a DEVELOPER sequence,
+#     against a mix project and a database it may have to create. A release has
+#     no mix project and must not create a database at boot, so the entrypoint
+#     deliberately does not copy that branch; point it at the release instead:
+#
+#         ENV KIT_MIGRATE_CMD=/app/bin/app eval "Ecto.Migrator.with_repo(_release, [_repo, _], fn repo -> Ecto.Migrator.run(repo, :up, all: true) end)"
+#
+#     Ecto's migrator keeps a `schema_migrations` table, so concurrent replicas
+#     converge on one schema rather than duplicating work. Whether Ecto also
+#     SERIALIZES them (an advisory lock) was **not verified while writing this
+#     note** — read Ecto's `Ecto.Migrator` source for the version you deploy
+#     before relying on it, and set `KIT_MIGRATE_ADVISORY_LOCK` if you cannot
+#     find it there. `docker/entrypoint.sh` states only what it guarantees
+#     itself, and this note deliberately does not claim more than it can show.
+#   - `exec "$@"` inside that script, so after the migration the release replaces
+#     the shell and is PID 1. An Elixir release is its own supervisor tree and
+#     traps SIGTERM itself; the shell is gone before it starts.
 ARG ELIXIR_VERSION=1.18.3
 ARG OTP_VERSION=27.3.4
 
@@ -37,8 +63,9 @@ RUN groupadd --system --gid 10001 app \
 COPY --from=build --chown=app:app /app/_build /app/_build
 COPY --from=build --chown=app:app /app/deps /app/deps
 COPY --chown=app:app . /app
+COPY --chown=app:app docker/entrypoint.sh /app/kit-entrypoint
 USER app
 RUN mix local.hex --force && mix local.rebar --force
 EXPOSE 4000
 # `app` is the :app name from mix.exs; mix release writes bin/app.
-ENTRYPOINT ["/app/bin/app", "start"]
+ENTRYPOINT ["/bin/sh", "/app/kit-entrypoint", "/app/bin/app", "start"]

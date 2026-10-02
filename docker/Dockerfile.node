@@ -14,8 +14,21 @@
 #     where a bug is a host compromise.
 #   - `npm ci` (not `npm install`): ci installs exactly package-lock.json and
 #     fails if the lock and manifest disagree, which is the whole point.
-#   - No init/tini. The ENTRYPOINT execs node directly, so PID 1 is the service
-#     and SIGTERM reaches it; a shell wrapper would swallow both.
+#   - THE ENTRYPOINT MIGRATES FIRST. `docker/entrypoint.sh` resolves this
+#     repository's migration command, runs it against DATABASE_URL, and only then
+#     `exec`s node. A migration that fails refuses to start the service, which is
+#     the point: it deletes the "service is healthy, schema is stale" cold-start
+#     class that a bare `ENTRYPOINT ["node", "dist/main.js"]` leaves open. Set
+#     `KIT_MIGRATE=required` for a service that owns a schema, so a
+#     misconfigured image fails loudly instead of serving the old one.
+#     `docker/entrypoint.sh` finds `./bin/migrate` on its own; a Node service with
+#     no `bin/migrate` sets `KIT_MIGRATE_CMD` (e.g. `npx prisma migrate deploy`,
+#     `knex migrate:latest`, or `node scripts/migrate.js`).
+#   - `exec "$@"` inside that script, so after the migration node replaces the
+#     shell and is PID 1: SIGTERM still reaches it. There is still no init/tini
+#     — after the exec there is no shell left to swallow anything. The
+#     difference from the bare ENTRYPOINT this replaced is that PID 1 is a shell
+#     for the duration of the migration only.
 ARG NODE_VERSION=22
 
 FROM node:${NODE_VERSION}-slim AS build
@@ -33,6 +46,7 @@ COPY package.json package-lock.json ./
 RUN npm ci --omit=dev && npm cache clean --force
 COPY --from=build --chown=node:node /app/dist ./dist
 COPY --chown=node:node . .
+COPY --chown=node:node docker/entrypoint.sh /app/kit-entrypoint
 USER node
 EXPOSE 3000
-ENTRYPOINT ["node", "dist/main.js"]
+ENTRYPOINT ["/bin/sh", "/app/kit-entrypoint", "node", "dist/main.js"]
