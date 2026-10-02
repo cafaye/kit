@@ -20,8 +20,21 @@
 #     `bun` at uid 1000, verified against oven/bun:1.3.12-slim. The `useradd`
 #     this note described was never in the file, so the note described a
 #     different Dockerfile than the one being read.)
-#   - No init/tini. ENTRYPOINT execs bun directly, so PID 1 is the service and
-#     SIGTERM reaches it; a shell wrapper would swallow both.
+#   - THE ENTRYPOINT MIGRATES FIRST. `docker/entrypoint.sh` resolves this
+#     repository's migration command, runs it against DATABASE_URL, and only then
+#     `exec`s bun. A migration that fails refuses to start the service, which is
+#     the point: it deletes the "service is healthy, schema is stale" cold-start
+#     class that a bare `ENTRYPOINT ["bun", "run", …]` leaves open. Set
+#     `KIT_MIGRATE=required` for a service that owns a schema, so a
+#     misconfigured image fails loudly instead of serving the old one.
+#     `docker/entrypoint.sh` finds `./bin/migrate` on its own; a Bun service with
+#     no `bin/migrate` sets `KIT_MIGRATE_CMD`.
+#   - `exec "$@"` inside that script, so after the migration bun replaces the
+#     shell and is PID 1: SIGTERM still reaches it. There is still no init/tini,
+#     and the reason is unchanged — after the exec there is no shell left to
+#     swallow anything. The difference from the bare ENTRYPOINT this replaced is
+#     that PID 1 is a shell for the duration of the migration only, and there
+#     are no orphaned children to reap in that window.
 ARG BUN_VERSION=1.3.12
 
 FROM oven/bun:${BUN_VERSION}-slim AS build
@@ -45,7 +58,8 @@ COPY --from=build --chown=bun:bun /app/node_modules ./node_modules
 COPY --from=build --chown=bun:bun /app/dist ./dist
 COPY --from=build --chown=bun:bun /app/package.json ./package.json
 COPY --chown=bun:bun . .
+COPY --chown=bun:bun docker/entrypoint.sh /app/kit-entrypoint
 
 USER bun
 EXPOSE 3000
-ENTRYPOINT ["bun", "run", "src/index.ts"]
+ENTRYPOINT ["/bin/sh", "/app/kit-entrypoint", "bun", "run", "src/index.ts"]

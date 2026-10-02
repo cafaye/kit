@@ -98,7 +98,8 @@ the entry; deleting the entry to shrink the file is a hard failure of its own.
 | `lint/golangci.yml` | golangci-lint v2, correctness linters on, `errcheck` excluded only for `Close`/`Flush`. Read at run time via `--config`, never copied. | Go services |
 | `lint/rubocop.yml` | RuboCop, `NewCops: enable`, Metrics left on. Read at run time via `--config`, never copied. | Ruby services |
 | `lint/eslint.config.mjs` | ESLint 9 flat config, type-checked rules on. Read at run time via `--config`, and it must be checked out INSIDE the repo — see below. | Node/TypeScript/Bun services |
-| `docker/Dockerfile.<lang>` | Seven multi-stage templates. `go` and `rust` finish on distroless; the rest finish on `*-slim`. All run non-root. Linted by `hadolint -c lint/hadolint.yaml`, plus a non-root/no-`:latest`/no-`ADD` check the linter does not cover. | Every service |
+| `docker/Dockerfile.<lang>` | Seven multi-stage templates. All run non-root. All start through **`docker/entrypoint.sh`, which applies the service's migrations and `exec`s the service** — so a failed migration is a failed container, and the "service is up, the schema is not" cold-start class is gone. `go` and `rust` finish on `debian:*-slim` rather than distroless, because **no distroless variant ships a shell** (measured: `bin/` is empty in both) and a script needs one; the file says so and gives the escape hatch. Linted by `hadolint -c lint/hadolint.yaml`, plus a non-root/no-`:latest`/no-`ADD` check the linter does not cover. | Every service |
+| `docker/entrypoint.sh` | The one entrypoint, shared by all seven templates. POSIX sh, parameterised by environment rather than by copy: resolve the migration command → prove `DATABASE_URL` → migrate → `exec "$@"`. `KIT_MIGRATE=auto\|required\|off`, `KIT_MIGRATE_CMD`, and `KIT_MIGRATE_ADVISORY_LOCK` (a Postgres **session**-level `pg_advisory_lock`, opt-in because it needs `psql`). It does **not** serialize replicas by default and says so on every boot. | Copied with the Dockerfile |
 | `lint/hadolint.yaml` | hadolint config, with the two ignored rules (DL3008, DL3067) argued rather than assumed. | Any repo that ships a Dockerfile |
 | `lint/drift-allowlist` | Known, owned service configs that disagree with kit's: reason, owner, since, until. An entry that expires, duplicates, or stops describing a real difference is a failure. | kit's gate only |
 | `templates/bin-prime/<lang>.sh` | The worktree primer: one script per language, exit 0 only when the tree is genuinely ready. | Every service, as `bin/prime` |
@@ -1018,6 +1019,7 @@ it, so a service inherits kit's policy with no file in its tree and no action.
 
 ```sh
 cp <kit>/docker/Dockerfile.go          docker/Dockerfile
+cp <kit>/docker/entrypoint.sh          docker/entrypoint.sh
 cp <kit>/templates/bin-prime/go.sh     bin/prime
 cp <kit>/templates/bin/dev.sh          bin/dev
 chmod +x bin/prime bin/dev
@@ -1030,6 +1032,30 @@ them. Write the pin and commit it:
 ```sh
 git -C <kit> rev-parse HEAD > kit.ref
 ```
+
+**The entrypoint changes what a deploy does, so read this before you ship it.**
+Every Dockerfile now starts through `docker/entrypoint.sh`, which resolves a
+migration command, runs it against `DATABASE_URL`, and only then `exec`s your
+service. Consequences, all of them the point:
+
+- **A failed migration is now a failed container.** It will crash-loop rather
+  than serve requests against a schema it does not understand. Your healthcheck
+  and your restart policy see a real failure instead of a 500.
+- **Every replica migrates at boot.** That is safe only if your migration step is
+  idempotent — which is what a version table buys you. If yours is a bare `for`
+  loop of SQL files with no version table, set `KIT_MIGRATE_ADVISORY_LOCK` and
+  install `postgresql-client`, or every replica replays every file at once.
+- **You can no longer `docker run` the image for a side purpose** without
+  `KIT_MIGRATE=off`. A `--help`, a one-off shell, a debug container: set it.
+- **`go` and `rust` images no longer finish on distroless.** They finish on
+  `debian:*-slim`, because neither distroless variant ships a shell and the
+  entrypoint is a script. If you would rather keep distroless, set
+  `KIT_MIGRATE=off`, run migrations from a Kamal `pre-deploy` job, and change the
+  final stage back — that is a legitimate trade, and the Dockerfile says so.
+
+Set `KIT_MIGRATE=required` for any service that owns a schema, so an image whose
+migration command went missing fails loudly at boot instead of quietly serving
+the old schema.
 
 See [the local stack](#the-local-stack--templatescompose).
 
@@ -1160,6 +1186,14 @@ bash <kit>/tests/validate.sh
       If your repo carries a `.golangci.yml`, it must AGREE with kit's; see
       [Where the lint configs run](#where-the-lint-configs-run)
 - [ ] `docker/Dockerfile` copied, binary/application name set
+- [ ] `docker/entrypoint.sh` copied beside it, `chmod +x`
+- [ ] `KIT_MIGRATE` decided: `required` if this service owns a schema, `auto` if
+      it does not. A service that owns a schema and leaves this at `auto` is one
+      misconfigured image away from serving an old one.
+- [ ] `KIT_MIGRATE_CMD` set if there is no `bin/migrate` in the repo (Go, Rust
+      and Elixir all need it — the image ships the binary, not the SQL)
+- [ ] `KIT_MIGRATE_ADVISORY_LOCK` set, **or** you have checked that your migration
+      tool serializes replicas by itself and you can say which mechanism
 - [ ] `bin/prime` copied, `chmod +x`, green on a fresh clone
 - [ ] `bin/dev` copied, `chmod +x`, `bin/dev up` green on a fresh clone
 - [ ] `kit.ref` written and committed: a 40-char sha or a `v<semver>` tag, never a branch

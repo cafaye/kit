@@ -1173,6 +1173,91 @@ if problems:
 PY
   }
 
+  # Every image starts through `docker/entrypoint.sh`, and this is the check that
+  # says so. See the call site for why a presence check would not do.
+  docker_entrypoint() {
+    "$PY" - "$ROOT" <<'PY'
+import json
+import os
+import re
+import sys
+
+root = sys.argv[1]
+docker_dir = os.path.join(root, "docker")
+script = os.path.join(docker_dir, "entrypoint.sh")
+
+problems = []
+if not os.path.isfile(script):
+    problems.append(
+        "docker/entrypoint.sh is missing, and every Dockerfile's ENTRYPOINT "
+        "names it — which means all seven images exec a file that is not there"
+    )
+
+for name in sorted(os.listdir(docker_dir)):
+    if not name.startswith("Dockerfile."):
+        continue
+    rel = f"docker/{name}"
+    body = open(os.path.join(docker_dir, name), encoding="utf-8").read()
+
+    entrypoints = re.findall(r"^\s*ENTRYPOINT\s+(.+)$", body, re.I | re.M)
+    if not entrypoints:
+        problems.append(f"{rel}: no ENTRYPOINT at all")
+        continue
+    # The LAST one wins: a multi-stage file may set an ENTRYPOINT per stage, and
+    # the one that decides what the container runs is the final stage's.
+    raw = entrypoints[-1].strip()
+    if not raw.startswith("["):
+        problems.append(
+            f"{rel}: the final ENTRYPOINT is shell form ({raw!r}); kit's exec "
+            f"contract is exec-form, because a shell form adds a shell that "
+            f"does not forward SIGTERM"
+        )
+        continue
+    try:
+        argv = json.loads(raw)
+    except ValueError as exc:
+        problems.append(f"{rel}: the final ENTRYPOINT is not a JSON array ({exc})")
+        continue
+
+    # Endswith, not equality. The ENTRYPOINT carries the PATH
+    # (`/app/kit-entrypoint`) while the Dockerfile that COPYs it names the SOURCE
+    # (`docker/entrypoint.sh`); a test for the bare name `kit-entrypoint` as a
+    # list member is a test that fails on every correct tree. It did, once, and
+    # the tree it failed on was the one it was written for.
+    at = next(
+        (i for i, a in enumerate(argv) if a.endswith("kit-entrypoint")),
+        None,
+    )
+    if at is None:
+        problems.append(
+            f"{rel}: the final ENTRYPOINT does not start through "
+            f"docker/entrypoint.sh, so this image boots without applying its "
+            f"migrations — the cold-start race kit ships the entrypoint to "
+            f"delete. Expected the script before the service command."
+        )
+        continue
+    rest = [a for a in argv[at + 1:] if a]
+    if not rest:
+        problems.append(
+            f"{rel}: the final ENTRYPOINT ends at the entrypoint script and "
+            f"names no service command, so the container would exec nothing. "
+            f"The script refuses to start with no arguments."
+        )
+        continue
+    # `-e` or `--env` before the command would be the other way to spell this,
+    # but kit does not use it and accepting it would accept a Dockerfile whose
+    # CMD was relied on instead — which is invisible in the ENTRYPOINT alone.
+    if rest[0].startswith("-"):
+        problems.append(
+            f"{rel}: the final ENTRYPOINT puts {rest[0]!r} before the service "
+            f"command, so the script would try to exec a flag as a program"
+        )
+
+if problems:
+    sys.exit("; ".join(problems))
+PY
+  }
+
   # First, because it is the cheapest check in the phase and the one that makes
   # the others trustworthy: a marker in a shell script or a YAML file will be
   # caught downstream by a parser complaining about the residue, but a marker in
@@ -1511,8 +1596,16 @@ PY
   # OUT: an operator runs it, exactly as they run entrypoint.sh. A non-executable
   # drill.sh is a drill nobody can start, and the message is "permission denied"
   # without saying which file.
+  # `docker/entrypoint.sh` is here because the comment above already named it:
+  # every one of the seven Dockerfiles now `COPY`s it and `exec`s it, and a
+  # developer running it against a local database needs it executable too. The
+  # image itself does not depend on the mode — the ENTRYPOINT is
+  # `["/bin/sh", "/app/kit-entrypoint", …]` — so this is about the person, not
+  # the container. That is still a contract worth asserting, because
+  # `chmod -x` is a one-character diff.
   for f in "$ROOT"/templates/bin-prime/* "$ROOT"/templates/bin/* \
     "$ROOT"/templates/kamal/drill.sh \
+    "$ROOT"/docker/entrypoint.sh \
     "$ROOT/$GITLEAKS_GATE" "$ROOT/tests/zizmor_gate.sh"; do
     [ -f "$f" ] || continue
     path="${f#"$ROOT"/}"
@@ -1539,7 +1632,7 @@ PY
     section 'static: shellcheck -S warning'
     par_begin
     for f in "$ROOT"/templates/bin-prime/* "$ROOT"/templates/bin/* \
-      "$ROOT"/templates/kamal/*.sh "$ROOT"/tests/*.sh; do
+      "$ROOT"/templates/kamal/*.sh "$ROOT"/docker/*.sh "$ROOT"/tests/*.sh; do
       [ -f "$f" ] || continue
       path="${f#"$ROOT"/}"
       # SC2317 (unreachable command) is excluded deliberately: the `check`
@@ -2006,6 +2099,37 @@ SNIPPETS
   # is true, are different checks; this is the first.
   section 'static: each Dockerfile documents its own non-root guarantee'
   check 'docker/Dockerfile.*  (STRICTNESS NOTES state the non-root stage)' docker_notes
+
+  # -------------------------------------------------------------------------
+  # Every image starts through the entrypoint, and this asserts the WIRING rather
+  # than the presence of the file.
+  #
+  # A presence check would be satisfied by a `docker/entrypoint.sh` that nothing
+  # runs — and, worse, would be satisfied SILENTLY by its absence: the
+  # executable-files loop above is `[ -f "$f" ] || continue`, so deleting the
+  # script removes a line from the output and nothing else. The file existing and
+  # the contract holding are different claims, and only the second one is worth
+  # anything here.
+  #
+  # What it checks per Dockerfile, because each of the three is a way this has
+  # silently stopped being true:
+  #
+  #   1. the final `ENTRYPOINT` names the entrypoint script. A template edited
+  #      back to a bare `ENTRYPOINT ["/app/service"]` is exactly the regression
+  #      this packet exists to reverse, and it is a one-line diff that looks like
+  #      tidying.
+  #   2. the final `ENTRYPOINT` still carries the SERVICE command after the
+  #      script. An `ENTRYPOINT` that ends at the script execs nothing; the
+  #      script refuses to start with no arguments, so the container crash-loops
+  #      on a perfectly good image.
+  #   3. the script itself is present, so (1) cannot be satisfied by a name.
+  #
+  # Read as text with a regex, not with a Dockerfile parser, for the reason
+  # `docker_rules` gives two paragraphs earlier: these templates use ARG
+  # interpolation, so the claim is about the shape of the last ENTRYPOINT, not
+  # about a resolved image reference.
+  section 'static: every image starts through the migration entrypoint'
+  check 'docker/Dockerfile.*  (ENTRYPOINT migrates, then execs the service)' docker_entrypoint
 
   # -------------------------------------------------------------------------
   # AGENTS.md: "Half a language is worse than none." The whole point of kit is
