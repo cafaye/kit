@@ -45,6 +45,7 @@ kit/
     ├── self_test.sh                      # proves the gate can go red
     ├── lint_test.sh                      # the linters RUN, against fixtures
     ├── isolation_test.sh                 # the cluster, RUN; A cannot reach B's database
+    ├── tenancy_test.sh                   # the account boundary, RUN; and its FORCE control
     ├── gitleaks_gate.sh                  # the one secret scan, for CI and here
     ├── zizmor_gate.sh                    # the one zizmor split, ditto
     ├── bootstrap.sh                      # the gate installs its own tools
@@ -293,11 +294,14 @@ have that option: a redactor can be taught nothing and still be defeated by a
 string it does not recognise, but a leaked credential does not become safe because
 a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
 
-- **observability** — the two claims that are worth nothing unexercised: a
-  canary secret in ten leak shapes reaches no exporter (and the allowed data
-  survives), and a service starts, serves and reports healthy with the collector
-  killed. Both need a real collector, so both SKIP loudly without docker —
-  never pass silently.
+- **observability** — the claims that are worth nothing unexercised: a canary
+  secret in ten leak shapes reaches no exporter (and the allowed data survives),
+  a service starts, serves and reports healthy with the collector killed, the
+  fetched stack runs, a service cannot reach another service's database, and
+  **the account boundary holds with its `FORCE` control**. The last two need a
+  real Postgres rather than a real collector, and they live in this phase for the
+  same reason: a security property that nothing executes is worth nothing. They
+  SKIP loudly without docker — never pass silently.
 - **classifier + staleness** — the change classifier and the staleness reporter
   are *executed*, not parsed, and deliberately **outside** the `RUN_STATIC`
   guard: a check that only parsed those two files would pass on a classifier
@@ -311,7 +315,7 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   is the one that tells a working config from a valid one, and — unlike every
   other phase — it is **fatal on a skip**, because the claim under test is "kit's
   configs work" and a run in which no linter executed has not tested it.
-- **self_test** — seventy-seven breakages of a throwaway copy. Seventy-five assert
+- **self_test** — ninety-four breakages of a throwaway copy. Ninety-two assert
   the gate goes red; two assert it stays **green** while naming what it said —
   23b a SKIP, because a check that turns a red into an honest skip is
   load-bearing precisely by not going red, and 59 a FINDING, because kit-13's
@@ -329,6 +333,17 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   most**: a generated config carrying `prepare: :unnamed` on a fleet with no
   pooler is slower and looks entirely correct, so the forbidden-list check is the
   only thing that will ever find it.
+  - Three are the account boundary (90-92). **90 is the one worth the most of
+    those**, and its mutation is `delete`, not `sed`: it removes
+    `execute format('alter table %s force row level security', p_table)` from the
+    substrate and nothing else. Removing the *word* would satisfy a check that
+    read the file as text, because the substrate's comments quote it twice while
+    explaining why it exists — which is exactly why the tenancy contract check
+    strips SQL comments before looking. 91 is the one about the check rather than
+    the templates: a driver that reads `isolation.sql` and stops reading
+    `assertions.txt` still runs and still passes, and now asserts "no red rows"
+    about an unknown number of assertions, so the check requires the read on the
+    **same line** as a read call rather than a mention anywhere in the file.
   - **75 is the one worth the second-most, and it exists because a green control
     was evidencing a different check.** kit-21 turned the cluster into a *built*
     image, which renamed kit's from `postgres` to `kit-postgres` — and
@@ -555,7 +570,7 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   rubocop ran on kit's own Ruby with kit's own config. That is the only way an
   obsolete key surfaces before six repos inherit it.
 - The suite must be able to fail: `self_test` breaks a throwaway copy of the
-  tree seventy-seven ways and asserts the run goes red. If you change the suite,
+  tree ninety-four ways and asserts the run goes red. If you change the suite,
   keep that true.
 
 ## The classifier fails closed, and that is a rule about code
@@ -984,6 +999,9 @@ appended, not substituted.** Move a port in `.env`; never in the override.
 - [ ] `README.md` still matches the tree (every language, every file)
 - [ ] `CHANGELOG.md` has an entry
 - [ ] You did not weaken a check, a threshold, or a pin to get green
+- [ ] If you touched `templates/database/tenancy/`, you ran
+      `bash tests/tenancy_test.sh` — the FORCE control and the init-plan
+      measurement are the only things that can see two of those changes
 - [ ] If you touched the secret scanner, you did not add an allowlist entry
       without a reason, you did not add one to `continue-on-error`, and if you
       added one you **proved the thing it excuses can still fail** — an allowlist
