@@ -91,8 +91,19 @@ def selftest_by_breakage(inner):
         if kind == TOTAL:
             continue
         name = tag[len(SELFTEST_PREFIX):]
-        entry = per.setdefault(name, {"total": 0.0, "rows": 0, "boot": 0.0})
-        entry["total"] += secs
+        entry = per.setdefault(name, {"total": 0.0, "rows": 0, "boot": 0.0,
+                                      "wall": 0.0, "checks": 0.0})
+        # `check` and `tier` rows are NESTED INSIDE the `phase` row that covers
+        # them, so summing kinds together double-counts -- which is how the first
+        # version of this column reported a 48s copy as 99s. Only the PHASE rows
+        # tile a copy without overlapping, so only they are summed, and the copy's
+        # own `total` row is carried beside them as the number to trust.
+        if kind == PHASE:
+            entry["total"] += secs
+        elif kind in (CHECK, TIER):
+            entry["checks"] += secs
+        elif kind == TOTAL:
+            entry["wall"] = secs
         entry["rows"] += 1
         if kind == PHASE and label.startswith("00 bootstrap"):
             entry["boot"] = secs
@@ -169,15 +180,21 @@ def main(argv=None):
     per = selftest_by_breakage(inner)
     total = sum(e["total"] for e in per.values())
     boot = sum(e["boot"] for e in per.values())
-    ordered = sorted(per.items(), key=lambda kv: -kv[1]["total"])[: args.top]
-    print(f"\n== the SELF-TEST: {len(per)} breakages, {total:.1f}s total "
-          f"({total / max(len(per), 1):.1f}s each on average)")
-    print(f"   of which {boot:.1f}s ({100 * boot / total if total else 0:.0f}%) is interpreter "
-          f"resolution and dependency bootstrap, once per copy")
-    print(f"{'seconds':>9}  {'boot':>7}  {'rows':>5}  breakage")
-    print(f"{'-' * 9}  {'-' * 7}  {'-' * 5}  {'-' * 40}")
+    ordered = sorted(per.items(), key=lambda kv: -max(kv[1]["total"], kv[1]["wall"]))[: args.top]
+    n = max(len(per), 1)
+    print(f"\n== the SELF-TEST: {len(per)} breakages reached, {total:.1f}s inside "
+          f"their gate copies so far ({total / n:.1f}s each)")
+    print(f"   of which {boot:.1f}s is interpreter resolution and dependency "
+          f"bootstrap, once per copy; of the rest, {sum(e['checks'] for e in per.values()):.1f}s "
+          f"is the named checks themselves")
+    print("   the copy's OWN wall clock is in `wall` and the phase sum in `total`; they")
+    print("   differ by the argument parsing and the exit trap, and `wall` is the one to")
+    print("   quote. `total` is a sum of rows that tile the copy, so it cannot double count.")
+    print(f"{'wall':>9}  {'phases':>8}  {'checks':>7}  {'rows':>5}  breakage")
+    print(f"{'-' * 9}  {'-' * 8}  {'-' * 7}  {'-' * 5}  {'-' * 40}")
     for name, e in ordered:
-        print(f"{e['total']:9.2f}  {e['boot']:7.2f}  {e['rows']:5d}  {name[:78]}")
+        wall = e["wall"] or e["total"]
+        print(f"{wall:9.2f}  {e['total']:8.2f}  {e['checks']:7.2f}  {e['rows']:5d}  {name[:74]}")
 
     grand = sum(r[2] for r in gate if r[0] == PHASE) + total
     print(f"\n   accounted: {grand:.1f}s of the gate's own phase time "
