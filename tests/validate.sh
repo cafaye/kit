@@ -2198,7 +2198,7 @@ for name, cfg in exporters.items():
         if isinstance(value, str) and "${env:" not in value:
             problems.append(f"exporter {name}.{key} is a literal endpoint, not an ${{env:}} substitution")
 
-# The shipped stack is EXACTLY the three backends plus the local `debug`. Anything
+# The shipped stack is EXACTLY the two backends plus the local `debug`. Anything
 # else is an exporter a reviewer did not read, and `otlp` with a *defaulted*
 # endpoint is the exact shape of that mistake.
 #
@@ -2211,11 +2211,19 @@ for name, cfg in exporters.items():
 # exporter pointed at either of them fails to connect, which is a broken stack
 # that still satisfies "the only exporter is debug".
 #
-# So the claim under test is "these three backends and nothing else", and the
+# So the claim under test is "these backends and nothing else", and the
 # transport is a property of the backend rather than part of the name. Asserting
-# `(otlp|otlphttp)/<one of the three>` keeps that claim exactly as tight while
+# `(otlp|otlphttp)/<one of the two>` keeps that claim exactly as tight while
 # letting each backend be spoken to in the dialect it speaks.
-BACKENDS = {"tempo", "loki", "mimir"}
+#
+# THE THIRD NAME LEFT WITH THE THIRD STORE. There was a metrics backend here,
+# and it cost 130s of readiness budget per cold start (retries 12 x interval 10s)
+# against a 180s deadline for the whole stack, so it was removed rather than left
+# half-removed. Dropping its name from this tuple is the check following the tree
+# out; the tuple is a CLOSED set either way, so an exporter for a store that does
+# not exist is still `unexpected exporter(s)` and one added to the tree has to be
+# added here too, in the same commit, or this goes red.
+BACKENDS = {"tempo", "loki"}
 unknown = []
 for name in exporters:
     if name == "debug":
@@ -2227,7 +2235,7 @@ if unknown:
     problems.append(
         "unexpected exporter(s): "
         + ", ".join(unknown)
-        + " — the shipped stack is tempo, loki, mimir and the local debug. A "
+        + " — the shipped stack is tempo, loki and the local debug. A "
         "bring-your-own backend is an ${env:} endpoint, never a new exporter."
     )
 
@@ -2237,11 +2245,11 @@ if unknown:
 # stack that collects everything and prints it. Asserted per signal below that
 # every pipeline has exporters, but that is a different claim: a pipeline can
 # point at `debug` alone and still be a pipeline. This is the one that says the
-# three backends are actually wired.
+# backends are actually wired.
 for backend in sorted(BACKENDS):
     if not any(n.partition("/")[2] == backend for n in exporters):
         problems.append(
-            f"no exporter for {backend}: the shipped stack is three backends, and a "
+            f"no exporter for {backend}: the shipped stack is two backends, and a "
             "config with only `debug` is a stack that collects everything and "
             "prints it rather than storing it"
         )
@@ -2294,6 +2302,54 @@ for signal, pipe in pipelines.items():
 for signal in ("traces", "metrics", "logs"):
     if signal not in pipelines:
         problems.append(f"no {signal} pipeline: the stack is a partial observability story")
+
+# PER-SIGNAL WIRING, which is a different claim from the backend tuple above.
+# The tuple answers "no exporter for a store the tree ships"; this answers "and
+# the signal that store answers is the one actually pointed at it". Without it a
+# config can hold `otlp/tempo` somewhere on the traces pipeline, leave `debug`
+# alone on the pipeline that matters, and be green on both counts above.
+#
+# The METRICS half is the new one and it is the negative, which is the point.
+# There is no metrics store, so the metrics pipeline exports to `debug` and to
+# NOTHING ELSE — and this assertion is what makes the removal of that store
+# load-bearing rather than aspirational. The failure it names is the one that
+# actually happens: somebody re-adds the endpoint variable to .env.example to
+# "put metrics back" and leaves the exporter too, and the stack then flushes to
+# a host with nothing on it once every 15s for the life of the process, in a log
+# nobody reads, while `up --wait` reports the stack healthy. Putting a store back
+# is four edits and they belong together — see `otel-collector.yml`.
+WIRING = {"traces": "tempo", "logs": "loki"}
+for signal, backend in sorted(WIRING.items()):
+    pipe = pipelines.get(signal)
+    if not isinstance(pipe, dict):
+        continue
+    names = [str(e) for e in (pipe.get("exporters") or [])]
+    if not any(n.partition("/")[2] == backend for n in names):
+        problems.append(
+            f"the {signal} pipeline exports to {names} and not to the {backend} "
+            f"store: an exporter nobody reads is the same as no exporter, and a "
+            f"panel over {backend} that renders empty teaches a reader that empty "
+            f"means no traffic"
+        )
+
+metrics_pipe = pipelines.get("metrics")
+if isinstance(metrics_pipe, dict):
+    stored = [
+        str(e) for e in (metrics_pipe.get("exporters") or []) if str(e) != "debug"
+    ]
+    if stored:
+        problems.append(
+            "the metrics pipeline exports to "
+            + ", ".join(stored)
+            + ": there is no metrics store in this stack. Span metrics are "
+            "derived and redacted and go to `debug` (this process's own stdout). "
+            "An exporter pointed at a host with nothing behind it is a connection "
+            "refused per flush, forever, in a log nobody reads — the half-removed "
+            "backend this file will not ship. Restoring a store is four edits and "
+            "they belong together: the endpoint variable in .env.example, the "
+            "exporter block in otel-collector.yml, the `exporters:` line on this "
+            "pipeline, the compose service, and the datasource"
+        )
 
 # No literal URL anywhere outside a comment: an endpoint that is not an
 # ${env:...} substitution is an endpoint somebody's laptop will use by default.
@@ -2840,13 +2896,22 @@ if not services:
 
 # The shared infra every cafaye service joins. Half a platform is worse than
 # none: a service that adopts the stack needs all of these or none of them.
-# The four backing services are in the required set because observability is ON
-# BY DEFAULT (PLAN.md §7b) — they are the answer to "what does this look like
-# when it breaks", and the answer must not be "install four more services
-# first". They are in a compose PROFILE so a constrained machine can opt out;
-# the default `bin/dev up` path brings them up, and that is a property of
-# bin/dev, which the readiness and profile checks below hold to account.
-for required in ("postgres", "nats", "redis", "otel-collector", "tempo", "loki", "mimir", "grafana"):
+# The three backing services are in the required set because the observability
+# PROFILE exists so a constrained machine can opt out, and the profile is the
+# explicit spelling rather than the default: `bin/dev up` alone brings up
+# postgres, nats, redis and the collector, and `KIT_DEV_PROFILES=observability
+# bin/dev up` brings up the stores too. The check that the profile and the
+# default AGREE is `dev_escape_hatch_check`, which executes bin/dev with the
+# variable empty; the one that the backends are inside the profile at all is
+# `backing_check` below. They are required HERE so that deleting a store cannot
+# be half-done: a service that adopts the stack and loses one of them finds out.
+#
+# It was four. There was a metrics backend here, and it cost 130s of readiness
+# budget per cold start against a 180s deadline for the whole stack, so it went
+# with its volume, its port and its collector exporter rather than being left
+# half-wired. A name added to this tuple without a service behind it is a red
+# gate, which is the point.
+for required in ("postgres", "nats", "redis", "otel-collector", "tempo", "loki", "grafana"):
     if required not in services:
         problems.append(f"missing service: {required}")
 
@@ -2899,7 +2964,6 @@ INFRASTRUCTURE = (
     "otel-collector",
     "tempo",
     "loki",
-    "mimir",
     "grafana",
 )
 for name in services:
@@ -2912,14 +2976,19 @@ PY
   }
   check 'templates/compose/docker-compose.yml  (pinned, healthy, parameterized)' compose_check
 
-  # The four backing services. Grafana, Loki, Tempo and Mimir are AGPL-3.0 and
-  # are shipped UNMODIFIED, which is the condition the licence cares about and
-  # the one this check can actually hold: no `build:` (a build is a fork), no
-  # image from a cafaye-owned registry, no volume overlaying anything into the
-  # vendor's own tree. Configuration is fine and is what the flags are; a
-  # modified binary is not, and `build:` is the only way that gets here.
+  # The backing services. Grafana, Loki and Tempo are AGPL-3.0 and are shipped
+  # UNMODIFIED, which is the condition the licence cares about and the one this
+  # check can actually hold: no `build:` (a build is a fork), no image from a
+  # cafaye-owned registry, no volume overlaying anything into the vendor's own
+  # tree. Configuration is fine and is what the flags are; a modified binary is
+  # not, and `build:` is the only way that gets here.
   #
-  # They are also bounded, because a dev machine running six services plus four
+  # It was four, and the fourth went because it cost 130s of readiness budget per
+  # cold start against a 180s deadline for the whole stack. A licence check that
+  # names a backend the tree does not ship is a check reporting on a container
+  # nobody can pull, so the name went with it rather than being left to fail.
+  #
+  # They are also bounded, because a dev machine running six services plus three
   # more needs bounded memory or the whole thing gets killed and blamed on
   # something else.
   backing_check() {
@@ -2937,7 +3006,6 @@ BACKING = {
     "grafana": "grafana/grafana",
     "loki": "grafana/loki",
     "tempo": "grafana/tempo",
-    "mimir": "grafana/mimir",
 }
 problems = []
 
@@ -2961,14 +3029,14 @@ for name, upstream in BACKING.items():
         problems.append(f"{name}: no healthcheck, so `up --wait` cannot gate on it")
     if not svc.get("mem_limit"):
         problems.append(
-            f"{name}: no mem_limit. Six services plus four more on one laptop "
+            f"{name}: no mem_limit. Six services plus three more on one laptop "
             f"needs a bound, or the stack is killed and the cause is attributed "
             f"to whatever was running when the machine ran out of memory."
         )
     profiles = svc.get("profiles") or []
     if "observability" not in profiles:
         problems.append(
-            f"{name}: not in the `observability` profile. The four backends are "
+            f"{name}: not in the `observability` profile. The three backends are "
             f"the expensive half of the stack, and an escape hatch that does not "
             f"exist is not an escape hatch — but they must still be what the "
             f"DEFAULT bin/dev path brings up, which is a property of bin/dev, "
@@ -2990,7 +3058,7 @@ if problems:
     sys.exit("; ".join(problems))
 PY
   }
-  check 'docker-compose.yml  (four AGPL backends, unmodified, pinned, bounded)' backing_check
+  check 'docker-compose.yml  (three AGPL backends, unmodified, pinned, bounded)' backing_check
 
   # The port range. kit-02 was moving the stack onto a high range so two
   # checkouts — or a developer's own postgres — do not collide; this check is
@@ -3348,11 +3416,31 @@ for ds in datasources:
         problems.append(f"datasource {ds.get('name')!r} has no uid; a dashboard that points at a datasource by uid cannot survive a rename")
         continue
     uids[uid] = ds.get("type")
-for need, kind in (("tempo", "tempo"), ("loki", "loki"), ("mimir", "prometheus")):
+# TWO LAYERS OF §7b HAVE A STORE, and this asserts both halves of that: the two
+# are provisioned, and the third is NOT. The positive half is what it always
+# was. The negative half is the one worth having, because a metrics datasource
+# left behind by a store that left is the worst of both — Grafana resolves it,
+# every panel over it renders, and the number is simply absent, with nothing in
+# the UI saying why. A reader who meets a permanently-empty panel learns that
+# empty means nothing, and then misses the one time it did.
+for need, kind in (("tempo", "tempo"), ("loki", "loki")):
     if need not in uids:
-        problems.append(f"no {kind} datasource with uid {need!r}: traces, logs and metrics are the three layers of §7b")
+        problems.append(f"no {kind} datasource with uid {need!r}: traces and logs are the two layers of §7b that have a store")
     elif uids[need] != kind:
         problems.append(f"datasource uid {need!r} is type {uids[need]!r}, expected {kind!r}")
+
+for uid, kind in sorted(uids.items()):
+    if kind in ("prometheus", "grafana-mimir-datasource"):
+        problems.append(
+            f"datasource uid {uid!r} is type {kind!r}, but there is no metrics "
+            f"store in this stack: the backend cost 130s of readiness budget per "
+            f"cold start and went with its service, its volume and its collector "
+            f"exporter. A datasource nothing fills renders panels that are "
+            f"permanently empty and teach a reader that empty means nothing. "
+            f"Putting a store back means this entry, an exporter in "
+            f"`otel-collector.yml`, an endpoint variable in `.env.example` and "
+            f"the compose service — all four, together"
+        )
 
 dash_dir = f"{base}/provisioning/dashboards"
 provider = f"{dash_dir}/dashboards.yml"
@@ -3405,7 +3493,7 @@ if problems:
     sys.exit("; ".join(problems))
 PY
   }
-  check 'grafana provisioning  (3 datasources, dashboards, alerting — all files)' grafana_provisioning_check
+  check 'grafana provisioning  (2 datasources, and no third, dashboards, alerting — all files)' grafana_provisioning_check
 
   # The error predicate. PLAN.md §7b and the semconv, verbatim:
   #
@@ -3499,11 +3587,16 @@ PY
   #
   # Both dashboards shipped with `"datasource": null` on all 15 query targets.
   # A null datasource in Grafana means "use the DEFAULT datasource", and the
-  # default is Mimir — so every LogQL panel and the TraceQL panel were being
-  # sent to a Prometheus API:
+  # default was the metrics store — so every LogQL panel and the TraceQL panel
+  # were being sent to a Prometheus API:
   #
   #     Mimir, given {service_name=~"$service"} |= `log.severity` |~ "..."
   #       parse error: unexpected character: '|'
+  #
+  # The store has since gone and `isDefault` moved to Tempo, so the uid a null
+  # panel reaches is different. The bug is identical and the rule did not
+  # change with the default, which is why the rule is what this check asserts
+  # and not the uid it happened to be.
   #
   # The panels provision, the dashboards render, the datasource health checks
   # are green, and the crash layer — the panel the user explicitly asked for —
@@ -3591,7 +3684,7 @@ for entry in sorted(os.listdir(dash_dir)):
         if not ds or not isinstance(ds, dict) or not ds.get("uid"):
             problems.append(
                 f"{entry} / {title}: the query has no datasource, so Grafana sends "
-                f"it to the DEFAULT one — which is Mimir. This is a {want} query; "
+                f"it to the DEFAULT one — traces, not logs. This is a {want} query; "
                 f"bound to a Prometheus API it returns a parse error, which is a "
                 f"red panel rather than an empty one. Name the uid explicitly."
             )
@@ -5339,11 +5432,19 @@ DBSNIPPETS
     # config directories. Everything `bin/dev` mounts comes from the tree it
     # fetches, so the fixture has to have one — pointed at with `KIT_STACK_DIR`,
     # which is a checkout a person named rather than one that was fetched.
+    # The stub kit tree, with exactly the directories a cheap-default run needs:
+    # the two config directories that are FETCHED, and NO metrics-store
+    # directory. That absence is the point of the fixture now. `stack_is_usable`
+    # used to require the metrics store's directory, and a fixture that carried
+    # it proved nothing about whether the check and the default agree — it
+    # passed for the same reason the old default passed. A fetched tree with only
+    # tempo/ and loki/ in it is what a cheap `bin/dev up` actually resolves, and
+    # this check requires the script to accept it.
     kitcheck="$TMP/dev-hatch-kit"
     rm -rf "$stub" "$sandbox" "$kitcheck"
     mkdir -p "$stub" "$sandbox/bin"
     mkdir -p "$kitcheck/templates/compose" "$kitcheck/templates/compose/tempo" \
-      "$kitcheck/templates/compose/loki" "$kitcheck/templates/compose/mimir" \
+      "$kitcheck/templates/compose/loki" \
       "$kitcheck/templates/compose/grafana/provisioning"
     : >"$kitcheck/templates/compose/docker-compose.yml"
     : >"$kitcheck/templates/compose/otel-collector.yml"
@@ -5514,6 +5615,7 @@ STUB
   # in their AGREEMENT, so the check is over their agreement.
   stack_mount_check() {
     "$PY" - "$ROOT" <<'PY'
+import os
 import re
 import sys
 
@@ -5527,11 +5629,16 @@ problems = []
 #    of them through a bare `./`. A bare `./` was correct when the file sat in the
 #    service and is wrong now that it does not, and nothing else in the tree would
 #    notice the difference.
+#
+#    It was five. The metrics store's config went with the store, and this list is
+#    the one place in the gate where a config that nobody mounts is invisible:
+#    nothing renders a compose file, nothing resolves a bind source, and an
+#    unreferenced `mimir.yaml` in the tree would have gone on being fetched by
+#    every service that adopts kit for ever.
 VENDOR_MOUNTS = {
     "otel-collector.yml": "/etc/otel/otel-collector.yml",
     "tempo/tempo.yaml": "/etc/tempo/tempo.yaml",
     "loki/loki-config.yaml": "/etc/loki/loki-config.yaml",
-    "mimir/mimir.yaml": "/etc/mimir/mimir.yaml",
     "grafana/provisioning": "/etc/grafana/provisioning",
 }
 for source, destination in VENDOR_MOUNTS.items():
@@ -5550,6 +5657,42 @@ for source, destination in VENDOR_MOUNTS.items():
             f"DIRECTORY at a missing bind source and the collector exits naming a "
             f"file type instead of the mount that is wrong."
         )
+
+# 1a. ...AND NOTHING IN THE COMPOSE DIRECTORY IS UNREFERENCED, which is the other
+#      half of "nothing names a container that does not exist" and the half a
+#      hand-written list above can never hold by itself.
+#
+#      The list is a list, so a config file added under `templates/compose/` and
+#      not added here is mounted by nothing, fetched by every adopting service,
+#      and reported as `current` by the staleness reporter forever. That is the
+#      silent half-removal this packet exists to close, and it is measurable:
+#      every file under the compose directory is either in VENDOR_MOUNTS, or is
+#      the compose file itself, or is the postgres build context (a `build:`, not
+#      a mount — see below).
+#
+#      `.env.example` is excluded too, and for a different reason: it is
+#      documentation the stack reads for defaults, not a file a container mounts,
+#      and its own coverage is asserted by the `.env.example` check above.
+compose_dir = os.path.join(root, "templates/compose")
+skip_unreferenced = {"docker-compose.yml", ".env.example"}
+unreferenced = []
+for dirpath, _dirnames, filenames in os.walk(compose_dir):
+    for fname in filenames:
+        full = os.path.join(dirpath, fname)
+        rel = os.path.relpath(full, compose_dir)
+        top = rel.split(os.sep)[0]
+        if fname in skip_unreferenced or top in ("postgres",):
+            continue
+        if not any(src == rel or src.split("/")[0] == top for src in VENDOR_MOUNTS):
+            unreferenced.append(rel)
+if unreferenced:
+    problems.append(
+        "nothing mounts: "
+        + ", ".join(sorted(unreferenced))
+        + ". Every file under templates/compose/ is fetched by every adopting "
+        "service and must be mounted by something; a file nothing mounts is a "
+        "config nobody can read, and a store that 'is configured' on disk"
+    )
 
 # 1b. AND NO HOST PATH IN THIS FILE IS BARE-RELATIVE, WHICHEVER SERVICE IT
 #     BELONGS TO.
@@ -8157,7 +8300,10 @@ for path in (
     "templates/compose/grafana/provisioning",
     "templates/compose/loki",
     "templates/compose/tempo",
-    "templates/compose/mimir",
+    # NOT `templates/compose/mimir`, and that omission is the check. This list
+    # is what keeps a directory that is gone from being documented as present;
+    # adding the path back to satisfy a stale README is the one edit that would
+    # make this whole list worthless.
     "tests/canary_test.sh",
     "tests/no_telemetry_in_readiness.sh",
     # The two files the staleness templates half is made of. Both are the kind

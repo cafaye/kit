@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 #
-# kit's proof that the FETCHED stack actually runs, and that traces and metrics
-# arrive in the stores behind it.
+# kit's proof that the FETCHED stack actually runs, and that traces arrive in
+# the store behind them and derived metrics reach the only place there is one.
 #
 #   bash tests/stack_live_test.sh
 #
@@ -11,28 +11,32 @@
 #   nothing was listening on, and on a bind mount naming a directory four
 #   containers later. kit's own history says so twice: the collector's
 #   `environment:` block was missing, so every `${env:}` resolved empty and the
-#   collector exited naming a memory limiter; and Mimir's healthcheck named
-#   `/mimir`, a directory, so the stack came up and then reported one unhealthy
-#   service for two minutes.
+#   collector exited naming a memory limiter; and a store's healthcheck named a
+#   directory, so the stack came up and then reported one unhealthy service for
+#   two minutes.
 #
 #   So this brings the whole thing up, sends it a real OTLP payload, and reads
-#   the data back out of Tempo and Mimir over HTTP. If the fetch produced a
-#   tree that cannot run, nothing here can pass.
+#   the data back out of Tempo over HTTP. If the fetch produced a tree that
+#   cannot run, nothing here can pass.
 #
 # WHAT IS PROVED, IN ORDER
 #   1. `bin/dev` fetches kit at a pinned ref and the STACK COMES UP HEALTHY —
-#      all eight containers, `--wait`, no sleeps.
+#      every container, `--wait`, no sleeps.
 #   2. The collector is running the fetched `otel-collector.yml`, not a copy
 #      from the working tree. Asserted by diffing the container's mounted file
 #      against the fetched one.
 #   3. A TRACE arrives in Tempo, with the resource attributes the redaction
 #      boundary is supposed to preserve.
-#   4. A METRIC arrives in Mimir, under the `cafaye_` namespace the spanmetrics
-#      connector mints, with the labels core's schema requires.
-#   5. The redaction boundary held ON THE LIVE STACK: the canary is in neither
-#      store. `canary_test.sh` proves the same property against a substituted
-#      exporter; this proves it against the real three backends, which is the
-#      only way to know the fan-out is wired to the stores and not to nowhere.
+#   4. A DERIVED METRIC reaches the collector's own stdout, under the `cafaye_`
+#      namespace the spanmetrics connector mints, with the high-cardinality
+#      dimensions gone. There is no metrics STORE and there has not been one
+#      since it cost 130s of readiness budget per cold start; where the data
+#      goes is the collector's `debug` exporter, and this reads it there.
+#   5. The redaction boundary held ON THE LIVE STACK: the canary is in the
+#      trace store and in neither the exported attributes nor the exported
+#      metric. `canary_test.sh` proves the same property against a substituted
+#      exporter; this proves it against the real fan-out, which is the only way
+#      to know it is wired to what ships and not to nowhere.
 #
 # THE REMOTE IS LOCAL
 #   A bare repository is built from this tree and fetched over `file://`, so the
@@ -271,7 +275,13 @@ KIT_NATS_MONITOR_PORT=$((PORT_BASE + 700))
 KIT_REDIS_PORT=$((PORT_BASE + 800))
 KIT_TEMPO_PORT=$((PORT_BASE + 900))
 KIT_LOKI_PORT=$((PORT_BASE + 901))
-KIT_MIMIR_PORT=$((PORT_BASE + 902))
+# `detailed`, and deliberately NOT the shipped default. The metric assertions
+# below read the `debug` exporter's own output, and at `normal` it prints each
+# metric's data point WITHOUT its attribute map — so the "the high-cardinality
+# dimensions are not there" assertion would be satisfied by the exporter being
+# quiet rather than by the dimensions being gone. `detailed` prints attributes,
+# which is what makes the absence mean something.
+KIT_OTEL_DEBUG_VERBOSITY=detailed
 ENV
 
 cd "$SERVICE"
@@ -279,7 +289,7 @@ cd "$SERVICE"
 # ---------------------------------------------------------------------------
 # 1. up
 # ---------------------------------------------------------------------------
-printf -- '-- live: the FETCHED stack comes up, and data arrives in Tempo and Mimir\n'
+printf -- '-- live: the FETCHED stack comes up, and a trace reaches Tempo\n'
 
 step_up() {
   # ALWAYS returns 0, and writes the log. `bin/dev up` is EXPECTED to exit
@@ -601,11 +611,9 @@ done
 # asserting the default is still the default rather than asserting the data
 # arrived.
 tempo_port() { docker compose -p "$PROJECT" port tempo 3200 2>/dev/null | sed 's/.*://'; }
-mimir_port() { docker compose -p "$PROJECT" port mimir 8080 2>/dev/null | sed 's/.*://'; }
 
 TP="$(tempo_port)"
-MP="$(mimir_port)"
-note "tempo on $TP, mimir on $MP (read from compose, not assumed)"
+note "tempo on $TP (read from compose, not assumed)"
 
 # The canary is in the payload and must not be in the store. Asserted as an
 # ABSENCE against a search for the trace's own identity, so a store that simply
@@ -630,8 +638,8 @@ else
 fi
 
 # The canary, on the real backend rather than a substituted exporter. This is the
-# half `canary_test.sh` cannot make: it proves the fan-out reaches three stores
-# that are really there, rather than a file exporter standing in for them.
+# half `canary_test.sh` cannot make: it proves the fan-out reaches a store that is
+# really there, rather than a file exporter standing in for it.
 if curl -sf "http://localhost:$TP/api/traces/9c1f2b7a4d3e5f60718293a4b5c6d7e8" 2>/dev/null |
   grep -q "$CANARY"; then
   fail "the canary reached TEMPO — the redaction boundary does not hold on the live stack"
@@ -640,43 +648,63 @@ else
 fi
 
 # ---------------------------------------------------------------------------
-# 5. the metric is in MIMIR
+# 5. the DERIVED METRIC REACHES THE COLLECTOR'S OWN STDOUT
 # ---------------------------------------------------------------------------
-# Two metrics, and both matter: the one this test sent directly, and the one the
-# spanmetrics connector minted from the trace. A stack where the OTLP metrics
-# path works and the connector is not wired looks identical from the outside, and
-# the fleet error dashboard is built on the connector's output.
-if wait_for "the direct metric reaches Mimir" 60 sh -c \
-  "curl -sf -H 'X-Scope-OrgID: single-tenant' 'http://localhost:$MP/prometheus/api/v1/query?query=kit_probe_calls_total' | grep -q '\"result\"'"; then
-  pass "the direct OTLP metric is in Mimir under the kit_probe_ namespace"
-else
-  fail "the direct metric never reached Mimir within 60s"
-  curl -s -H 'X-Scope-OrgID: single-tenant' \
-    "http://localhost:$MP/prometheus/api/v1/query?query=kit_probe_calls_total" 2>&1 |
-    head -3 | sed 's/^/        /' || true
-fi
+# WHERE THIS LOOKED BEFORE, AND WHY IT CANNOT LOOK THERE ANY MORE. This section
+# used to query a metrics store over its published PromQL port for two things:
+# the metric the probe sent directly, and the one the `spanmetrics` connector
+# minted from the trace. That store cost 130s of readiness budget per cold start
+# (retries 12 x interval 10s) against a 180s deadline for the whole stack, and
+# was removed rather than left half-wired — no service, no volume, no port, no
+# exporter dialling a host with nothing on it.
+#
+# So the assertions move to the collector's `debug` exporter, which is where the
+# metrics pipeline goes now, and which is a BETTER place to read them from: the
+# store answered a question about what survived to disk, and the exporter
+# answers the question the change is actually about, which is whether the
+# derived series still pass the ingest deny set on the way OUT. Nothing in this
+# tree stores metrics, so the collector's stdout is the last place a dropped
+# dimension can still be observed — and it is observable, because the export
+# prints the attribute map (see `KIT_OTEL_DEBUG_VERBOSITY=detailed` in the .env
+# this test writes above).
+#
+# `collector_logs` reads the container rather than a file, because a file
+# exporter standing in for the fan-out is exactly what `canary_test.sh` already
+# substitutes and what this test exists not to do.
+collector_logs() { docker compose -p "$PROJECT" logs --no-color otel-collector 2>/dev/null; }
 
-# The connector. `duration_count` is the shape `spanmetrics` mints for an
+# The connector. `duration` is the shape `spanmetrics` mints for an
 # `http.server.request.duration`-style span, and the namespace prefix is the
-# `KIT_OTEL_METRIC_NAMESPACE` the collector was configured with — so a
-# successful query here is a proof that the CONFIG reached the container, not
-# only that Mimir is answering.
+# `KIT_OTEL_METRIC_NAMESPACE` the collector was configured with — so finding it
+# is a proof that the CONFIG reached the container and that the connector is
+# wired, not only that the collector is printing something.
 if wait_for "the spanmetrics connector mints a metric" 90 sh -c \
-  "curl -sf -H 'X-Scope-OrgID: single-tenant' 'http://localhost:$MP/prometheus/api/v1/query?query=cafaye_duration_count' | grep -q '\"result\"'"; then
-  pass "the spanmetrics connector minted cafaye_duration_count — the fleet dashboard's source"
+  "collector_logs | grep -qE 'cafaye[_.]duration'"; then
+  pass "the spanmetrics connector exported cafaye_duration — the fleet dashboard's source"
 else
-  fail "the spanmetrics connector minted nothing: the fleet error dashboard would be empty"
+  fail "the spanmetrics connector minted nothing: the error view would be empty"
+  collector_logs | grep -iE 'cafaye[_.]' | head -5 | sed 's/^/        /' || true
 fi
 
-# The redaction boundary on the metric side. A metric that is a canary
-# would be the worst leak of all, because a metric is queryable by anyone with
-# read access to the store rather than visible only to someone reading a trace.
-if curl -sf -H 'X-Scope-OrgID: single-tenant' \
-  "http://localhost:$MP/prometheus/api/v1/label/__name__/values" 2>/dev/null |
-  grep -q "$CANARY"; then
-  fail "the canary reached MIMIR"
+# THE INGEST DENY SET, on the real pipeline. This is the assertion the removal
+# made necessary: the metrics pipeline still runs — derived, redacted, exported
+# — and its whole purpose now is to be observable, so the deny set has to be
+# observable too. `tenant_id` on a data point is the one that must never appear;
+# the transform's own comment records why a resource exemption cannot cover it.
+if collector_logs | grep -qE 'tenant_id|account_id|request_id'; then
+  fail "a high-cardinality dimension reached an exporter as a metric label — the ingest deny set did not run"
+  collector_logs | grep -nE 'tenant_id|account_id|request_id' | head -5 | sed 's/^/        /' || true
 else
-  pass "the canary reached no exporter on the live stack (Mimir checked by label scan)"
+  pass "no high-cardinality dimension appears on an exported metric label"
+fi
+
+# The redaction boundary on the metric side. A metric carrying the canary would
+# be the worst leak of all, because a metric is queryable by anyone with read
+# access rather than visible only to someone reading a trace.
+if collector_logs | grep -q "$CANARY"; then
+  fail "the canary reached the collector's exporter"
+else
+  pass "the canary reached no exporter on the live stack (exported attributes checked)"
 fi
 
 # ---------------------------------------------------------------------------
@@ -684,7 +712,7 @@ fi
 # ---------------------------------------------------------------------------
 # The final assertion, and the one the packet is really about: the service's
 # three-line override and the fetched 400-line stack merge into ONE coherent
-# project, with kit's eight services intact and the service's own network joined
+# project, with kit's seven services intact and the service's own network joined
 # to the same one the collector is on. If the override had shadowed the network,
 # `probe` would not have been able to reach `otel-collector` by name — and every
 # assertion above would already have failed, which is why this is the last line
@@ -700,4 +728,4 @@ if [ "$failures" -ne 0 ]; then
   echo "FAIL: stack live — $failures assertion(s) failed. Logs in $WORK/up.log"
   exit 1
 fi
-echo "PASS: stack live — the fetched stack ran, and a trace and a metric reached Tempo and Mimir."
+echo "PASS: stack live — the fetched stack ran, and a trace reached Tempo and a derived metric reached the collector's exporter."

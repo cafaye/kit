@@ -15,24 +15,38 @@
 #
 # WHAT THIS IS
 #   Postgres, NATS with JetStream, Redis, the OpenTelemetry collector, and the
-#   four services that make a developer's traces, metrics and errors visible
+#   three services that make a developer's traces, logs and errors visible
 #   without installing anything. One stack, one set of credentials, one command.
 #   A service joins it by adding a `depends_on` and copying its connection URLs
 #   into .env.
 #
-#   Observability is ON BY DEFAULT and worked on in dev (PLAN.md §7b, user
-#   directive 2026-09-30). A developer working on a cafaye service sees real
-#   traces, real metrics and a real error view with nothing switched on. That
-#   is why the four backing services ship here rather than in a document
-#   describing how to install them: the first question a self-hoster asks is
-#   "what does this look like when it breaks", and the answer must not be
-#   "install four more services first".
+#   THE THREE BACKENDS ARE OFF BY DEFAULT. `bin/dev` starts postgres, nats,
+#   redis and the collector; the observability profile — tempo, loki, grafana —
+#   is `KIT_DEV_PROFILES=observability bin/dev up`.
 #
-#   It is still not MANDATORY. `<SERVICE>_OTEL_ENDPOINT` is the only contract
-#   and the collector below is just that variable's default value, so a
-#   self-hoster already running Datadog, Honeycomb or Grafana Cloud sets the
-#   variable in their service and this stack goes quiet. Bring-your-own is a
-#   supported deployment, not a degraded mode.
+#   That is a reversal, and the numbers are why. As defaults they cost every
+#   developer's first run: grafana downloading a plugin zip on first boot
+#   (20s once, over 180s another time), 130s of the metrics store's readiness
+#   budget before it was removed, 65s of
+#   Tempo's, 16s of Loki's — against a 180s deadline for the whole stack. A
+#   default that taxes everyone's startup to serve a view they did not open is
+#   a default that gets switched off fleet-wide, and the telemetry goes with it.
+#   The escape hatch existed the whole time and was the documented good path.
+#   So the hatch is now the default and observability is the deliberate spelling.
+#
+#   WHAT DOES NOT CHANGE. `<SERVICE>_OTEL_ENDPOINT` is still the only contract,
+#   its default is still this collector, and the collector is still NOT behind
+#   the profile: on the cheap path telemetry still arrives, is still run through
+#   the redaction allowlist — which drops high-cardinality dimensions at INGEST,
+#   before anything would be stored — and is then dropped because there is no
+#   store to hand it to. Losing a span is better than becoming a slow service,
+#   and cheaper than paying 130 seconds for the privilege of keeping it.
+#
+#   It is still not MANDATORY, in either direction. `<SERVICE>_OTEL_ENDPOINT` is
+#   the only contract and the collector below is just that variable's default
+#   value, so a self-hoster already running Datadog, Honeycomb or Grafana Cloud
+#   sets the variable in their service and this stack goes quiet. Bring-your-own
+#   is a supported deployment, not a degraded mode.
 #
 # WHAT THIS IS NOT
 #   It is not production. Volumes are named, not replicated; passwords are the
@@ -94,7 +108,7 @@
 #         schemas; a service that overrides the mount is shipping a telemetry
 #         boundary nobody derived, and prompt content leaves the process inside
 #         it. The gate fails on any of the three.
-#   MAY NOT — override the four AGPL backends. `grafana/*` images unmodified is
+#   MAY NOT — override the three AGPL backends. `grafana/*` images unmodified is
 #         the licence condition, and a `build:` or a retag is a fork.
 #   MAY NOT — set POSTGRES_USER, POSTGRES_DB or POSTGRES_PASSWORD on this
 #         service. THIS USED TO BE THE RECOMMENDED FIX and it is the single most
@@ -173,7 +187,6 @@ volumes:
   # removes them and `bin/dev down` keeps them, with no special-casing.
   tempo-data:
   loki-data:
-  mimir-data:
   grafana-data:
 
 services:
@@ -461,11 +474,25 @@ services:
       KIT_OTEL_METRICS_FLUSH_INTERVAL: ${KIT_OTEL_METRICS_FLUSH_INTERVAL:-15s}
       KIT_TEMPO_OTLP_ENDPOINT: ${KIT_TEMPO_OTLP_ENDPOINT:-tempo:4317}
       KIT_LOKI_OTLP_ENDPOINT: ${KIT_LOKI_OTLP_ENDPOINT:-http://loki:3100/otlp}
-      # HTTP, on the gateway. 9009 is not listening on this build and 9095 is
-      # the ingester ring, not OTLP — see the note on `otlphttp/mimir`.
-      KIT_MIMIR_OTLP_ENDPOINT: ${KIT_MIMIR_OTLP_ENDPOINT:-http://mimir:8080/otlp}
-      KIT_MIMIR_TENANT: ${KIT_MIMIR_TENANT:-single-tenant}
-      # The three backends speak plaintext OTLP to each other inside the
+      # TWO backends now, not three, and the one that left is worth a note.
+      #
+      # THERE IS NO METRICS ENDPOINT VARIABLE ANY MORE. The metrics store cost
+      # 130 seconds of readiness budget per cold start (its own healthcheck:
+      # retries 12 x interval 10s), against a 180s deadline for the whole stack,
+      # and 384m of memory — for a set of series this fleet does not have, on a
+      # machine that is also running a compiler and a browser. It is REMOVED,
+      # not disabled: no service, no volume, no port, no `mimir.yaml`, and — the
+      # part that matters — no collector exporter still dialling `mimir:8080`.
+      # An exporter pointed at a host with nothing behind it is a connection
+      # refused per flush, forever, in a log nobody reads.
+      #
+      # The metrics pipeline still DERIVES span metrics, still runs the full
+      # redaction allowlist and the ingest deny set over them, and exports them
+      # to the collector's own stdout. Restoring a store is one endpoint variable
+      # here, one exporter block in `otel-collector.yml`, one `exporters:` line
+      # on the metrics pipeline, and one datasource in Grafana's provisioning.
+      #
+      # The two remaining backends speak plaintext OTLP to each other inside the
       # compose network. A self-hoster who terminates TLS does it here, and a
       # literal endpoint never appears in the collector config.
       KIT_OTEL_TLS_INSECURE: ${KIT_OTEL_TLS_INSECURE:-true}
@@ -516,20 +543,20 @@ services:
     networks: [platform]
 
   # =========================================================================
-  # The four backing services: Tempo (traces), Loki (logs and the crash
-  # layer), Mimir (metrics), Grafana (the views).
+  # The three backing services: Tempo (traces), Loki (logs and the crash
+  # layer), Grafana (the views).
   #
-  # ALL FOUR ARE AGPL-3.0 AND ARE SHIPPED UNMODIFIED. That is the condition
+  # ALL THREE ARE AGPL-3.0 AND ARE SHIPPED UNMODIFIED. That is the condition
   # the licence cares about and it is the reason for three rules below that
   # look fussy:
   #
   #   - `image:` is a stock `grafana/<name>:<pinned tag>`. No `build:` stanza
-  #     anywhere on these four services, and the gate fails on one. Building
+  #     anywhere on these services, and the gate fails on one. Building
   #     the image is how a fork happens, and a fork is the thing that would
   #     make this a licensing problem for the people we sell this to. The gate
   #     asserts it, so "we didn't modify it" is a checked fact rather than a
   #     claim in a README.
-  #   - The configuration files under loki/, tempo/, mimir/ and grafana/ are
+  #   - The configuration files under loki/, tempo/ and grafana/ are
   #     CONFIGURATION, which the licence expressly permits, mounted read-only.
   #     They set retention, limits and paths. They do not patch anything.
   #   - Nothing is overridden onto the vendor's own image contents.
@@ -539,19 +566,25 @@ services:
   # one direction: we may use these; a self-hoster using our code is not
   # thereby offered a modified Grafana.
   #
-  # WHY A PROFILE. These four are the expensive half — four images, four
-  # processes, real disk. `profiles: [observability]` means a developer on a
-  # constrained machine, or in CI, can bring up postgres/nats/redis/collector
-  # alone with `docker compose up` and no extra flags. `bin/dev` passes
-  # `--profile observability` by default, so the DEFAULT path still gets the
-  # whole stack, and that is the property the packet is judged on.
+  # WHY A PROFILE, AND WHY IT IS OFF BY DEFAULT. These are the expensive half —
+  # three images, three processes, real disk, and a first boot that is not fast
+  # on a cold volume. `profiles: [observability]` means the default path is
+  # postgres/nats/redis/collector and the backends are one deliberate variable:
   #
-  # WHY BOUNDED. A dev machine running six services plus four more needs every
+  #     KIT_DEV_PROFILES=observability bin/dev up
+  #
+  # The readiness budgets below are the argument, and they are the compose
+  # file's own numbers rather than a report's: tempo 65s, loki 16s, grafana up
+  # to 180s, and — until mimir was removed, see its entry — mimir 130s. Summed
+  # against a 180s deadline for the whole stack, the default was the tax and the
+  # escape hatch was the good path.
+  #
+  # WHY BOUNDED. A dev machine running six services plus three more needs every
   # one of them capped, or the kernel kills the largest and the whole thing
   # gets attributed to something else. `mem_limit` here is a per-service cap,
   # deliberately conservative: this is a laptop, and disk is the other half.
   #
-  # The `depends_on` graph among the four is health-based, not sleeps, and it
+  # The `depends_on` graph among the three is health-based, not sleeps, and it
   # runs BACKWARDS from the usual intuition: nothing here depends on the
   # collector. A collector whose Tempo is down is a collector that has lost
   # spans, not one that is unhealthy, and gating `up --wait` on Tempo would
@@ -603,51 +636,6 @@ services:
       # kit-02's 6 retries at 10s looked more generous and was not.
       retries: 12
       start_period: 5s
-    profiles: [observability]
-    networks: [platform]
-
-  # --------------------------------------------------------------------- mimir
-  mimir:
-    image: grafana/mimir:${KIT_MIMIR_TAG:-2.13.0}
-    # Single-binary mode. The distroless Mimir image has no shell, so there is
-    # no `command` array trickery here beyond the two flags it needs.
-    # `-ingester.ring.replication-factor=1` and it is not optional. Mimir's
-    # ring defaults to 3 replicas, a single-binary dev stack has one ingester,
-    # and every metrics write is then rejected with "at least 2 live replicas
-    # required, could only find 1" — a message that reads like a broken cluster
-    # rather than a default sized for one. There is no config key for it; both
-    # `limits.ingestion_replication_factor` and a `distributor:` block were
-    # tried against grafana/mimir:2.13.0, and both parse and change nothing.
-    command:
-      - "-target=all"
-      - "-ingester.ring.replication-factor=1"
-      - "-config.file=/etc/mimir/mimir.yaml"
-    volumes:
-      - ${KIT_COMPOSE_DIR:-.}/mimir/mimir.yaml:/etc/mimir/mimir.yaml:ro
-      - mimir-data:/mimir
-    ports:
-      - "${KIT_MIMIR_PORT:-15902}:8080"
-    mem_limit: ${KIT_MIMIR_MEMORY_LIMIT:-384m}
-    healthcheck:
-      # `/bin/mimir`, not `/mimir`: the data directory is mounted at /mimir, so
-      # the bare path is a DIRECTORY and exec fails with "is a directory:
-      # permission denied" on every probe. The whole stack came up 120s and then
-      # reported one unhealthy service for that reason, which is exactly the
-      # "slow and fragile dev loop" this packet is not allowed to ship.
-      #
-      # What it actually proves, stated plainly: the binary runs and the config
-      # parsed. It does NOT prove the distributor is ready to receive metrics,
-      # which is what `/-/ready` would prove. Mimir's image is distroless — no
-      # shell, no wget, no curl — and adding one is a `build:` stanza, which the
-      # AGPL unmodified condition forbids. So this is the strongest probe
-      # available without forking the image, and the gap is recorded in the
-      # report rather than papered over. In practice the two failures differ:
-      # a config that does not parse is the one this has produced.
-      test: ["CMD", "/bin/mimir", "-version"]
-      interval: 10s
-      timeout: 10s
-      retries: 12
-      start_period: 10s
     profiles: [observability]
     networks: [platform]
 

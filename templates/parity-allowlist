@@ -274,7 +274,7 @@ absent parlor bin/dev reason="this service holds no compose stack — it runs it
 # draft of this file said "so it cannot start" and that was a guess dressed as a
 # measurement:
 #
-#   $ grep -cE '\./(otel-collector|tempo|loki|mimir|grafana)' */docker-compose.yml
+#   $ grep -cE '\./(otel-collector|tempo|loki|grafana)' */docker-compose.yml
 #   billing 0  courier 0  darkroom 0  guard 0  identity 0  muse 0
 #   $ grep -cE '^\s+- \./' templates/compose/docker-compose.yml
 #   5
@@ -287,12 +287,12 @@ absent parlor bin/dev reason="this service holds no compose stack — it runs it
 #
 # The five bind mounts are worth being exact about, because an earlier draft of
 # this file said the compose file "mounts the other eleven files by path". It
-# binds FIVE paths, and one of them is a directory: `./otel-collector.yml`,
-# `./tempo/tempo.yaml`, `./loki/loki-config.yaml`, `./mimir/mimir.yaml` and
-# `./grafana/provisioning` — the last of which holds six of the twelve members.
-# That is ten of the eleven non-compose members reachable by path. The
-# eleventh, `.env.example`, is not mounted at all: it is `cp`'d to `.env`, which
-# is why it is a bundle member at all.
+# binds FOUR paths, and one of them is a directory: `./otel-collector.yml`,
+# `./tempo/tempo.yaml`, `./loki/loki-config.yaml` and
+# `./grafana/provisioning` — the last of which holds five of the bundle's
+# members. That is every non-compose member except `.env.example`, which is not
+# mounted at all: it is `cp`'d to `.env`, which is why it is a bundle member at
+# all.
 #
 # So the honest reason is the boring one: these seven predate kit's
 # observability profile, nobody re-copied, and nobody recorded a decision. That

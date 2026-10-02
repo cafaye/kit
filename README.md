@@ -69,12 +69,12 @@ was built:
 3. **The local stack is not "drifted", it is *not there*.** Of the twelve files
    in `templates/compose/`, the fleet holds `docker-compose.yml` in six
    services and `.env.example` in two, and seven services hold at least one
-   member. The collector, Tempo, Loki, Mimir and
+   member. The collector, Tempo, Loki and
    the Grafana provisioning are **0 of 12, in all nine services**. Those six
    compose files are each ~420 lines different from kit's, and the number is
    the least interesting thing about them. They are also **replacements rather
    than broken copies**: none of them mounts a single one of kit's stack files
-   (`grep -cE '\./(otel-collector|tempo|loki|mimir|grafana)'` is 0 in all
+   (`grep -cE '\./(otel-collector|tempo|loki|grafana)'` is 0 in all
    six), each declares one or two services of its own, and
    `docker compose config` is **green on five of the six** — so they are valid
    stacks that are simply not this one. The reporter calls the state `diverged`
@@ -113,8 +113,8 @@ the entry; deleting the entry to shrink the file is a hard failure of its own.
 | `tests/isolation_test.sh` | **The proof.** Brings the shipped stack up, creates two service databases, and asserts service A is refused service B's database — printing the query and the server's answer. Includes a **control** cluster without the revoke, which must let A in. | kit's gate (needs docker) |
 | `tests/tenancy_test.sh` | **The other proof.** Same cluster, the account boundary: 24 assertions run as the login role **and** as the owner, a **control** that deletes `FORCE ROW LEVEL SECURITY` and requires the owner half to go red while the login half stays green, and a **measurement** of the `(select …)` wrapping (1 call against 5 over five rows). | kit's gate (needs docker) |
 | `bin/dev db grant <name>` | Adds one service to an **already-running** cluster. `initdb` only runs on a fresh volume, so naming a service in `KIT_POSTGRES_DATABASES` after the fact creates nothing. It **prints** the statements — including the `REVOKE ALL ON DATABASE … FROM PUBLIC` that makes the database a boundary — and does not run them. | Copied into the service, with `bin/dev` |
-| `templates/compose/otel-collector.yml` | The collector: OTLP + container-stderr receivers, the redaction allowlist **derived from core's schemas**, the `spanmetrics` connector, and fan-out to Tempo/Loki/Mimir. Every endpoint a `${env:}`. | **Fetched** — never copied |
-| `templates/compose/{tempo,loki,mimir}/` | Vendor **configuration** for the three stores: retention, limits, paths. Read-only mounts over stock images. | **Fetched** — never copied |
+| `templates/compose/otel-collector.yml` | The collector: OTLP + container-stderr receivers, the redaction allowlist **derived from core's schemas**, the `spanmetrics` connector, and fan-out to Tempo and Loki. Every endpoint a `${env:}`. Derived metrics go to the collector's own stdout — there is no metrics store. | **Fetched** — never copied |
+| `templates/compose/{tempo,loki}/` | Vendor **configuration** for the two stores: retention, limits, paths. Read-only mounts over stock images. | **Fetched** — never copied |
 | `templates/compose/grafana/provisioning/` | Datasources, the dashboard provider, the fleet error dashboard and the alert rules — all files, working on first load. Nothing to click together by hand. | **Fetched** — never copied |
 | `templates/compose/.env.example` | Every `${KIT_*}` the stack interpolates, each with a default. **Fetched, not copied** — `bin/dev` writes it into `.env` on first run. | `bin/dev`, on first run |
 | `templates/kamal/deploy.yml.erb` | The Kamal config: service, registry, servers, proxy, and the postgres and backup accessories. ERB for the four values that differ per operator; **every credential is a `NAME`, never a value**. A missing required variable fails the render by name rather than rendering empty. | Every service, as `config/deploy.yml` |
@@ -122,7 +122,7 @@ the entry; deleting the entry to shrink the file is a hard failure of its own.
 | `templates/kamal/drill.sh` | A restore drill that drops its scratch database on **every** exit path and **asserts** rows rather than printing a count — the two things kamal-backup does not do, both found by reading the gem. | Every service, as `bin/drill` |
 | `tests/kamal_test.sh` | The proof: generates the config **from the templates** and runs the **real** `kamal` and the real `kamal-backup` against it. 22 cases, all against the binaries. It exists because a doubled registry host, a missing `builder.arch` and a cross-file secret are all valid YAML that parses clean. | kit |
 | `tests/fetch_test.sh` | Executes the fetch against a local bare remote: a pin resolves and the bytes are identical, a branch is refused **before any network call**, and offline mode is real in all four of its states. | kit |
-| `tests/stack_live_test.sh` | Brings the **fetched** stack up, sends real OTLP, and reads a trace out of Tempo, a metric out of Mimir, and no canary into either. | kit |
+| `tests/stack_live_test.sh` | Brings the **fetched** stack up, sends real OTLP, reads a trace out of Tempo and a **derived metric** off the collector's own exporter, and finds no canary in either. | kit |
 | `tests/fleet_check.py` | Reads the **other** repositories: a stale copy of the stack, a weakened redaction boundary, a collector config nothing starts, a published port on a service kit already ships, an unpinned ref. Under the **adoption ceiling**: a `FAIL` inside a repository that has a `kit.ref`, a named `WARN` inside one that has not. | kit, over the sibling checkouts |
 | `tests/canary_test.sh` | Plants a canary in ten leak shapes against a real collector and asserts it reaches no exporter. | kit |
 | `tests/no_telemetry_in_readiness.sh` | Kills the collector and proves a service still starts, still serves and still reports healthy. | kit |
@@ -317,13 +317,28 @@ has no word for.
 
 ## The local stack — `templates/compose/`
 
-Postgres, NATS with JetStream, Redis, the OpenTelemetry collector, and the four
-services that make a developer's traces, metrics and errors visible: **Grafana,
-Loki, Tempo and Mimir**. One stack, one set of credentials, one command, for
+Postgres, NATS with JetStream, Redis, the OpenTelemetry collector, and the three
+services that make a developer's traces, logs and errors visible: **Grafana,
+Loki and Tempo**. One stack, one set of credentials, one command, for
 every service.
 
+**`bin/dev up` starts the cheap half.** Postgres, NATS, Redis and the collector,
+and nothing else. The three stores are one deliberate variable:
+
+```sh
+bin/dev up                                        # postgres, nats, redis, collector
+KIT_DEV_PROFILES=observability bin/dev up        # ...and tempo, loki, grafana
+```
+
+The reasons are measured rather than asserted — 65s of Tempo's readiness budget,
+16s of Loki's, and up to 180s of Grafana's on a cold volume, against a 180s
+deadline for the whole stack — and they are in **The reversal** below. Telemetry
+itself does not change: the collector is not behind the profile, so a service
+with nothing configured still exports into it on the cheap path, and the
+redaction allowlist still runs before anything would be stored.
+
 **You do not copy any of it.** There is no `docker-compose.yml` of kit's in your
-repository, no `otel-collector.yml`, no `tempo/`, no `loki/`, no `mimir/`, no
+repository, no `otel-collector.yml`, no `tempo/`, no `loki/`, no
 `grafana/`, and no `.env.example`. `bin/dev` fetches all of it from a **pinned**
 ref and runs it beside the one compose file you do have:
 
@@ -341,8 +356,8 @@ bin/dev nuke       # stop and DELETE the data
 ```
 
 Everything the stack needs comes from the fetch: `templates/compose/otel-collector.yml`,
-and the vendor **configuration** for the three stores — `templates/compose/tempo`,
-`templates/compose/loki`, `templates/compose/mimir` — plus
+and the vendor **configuration** for the two stores — `templates/compose/tempo`,
+`templates/compose/loki` — plus
 `templates/compose/grafana/provisioning`, which is where the datasources, the
 fleet error dashboard and the alert rules live as files. None of it is copied, so
 none of it can be a stale copy.
@@ -562,19 +577,40 @@ rather than half-starting: if the stack does not become healthy it prints what i
 unhealthy and its logs, and stops *before* migrating, so a failed `up` cannot
 leave a half-migrated database behind.
 
-### Observability is on by default
+### Telemetry is on by default; the stores to read it back from are not
 
-You did not have to install anything. `bin/dev up` brings up the collector and
-the four stores behind it, and a service with nothing configured exports into
-them, because `<SERVICE>_OTEL_ENDPOINT` **defaults to the collector that ships
-with this stack**. Open <http://localhost:15000> and the fleet error dashboard is
-already there.
+You did not have to install anything, and you still do not have to. `bin/dev up`
+brings up the collector, and a service with nothing configured exports into it,
+because `<SERVICE>_OTEL_ENDPOINT` **defaults to the collector that ships with this
+stack**. What it does *not* bring up by default is the stores behind it:
 
-That is on-by-default-and-worked-on-in-dev, not on-by-default-and-mandatory. The
-escape hatches are first-class:
+```sh
+bin/dev up                              # postgres, nats, redis, collector — fast
+KIT_DEV_PROFILES=observability bin/dev up   # …and tempo, loki, grafana
+```
+
+That is a reversal, and it is worth being explicit about why, because the old
+default was a measured decision that turned out to be the wrong one. As a
+default, the observability profile cost every developer's cold start: Grafana
+downloading a plugin zip on first boot (20s once, over 180s another time), 65s
+of Tempo's, 16s of Loki's — against a 180s
+deadline for the whole stack and a 76s typical cold start. A fourth service, the
+metrics store, cost 130s of readiness budget per cold start on top of those and
+was removed outright rather than left half-wired. A default that taxes
+everyone's startup to serve a view they did not open is a default that gets
+switched off fleet-wide, and the telemetry goes with it. **The escape hatch was
+the documented good path the whole time; it is now the default.**
+
+**Nothing about the telemetry boundary changed.** The collector is not behind
+the profile, so spans, logs and metrics still arrive and still pass through the
+redaction allowlist — which drops high-cardinality dimensions at *ingest*, before
+anything would be stored. On the cheap path the data is then dropped because
+there is no store to hand it to, which is strictly better than paying 130 seconds
+to keep it. If you want to read traces back, ask for them:
 
 | You want | You do | What happens |
 |---|---|---|
+| **Traces, logs and metrics to read back** | `KIT_DEV_PROFILES=observability bin/dev up` | tempo, loki and grafana come up too; open <http://localhost:15000> and the fleet error dashboard is already there |
 | **Your own backend** | set `MUSE_OTEL_ENDPOINT` (or `CAF_OTEL_ENDPOINT`, `BILLING_OTEL_ENDPOINT`, … — `<SERVICE>_OTEL_ENDPOINT`, the name derived from the service) to your Datadog / Honeycomb / Grafana Cloud OTLP endpoint | this service exports there and the shipped stack goes quiet for it. **Bring your own backend is a supported deployment, not a degraded mode** |
 | **No telemetry at all** | unset the variable | a genuine no-op: no queue, no retry loop, no warning per request, no dial at boot |
 | **Still on, quieter** | `KIT_OTEL_DEBUG_VERBOSITY=basic` | the `debug` exporter stops printing every span to the terminal |
@@ -595,7 +631,6 @@ asserts every published port is inside it and that no two services reuse one.
 | 15500 | Postgres | | 15800 | Redis |
 | 15600 | NATS (client) | | 15900 | Tempo (traces) |
 | | | | 15901 | Loki (logs + crash layer) |
-| | | | 15902 | Mimir (metrics) |
 
 Not 5432, 4222 or 6379, and that is the point: those are the two or three most
 likely things already listening on a developer's machine. `bin/dev` is the first
@@ -628,10 +663,10 @@ NEEDED in kit-03's report before a second repo adopts it.
 
 ### The licence, stated plainly
 
-**Grafana, Loki, Tempo and Mimir are AGPL-3.0, and kit ships them UNMODIFIED.**
+**Grafana, Loki and Tempo are AGPL-3.0, and kit ships them UNMODIFIED.**
 Stock `grafana/*` images, pinned, with read-only *configuration* mounted over
 them. Nothing is forked, patched or rebranded — that is the condition the licence
-cares about, and the gate fails on a `build:` stanza on any of the four.
+cares about, and the gate fails on a `build:` stanza on any of the three.
 
 AGPL attaches to the Grafana **server**, not to the applications it observes, so
 this is compatible with cafaye being MIT/Apache. The obligation runs one way: we
@@ -669,7 +704,7 @@ telemetry at all. So:
   dead Tempo costs you spans rather than a background thread and a queue.
 
 `tests/no_telemetry_in_readiness.sh` proves it against a real collector: it
-starts the collector with Tempo, Loki and Mimir all refusing connections and
+starts the collector with Tempo and Loki both refusing connections and
 checks it is still healthy, has not restarted, and has not entered a retry loop;
 then it stands up a service whose `/readyz` **really** checks a dependency, stops
 that dependency, confirms `/readyz` has gone 503 — so the probe is known to be
@@ -685,10 +720,14 @@ gate now holds all of them, but the rules are worth stating because the next
 person to add a panel will hit them:
 
 - **Name the datasource on every panel.** A panel with `"datasource": null` goes
-  to Grafana's *default* datasource, which is Mimir. That is how a LogQL panel
-  ends up asking a Prometheus API for `{service_name=~"..."} |= "error"` and
+  to Grafana's *default* datasource, which is **Tempo** — traces. That is how a
+  LogQL panel
+  ends up asking the traces API for `{service_name=~"..."} |= "error"` and
   getting `parse error: unexpected character: '|'`. The panel renders red, not
-  empty, and every datasource still shows green.
+  empty, and every datasource still shows green. (It used to be the metrics
+  store, which is the same bug with a different victim; the store went, the flag
+  moved to Tempo so that Explore still opens on something, and the rule did not
+  change.)
 - **Label names lose their dots.** OTLP ingestion mangles `.` in a label name to
   `_`, so the collector's `otel.status_code` reaches Prometheus as
   `otel_status_code`. A matcher on the dotted spelling is a *parse error*, and an

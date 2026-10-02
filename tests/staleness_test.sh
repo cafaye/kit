@@ -472,16 +472,17 @@ adopt diverged-svc lint/rubocop.yml .rubocop.yml
 mksvc absent-svc node
 
 # 13b. THE HARD CASE, and the one a member-by-member report would get wrong. A
-#      service holding NINE of the stack's twelve files: `docker-compose.yml` is
-#      its own, and `otel-collector.yml` is absent. That stack does not start,
-#      and eleven separately-pinned cells would call it nine successes and two
-#      absences. `compose` is one artefact precisely so it is `diverged` here.
+#      service holding a FRACTION of the stack's files: `docker-compose.yml` is
+#      its own, `otel-collector.yml` is absent, and only ONE of the store
+#      configs is present. That stack does not start, and every file separately
+#      pinned would call those successes and absences rather than one diverged
+#      cell with a breakdown. `compose` is one artefact precisely so it reads
+#      that way.
 mksvc halfstack-svc python
 adopt halfstack-svc templates/compose/docker-compose.yml docker-compose.yml
 sed 's/^# the LGTM stack.*/# this service runs postgres and nats only/' \
   "$TPL/kit/templates/compose/docker-compose.yml" >"$TPL/halfstack-svc/docker-compose.yml"
 adopt halfstack-svc templates/compose/loki/loki-config.yaml loki/loki-config.yaml
-adopt halfstack-svc templates/compose/mimir/mimir.yaml mimir/mimir.yaml
 adopt halfstack-svc templates/compose/tempo/tempo.yaml tempo/tempo.yaml
 
 # 14. UNDECLARED LANGUAGE. Calls nothing, so the language-dependent artefacts

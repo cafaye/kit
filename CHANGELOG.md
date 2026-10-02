@@ -166,6 +166,106 @@ it without a copy (see kit-12 below).
   profiling run is not a substitute for a plain one — the run that printed the
   table is still the run whose exit status counts.
 
+### Fixed — `bin/dev down` left the observability containers running
+
+- **Measured, and it is the mirror of the `print_urls` fix.** The backends are
+  behind a compose profile, and `docker compose down` without that profile does
+  not touch them. So `KIT_DEV_PROFILES=observability bin/dev up` followed by a
+  plain `bin/dev down` exited 0, printed "stopping the stack (volumes kept)", and
+  left tempo, loki and grafana **running and healthy**. A teardown that reports
+  success while three containers and their memory limits are still up costs more
+  than a printed URL that does not resolve.
+
+- **`down` and `nuke` now stop the whole project.** Both read the project's own
+  profile list from `compose config --profiles` and pass every one, so the
+  teardown covers what is actually running whichever variable the shell happens
+  to have. The list comes from the compose file because a hardcoded
+  `observability` would be a second copy of a name that already lives there.
+
+- **`nuke` mattered more.** It removes the volumes the observability containers
+  were writing to while leaving those containers running, so Docker recreated
+  the volumes empty on the next start — a half-deleted stack rather than a clean
+  one.
+
+- Re-measured after the full stack is up: `bin/dev down` with `KIT_DEV_PROFILES`
+  unset leaves **0 containers and 6 volumes**, which is what "stop, keep the
+  data" says.
+
+
+### Changed — the metrics store is gone, and nothing is left dialled at nothing
+
+- **The fourth backend left the stack: mimir.** Its own healthcheck was
+  `retries 12 × interval 10s` — 130 seconds of readiness budget per cold start,
+  against a 180-second deadline for the whole stack, and 384m of memory — for a
+  fleet that does not have the series to put in it. It is **removed rather than
+  disabled**: `mimir.yaml` deleted, and with it the compose service, the volume,
+  the published port (`15902`), the `KIT_MIMIR_*` variables in `.env.example`,
+  the collector's exporter, and the `prometheus`-typed datasource. An exporter
+  pointed at a host with nothing behind it is one connection refused per flush,
+  forever, in a log nobody reads — while `up --wait` reports the stack healthy.
+
+- **Span metrics are still derived and still redacted; they go to the
+  collector's own stdout.** `spanmetrics`, `redaction/cafaye_metrics`,
+  `transform/cafaye_metrics_ingest_drop` and `batch` all still run, and
+  `exporters: [debug]` is where they land. That is not a consolation prize: it
+  keeps the allowlist exercised on real derived metrics rather than only
+  asserted about. **Putting a store back is four edits that belong together** —
+  the endpoint variable in `.env.example`, the exporter block in
+  `otel-collector.yml`, the `exporters:` line on the metrics pipeline, and the
+  compose service plus its Grafana datasource. Any subset of them is the
+  half-removed backend this will not ship, and two checks now say so out loud.
+
+- **The gate's own assertions follow it out, and two of them got STRONGER.**
+  Eight checks were red on this tree, all of them naming a container that no
+  longer exists. Each lost the name and kept its shape; two gained a claim that
+  could not be made before: the metrics pipeline must export to `debug` **and to
+  nothing else**, and Grafana must provision **no** metrics datasource — because
+  a datasource nothing fills renders panels that are permanently empty and teach
+  a reader that empty means nothing. A third is new: nothing under
+  `templates/compose/` may be unreferenced, which is the half of "nothing names a
+  container that does not exist" that a hand-written mount list cannot hold.
+
+- **`tests/stack_live_test.sh` reads the metrics out of the collector instead of
+  a store.** The two PromQL assertions became three assertions over the
+  collector's own `debug` output, at `KIT_OTEL_DEBUG_VERBOSITY=detailed` because
+  at `normal` the exporter does not print the attribute map and "the
+  high-cardinality dimensions are absent" would be satisfied by the exporter
+  being quiet. It now proves something the store never did: that the ingest deny
+  set runs on the way out.
+
+- `templates/AGENTS.md`, `README.md`, `templates/parity-allowlist`,
+  `templates/compose/loki/loki-config.yaml` and the compose header stop saying
+  "four" and stop naming a directory that is gone.
+
+### Changed — `bin/dev` starts the cheap stack, and observability is the deliberate spelling
+
+- **`KIT_DEV_PROFILES` defaults to empty.** `templates/bin/dev.sh` read
+  `${KIT_DEV_PROFILES-observability}`, so every developer's `bin/dev up` paid for
+  four observability backends by default — and the compose file's own readiness
+  budgets are the argument: mimir 130s (retries 12 × interval 10s), tempo 65s,
+  loki 16s, grafana 20s once and over 180s another time on a cold volume while it
+  downloads a plugin zip nobody asked for. Against a 180s stack deadline and a
+  76s typical cold start (`RESEARCH-fleet-velocity.md` P1), the default was the
+  tax and `KIT_DEV_PROFILES= bin/dev up` — documented as the *escape hatch* — was
+  the good path. That is backwards, so it is now the highway:
+  `KIT_DEV_PROFILES=observability bin/dev up` brings up tempo, loki and grafana.
+
+- **Telemetry is unaffected, and that is the part worth stating.** The collector
+  is not behind the profile, so `<SERVICE>_OTEL_ENDPOINT` still has somewhere to
+  send on the default path, and `redaction/*` still runs before anything would be
+  stored. On the cheap path the data is dropped because there is no store to hand
+  it to, which is strictly better than paying 130 seconds to keep it.
+
+- **Deliberately NOT read from `.env`.** Every other `KIT_*` goes through
+  `stack_setting`, which cannot distinguish "unset" from "set to empty" — so a
+  `.env` reader here would be a second reader of one fact with different
+  semantics, and a `.env` saying `observability` would silently re-impose the tax.
+
+- Docs that described the old default are updated in the same commit
+  (`README.md`, `templates/AGENTS.md`, the compose file's header, and `bin/dev`'s
+  own `--help` and completion message), because a doc that describes a default
+  the script no longer has is drift the next reader pays for.
+>>>>>>> worker/kit-dev-profile-01
 ### Added — the account boundary, shipped once in kit
 
 - **`templates/database/tenancy/substrate.sql`.** The account boundary inside one

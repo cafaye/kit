@@ -57,7 +57,7 @@ Run these; do not improvise equivalents.
 ## The local stack
 
 **You do not copy kit's stack.** There is no `docker-compose.yml` of kit's in this
-repository, no `otel-collector.yml`, and no `tempo/`, `loki/`, `mimir/` or
+repository, no `otel-collector.yml`, and no `tempo/`, `loki/` or
 `grafana/`. `bin/dev` fetches all of it from a **pinned** ref and runs it beside
 your own `docker-compose.yml`, which is an **override** — the second `-f`, so what
 is in it wins and everything you did not mention still comes from kit.
@@ -76,7 +76,7 @@ is in it wins and everything you did not mention still comes from kit.
   `otel-collector.yml`. That file carries the redaction allowlist, and it is
   **derived from core's schemas**; owning it means shipping a telemetry boundary
   nobody derived, and prompt content leaves the process inside it. Nor may you
-  override the four AGPL backends, set `allow_all_keys`, or add an exporter.
+  override the three AGPL backends, set `allow_all_keys`, or add an exporter.
 - **A `ports:` entry for a service kit ships is a bug, and a quiet one.** Compose
   **appends** a second file's `ports:` list rather than replacing it, so writing
   one publishes postgres on kit's port *and* on yours. Move the port in `.env`.
@@ -116,14 +116,17 @@ is in it wins and everything you did not mention still comes from kit.
 
 ## Observability
 
-On by default. Not opt-in, and not something a developer turns on to see traces
-(PLAN.md §7b, user directive 2026-09-30).
+Telemetry is on by default. The **stores to read it back from are not** — that
+is `KIT_DEV_PROFILES=observability bin/dev up`, and `bin/dev up` on its own gives
+you postgres/nats/redis plus the collector. The collector is not behind the
+profile, so a service with nothing configured still exports into it, and the
+redaction allowlist still runs before anything would be stored.
 
 - **`<SERVICE>_OTEL_ENDPOINT` is the only contract** — `MUSE_OTEL_ENDPOINT`,
   `CAF_OTEL_ENDPOINT`, `DARKSROOM_OTEL_ENDPOINT`, whatever this service is
   called, uppercase, no `OTEL_EXPORTER_` prefix and no `_EXPORTER_` infix. Its
   DEFAULT is the collector that ships with `bin/dev`, which is why a developer
-  sees real traces with nothing configured.
+  still gets real spans with nothing configured.
 - **A self-hoster who already runs Datadog, Honeycomb or Grafana Cloud sets that
   variable** and the shipped stack goes quiet for this service. Bring-your-own
   is a supported deployment, documented as carefully as the default, not a

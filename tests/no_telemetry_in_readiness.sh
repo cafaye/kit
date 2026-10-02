@@ -21,9 +21,9 @@
 #      path waits on the collector. This is cheap and cannot be faked by a
 #      runtime, but it also cannot see a probe that opens a socket.
 #
-#   2. LIVE, a real collector. The shipped collector is started with its three
-#      exporters pointed at ports where NOTHING is listening — Tempo, Loki and
-#      Mimir all absent — and the question is whether it reports healthy. A
+#   2. LIVE, a real collector. The shipped collector is started with its store
+#      exporters pointed at ports where NOTHING is listening — Tempo and Loki
+#      both absent — and the question is whether it reports healthy. A
 #      collector that fails its health check when its backends are down has put
 #      an observability store in everyone's readiness path, which is the exact
 #      inversion this packet is about.
@@ -150,7 +150,7 @@ if docker info >/dev/null 2>&1; then
   # -----------------------------------------------------------------------
   # 2. LIVE — a collector whose three backends are all absent
   # -----------------------------------------------------------------------
-  printf -- '-- 2. live: collector healthy with tempo, loki and mimir all absent\n'
+  printf -- '-- 2. live: collector healthy with tempo and loki both absent\n'
 
   # An exporter pointed at a port on the loopback interface of a container that
   # has nothing listening on it. `connection refused` is the honest failure, and
@@ -175,21 +175,19 @@ services:
       KIT_OTEL_BATCH_SIZE: 16
       KIT_OTEL_METRIC_NAMESPACE: cafaye
       KIT_OTEL_METRICS_FLUSH_INTERVAL: 5s
-      # A URL, with a scheme, for the two `otlphttp` exporters — and that is not
+      # A URL, with a scheme, for the `otlphttp` exporter — and that is not
       # a style detail. The `otlphttp` component parses its endpoint as a URL
       # and the collector refuses to BUILD the pipeline if it has no scheme, so
-      # this test's old bare `127.0.0.1:4317` for loki and mimir made the
-      # collector exit(1) with `endpoint must be a valid URL`. That looked
-      # exactly like the bug this file exists to detect — a collector that
-      # cannot start without its backends — and it was the test's own env.
+      # this test's old bare `127.0.0.1:4317` for loki and the metrics store
+      # made the collector exit(1) with `endpoint must be a valid URL`. That
+      # looked exactly like the bug this file exists to detect — a collector
+      # that cannot start without its backends — and it was the test's own env.
       #
       # Port 9 (discard), not 4317: 4317 is the collector's own OTLP receiver,
       # so "nothing is listening" would have been false, and the test would
       # have been measuring a loopback to itself.
       KIT_TEMPO_OTLP_ENDPOINT: 127.0.0.1:9
       KIT_LOKI_OTLP_ENDPOINT: http://127.0.0.1:9/otlp
-      KIT_MIMIR_OTLP_ENDPOINT: http://127.0.0.1:9/otlp
-      KIT_MIMIR_TENANT: single-tenant
       KIT_OTEL_TLS_INSECURE: "true"
       KIT_OTEL_EXPORT_TIMEOUT: 1s
       KIT_OTEL_DEBUG_VERBOSITY: normal

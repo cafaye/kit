@@ -146,8 +146,15 @@ source = open(path, encoding="utf-8").read()
 # that fails on a rename is a test that will be "fixed" by renaming the thing it
 # was asserting about, so the names come from the parsed document and a rename
 # costs nothing here.
+#
+# The set is the two stores that ship. The metrics store's name was here once
+# and its exporter is gone, and this list is a filter over what may be
+# SUBSTITUTED rather than an assertion about what exists — so an absent name is
+# inert, which is why the removal needed no change here at all. It is removed
+# anyway, because a test naming a container the tree does not ship is a test
+# that reads as though it did.
 shipped = yaml.safe_load(source)
-BACKENDS = {"tempo", "loki", "mimir"}
+BACKENDS = {"tempo", "loki"}
 targets = [
     name
     for name in (shipped.get("exporters") or {})
@@ -303,7 +310,6 @@ services:
       KIT_OTEL_METRICS_FLUSH_INTERVAL: 5s
       KIT_TEMPO_OTLP_ENDPOINT: 127.0.0.1:4317
       KIT_LOKI_OTLP_ENDPOINT: 127.0.0.1:4317
-      KIT_MIMIR_OTLP_ENDPOINT: 127.0.0.1:4317
       KIT_OTEL_TLS_INSECURE: "true"
       KIT_OTEL_EXPORT_TIMEOUT: 1s
       KIT_OTEL_DEBUG_VERBOSITY: basic
