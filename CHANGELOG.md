@@ -13,6 +13,55 @@ it without a copy (see kit-12 below).
 
 ## Unreleased
 
+### Fixed — the credential audit told the cluster's own admin role it had found nothing
+
+- **`cafaye.credential_tables()` no longer reads a deparsed expression.** It
+  returned `public | api_keys | token_digest` as role `alpha` and **zero rows** as
+  role `cafaye` — same database, same policy — because `pg_get_expr` drops the
+  schema from a name the *reader's* `search_path` resolves, `"$user"` is a
+  `search_path` entry, and role `cafaye`'s own schema is the `cafaye` schema the
+  substrate creates. The function's regexp required the qualified spelling, so an
+  operator auditing credentials as the cluster's admin role was told this database
+  holds no table resolvable without an account. Its own comment had already warned
+  that *"an audit query that returns an empty column forever looks exactly like an
+  audit query that found nothing"*; the trap was never the regexp's strictness, it
+  was reading a pretty-printer's spelling at all.
+- **What it reads instead: `pg_depend`.** `CREATE POLICY` records the policy's own
+  `using` expression as dependencies — one `pg_proc` row for each function called
+  (`deptype = 'n'`) and one `pg_class` row per referenced column of the policy's
+  own table, with the column's `attnum` in `refobjsubid`. Both are OIDs, so the
+  answer is the same for every role and every `search_path`. Measured on 16.15 and
+  17; **not** on 15, kit's floor, because no 15 image was available to measure and
+  an unmeasured version is not a verified one.
+- **Semantics unchanged, in both directions, and measured.** A resolve-named policy
+  whose qualifier is not the digest call still does not appear; a hand-written
+  policy that mentions the digest under another name still does not appear; a
+  qualifier reading *another* table's column does not appear. A qualifier naming
+  **more than one** column of its own table cannot be narrowed to one — nothing
+  structural says which the digest is compared against — so that row is reported
+  with `'(unresolved)'` rather than with a NULL column, because a table named with
+  an unresolved column is an audit finding and a table absent from the audit is the
+  silence the function exists to prevent.
+- **Rejected: `(cafaye\.)?` in the pattern.** That is the quiet fix, it is what
+  `advisor.sql` does with its own regexps, and it is still a regexp over a
+  pretty-printer's output — it accepts two spellings of one name and stays silent
+  on a third, and the next reader cannot tell which spelling the audit saw.
+- **`tests/tenancy_test.sh` assertion 8** reads the audit as three roles — the
+  owner, the cluster's admin role, and the non-owner LOGIN role — and requires one
+  answer that is **non-empty**, because three roles agreeing on nothing proves only
+  that the audit has stopped working. Its control asserts the trap is still live on
+  this cluster (one policy, two renderings), so the property half cannot pass
+  vacuously.
+- **`advisor.sql` keeps reading the text, deliberately, and says so.** Its rules are
+  about what a predicate *says* — `using (true)` is invisible in every dependency
+  catalog — so `(cafaye\.)?` stays and the residual reader-dependence is listed
+  under that file's "what this does not find" rather than left to be inferred.
+  Its comments no longer claim the substrate's audit requires the qualified form,
+  which stopped being true.
+- Mechanism semantics do not change: only how this mechanism is **audited**.
+  `begin_credential/1`, the resolve policy, its predicate and the digest are
+  untouched.
+
 ### Added — the account boundary's own advisor: the database grades its own policies
 
 - **`templates/database/tenancy/advisor.sql`.** Eight row-level-security rules as
@@ -65,9 +114,10 @@ it without a copy (see kit-12 below).
   both forms, and says why. Requiring the qualified form alone would make
   `multiple_permissive_policies` report MD24's own policy as hand-written, and
   make `auth_rls_initplan` silently miss a bare call, to exactly the reader least
-  likely to know why. `cafaye.credential_tables()` reads the qualified form only
-  and returns nothing at all in that second session — a latent substrate issue,
-  recorded rather than fixed here, because `substrate.sql` was out of scope.
+  likely to know why. That sentence also named the latent defect this entry's
+  follow-up fixes: `cafaye.credential_tables()` read the qualified form only and
+  returned nothing at all in that second session. Recorded rather than fixed here,
+  because `substrate.sql` was out of scope.
 - `assertions.txt` is **unchanged**: the advisor answers a different question with a
   different row shape, and the manifest names `isolation.sql`'s assertions.
 - Gate shape: `tests/validate.sh` (the `.sql` parse-loop arm and the presence

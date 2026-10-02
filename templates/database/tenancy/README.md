@@ -202,6 +202,17 @@ Every other table reads zero rows.
    one query rather than by searching the source. It reads the policies, not a
    list, so it cannot be satisfied by a mechanism that records nothing.
 
+   **It answers the same to every role that asks**, which is a property it had to
+   be given rather than one it has by default. `pg_get_expr` deparses a name
+   unqualified whenever the *reader's* `search_path` resolves it, and `"$user"` is
+   a search_path entry — so an audit written against the rendered policy text
+   returns everything to the owner's role and **nothing at all** to the cluster's
+   admin role, whose `"$user"` schema is the `cafaye` schema itself. "This database
+   has no credential path" is the most expensive sentence in this file to be wrong
+   about, so the function resolves the digest function and the column it is
+   compared against from `pg_depend`, which records them as OIDs, and
+   `tests/tenancy_test.sh` reads it as three roles and requires one answer.
+
 ### What it was instead of, and why — `DECISIONS.md` (MD24)
 
 - **A `BYPASSRLS` role.** This is Supabase's answer, and it is right for Supabase's

@@ -121,8 +121,8 @@
 -- installed it — which is the service that needs it. So rule 5's recognition of a
 -- substrate-written policy, which is the one place the substrate's own naming
 -- convention appears, is inlined rather than delegated to
--- `cafaye.credential_tables()`. The duplication is four lines of regexp and the
--- comment above each says which catalog it reads.
+-- `cafaye.credential_tables()`. What is duplicated is the two PREDICATE SHAPES,
+-- and the comment above each says which catalog it reads.
 --
 -- ---------------------------------------------------------------------------
 -- WHAT THIS DOES NOT FIND, because a rule that reads as a promise it cannot keep
@@ -145,6 +145,22 @@
 --       RUNNING the denials as the owner, because a catalog reading can be
 --       satisfied by a table nobody reads. One file claiming all three would
 --       mean one file where a reader looks for the proof and finds a column.
+--
+--   * THAT ITS OWN ANSWER IS THE SAME FOR EVERY ROLE. Every rule here reads
+--       `pg_get_expr`, which deparses a name unqualified whenever the READER's
+--       `search_path` resolves it, so this function's findings are a function of
+--       who runs it. Both spellings are accepted above, which is a mitigation and
+--       not a fix: the shape `(cafaye\.)?` accepts is one narrow family, and a
+--       third spelling would be missed rather than reported.
+--       `substrate.sql`'s `credential_tables()` had the same defect in the worst
+--       possible form — it reported NO credential table at all to the role whose
+--       `"$user"` schema is `cafaye` — and it no longer does, because it resolves
+--       the same facts from `pg_depend`. That function can do that here too and
+--       does not: these rules are about what a predicate SAYS, and the predicate
+--       `using (true)` is invisible in every dependency catalog. Closing this
+--       properly means deciding what a rule claims when it cannot see the text,
+--       which is a change to the RULES and not to a regexp — deliberately out of
+--       scope here, and written down rather than left for a reader to infer.
 
 -- ---------------------------------------------------------------------------
 -- rule 5's exemption, stated here because it is the only judgement in this file
@@ -229,9 +245,7 @@ api_roles as (
 --     — its own capitalisation, spacing and generated alias. Every regexp below
 --     is written against the RENDERED form, and a regexp written against the
 --     executed form matches nothing here and looks for ever afterwards like a
---     rule that found nothing. This is the trap `substrate.sql` records beside
---     `credential_tables()`, and it is why that function's pattern is copied
---     below rather than reinvented.
+--     rule that found nothing.
 --
 --     AND THE SCHEMA QUALIFICATION IN THAT OUTPUT IS NOT FIXED, which is a
 --     measurement rather than a caveat. `pg_get_expr` drops the schema from a
@@ -248,16 +262,26 @@ api_roles as (
 --
 --     `"$user"` is the whole mechanism, and it means the cluster's own admin
 --     role — the one named after the platform — reads the substrate's policies in
---     the short form. `cafaye.credential_tables()` returns nothing at all in that
---     session, for exactly this reason.
+--     the short form.
 --
 --     So every regexp below accepts BOTH forms, and the comment says why rather
---     than leaving `(cafaye\.)?` looking like sloppiness. The alternative — match
---     the qualified form only, as the substrate does — makes rule 5 report MD24's
---     credential policy as a hand-written one to exactly the reader least likely
---     to know why, and makes rule 7 silently miss a bare call for the same
---     reader. A rule that is blind under one search_path is the defect this
---     comment exists to prevent.
+--     than leaving `(cafaye\.)?` looking like sloppiness. Requiring the qualified
+--     form alone makes rule 5 report MD24's credential policy as a hand-written
+--     one to exactly the reader least likely to know why, and makes rule 7
+--     silently miss a bare call for the same reader. A rule that is blind under
+--     one search_path is the defect this comment exists to prevent.
+--
+--     `substrate.sql`'s `credential_tables()` had exactly this defect and no
+--     longer has it: it read a regexp over this text and returned NOTHING to the
+--     `cafaye` role while returning everything to `alpha`, which is an audit
+--     telling the cluster's own admin role that this database holds no credential
+--     path. It now resolves the same two facts from `pg_depend` — OIDs rather
+--     than spelling — and `tests/tenancy_test.sh` asserts all three roles get one
+--     answer. THIS FILE STILL READS THE TEXT, because every rule here is about
+--     what a predicate SAYS (`using (true)` is a predicate no dependency catalog
+--     records as anything but a boolean), so `(cafaye\.)?` stays and the residual
+--     limitation is listed under "what this does not find" rather than left for a
+--     reader to infer.
 policies as (
   select n.nspname,
          c.relname,
@@ -326,11 +350,7 @@ policy_cmds as (
 --     shape is `protect_credential_table`'s, and it is checked against the
 --     DIGEST FORM rather than against the digest COLUMN, because the column is
 --     the adopter's choice and the form is the substrate's. Both shapes carry
---     `(cafaye\.)?` for the `search_path` reason recorded above, and it is worth
---     being blunt about the asymmetry: the substrate's own `credential_tables()`
---     requires the qualified form, so this function recognises more policies than
---     that one does. That is the right direction to err — over-recognising a
---     substrate policy leaves a hand-written one still reported.
+--     `(cafaye\.)?` for the `search_path` reason recorded above.
 substrate_written as (
   select pc.*,
          (pc.qual ~* '^\s*\(?account_id = \(\s*select (cafaye\.)?current_account_id\(\)'

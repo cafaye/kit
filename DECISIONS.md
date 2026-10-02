@@ -574,7 +574,13 @@ table. That is asserted, not argued: `credential/resolution-cannot-browse` and
 5. **Runtime audit is Postgres's job, not this one's.** What is auditable here is
    the *scope*: `cafaye.credential_tables()` names every table carrying a
    resolution path, so "which tables in this database can be read without an
-   account" is one query and not a code search. Auditing *who* resolved is not
+   account" is one query and not a code search. It answers that **the same to
+   every role that asks**, which it has to be given rather than have by default:
+   the audit reads the policy's dependencies (`pg_depend`), not its rendered text,
+   because `pg_get_expr` deparses a name unqualified whenever the *reader's*
+   `search_path` resolves it and `"$user"` is a `search_path` entry — the version
+   that read the text reported no credential table at all to the cluster's own
+   admin role, whose `"$user"` schema is `cafaye`. Auditing *who* resolved is not
    claimed — the GUC is transaction-local and leaves nothing behind, and a claim
    kit cannot honour is a comment pretending to be a control.
 

@@ -104,7 +104,7 @@
         },
         {
           "token": "create or replace function cafaye.credential_tables",
-          "why": "THE AUDIT, and the reason the mechanism\u2019s scope is auditable rather than ambient: one query answers \u2018which tables in this database can be read with no account\u2019. It reads the POLICIES rather than a list, so it cannot be satisfied by a mechanism that records nothing. It deliberately does NOT answer who resolved \u2014 the digest is transaction-local \u2014 because a claim this file cannot honour is a comment pretending to be a control."
+          "why": "THE AUDIT, and the reason the mechanism\u2019s scope is auditable rather than ambient: one query answers \u2018which tables in this database can be read with no account\u2019. It reads the POLICIES rather than a list, so it cannot be satisfied by a mechanism that records nothing, and it reads them through pg_depend rather than through pg_get_expr, so the answer does not depend on the reader\u2019s search_path \u2014 the dependence that made this audit report NO credential table at all to the one role whose \"$user\" schema is cafaye. It deliberately does NOT answer who resolved \u2014 the digest is transaction-local \u2014 because a claim this file cannot honour is a comment pretending to be a control."
         },
         {
           "token": "not c.relforcerowsecurity",
