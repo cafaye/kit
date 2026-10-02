@@ -12,6 +12,77 @@ it without a copy (see kit-12 below).
 > `workflows/ci.reusable.yml` until the move recorded in Unreleased/Changed.
 
 ## Unreleased
+### Added — `security_definer_view`, the one ERROR/SEC rule the advisor never carried
+
+- **`templates/database/tenancy/advisor.sql` gains a ninth rule**, and the header
+  now says ten where it said nine. Postgres gives a view the privileges **and the
+  row-level-security exemption** of the role that created it, so a view over an
+  account-scoped table enforces the policies that apply to its *owner* — and a
+  policy that applies to the owner is not a policy, because the owner bypasses its
+  own policies unless the table is `FORCE`d. Writing a view over `account_users`
+  is a way to hand every caller who can reach it every account's rows, and it reads
+  in review as a `SELECT`.
+- **It matters more here than in the Supabase reference it comes from
+  (`lints.ts:604-614`, ERROR / SECURITY), and that is the whole reason the rule
+  exists.** kit's model is per-service `NOINHERIT` login roles that **own** their
+  tables, so "the owner is exempt from its own policies" is not a corner case of
+  the definer model — it is every table in the fleet. A definer view here is a
+  hole, and before this there was **no lint anywhere in the fleet watching for
+  it**.
+- **Three narrowings, each the difference between a rule that is trusted and one
+  that gets switched off.** A view with `security_invoker = true` is not this
+  finding — that is the remedy. A view that reads **no** table with row-level
+  security is not this finding, or the rule becomes "every view in the schema is
+  an ERROR". A view no login role can `SELECT` is not this finding;
+  `has_table_privilege`, not a grant scan, for rule 2's reason that a grant is not
+  the capability.
+- **The dependency graph is walked transitively through views.** A view over a
+  view is the *same* hole: Postgres evaluates the outer view with the outer
+  view's owner's privileges and no hop in the chain puts a caller's policies back
+  in force. A rule that stopped at the first hop would report the inner view and
+  stay silent about the one a caller actually queries. The walk **stops at an
+  invoker view**, which is the entire meaning of the flag.
+- **The remediation is branched on the server version**, because
+  `security_invoker` arrived in Postgres 15. Below it the option does not exist,
+  every view is a definer view, every finding is true and none is clearable —
+  so printing `ALTER VIEW … SET (security_invoker = true)` there would hand out a
+  remediation that cannot execute, which is the one thing that column must never
+  do. This fleet floors at PG15, so the branch is unreachable on kit's own
+  cluster; it is written anyway, because a rule that means something different on
+  two supported server versions is not a rule to be trusted on either.
+- **Two Postgres behaviours measured rather than assumed, and both would have been
+  silent:**
+  - `pg_depend` records one row per *(rewrite rule, reference)*, so a view that
+    names a table twice in its body reported it twice — `{plain, plain}` for one
+    relation. `DISTINCT` in both the detail and the metadata.
+  - **`pg_class.reloptions` is stored verbatim and the boolean is not
+    canonicalised.** `security_invoker = on` is stored as `on`, `= true` as
+    `true`, `= off` as `off`. The chain-stop hop was first written as an equality
+    test against the literal `security_invoker=true` and it **missed the `on`
+    spelling** — which is the spelling `core`'s own conforming fixture uses
+    (`harness/tests/fixtures/tenancy/conforming/migrations/0002_rls.sql:89`). It
+    would have walked straight past a view whose policies were already in force
+    and reported a chain as broken that is not. Both spellings are now asserted.
+
+### Added — the advisor and the fixtures that trip its rules were compared by nothing
+
+- **`tests/validate.sh`'s tenancy contract check now compares rule NAMES, both
+  ways.** `advisor.sql` is the only thing in the account boundary that grades the
+  **live** database, every rule in it is proved by a fixture in
+  `tests/tenancy_test.sh`, and `--static-only` runs neither — so nothing compared
+  the two lists. A rule renamed, or its trip fixture renamed with it, left every
+  static check green while the suite proved a rule that no longer existed.
+  Over **names** rather than counts, because nine rules and nine fixtures that do
+  not correspond is exactly the state this exists to make impossible.
+- **`self_test` breakage 93** is the recipe. Its first version mutated the rule's
+  `having` clause — the condition requiring the view to read something protected —
+  on the theory that a rule which no longer narrows would be visible to the new
+  check. **Measured: the gate stayed green**, because a check that compares names
+  cannot see a rule that is present, correctly named and no longer selective. The
+  recipe now mutates the name, and says plainly which file proves which property:
+  `tests/tenancy_test.sh` proves the rule fires and does not misfire; the static
+  check proves the advisor and its proof agree. Neither substitutes for the other.
+
 ### Fixed — the credential audit told the cluster's own admin role it had found nothing
 
 - **`cafaye.credential_tables()` no longer reads a deparsed expression.** It
