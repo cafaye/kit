@@ -25,119 +25,19 @@ apiVersion: 1
 
 groups:
   # ------------------------------------------------------------ fleet health
-  - orgId: 1
-    name: cafaye-fleet
-    folder: cafaye
-    interval: 1m
-    rules:
-      # The one that matters, and the smallest useful expression of §7b: the
-      # predicate is status, partitioned by service, so a developer sees which
-      # service is failing without opening six dashboards.
-      - uid: cafaye-fleet-error-ratio
-        title: "Fleet error ratio above 5%"
-        condition: C
-        for: 5m
-        annotations:
-          summary: "{{ $labels.service_name }} is failing {{ $value | humanizePercentage }} of requests"
-          description: >-
-            Span status Error over 5 minutes, partitioned by service. The
-            predicate is span STATUS, not error.type: error.type is a
-            drill-down inside a service, never a fleet-wide grouping key.
-        labels:
-          severity: warning
-          cafaye_layer: fleet
-        data:
-          - refId: A
-            relativeTimeRange:
-              from: 600
-              to: 0
-            datasourceUid: mimir
-            model:
-              refId: A
-              expr: sum by (otel_status_code) (rate(cafaye_calls_total[5m]))
-              instant: false
-              intervalMs: 15000
-              maxDataPoints: 20000
-          - refId: B
-            relativeTimeRange:
-              from: 600
-              to: 0
-            datasourceUid: mimir
-            model:
-              refId: B
-              expr: sum by (otel_status_code) (rate(cafaye_calls_total[5m]))
-              instant: false
-              intervalMs: 15000
-              maxDataPoints: 20000
-          - refId: C
-            relativeTimeRange:
-              from: 0
-              to: 0
-            datasourceUid: __expr__
-            model:
-              refId: C
-              type: threshold
-              expression: A
-              conditions:
-                - evaluator:
-                    params: [5, 0]
-                    type: gt
-                  operator:
-                    type: and
-                  query:
-                    params: [B, 5m, now]
-                  reducer:
-                    params: []
-                    type: last
-                  type: query
-
-      # A service that stopped reporting. Distinct from an error ratio, and the
-      # one people miss: a service that is fully down has an error ratio of
-      # nothing, because it is not serving.
-      - uid: cafaye-service-silent
-        title: "A service has exported no spans for 10 minutes"
-        condition: C
-        for: 0m
-        annotations:
-          summary: "{{ $labels.service_name }} has exported no spans for 10 minutes"
-          description: >-
-            A fully-down service has an error ratio of nothing, because it is
-            not serving. Silence is its own signal and needs its own rule.
-        labels:
-          severity: warning
-          cafaye_layer: fleet
-        data:
-          - refId: A
-            relativeTimeRange:
-              from: 600
-              to: 0
-            datasourceUid: mimir
-            model:
-              refId: A
-              expr: sum by (service_name) (rate(cafaye_calls_total[10m]))
-              instant: true
-              intervalMs: 60000
-          - refId: C
-            relativeTimeRange:
-              from: 0
-              to: 0
-            datasourceUid: __expr__
-            model:
-              refId: C
-              type: threshold
-              expression: A
-              conditions:
-                - evaluator:
-                    params: [0.0001]
-                    type: lt
-                  operator:
-                    type: and
-                  query:
-                    params: [A, 10m, now]
-                  reducer:
-                    params: []
-                    type: last
-                  type: query
+  # The PROMETHEUS ALERT GROUP IS GONE WITH THE METRICS STORE, deliberately,
+  # and an empty group is not what shipped: a group with no rules is a group
+  # Grafana rejects or silently discards, and one that survived with two dead
+  # rules would be worse than either — an alert that can never fire is a
+  # folder that looks like coverage.
+  #
+  # `cafaye_calls_total` is still DERIVED by the collector's spanmetrics
+  # connector and still passes the same redaction allowlist. It has nowhere
+  # to be QUERIED because Mimir cost 130s of readiness budget per cold start
+  # and was removed rather than left half-wired. Restoring these two rules is
+  # one `datasourceUid`, one exporter and one pipeline line.
+  #
+  # The group below reads loki and is unaffected.
 
   # ------------------------------------------------------ the redaction check
   # Not an error-rate rule. A rule that fires when prompt-shaped ATTRIBUTES

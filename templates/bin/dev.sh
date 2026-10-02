@@ -455,7 +455,6 @@ stack_is_usable() {
     [ -f "$dir/templates/compose/otel-collector.yml" ] &&
     [ -d "$dir/templates/compose/tempo" ] &&
     [ -d "$dir/templates/compose/loki" ] &&
-    [ -d "$dir/templates/compose/mimir" ] &&
     [ -d "$dir/templates/compose/grafana/provisioning" ]
 }
 
@@ -572,7 +571,7 @@ resolve_stack() {
     fi
     if ! stack_is_usable "$vendor" "$ref"; then
       die "$vendor records $ref but is missing files the stack mounts
-   (templates/compose/{docker-compose,otel-collector}.yml, tempo/, loki/, mimir/,
+   (templates/compose/{docker-compose,otel-collector}.yml, tempo/, loki/,
    grafana/provisioning/). Re-vendor it rather than starting a stack that will die
    four containers later on a bind mount."
     fi
@@ -998,10 +997,15 @@ print_urls() {
   # ones. A printed URL that does not resolve is worse than none, and the whole
   # point of kit's claimed port block is that these are NOT the well-known
   # numbers, so hardcoding them here would print the one address that is wrong.
+  #
+  # AND ONLY IF THAT PROFILE IS ACTUALLY ON. Printing a URL for a backend that
+  # `compose ps` will not list is a printed lie: a developer pastes 15900 into a
+  # browser on the default path, gets connection refused, and concludes the
+  # stack is broken. So the observability block is conditional on
+  # KIT_DEV_PROFILES — which is the whole point of the default having flipped.
   local pg_port="${KIT_POSTGRES_PORT:-15500}"
   local nats_port="${KIT_NATS_CLIENT_PORT:-15600}"
   local redis_port="${KIT_REDIS_PORT:-15800}"
-  local grafana_port="${KIT_GRAFANA_PORT:-15000}"
   local pg_user="${KIT_POSTGRES_USER:-cafaye}"
   local pg_pass="${KIT_POSTGRES_PASSWORD:-cafaye}"
   local pg_db="${KIT_POSTGRES_DB:-cafaye_platform}"
@@ -1012,17 +1016,30 @@ print_urls() {
    nats         nats://localhost:$nats_port
    redis        redis://localhost:$redis_port
 
-   grafana      http://localhost:$grafana_port        (traces, metrics, errors)
-   tempo        http://localhost:${KIT_TEMPO_PORT:-15900}
-   loki         http://localhost:${KIT_LOKI_PORT:-15901}
-   mimir        http://localhost:${KIT_MIMIR_PORT:-15902}
-
    otel (otlp)  http://otel-collector:${KIT_OTEL_HTTP_PORT:-4318}   (compose network only)
 
    service      ${KIT_DEV_SERVICE_URL:-http://localhost:3000}
+URLS
+
+  if [ -n "$KIT_DEV_PROFILES" ]; then
+    cat <<URLS
+
+   grafana      http://localhost:${KIT_GRAFANA_PORT:-15000}        (traces, logs, errors)
+   tempo        http://localhost:${KIT_TEMPO_PORT:-15900}
+   loki         http://localhost:${KIT_LOKI_PORT:-15901}
+URLS
+  else
+    cat <<URLS
+
+   (no observability backends: this run started the cheap stack. For grafana,
+   tempo and loki:  KIT_DEV_PROFILES=observability bin/dev up)
+URLS
+  fi
+
+  cat <<URLS
 
    Nothing leaves this machine unless you point it somewhere. To use your own
-   backend instead of the four above, set <SERVICE>_OTEL_ENDPOINT in your own
+   backend instead of the ones above, set <SERVICE>_OTEL_ENDPOINT in your own
    .env — that is the only contract, and the shipped collector is just its
    default value. Unset the variable and the exporter is a genuine no-op: no
    queue, no retry loop, no warning per request, no dial at boot.

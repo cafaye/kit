@@ -26,7 +26,8 @@
 #
 #   That is a reversal, and the numbers are why. As defaults they cost every
 #   developer's first run: grafana downloading a plugin zip on first boot
-#   (20s once, over 180s another time), 130s of Mimir readiness budget, 65s of
+#   (20s once, over 180s another time), 130s of the metrics store's readiness
+#   budget before it was removed, 65s of
 #   Tempo's, 16s of Loki's — against a 180s deadline for the whole stack. A
 #   default that taxes everyone's startup to serve a view they did not open is
 #   a default that gets switched off fleet-wide, and the telemetry goes with it.
@@ -186,7 +187,6 @@ volumes:
   # removes them and `bin/dev down` keeps them, with no special-casing.
   tempo-data:
   loki-data:
-  mimir-data:
   grafana-data:
 
 services:
@@ -474,11 +474,25 @@ services:
       KIT_OTEL_METRICS_FLUSH_INTERVAL: ${KIT_OTEL_METRICS_FLUSH_INTERVAL:-15s}
       KIT_TEMPO_OTLP_ENDPOINT: ${KIT_TEMPO_OTLP_ENDPOINT:-tempo:4317}
       KIT_LOKI_OTLP_ENDPOINT: ${KIT_LOKI_OTLP_ENDPOINT:-http://loki:3100/otlp}
-      # HTTP, on the gateway. 9009 is not listening on this build and 9095 is
-      # the ingester ring, not OTLP — see the note on `otlphttp/mimir`.
-      KIT_MIMIR_OTLP_ENDPOINT: ${KIT_MIMIR_OTLP_ENDPOINT:-http://mimir:8080/otlp}
-      KIT_MIMIR_TENANT: ${KIT_MIMIR_TENANT:-single-tenant}
-      # The three backends speak plaintext OTLP to each other inside the
+      # TWO backends now, not three, and the one that left is worth a note.
+      #
+      # THERE IS NO METRICS ENDPOINT VARIABLE ANY MORE. The metrics store cost
+      # 130 seconds of readiness budget per cold start (its own healthcheck:
+      # retries 12 x interval 10s), against a 180s deadline for the whole stack,
+      # and 384m of memory — for a set of series this fleet does not have, on a
+      # machine that is also running a compiler and a browser. It is REMOVED,
+      # not disabled: no service, no volume, no port, no `mimir.yaml`, and — the
+      # part that matters — no collector exporter still dialling `mimir:8080`.
+      # An exporter pointed at a host with nothing behind it is a connection
+      # refused per flush, forever, in a log nobody reads.
+      #
+      # The metrics pipeline still DERIVES span metrics, still runs the full
+      # redaction allowlist and the ingest deny set over them, and exports them
+      # to the collector's own stdout. Restoring a store is one endpoint variable
+      # here, one exporter block in `otel-collector.yml`, one `exporters:` line
+      # on the metrics pipeline, and one datasource in Grafana's provisioning.
+      #
+      # The two remaining backends speak plaintext OTLP to each other inside the
       # compose network. A self-hoster who terminates TLS does it here, and a
       # literal endpoint never appears in the collector config.
       KIT_OTEL_TLS_INSECURE: ${KIT_OTEL_TLS_INSECURE:-true}
@@ -622,51 +636,6 @@ services:
       # kit-02's 6 retries at 10s looked more generous and was not.
       retries: 12
       start_period: 5s
-    profiles: [observability]
-    networks: [platform]
-
-  # --------------------------------------------------------------------- mimir
-  mimir:
-    image: grafana/mimir:${KIT_MIMIR_TAG:-2.13.0}
-    # Single-binary mode. The distroless Mimir image has no shell, so there is
-    # no `command` array trickery here beyond the two flags it needs.
-    # `-ingester.ring.replication-factor=1` and it is not optional. Mimir's
-    # ring defaults to 3 replicas, a single-binary dev stack has one ingester,
-    # and every metrics write is then rejected with "at least 2 live replicas
-    # required, could only find 1" — a message that reads like a broken cluster
-    # rather than a default sized for one. There is no config key for it; both
-    # `limits.ingestion_replication_factor` and a `distributor:` block were
-    # tried against grafana/mimir:2.13.0, and both parse and change nothing.
-    command:
-      - "-target=all"
-      - "-ingester.ring.replication-factor=1"
-      - "-config.file=/etc/mimir/mimir.yaml"
-    volumes:
-      - ${KIT_COMPOSE_DIR:-.}/mimir/mimir.yaml:/etc/mimir/mimir.yaml:ro
-      - mimir-data:/mimir
-    ports:
-      - "${KIT_MIMIR_PORT:-15902}:8080"
-    mem_limit: ${KIT_MIMIR_MEMORY_LIMIT:-384m}
-    healthcheck:
-      # `/bin/mimir`, not `/mimir`: the data directory is mounted at /mimir, so
-      # the bare path is a DIRECTORY and exec fails with "is a directory:
-      # permission denied" on every probe. The whole stack came up 120s and then
-      # reported one unhealthy service for that reason, which is exactly the
-      # "slow and fragile dev loop" this packet is not allowed to ship.
-      #
-      # What it actually proves, stated plainly: the binary runs and the config
-      # parsed. It does NOT prove the distributor is ready to receive metrics,
-      # which is what `/-/ready` would prove. Mimir's image is distroless — no
-      # shell, no wget, no curl — and adding one is a `build:` stanza, which the
-      # AGPL unmodified condition forbids. So this is the strongest probe
-      # available without forking the image, and the gap is recorded in the
-      # report rather than papered over. In practice the two failures differ:
-      # a config that does not parse is the one this has produced.
-      test: ["CMD", "/bin/mimir", "-version"]
-      interval: 10s
-      timeout: 10s
-      retries: 12
-      start_period: 10s
     profiles: [observability]
     networks: [platform]
 

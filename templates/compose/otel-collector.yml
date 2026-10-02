@@ -18,9 +18,11 @@
 #      twins — so the coverage is legible and so a later widening is a line
 #      somebody read. Not one of those names is ever a metric label, on the
 #      cheap default path or the full one.
-#   4. Fans out: traces to Tempo, logs to Loki, metrics to Mimir. Metrics
-#      come from the `spanmetrics` connector, so they are derived from spans
-#      that have ALREADY been redacted.
+#   4. Fans out: traces to Tempo, logs to Loki, and metrics to this process's own
+#      stdout. Metrics come from the `spanmetrics` connector, so they are derived
+#      from spans that have ALREADY been redacted — and there is deliberately no
+#      metrics STORE (see the note above the `debug` exporter: it cost 130s of
+#      readiness budget per cold start and was removed rather than half-removed).
 #
 # THIS CONFIG IS DERIVED, NOT INVENTED
 #   Every `allowed_keys` list below is a projection of core's schemas, and
@@ -815,34 +817,31 @@ exporters:
       enabled: false
     timeout: ${env:KIT_OTEL_EXPORT_TIMEOUT}
 
-  # `otlphttp`, not `otlp`, for BOTH Mimir and Loki — and the reason is
-  # measured rather than preferred.
+  # THERE IS NO METRICS EXPORTER, AND THAT IS A DECISION RATHER THAN A GAP.
   #
-  # Mimir's ports on grafana/mimir:2.13.0 in `-target=all`:
+  # The metrics store was 130 seconds of readiness budget per cold start and
+  # 384m of memory — against a 180s deadline for the whole stack — for a fleet
+  # that does not have the series to put in it. It is removed from the stack,
+  # and removing it means removing this exporter too: an exporter pointed at a
+  # host with nothing behind it is a connection refused on every flush, forever,
+  # in a log nobody reads. That is the "half-removed backend" this file will not
+  # ship.
   #
-  #   8080  the gateway. `/ready`, `/prometheus/api/v1/...`, and the OTLP
-  #         **HTTP** endpoint at `/otlp/v1/metrics`. Answers 401 with no tenant.
-  #   9009  the classic Prometheus port. NOT LISTENING on this build.
-  #   9095  the ingesters' gRPC — which is the RING, not OTLP. A gRPC OTLP
-  #         exporter pointed here fails with
-  #         `Unimplemented desc = unknown service
-  #         opentelemetry.proto.collector.metrics.v1.MetricsService`, which is
-  #         the most confusing possible "your backend is down" message: the
-  #         connection succeeds and the service does not exist.
+  # SO THE METRICS PIPELINE BELOW STILL RUNS. Span metrics are still derived by
+  # the `spanmetrics` connector, still pass `redaction/cafaye_metrics`, still
+  # pass `transform/cafaye_metrics_ingest_drop`, and are exported to `debug` —
+  # this process's own stdout, on the machine already running it, which cannot
+  # reach the network and costs nothing. That is not a consolation prize: it is
+  # what keeps the allowlist EXERCISED on real derived metrics rather than only
+  # asserted about, and `KIT_OTEL_DEBUG_VERBOSITY=basic` mutes it.
   #
-  # So Mimir takes OTLP over HTTP on the gateway, and a tenant header, because
-  # Mimir is multi-tenant and a write with no `X-Scope-OrgID` is a 401.
-  # `single-tenant` matches the Tempo `overrides.defaults` key and is the one
-  # tenant a single-binary dev stack has.
-  otlphttp/mimir:
-    endpoint: ${env:KIT_MIMIR_OTLP_ENDPOINT}
-    headers:
-      X-Scope-OrgID: ${env:KIT_MIMIR_TENANT}
-    sending_queue:
-      enabled: false
-    retry_on_failure:
-      enabled: false
-    timeout: ${env:KIT_OTEL_EXPORT_TIMEOUT}
+  # PUTTING A STORE BACK IS THREE EDITS, and they belong together — a store with
+  # no exporter collects nothing, and an exporter with no store dials nothing:
+  #   1. an `otlp/<store>` exporter here, endpoint a `${env:...}`;
+  #   2. `exporters: [<it>]` on the metrics pipeline below, keeping `debug` or
+  #      dropping it deliberately;
+  #   3. the store's service, volume and `KIT_*` endpoint variable in the compose
+  #      file, plus its datasource in Grafana's provisioning.
 
   # The local escape hatch, and the reason a developer can see a span
   # without opening Grafana. It writes to this process's stdout on the machine
@@ -917,7 +916,10 @@ service:
         - transform/cafaye_metrics_labels
         - transform/cafaye_resource_restore
         - batch
-      exporters: [otlphttp/mimir]
+      # `debug`, not a store. See the note above `debug` for why there is no
+      # metrics exporter and what it takes to put one back — and why the pipeline
+      # runs at all rather than being deleted with the store it used to feed.
+      exporters: [debug]
 
     logs:
       # otlp for an SDK's own records — including the exception log record
