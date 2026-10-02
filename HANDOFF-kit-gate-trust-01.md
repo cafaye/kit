@@ -224,10 +224,15 @@ print the count.
 
 ## Commits
 
-1. `bad1391` — **defect 1**: the shard arithmetic, the `i`/`n` refusals, and
-   `tests/shard_test.sh`.
-2. **defect 2 + the two new breakages + `validate.sh` wiring + CHANGELOG** — see
-   `git log` for the sha; it is the tip of `worker/kit-gate-trust-01`.
+| sha | what |
+| --- | --- |
+| `bad1391` | defect 1: the shard arithmetic, the `i`/`n` refusals, `tests/shard_test.sh` |
+| `4471d07` | defect 2: the canary fix + breakages 94/95 + `validate.sh` wiring + README + CHANGELOG |
+| `defd844` | the truncation fix for `shard_test.sh`'s findings, and this handoff |
+
+Worktree clean. `tests/shard_test.sh` is new and executable;
+`tests/canary_test.sh` gains no dependency. No pin, threshold, allowlist or
+backend was touched, and no check was weakened.
 
 ## Open questions
 
