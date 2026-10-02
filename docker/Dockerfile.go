@@ -11,11 +11,15 @@
 #     (sqlite, DNS resolution), re-test before you ship it.
 #   - The build context is the service root, so `COPY . .` sees go.mod. Set
 #     working-dir in the CI caller if the module lives in a subdirectory.
-#   - The final stage runs non-root, as uid/gid 65532. There is no passwd entry
-#     for that uid in this base, which is fine and is the point: `USER 65532:65532`
-#     is numeric, so the kernel enforces it and nothing in the image can widen
-#     it. A container running as root is a container where a bug is a host
-#     compromise.
+#   - The final stage runs non-root, as a numeric uid/gid directive (65532:65532).
+#     The base ships no unprivileged account, which is fine and is the point: a
+#     numeric directive is enforced by the kernel and nothing in the image can
+#     widen it, where a named user is a name the base may not have. A container
+#     running as root is a container where a bug is a host compromise.
+#     (This note deliberately does not QUOTE that directive. A comment that
+#     repeats an instruction verbatim gives `tests/self_test.sh`'s `edit` — which
+#     replaces the FIRST occurrence — a comment to mutate instead of the
+#     instruction, and breakage 12 stayed green for exactly that reason.)
 #
 #   - THE RUNTIME BASE IS DEBIAN-SLIM AND NOT DISTROLESS, and that is a change
 #     this file used to argue the other way. It is here because the image now

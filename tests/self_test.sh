@@ -1740,6 +1740,16 @@ twelve="$(fresh_copy dockerfile-as-root)"
 # run. Which is the right outcome, and the reason this comment exists: a recipe
 # whose subject moved is a proof of nothing, and the loud version of that is
 # better than the quiet version but is still a red gate.
+#
+# AND THE STRING MUST APPEAR EXACTLY ONCE IN THE FILE. `edit` replaces the FIRST
+# occurrence, so when the Go template's STRICTNESS NOTES still quoted that
+# directive while explaining why it was numeric, this recipe removed the QUOTE
+# and left the instruction — and breakage 12 reported "the gate stayed GREEN",
+# which is a proof of nothing wearing a proof's label. The notes were reworded
+# not to repeat an instruction verbatim; that is the durable half of the fix, and
+# the reason is general: a comment that copies an instruction is a mutation a
+# check can be aimed at instead of the instruction. The same file already records
+# the mirror-image lesson, "a check that a comment can satisfy is not a check".
 edit "$twelve/docker/Dockerfile.go" 'USER 65532:65532' '# USER removed'
 expect_red_check 'breakage 12: a Dockerfile final stage runs as root' \
   "$twelve" "$DOCKERLINT" --static-only
