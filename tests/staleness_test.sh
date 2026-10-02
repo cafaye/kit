@@ -630,19 +630,82 @@ _fixture_expected="current-svc diverged-svc absent-svc halfstack-svc undeclared-
 # a fully-adopted fixture broken. The JSON carries every cell, so it answers
 # "was this service measured" without depending on what the report chooses to
 # print.
+# "COULD NOT BE MEASURED" IS A VERDICT, AND IT HAS A SPELLING.
+#
+# This harness runs the reporter ITSELF, in a command substitution, and parses
+# what came back with `json.loads` — so a reporter that failed, printed a
+# traceback, or wrote nothing left `json.loads("")` to raise
+# JSONDecodeError, and a raise inside `$( … )` under `set -euo pipefail` takes
+# the whole suite down with it. The suite died with a traceback where a reader
+# needed a sentence, which is the opposite of what every other case here does
+# and the reason REPORT-kit-20's §7 flagged it.
+#
+# So the child never raises. It answers in exactly one shape: either the list of
+# services the fixture lost, or the literal word `UNMEASURABLE:` followed by why
+# — and the shell turns the second into a named FAIL with prose, beside the
+# FAIL it already raises for a fixture that lost a service. It is a FAIL and not
+# a SKIP for the reason its sibling is a FAIL: this is not a claim about the
+# ENVIRONMENT (nothing here is missing a toolchain), it is a harness that
+# measured something other than what its cases assert on, and a harness in that
+# state has proved nothing. A SKIP would be the worse answer precisely because it
+# is the one a reader has learned to ignore.
+#
+# The three things that are checked, and why each is a separate exit:
+#   returncode — a reporter that failed has no output to parse, and reading past
+#     a failure is how a traceback gets mistaken for a result.
+#   JSON       — `JSONDecodeError` subclasses `ValueError`, so one `except`
+#     catches a truncated document and a non-JSON one alike.
+#   `cells`    — a well-formed document with no `cells` key, or with one that is
+#     not a list, is the fail-closed case this repository argues for everywhere
+#     else: the cheap answer would be to treat it as "measured nothing", and
+#     that would report a broken reporter as a clean fleet.
 _fixture_gone=$(
   "$PY" - "$TPL" "$STALE" "$_fixture_expected" <<'PY'
 import json, os, subprocess, sys
+
 tpl, stale = sys.argv[1], sys.argv[2]
 expected = sys.argv[3].split()
 out = subprocess.run(
     [sys.executable, stale, "--repos-dir", tpl, "--scope", "templates",
      "--allowlist", os.path.join(tpl, "parity-allowlist"), "--json"],
     capture_output=True, text=True)
-measured = {c["repo"] for c in json.loads(out.stdout)["cells"]}
+if out.returncode != 0:
+    first = (out.stderr or out.stdout or "").strip().splitlines()
+    print(f"UNMEASURABLE: the reporter exited {out.returncode}"
+          + (f": {first[0]}" if first else " with no output at all"))
+    sys.exit(0)
+try:
+    payload = json.loads(out.stdout)
+except ValueError as exc:
+    first = out.stdout.strip().splitlines()
+    print(f"UNMEASURABLE: the reporter's stdout was not JSON ({exc})"
+          + (f"; it began {first[0][:80]!r}" if first else "; it was empty"))
+    sys.exit(0)
+cells = payload.get("cells") if isinstance(payload, dict) else None
+if not isinstance(cells, list):
+    print("UNMEASURABLE: the reporter's JSON carries no `cells` list, so no cell "
+          "could be counted. Treated as unmeasured rather than as a clean fleet.")
+    sys.exit(0)
+measured = {c["repo"] for c in cells}
 print(" ".join(s for s in expected if s not in measured))
 PY
 )
+case "$_fixture_gone" in
+  UNMEASURABLE:*)
+    printf 'FAIL staleness_test: the fixture could not be MEASURED, so this is NOT a reporter result\n'
+    printf '       %s\n' "${_fixture_gone#UNMEASURABLE: }"
+    printf '       The harness above parses the reporter with json.loads and did not\n'
+    printf '       guard it, so a reporter that failed, traced back, or printed\n'
+    printf '       nothing left json.loads("") to raise inside a command substitution\n'
+    printf '       under set -euo pipefail -- which killed the suite with a traceback\n'
+    printf '       where a reader needed a sentence. Every other case in this file\n'
+    printf '       names its own failure; this one now does too.\n'
+    printf '       fixture: %s\n' "$TPL"
+    tpl_run
+    printf '%s\n' "$OUT" | sed 's/^/       /'
+    exit 1
+    ;;
+esac
 if [ -n "$_fixture_gone" ]; then
   printf 'FAIL staleness_test: the FIXTURE lost a service the cases assert on, so this is NOT a reporter result\n'
   printf '       the reporter measured no cell for:%s\n' "$_fixture_gone"
