@@ -108,7 +108,7 @@
 #         schemas; a service that overrides the mount is shipping a telemetry
 #         boundary nobody derived, and prompt content leaves the process inside
 #         it. The gate fails on any of the three.
-#   MAY NOT — override the four AGPL backends. `grafana/*` images unmodified is
+#   MAY NOT — override the three AGPL backends. `grafana/*` images unmodified is
 #         the licence condition, and a `build:` or a retag is a fork.
 #   MAY NOT — set POSTGRES_USER, POSTGRES_DB or POSTGRES_PASSWORD on this
 #         service. THIS USED TO BE THE RECOMMENDED FIX and it is the single most

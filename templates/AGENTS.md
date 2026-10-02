@@ -57,7 +57,7 @@ Run these; do not improvise equivalents.
 ## The local stack
 
 **You do not copy kit's stack.** There is no `docker-compose.yml` of kit's in this
-repository, no `otel-collector.yml`, and no `tempo/`, `loki/`, `mimir/` or
+repository, no `otel-collector.yml`, and no `tempo/`, `loki/` or
 `grafana/`. `bin/dev` fetches all of it from a **pinned** ref and runs it beside
 your own `docker-compose.yml`, which is an **override** — the second `-f`, so what
 is in it wins and everything you did not mention still comes from kit.
@@ -76,7 +76,7 @@ is in it wins and everything you did not mention still comes from kit.
   `otel-collector.yml`. That file carries the redaction allowlist, and it is
   **derived from core's schemas**; owning it means shipping a telemetry boundary
   nobody derived, and prompt content leaves the process inside it. Nor may you
-  override the four AGPL backends, set `allow_all_keys`, or add an exporter.
+  override the three AGPL backends, set `allow_all_keys`, or add an exporter.
 - **A `ports:` entry for a service kit ships is a bug, and a quiet one.** Compose
   **appends** a second file's `ports:` list rather than replacing it, so writing
   one publishes postgres on kit's port *and* on yours. Move the port in `.env`.

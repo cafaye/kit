@@ -150,14 +150,18 @@ SERVICE_COMPOSE_FILES = (
 # how they agree.
 COLLECTOR_CONFIG = "otel-collector.yml"
 
-# The four AGPL backends. Their `image:` may not be overridden at all, and a
-# `build:` is a fork rather than configuration. Named rather than DERIVED from
+# The AGPL backends that ship. Their `image:` may not be overridden at all, and
+# a `build:` is a fork rather than configuration. Named rather than DERIVED from
 # kit's compose file, unlike the service images above, because the reason here is
-# a LICENCE and not drift: grafana/tempo/loki/mimir are shipped unmodified as the
-# condition of AGPL-3.0, and that condition does not stop applying because kit's
+# a LICENCE and not drift: grafana/tempo/loki/grafana are shipped unmodified as
+# the condition of AGPL-3.0, and that condition does not stop applying because kit's
 # compose file was reorganised. A renamed service would still be the same
 # obligation.
-AGPL_BACKENDS = ("tempo", "loki", "mimir", "grafana")
+#
+# It was four. The metrics store left with its service, its volume, its port and
+# its collector exporter, and naming it here would have kept a licence obligation
+# attached to a container no adopting repository can pull.
+AGPL_BACKENDS = ("tempo", "loki", "grafana")
 
 # The environment variables a service may NOT set on the shared cluster, and the
 # three-line reason each one is refused.

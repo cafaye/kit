@@ -1,7 +1,7 @@
 ---
 # kit template — Loki CONFIGURATION for the local cafaye stack.
 #
-#   tempo.yaml / loki-config.yaml / mimir.yaml are CONFIGURATION, which AGPL-3.0
+#   tempo.yaml / loki-config.yaml are CONFIGURATION, which AGPL-3.0
 #   expressly permits. They are mounted read-only over stock `grafana/*` images.
 #   Nothing here patches, forks or rebrands a vendor binary; the gate fails if
 #   any of these four services grows a `build:` stanza.

@@ -140,10 +140,6 @@
           "dest": "loki/loki-config.yaml"
         },
         {
-          "source": "templates/compose/mimir/mimir.yaml",
-          "dest": "mimir/mimir.yaml"
-        },
-        {
           "source": "templates/compose/tempo/tempo.yaml",
           "dest": "tempo/tempo.yaml"
         },

@@ -560,10 +560,13 @@ processors:
   # still answer "how much did account N send this month" without minting one
   # series per account.
   #
-  # THIRTEEN names plus SEVEN canonical twins, and the twins are not padding. A
+  # THIRTEEN names plus EIGHT canonical twins, and the twins are not padding. A
   # `delete_key` on a name no producer emits is a no-op wearing the costume of a
   # working control, so where the fleet's spelling and OpenTelemetry's semantic
-  # convention name the same thing, both are listed:
+  # convention name the same thing, both are listed. EIGHT and not seven, because
+  # the `error.message` line below contributes TWO twins — `exception.message`
+  # and `exception.stacktrace` — and thirteen plus eight is the twenty-one
+  # `delete_key` statements this block actually carries:
   #
   #     tenant_id  account_id  user_id        request_id   trace_id   span_id
   #     session_id message_id  email          error.message

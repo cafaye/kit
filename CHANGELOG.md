@@ -13,6 +13,51 @@ it without a copy (see kit-12 below).
 
 ## Unreleased
 
+### Changed — the metrics store is gone, and nothing is left dialled at nothing
+
+- **The fourth backend left the stack: mimir.** Its own healthcheck was
+  `retries 12 × interval 10s` — 130 seconds of readiness budget per cold start,
+  against a 180-second deadline for the whole stack, and 384m of memory — for a
+  fleet that does not have the series to put in it. It is **removed rather than
+  disabled**: `mimir.yaml` deleted, and with it the compose service, the volume,
+  the published port (`15902`), the `KIT_MIMIR_*` variables in `.env.example`,
+  the collector's exporter, and the `prometheus`-typed datasource. An exporter
+  pointed at a host with nothing behind it is one connection refused per flush,
+  forever, in a log nobody reads — while `up --wait` reports the stack healthy.
+
+- **Span metrics are still derived and still redacted; they go to the
+  collector's own stdout.** `spanmetrics`, `redaction/cafaye_metrics`,
+  `transform/cafaye_metrics_ingest_drop` and `batch` all still run, and
+  `exporters: [debug]` is where they land. That is not a consolation prize: it
+  keeps the allowlist exercised on real derived metrics rather than only
+  asserted about. **Putting a store back is four edits that belong together** —
+  the endpoint variable in `.env.example`, the exporter block in
+  `otel-collector.yml`, the `exporters:` line on the metrics pipeline, and the
+  compose service plus its Grafana datasource. Any subset of them is the
+  half-removed backend this will not ship, and two checks now say so out loud.
+
+- **The gate's own assertions follow it out, and two of them got STRONGER.**
+  Eight checks were red on this tree, all of them naming a container that no
+  longer exists. Each lost the name and kept its shape; two gained a claim that
+  could not be made before: the metrics pipeline must export to `debug` **and to
+  nothing else**, and Grafana must provision **no** metrics datasource — because
+  a datasource nothing fills renders panels that are permanently empty and teach
+  a reader that empty means nothing. A third is new: nothing under
+  `templates/compose/` may be unreferenced, which is the half of "nothing names a
+  container that does not exist" that a hand-written mount list cannot hold.
+
+- **`tests/stack_live_test.sh` reads the metrics out of the collector instead of
+  a store.** The two PromQL assertions became three assertions over the
+  collector's own `debug` output, at `KIT_OTEL_DEBUG_VERBOSITY=detailed` because
+  at `normal` the exporter does not print the attribute map and "the
+  high-cardinality dimensions are absent" would be satisfied by the exporter
+  being quiet. It now proves something the store never did: that the ingest deny
+  set runs on the way out.
+
+- `templates/AGENTS.md`, `README.md`, `templates/parity-allowlist`,
+  `templates/compose/loki/loki-config.yaml` and the compose header stop saying
+  "four" and stop naming a directory that is gone.
+
 ### Changed — `bin/dev` starts the cheap stack, and observability is the deliberate spelling
 
 - **`KIT_DEV_PROFILES` defaults to empty.** `templates/bin/dev.sh` read
