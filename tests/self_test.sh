@@ -3702,6 +3702,47 @@ edit "$base92/templates/database/tenancy/assertions.txt" \
 expect_red_check 'breakage 92: the assertion manifest and the proof stop agreeing' \
   "$base92" "$TENANCY" --static-only
 
+# 93. The advisor rule that grades the LIVE DATABASE, with the exclusion that
+# makes it a rule rather than an alarm removed. `security_definer_view` is the
+# one ERROR/SEC detection the Supabase reference carries that kit had no lint for,
+# and the way it goes quiet is the way every rule in this file goes quiet: a
+# condition that no longer holds, rather than one that is wrong.
+#
+# THE MUTATION IS THE `having`, and it is the whole rule. Every clause of the
+# `where` is a NARROWING — no security_invoker, at least one RLS'd table
+# reachable, a login role that can SELECT it — and they exist so the rule does
+# not fire on every view in a schema, which is how a security rule gets switched
+# off. Deleting the `having count(*) filter (where relrowsecurity) > 0` is
+# therefore the smallest possible break: the SQL still installs, still parses,
+# still returns rows, and every fixture it is asked about still produces output.
+# It simply no longer requires the view to read anything protected.
+#
+# WHY THIS IS A `validate.sh` BREAKAGE AND NOT A `tenancy_test.sh` ONE, which is
+# the judgement worth recording. The proof that this rule can fire lives in
+# `tests/tenancy_test.sh`, which needs a real cluster and is not run by
+# `validate.sh --static-only`. So a mutation proved against the static gate has
+# to be one the static gate can SEE, and it can see this one because
+# `tenancy_contract_check` reads `advisor.sql`'s rule names and asserts they
+# agree with the fixtures in the test that trips them. Renaming the rule out of
+# the union arm is the mutation for THAT check; stripping the `having` is the
+# mutation for the proof. This recipe does the second, and asserts the first's
+# check goes red -- which proves the agreement is real rather than a string both
+# files happen to share.
+#
+# `delete`, not `sed`, for the same reason breakage 90 uses it: the file
+# explains this rule in prose that quotes the shape, so a text mutation is
+# satisfiable by a comment. This one replaces the whole `having` clause with a
+# literal `true`, which no comment can satisfy.
+base93="$(fresh_copy kit-93)"
+edit "$base93/templates/database/tenancy/advisor.sql" \
+  "  having count(*) filter (where relrowsecurity) > 0
+     and exists (select 1 from api_roles r
+                  where has_table_privilege(r.rolname, min(view_reads.view_oid), 'SELECT'))
+" "  having true
+"
+expect_red_check 'breakage 93: the advisor rule can no longer tell whether a view reads a protected table' \
+  "$base93" "$TENANCY" --static-only
+
 base68="$(fresh_copy kit-68)"
 edit "$base68/templates/compose/.env.example" \
   'KIT_POSTGRES_TAG=17' 'KIT_POSTGRES_TAG=16.6-alpine'

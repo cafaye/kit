@@ -850,6 +850,38 @@ alter table kit_advisor_fixture.silent enable row level security;
 --   definer_no_grant A view nobody can reach. The bypass is real and no caller
 --                    can reach it, so it is not this rule's finding.
 --
+-- `definer_no_grant` NEEDS A NOLOGIN OWNER, and that is a measurement rather
+-- than a stylistic choice. The fixture is created by `alpha`, which is a LOGIN
+-- role, so alpha OWNS the view and `has_table_privilege` is true for the owner
+-- alone — `REVOKE ALL … FROM PUBLIC` does nothing, because ownership is not a
+-- grant and revoking every grant does not touch it. Measured: with a LOGIN owner
+-- the rule fires; with a NOLOGIN owner it is silent. The first run of this
+-- fixture failed exactly here, which is why the comment above says what it says.
+--
+-- THE UNREACHABLE VIEW IS BUILT BY THE CLUSTER ADMIN, and that is a measurement
+-- rather than a convenience. Two failed fixtures led here, and both are worth
+-- writing down because the rule was right in both cases and the FIXTURE was not:
+--
+--   1. The fixture is applied as `alpha`, which is a LOGIN role, so alpha OWNS
+--      the view. Ownership is not a grant, so `revoke all … from public` does
+--      nothing and the rule fires. Measured: ownership alone is enough.
+--   2. Giving the view a NOLOGIN owner is not enough either, because reaching
+--      that owner needs `grant <owner> to alpha` — MEMBERSHIP, and membership
+--      carries the owner's privileges. Measured: with `alpha` a member of the
+--      owner role, `has_table_privilege('alpha', …, 'SELECT')` is TRUE through
+--      the membership and the rule fires, correctly.
+--
+-- So the fixture is built by `cafaye`, the cluster's admin role, which is
+-- excluded from `api_roles` by exactly the predicate every other rule here uses
+-- (`not rolsuper`). A superuser-owned view that no login role can reach is a
+-- real and common shape — and it is the shape a reporting view has when it is
+-- owned by the migration role and nobody was granted SELECT on it.
+--
+-- It is a SEPARATE script, applied by the admin after the schema exists, because
+-- it cannot be part of the one `alpha` applies: alpha is the schema's owner and
+-- a `set role` in the middle of that script would leave the rest of it running
+-- as someone else. `advisor_unreachable_fixture.sql` below.
+--
 -- AND THE TRANSITIVE ONE, because a view over a view is the same hole: Postgres
 -- evaluates the outer view with the outer view's owner's privileges and the
 -- inner one with the inner one's, and no hop in that chain puts a caller's
@@ -860,6 +892,7 @@ alter table kit_advisor_fixture.silent enable row level security;
 -- `over_invoker_view` is the converse and is the guard on the fix: it reads only
 -- an invoker view, so the walk must STOP at that hop rather than walking past
 -- it and reporting a chain whose innermost link is already correct.
+drop table if exists kit_advisor_fixture.protected_accounts cascade;
 create table kit_advisor_fixture.protected_accounts (
   id int primary key, account_id uuid not null);
 alter table kit_advisor_fixture.protected_accounts enable row level security;
@@ -868,20 +901,26 @@ create policy fixture_scoped on kit_advisor_fixture.protected_accounts
   for select to public
   using (account_id = (select cafaye.current_account_id()));
 
+drop table if exists kit_advisor_fixture.unprotected_reads cascade;
 create table kit_advisor_fixture.unprotected_reads (id int primary key);
 
-create view kit_advisor_fixture.definer_view as
+-- Every `create view` is `or replace`, and every `create table` is preceded by a
+-- drop, because this fixture has failed to install three times while being
+-- written and a leftover object from the previous run reads as a new defect. A
+-- fixture that only installs on a clean cluster cannot be iterated on, and the
+-- person iterating on it is whoever is debugging the rule.
+create or replace view kit_advisor_fixture.definer_view as
   select id, account_id from kit_advisor_fixture.protected_accounts;
-create view kit_advisor_fixture.invoker_view
+create or replace view kit_advisor_fixture.invoker_view
   with (security_invoker = true) as
   select id, account_id from kit_advisor_fixture.protected_accounts;
-create view kit_advisor_fixture.plain_reads as
+create or replace view kit_advisor_fixture.plain_reads as
   select id from kit_advisor_fixture.unprotected_reads;
-create view kit_advisor_fixture.definer_no_grant as
+create or replace view kit_advisor_fixture.definer_no_grant as
   select id, account_id from kit_advisor_fixture.protected_accounts;
-create view kit_advisor_fixture.nested_definer_view as
+create or replace view kit_advisor_fixture.nested_definer_view as
   select id from kit_advisor_fixture.definer_view;
-create view kit_advisor_fixture.over_invoker_view as
+create or replace view kit_advisor_fixture.over_invoker_view as
   select id from kit_advisor_fixture.invoker_view;
 -- THE SPELLING THIS FLEET ACTUALLY WRITES. Postgres stores reloptions
 -- VERBATIM and does not canonicalise the boolean, so `security_invoker = on`
@@ -891,9 +930,9 @@ create view kit_advisor_fixture.over_invoker_view as
 -- an equality test against the literal `security_invoker=true` passes kit's own
 -- suite and misses the fleet's own idiom. This view is over an `on`-spelled
 -- invoker, so the transitive walk must stop there too.
-create view kit_advisor_fixture.on_spelled_invoker with (security_invoker = on) as
+create or replace view kit_advisor_fixture.on_spelled_invoker with (security_invoker = on) as
   select id, account_id from kit_advisor_fixture.protected_accounts;
-create view kit_advisor_fixture.over_on_spelled_invoker as
+create or replace view kit_advisor_fixture.over_on_spelled_invoker as
   select id from kit_advisor_fixture.on_spelled_invoker;
 
 -- The GRANT is the fixture, not a detail. `has_table_privilege` includes
@@ -921,6 +960,51 @@ if ! docker exec -e PGPASSWORD=cafaye "$C" psql -U "$ALPHA" -d "$ALPHA" \
   tail -20 "$WORK/fixture.log" | sed 's/^/       /'
   fail "the negative fixtures did not install"
 fi
+
+# The UNREACHABLE VIEW is a SEPARATE script applied by the cluster admin after the
+# main fixture, because it cannot be part of the one `alpha` applies. Two failed
+# fixtures led here and the RULE was right both times -- the FIXTURE was wrong:
+#
+#   1. Applied as `alpha`, which is a LOGIN role, so alpha OWNS the view.
+#      Ownership is not a grant: `revoke all ... from public` does nothing.
+#   2. Giving it a NOLOGIN owner is not enough either, because reaching that owner
+#      requires `grant <owner> to alpha` -- MEMBERSHIP, and membership carries the
+#      owner's privileges. `has_table_privilege('alpha', ..., 'SELECT')` is then
+#      TRUE through the membership.
+#
+# So `cafaye` builds it. `cafaye` is excluded from `api_roles` by the same
+# `not rolsuper` predicate every other rule here uses, and a superuser-owned view
+# no login role can reach is a real shape: it is a reporting view owned by the
+# migration role that nobody was granted SELECT on.
+cat >"$WORK/advisor_unreachable_fixture.sql" <<'UNREACHABLE'
+set client_min_messages = warning;
+drop table if exists kit_advisor_fixture.owner_protected cascade;
+create table kit_advisor_fixture.owner_protected (
+  id int primary key, account_id uuid not null);
+alter table kit_advisor_fixture.owner_protected enable row level security;
+alter table kit_advisor_fixture.owner_protected force row level security;
+create policy fixture_owner_scoped on kit_advisor_fixture.owner_protected
+  for select to public
+  using (account_id = (select cafaye.current_account_id()));
+drop view if exists kit_advisor_fixture.definer_no_grant;
+create view kit_advisor_fixture.definer_no_grant as
+  select id, account_id from kit_advisor_fixture.owner_protected;
+-- The revoke is the FIXTURE, not a detail: without it the view is reachable
+-- through PUBLIC and the rule fires, correctly, because it IS the finding then.
+revoke all on kit_advisor_fixture.definer_no_grant from public;
+revoke all on kit_advisor_fixture.owner_protected from public;
+UNREACHABLE
+docker cp "$WORK/advisor_unreachable_fixture.sql" "$C:/tmp/advisor_unreachable_fixture.sql" >/dev/null
+if ! docker exec -e PGPASSWORD=cafaye "$C" psql -U cafaye -d "$ALPHA" \
+  -v ON_ERROR_STOP=1 -q -f /tmp/advisor_unreachable_fixture.sql >"$WORK/unreach.log" 2>&1; then
+  say "FAIL: the unreachable-view fixture did not install. Last lines:"
+  tail -20 "$WORK/unreach.log" | sed 's/^/       /'
+  fail "the unreachable-view fixture did not install"
+fi
+say "   the unreachable view is built by the cluster admin, not by alpha: measured,"
+say "   a LOGIN owner is reachable by ownership alone and a NOLOGIN one is"
+say "   reachable by membership, and the rule was right about both."
+
 
 neg="$(psql_in "$ALPHA" "$ALPHA" "
   select name || '@' || coalesce(metadata->>'name', '')
@@ -990,11 +1074,12 @@ for quiet in invoker_view plain_reads definer_no_grant over_invoker_view \
              on_spelled_invoker over_on_spelled_invoker; do
   if printf '%s\n' "$neg" | grep -q "^security_definer_view@$quiet\$"; then
     say "FAIL: security_definer_view fired on $quiet, and must not."
-    say "      That view is one of the four the rule is required to stay silent on:"
-    say "      it is either its own remedy, reads no protected table, is unreachable,"
-    say "      or is reachable only through a security_invoker view. A rule that fires"
-    say "      on all four is not a selective rule; it is a rule that reports every"
-    say "      view in the schema, which is how a security rule gets switched off."
+    say "      Each of these views is one the rule is required to stay silent on, and"
+    say "      each is silent for a DIFFERENT reason: it is its own remedy, it reads no"
+    say "      protected table, it is unreachable, or it is reachable only through a"
+    say "      security_invoker view. A rule that fires on all of them is not a selective"
+    say "      rule; it is a rule that reports every view in the schema, which is how a"
+    say "      security rule gets switched off."
     printf '%s\n' "$neg" | grep '^security_definer_view@' \
       | awk -F@ '{print "       reported anyway: " $2}' | head -12
     fail "security_definer_view is not selective"
@@ -1148,5 +1233,5 @@ say "      an unprotected table in the substrate's own schema: named, proof red.
 say "      the database's own advisor on the substrate's own two tables: 0 ERROR, 0 WARN."
 say "      a hand-written permissive policy on api_keys: the exemption released it."
 say "      all 9 rules, each fired on a fixture built to trip it, each naming its object."
-say "      security_definer_view's 4 negatives: silent, for 4 different reasons."
+say "      security_definer_view's 6 negatives: silent, for 6 different reasons."
 say "      the credential audit, read as three roles: one answer, and not an empty one."
