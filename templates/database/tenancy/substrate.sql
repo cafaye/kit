@@ -375,38 +375,131 @@ $caf$;
 -- It reads the POLICIES rather than a list, for the reason the sweep reads
 -- `pg_class`: a table this function could only know about because
 -- `protect_credential_table` created it would be satisfied by a mechanism that
--- records nothing. The policy name and the rendered qualifier are both required,
+-- records nothing. The policy name and the digest reference are both required,
 -- so a hand-written policy that merely mentions the digest does not appear here
 -- and a policy named like this one with a different qualifier does not either.
 --
 -- It answers the SCOPE question and only that one. It cannot answer "who
 -- resolved what", and this file does not pretend otherwise: the digest is
 -- transaction-local and gone by the time anything could look at it.
--- ONE CAPTURE GROUP, AROUND THE COLUMN AND NOTHING ELSE. `pg_get_expr` is a
--- pretty-printer, so the qualifier this file writes renders back as
--- `(token_digest = ( SELECT cafaye.current_credential_digest() AS …))` — its own
--- capitalisation, spacing and alias. A regexp written against the SQL executed
--- rather than against what the catalog prints matches nothing here, and an audit
--- query that returns an empty column forever looks exactly like an audit query
--- that found nothing.
+--
+-- NOTHING HERE READS A DEPARSED EXPRESSION, AND THE REASON IS THE READER.
+-- `pg_get_expr` is a pretty-printer, and it drops the schema from a name the
+-- READER can resolve — which is that reader's `search_path`, and `"$user"` is a
+-- search_path entry. So the policy this file writes deparses as
+--
+--     (token_digest = ( SELECT cafaye.current_credential_digest() AS …))
+--
+-- for a role with no schema of its own, and as
+--
+--     (token_digest = ( SELECT current_credential_digest() AS …))
+--
+-- for the role named after this platform, whose `"$user"` schema IS `cafaye`.
+-- An audit written against that text therefore returned NOTHING in that session
+-- and the whole answer in every other one — same database, same policy — and
+-- "no table here can be resolved without an account" is exactly what an operator
+-- auditing credentials as the cluster's own admin role would then be told.
+-- `tests/tenancy_test.sh` measures both roles on every run and requires the
+-- answers to be equal.
+--
+-- The paragraph this one replaces warned that "an audit query that returns an
+-- empty column forever looks exactly like an audit query that found nothing". The
+-- trap was never the regexp's strictness; it was reading a spelling at all. So
+-- the two facts this query needs are read from DEPENDENCIES, which are OIDs:
+--
+--   * `cafaye.current_credential_digest()` is called by the policy's own `using`
+--     expression, and `CREATE POLICY` records that in `pg_depend` with
+--     `classid = pg_policy` and `refclassid = pg_proc`. Matching it through
+--     `pg_proc` JOIN `pg_namespace` ON `proname` is by OID rather than by
+--     spelling, so the answer is the same for every role and every `search_path`.
+--   * the COLUMN it is compared against is a reference to a column of the
+--     policy's OWN table, recorded as a `pg_depend` row onto that table with the
+--     column's `attnum` in `refobjsubid`. Measured on 16.15 and 17: one `pg_proc`
+--     row with `deptype = 'n'`, one `pg_class` row with `refobjsubid > 0`, and
+--     one `pg_class` row with `refobjsubid = 0` and `deptype = 'a'` — the last
+--     is the whole relation, which is why the column join requires
+--     `refobjsubid > 0` rather than joining the table.
+--
+-- WHAT THAT COSTS, all of it, so none of it is a surprise:
+--
+--   1. Two catalogs more (`pg_proc`, `pg_depend`) and one dependency join. This
+--      is a query a human runs once; it is sub-millisecond per row over a whole
+--      database and nothing calls it per request.
+--   2. It depends on `CREATE POLICY` recording dependencies — which is what
+--      stops a policy outliving the function it calls, so the fact is the
+--      catalog's rather than a convention of this file. Measured on 16.15 and
+--      17.x; NOT measured on 15, kit's floor, because no 15 image was available
+--      on this machine and an unmeasured version is not a verified one.
+--   3. `pronargs = 0` is part of the match. The substrate's digest function takes
+--      no arguments, and an overload of the same name is not that function.
+--   4. A qualifier naming MORE THAN ONE column of its own table cannot be
+--      narrowed to one, because nothing structural says which of them the digest
+--      is compared to. That row is still reported, with `'(unresolved)'` in the
+--      column: a table named with an unresolved column is an audit finding, and a
+--      table absent from the audit is the silence this function exists to
+--      prevent. The deparsing version reported the same policy with a NULL
+--      column, which is neither an answer nor a complaint.
 create or replace function cafaye.credential_tables()
 returns table (table_schema text, table_name text, digest_column text)
 language sql
 stable
 as $caf$
+  -- (1) The digest function, by OID. `pronargs = 0` is part of the identity and
+  --     not decoration — see cost 3 above.
+  with digest_fn as (
+    select fn.oid
+      from pg_proc fn
+      join pg_namespace fns on fns.oid = fn.pronamespace
+     where fns.nspname = 'cafaye'
+       and fn.proname = 'current_credential_digest'
+       and fn.pronargs = 0
+  ),
+
+  -- (2) The policies in the substrate's own naming that call it, with the columns
+  --     of THEIR OWN table that the call sits beside. `cd.refobjid = pol.polrelid`
+  --     is what keeps a qualifier that reads another table's column out: the
+  --     audit is about what THIS table resolves by.
+  resolve as (
+    select pol.oid as policy_oid,
+           pol.polrelid,
+           att.attname as column_name
+      from pg_policy pol
+      join pg_depend fd
+        on fd.classid = 'pg_policy'::regclass
+       and fd.objid = pol.oid
+       and fd.refclassid = 'pg_proc'::regclass
+       and fd.deptype = 'n'
+      join digest_fn df on df.oid = fd.refobjid
+      left join pg_depend cd
+        on cd.classid = 'pg_policy'::regclass
+       and cd.objid = pol.oid
+       and cd.refclassid = 'pg_class'::regclass
+       and cd.refobjid = pol.polrelid
+       and cd.refobjsubid > 0
+      left join pg_attribute att
+        on att.attrelid = pol.polrelid
+       and att.attnum = cd.refobjsubid
+       and not att.attisdropped
+     where pol.polname like '%!_cafaye!_resolve' escape '!'
+       and pol.polcmd = 'r'
+  )
+
+  -- (3) One row per policy. The column is reported only when the qualifier names
+  --     exactly one of the table's own columns, and `'(unresolved)'` otherwise —
+  --     cost 4 above. `min()` is never the answer; it is what a single-column
+  --     qualifier reduces to.
   select n.nspname::text,
          c.relname::text,
-         (regexp_match(
-            lower(coalesce(pg_get_expr(p.polqual, p.polrelid), '')),
-            '^ *\(?([a-z_][a-z0-9_$]*) = \( *select cafaye\.current_credential_digest\(\)'
-          ))[1]::text
-    from pg_policy p
-    join pg_class c on c.oid = p.polrelid
+         case when g.columns_named = 1 then g.column_name
+              else '(unresolved)' end
+    from (select policy_oid,
+                 polrelid,
+                 count(distinct column_name) as columns_named,
+                 min(column_name)            as column_name
+            from resolve
+           group by policy_oid, polrelid) g
+    join pg_class c on c.oid = g.polrelid
     join pg_namespace n on n.oid = c.relnamespace
-   where p.polname like '%!_cafaye!_resolve' escape '!'
-     and p.polcmd = 'r'
-     and lower(coalesce(pg_get_expr(p.polqual, p.polrelid), ''))
-         like '%cafaye.current_credential_digest()%'
    order by n.nspname, c.relname
 $caf$;
 
