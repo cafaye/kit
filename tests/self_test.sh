@@ -2988,39 +2988,50 @@ expect_red_check 'breakage 60: the same copy in an ADOPTING service is a hard FA
 unset KIT_FLEET
 
 # ---------------------------------------------------------------------------
-# 61-65. THE KAMAL CONFIG, and the green control 61b.
+# 78-82. THE KAMAL CONFIG, and the green control 78b.
+#
+# RENUMBERED. This block was 78-82 and its 78b/78/79 collided with the 78/79 of
+# the licence block above, which the kit-22 union merge put in the same file
+# without either side noticing. Two recipes sharing a label is not cosmetic: the
+# suite's own summary counts breakage NUMBERS, so a collision made it report 82
+# while 84 recipes existed, and made "breakage 78" ambiguous to anyone reading
+# a failure. Found by sharding the suite and checking that the shards covered
+# every number exactly once -- 78 and 79 came up claimed twice.
+#
+# The numbers moved to 78-82 so this block ends the file, next to nothing. If
+# more breakages are added, continue from 83.
 #
 # Every recipe below mutates `templates/kamal/` and asserts a NAMED check goes
 # red, because "the gate went red" is a weak claim when forty other checks could
 # have gone red instead.
 #
 # The green control is not optional here in the way it is elsewhere. Breakages
-# 61, 62 and 65 all work by making `tests/kamal_test.sh` fail; if the UNMODIFIED
+# 78, 79 and 82 all work by making `tests/kamal_test.sh` fail; if the UNMODIFIED
 # tree's generated config did not satisfy the real binaries, every one of those
 # three would pass for the wrong reason — the check would be reporting "this
-# template is broken" when what it reports is "every template is broken". So 61b
+# template is broken" when what it reports is "every template is broken". So 78b
 # runs the same script on the same binaries and asserts it is green, and it runs
-# FIRST, so a red in 61-65 reads as what it is rather than as an environment
+# FIRST, so a red in 78-82 reads as what it is rather than as an environment
 # problem.
 # ---------------------------------------------------------------------------
 KAMALCHECK='kamal_test'
 
 if command -v kamal >/dev/null 2>&1 && command -v kamal-backup >/dev/null 2>&1; then
   sixtyoneb="$(fresh_copy kamal-green-control)"
-  expect_green_script 'breakage 61b: the UNMODIFIED generated config satisfies kamal and kamal-backup' \
+  expect_green_script 'breakage 78b: the UNMODIFIED generated config satisfies kamal and kamal-backup' \
     "$sixtyoneb" tests/kamal_test.sh
 
-  # 61. `builder.arch` deleted. Valid YAML; kamal refuses the file outright
+  # 78. `builder.arch` deleted. Valid YAML; kamal refuses the file outright
   # ("Builder arch not set"), so this is the case where a parse check is not
   # merely weaker than the real one but points at a file the real one rejects.
   sixtyone="$(fresh_copy kamal-no-builder-arch)"
   edit "$sixtyone/templates/kamal/deploy.yml.erb" \
     'builder:
   arch: arm64' 'builder:'
-  expect_red_check 'breakage 61: the generated deploy.yml is invalid for kamal' \
+  expect_red_check 'breakage 78: the generated deploy.yml is invalid for kamal' \
     "$sixtyone" "$KAMALCHECK" --static-only
 
-  # 62. The doubled registry host. BOTH files are valid YAML and `kamal config`
+  # 79. The doubled registry host. BOTH files are valid YAML and `kamal config`
   # exits 0 — the config resolves to `ghcr.io/ghcr.io/org/repo`, and the failure
   # is a push that cannot authenticate against a host that does not exist. This
   # is the breakage that justifies running the binaries at all: it is invisible
@@ -3028,19 +3039,19 @@ if command -v kamal >/dev/null 2>&1 && command -v kamal-backup >/dev/null 2>&1; 
   sixtytwo="$(fresh_copy kamal-double-registry)"
   edit "$sixtytwo/templates/kamal/deploy.yml.erb" \
     'image: <%= org %>/<%= repo %>' 'image: <%= registry %>/<%= org %>/<%= repo %>'
-  expect_red_check 'breakage 62: the image name carries the registry host twice' \
+  expect_red_check 'breakage 79: the image name carries the registry host twice' \
     "$sixtytwo" "$KAMALCHECK" --static-only
 
-  # 63. One artifact of the set deleted. `deploy.yml` and `kamal-backup.yml` are
+  # 80. One artifact of the set deleted. `deploy.yml` and `kamal-backup.yml` are
   # ONE contract — every `{ secret: NAME }` in the second must appear in the
   # backup accessory's `env.secret` in the first — so half a set is a config that
   # is internally valid and jointly wrong.
   sixtythree="$(fresh_copy kamal-half-a-set)"
   rm -f "$sixtythree/templates/kamal/kamal-backup.yml.erb"
-  expect_red_check 'breakage 63: one half of the kamal config set is deleted' \
+  expect_red_check 'breakage 80: one half of the kamal config set is deleted' \
     "$sixtythree" 'templates/kamal/  (4 artifacts present, the set is whole)' --static-only
 
-  # 64. The superseded custom backup toolchain RESTORED. The only breakage here
+  # 81. The superseded custom backup toolchain RESTORED. The only breakage here
   # about something being PRESENT rather than absent, and it exists because "we
   # removed it" has no mechanical form until something asserts the absence —
   # which is the whole argument for a check on a path nobody should ever
@@ -3049,11 +3060,11 @@ if command -v kamal >/dev/null 2>&1 && command -v kamal-backup >/dev/null 2>&1; 
   # that recreated the tree would only be testing its own ability to copy files.
   sixtyfour="$(fresh_copy kamal-backup-returns)"
   mkdir -p "$sixtyfour/templates/backup"
-  printf '# resurrected by self_test breakage 64\n' >"$sixtyfour/templates/backup/job.sh"
-  expect_red_check 'breakage 64: the superseded custom backup toolchain is BACK' \
+  printf '# resurrected by self_test breakage 81\n' >"$sixtyfour/templates/backup/job.sh"
+  expect_red_check 'breakage 81: the superseded custom backup toolchain is BACK' \
     "$sixtyfour" 'the superseded custom backup toolchain' --static-only
 
-  # 65. The drill's refusal narrowed. The mutation is the one a well-meaning
+  # 82. The drill's refusal narrowed. The mutation is the one a well-meaning
   # commit makes: `*prod*` becomes `*production*`, so every name containing the
   # word still matches and the abbreviated spellings stop being caught. Nothing
   # about the code reads as a weakening — it reads as tidying a glob.
@@ -3064,7 +3075,7 @@ if command -v kamal >/dev/null 2>&1 && command -v kamal-backup >/dev/null 2>&1; 
   sixtyfive="$(fresh_copy kamal-drill-refusal-narrowed)"
   edit "$sixtyfive/templates/kamal/drill.sh" \
     '*prod* | *PROD* | *live* | *LIVE*)' '*production* | *PROD* | *live* | *LIVE*)'
-  expect_red_check 'breakage 65: the drill stops refusing a production-looking scratch name' \
+  expect_red_check 'breakage 82: the drill stops refusing a production-looking scratch name' \
     "$sixtyfive" "$KAMALCHECK" --static-only
 else
   # SKIPPED, and loudly, because a skipped proof is not a proof. The recipes above
@@ -3072,7 +3083,7 @@ else
   # real binaries, so on a machine without them this file's claim about the Kamal
   # templates is simply unexercised — and the summary line is how that stays
   # visible rather than becoming a silent gap.
-  printf 'SKIP self_test: breakages 61-65 — kamal or kamal-backup is not installed\n'
+  printf 'SKIP self_test: breakages 78-82 — kamal or kamal-backup is not installed\n'
   skips=$((skips + 1))
 fi
 
@@ -3351,7 +3362,7 @@ if [ -n "$_shard_i" ]; then
   # "ran N of N" -- true of every shard, and a claim about the suite made by a
   # run that never saw the suite. Counted the same way the un-sharded summary
   # below counts it, so both agree on what "the suite" means.
-  total=$(grep -cE '^ *expect_(red(_check|_lang|_script)?|skip_check|green_check) +.breakage +[0-9]+[a-z]*:' "$0" || true)
+  total=$(grep -cE '^ *expect_(red|green)(_check|_lang|_script)? +.breakage +[0-9]+[a-z]*:|^ *expect_skip_check +.breakage +[0-9]+[a-z]*:' "$0" || true)
   # A SHARD, not the suite. This line is deliberately NOT the sentence above: a
   # sharded run has not evaluated every breakage, so claiming it did is the one
   # false statement available here. It reports the shard, how many recipes it
@@ -3369,7 +3380,7 @@ if [ -n "$_shard_i" ]; then
 fi
 
 counted=$(grep -cE '^ *expect_red(_check|_lang|_script)? +.breakage +[0-9]+[a-z]*:' "$0" || true)
-total=$(grep -cE '^ *expect_(red(_check|_lang|_script)?|skip_check|green_check) +.breakage +[0-9]+[a-z]*:' "$0" || true)
+total=$(grep -cE '^ *expect_(red|green)(_check|_lang|_script)? +.breakage +[0-9]+[a-z]*:|^ *expect_skip_check +.breakage +[0-9]+[a-z]*:' "$0" || true)
 green_check=$(grep -cE '^ *expect_green_check +.breakage +[0-9]+[a-z]*:' "$0" || true)
 echo "PASS: self_test — all $total breakages hold ($counted assert red, $((total - counted - green_check)) assert a green gate with a named skip, $green_check assert a green gate with a named finding), and the unbroken tree is green."
 echo "       Every recipe above was EVALUATED: 0 environment failures, 0 skipped for a missing toolchain."
