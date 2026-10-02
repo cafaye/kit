@@ -7,16 +7,65 @@
 #     $GOPATH; the runtime does not. An image with a compiler in it is an image
 #     with a supply chain in it.
 #   - CGO_ENABLED=0 so the binary is static. That is what lets the final stage be
-#     distroless/static instead of a debian with libc in it. If you need cgo
-#     (sqlite, DNS resolution), switch the final stage to
-#     gcr.io/distroless/base-debian12 and re-test before you ship it.
+#     a runtime with no libc-managed dynamic anything in it. If you need cgo
+#     (sqlite, DNS resolution), re-test before you ship it.
 #   - The build context is the service root, so `COPY . .` sees go.mod. Set
 #     working-dir in the CI caller if the module lives in a subdirectory.
-#   - The final stage runs non-root, as `nonroot:nonroot` (uid 65532) — the
-#     user the distroless image ships. There is no shell in this image, so a
-#     compromised process cannot curl and pipe, and root would be a container
-#     where a bug is a host compromise.
+#   - The final stage runs non-root, as uid/gid 65532. There is no passwd entry
+#     for that uid in this base, which is fine and is the point: `USER 65532:65532`
+#     is numeric, so the kernel enforces it and nothing in the image can widen
+#     it. A container running as root is a container where a bug is a host
+#     compromise.
+#
+#   - THE RUNTIME BASE IS DEBIAN-SLIM AND NOT DISTROLESS, and that is a change
+#     this file used to argue the other way. It is here because the image now
+#     starts through `docker/entrypoint.sh`, which migrates before it serves,
+#     and a script needs a shell.
+#
+#     The claim that motivated distroless was measured rather than assumed, and
+#     the measurement went the way nobody expected. Neither distroless variant
+#     carries a shell — not `static`, and not `base`:
+#
+#         $ docker run --rm --entrypoint /bin/sh gcr.io/distroless/base-debian12:nonroot -c 'echo hi'
+#         exec: "/bin/sh": stat /bin/sh: no such file or directory
+#         $ docker export $(docker create gcr.io/distroless/base-debian12:nonroot) | tar -tf - | grep '^bin/'
+#         bin/                       # empty
+#
+#     So "there is no shell in this image, so a compromised process cannot curl
+#     and pipe" and "the entrypoint migrates" cannot both be true. Migrating at
+#     boot is the feature (it is what deletes the boot-against-a-stale-schema
+#     class); the shell is its price. The price is stated here rather than
+#     discovered.
+#
+#     IF YOU WANT DISTROLESS BACK, the honest way is not a trick: set
+#     `ENV KIT_MIGRATE=off`, run migrations from a job (Kamal's `pre-deploy`
+#     accessory), and change the final stage back to
+#     `gcr.io/distroless/static-debian12:nonroot`. You are choosing
+#     "migrate once, out of band" over "migrate at every boot", which is a
+#     legitimate trade — just not the default, because an out-of-band migration
+#     nobody wired up is the cold-start race this file exists to delete.
+#
+#   - WHERE THE MIGRATE COMMAND COMES FROM, and why it is not `bin/migrate`.
+#     This image copies the compiled binary and nothing else, so the repo's
+#     bash+psql `bin/migrate` is not in it — correctly, since there is no `psql`
+#     either. A Go service that migrates at boot compiles its own static binary:
+#
+#         RUN go build -trimpath -ldflags="-s -w" -o /out/migrate ./cmd/${SERVICE_NAME}/migrate
+#         COPY --from=build /out/migrate /app/migrate
+#         ENV KIT_MIGRATE_CMD=/app/migrate
+#
+#     and `pgx` is already in the dependency tree, so nothing new is pulled in.
+#     With no `KIT_MIGRATE_CMD` and no `KIT_MIGRATE=required`, the entrypoint
+#     logs one line and serves — correct for a service that owns no schema, and
+#     a lie for one that does, which is why `required` exists. Note that
+#     `KIT_MIGRATE_ADVISORY_LOCK` needs `psql` and therefore is NOT available in
+#     this image; the entrypoint refuses to start if you ask for it rather than
+#     migrating unserialized.
+#
+#   - `exec "$@"` in the entrypoint, so after the migration the service replaces
+#     the shell and is PID 1. SIGTERM still reaches the service.
 ARG GO_VERSION=1.24
+ARG RUNTIME_DEBIAN_VERSION=12
 
 FROM golang:${GO_VERSION} AS build
 WORKDIR /src
@@ -28,9 +77,13 @@ COPY . .
 ARG SERVICE_NAME=service
 RUN go build -trimpath -ldflags="-s -w" -o /out/service ./cmd/${SERVICE_NAME}
 
-FROM gcr.io/distroless/static-debian12:nonroot AS runtime
+FROM debian:${RUNTIME_DEBIAN_VERSION}-slim AS runtime
 WORKDIR /app
 COPY --from=build /out/service /app/service
-USER nonroot:nonroot
+COPY docker/entrypoint.sh /app/kit-entrypoint
+# Numeric, not a named user: this base ships no unprivileged account, and a
+# container running as root is a container where a bug is a host compromise.
+USER 65532:65532
 EXPOSE 8080
-ENTRYPOINT ["/app/service"]
+ENTRYPOINT ["/bin/sh", "/app/kit-entrypoint", "/app/service"]
+
