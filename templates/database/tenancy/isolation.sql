@@ -217,6 +217,32 @@ create temp table cafaye_probe_unprotected (
 
 select cafaye.protect_table('pg_temp.cafaye_probe_things');
 
+-- The CREDENTIAL fixture. A second account-scoped table whose access path is
+-- "find the row by a value you present and learn the account from it" — the
+-- shape that made `identity`'s scoped tokens resolve to nothing under 00016,
+-- measured and pinned in REPORT-identity-isolation-02.md §3 and in
+-- `TestTenancyACredentialLookupHasNoIdentityToRunUnder`.
+--
+-- TWO ROWS, ONE PER TENANT, WITH TWO DISTINCT DIGESTS, and that is the fixture
+-- doing the work. A credential table with one row cannot show that a resolution
+-- session is narrowed to the row it presented rather than to the table, because
+-- "the table" and "that row" are the same set here — and that distinction is the
+-- entire mechanism. See `credential/resolution-cannot-browse`.
+--
+-- The digests are constants rather than generated, like the tenant ids, so every
+-- expected count below is readable and a red row can be diagnosed by eye.
+create temp table cafaye_probe_credentials (
+  id uuid primary key default gen_random_uuid(),
+  account_id uuid not null,
+  token_digest text not null
+) on commit drop;
+
+insert into cafaye_probe_credentials (account_id, token_digest) values
+  (pg_temp.cafaye_alpha(), 'probe_digest_alpha'),
+  (pg_temp.cafaye_beta(),  'probe_digest_beta');
+
+select cafaye.protect_credential_table('pg_temp.cafaye_probe_credentials', 'token_digest');
+
 -- ===========================================================================
 -- THE SPINE. Three denials and one allowance, per role.
 -- ===========================================================================
@@ -282,6 +308,173 @@ begin
   end loop;
 end
 $spine$;
+
+-- ===========================================================================
+-- THE CREDENTIAL HALF. The same dual-role shape, over the one table whose
+-- access path is "find the row by a value you present and learn the account from
+-- it".
+--
+-- WHY THIS BLOCK EXISTS AT ALL, since the spine above already proves isolation
+-- and nothing here relaxes it. There is a query whose subject the RLS context
+-- cannot know: the account is WHAT THE QUERY IS FOR, so it cannot also be what
+-- the query is scoped BY. Measured against a real protected `api_keys` table, a
+-- request presenting a scoped token reads ZERO rows and authenticates as 401
+-- "not found" — the quietest possible failure, and one a green suite cannot see.
+--
+-- So the mechanism is `cafaye.protect_credential_table`: a fifth policy,
+-- `for select`, whose qualifier is the digest the CALLER PRESENTED. Its honest
+-- semantics, and every row below is one clause of it:
+--
+--     A resolution session may read exactly the credential row whose digest it
+--     presented, and nothing else in the database.
+--
+-- SIX ASSERTIONS PER ROLE, and the two that matter are the ones a permissive
+-- implementation fails. `resolution-cannot-browse` is satisfied by nothing except
+-- a policy carrying the digest predicate: an implementation whose policy said
+-- "a credential session may select this table" would return BOTH rows here and
+-- hand the caller a table-wide SELECT to browse every key with.
+-- `resolution-does-not-open-another-table` is satisfied by nothing except a
+-- mechanism scoped to the one table: a bypass role or a table-wide predicate
+-- would return probe_things' rows from inside the resolution session, which is
+-- precisely the "quietly becomes a general bypass" defect this whole directory
+-- exists to prevent.
+-- ===========================================================================
+do $credential$
+declare
+  r text;
+  seen text;
+begin
+  foreach r in array array['login', 'owner'] loop
+    if r = 'login' then
+      perform pg_temp.cafaye_as(current_user || '_app');
+    else
+      perform pg_temp.cafaye_as(current_user);
+    end if;
+
+    -- (1) NO RESOLUTION CONTEXT READS NOTHING. The fail-closed default, and the
+    --     row a substrate without the mechanism satisfies — which is the whole
+    --     reason the next six exist.
+    perform cafaye.begin_account(null);
+    perform cafaye.begin_credential(null);
+    perform pg_temp.cafaye_assert(
+      r || '/credential-no-context-reads-no-rows', '0',
+      (select count(*)::text from pg_temp.cafaye_probe_credentials
+        where token_digest = 'probe_digest_alpha'),
+      'a request that has not opened a resolution must read no credential rows at all, by digest or otherwise. This is the state `identity` measured as zero rows and turned into a 401'
+    );
+
+    -- (2) A RESOLUTION BY DIGEST, WITH NO ACCOUNT IDENTITY. The packet's finding,
+    --     proven, and the account is explicitly NULL throughout: this is the state
+    --     a request presenting a scoped token is actually in.
+    perform cafaye.begin_credential('probe_digest_alpha');
+    perform pg_temp.cafaye_assert(
+      r || '/credential-resolves-by-digest-with-no-account-identity', '1',
+      (select count(*)::text from pg_temp.cafaye_probe_credentials
+        where token_digest = 'probe_digest_alpha'),
+      'a resolution by an unguessable digest must return its row with NO account identity set, because the account is what the query is for and cannot also be what it is scoped by. This is the assertion that does not exist anywhere else in this file'
+    );
+
+    -- (3) AND IT CANNOT BROWSE. The clause that makes the mechanism a resolution
+    --     rather than a bypass, and the only one of the six that a policy saying
+    --     "a credential session may select this table" would fail. Two fixture rows
+    --     on purpose: with one, this assertion is satisfied by a table-wide SELECT.
+    perform pg_temp.cafaye_assert(
+      r || '/credential-resolution-cannot-browse', '1',
+      (select count(*)::text from pg_temp.cafaye_probe_credentials),
+      'an UNQUALIFIED read inside a resolution session must return the one row whose digest was presented and not the whole table. Policies combine permissively, so a policy that merely permitted the select would return both rows here and hand the caller every credential in the database'
+    );
+
+    -- (4) A DIGEST YOU DID NOT PRESENT RESOLVES NOTHING. The mirror of 3, because
+    --     one direction can be an accident: a context that leaked the whole table
+    --     would also pass a check that only looked at the row you asked for.
+    perform cafaye.begin_credential(null);
+    perform cafaye.begin_credential('probe_digest_beta');
+    perform pg_temp.cafaye_assert(
+      r || '/credential-wrong-digest-resolves-nothing', '0',
+      (select count(*)::text from pg_temp.cafaye_probe_credentials
+        where token_digest = 'probe_digest_alpha'),
+      'a resolution session presenting BETA''s digest must not read ALPHA''s credential. The resolution is scoped by the value the caller presented, not by the fact that a resolution happened'
+    );
+
+    -- (5) IT DOES NOT OPEN ANOTHER TABLE. The other half of "not a general
+    --     bypass", and the assertion a BYPASSRLS role or a table-wide predicate
+    --     fails while every other row in this block passes.
+    perform pg_temp.cafaye_assert(
+      r || '/credential-resolution-does-not-open-another-table', '0',
+      (select count(*)::text from pg_temp.cafaye_probe_things),
+      'a resolution session must read ZERO rows from every other protected table. The mechanism is a policy on ONE named table; if resolving a credential also opened account_users or assets, it would be the ambient bypass this directory exists to prevent, wearing a credential-shaped name'
+    );
+
+    -- (6) IT CANNOT WRITE. The resolve policy is `for select` and nothing else, so
+    --     a resolution session meets the ordinary write policies, whose `with
+    --     check` still demands an account identity. Measured as 42501 by
+    --     `cafaye_observed` rather than asserted as a shape: "the mechanism has no
+    --     write half" is a claim about a catalog, and the catalog is not the only
+    --     way to be wrong.
+    --
+    --     `cafaye_observed` is SECURITY INVOKER, so the statement runs as
+    --     whatever role this loop iteration is already set to — which is the only
+    --     way to measure this: a SECURITY DEFINER recorder would run it as the
+    --     owner, and the owner half would be reported as the login half's answer.
+    --
+    --     Run last in the loop, so the row this makes cannot perturb a count that
+    --     has not been taken yet. Under FORCE it makes none: the insert is refused.
+    seen := pg_temp.cafaye_observed(
+      'insert into pg_temp.cafaye_probe_credentials (account_id, token_digest) values ('''
+      || pg_temp.cafaye_alpha()::text || ''', ''probe_digest_minted'')');
+    perform pg_temp.cafaye_assert(
+      r || '/credential-cannot-write-in-a-resolution-context', '42501', seen,
+      'a resolution session must be unable to MINT a credential. The resolve policy is `for select` and no write counterpart exists, so the insert meets the ordinary `with check` and a NULL identity is refused. A mechanism that could write while resolving is how a lookup becomes a factory'
+    );
+
+    reset role;
+  end loop;
+end
+$credential$;
+
+-- The AUDIT, once, as the session's own role: which tables in this database can
+-- be read with no account, and by which column. A resolution path whose scope is
+-- only knowable by reading the source is an ambient path with a good name.
+--
+-- The expected value names the credential fixture AND ITS COLUMN, and the
+-- aggregate is over the whole database — so an implementation that reported
+-- nothing, or that also reported the non-credential fixture, fails here.
+select pg_temp.cafaye_assert(
+  'credential/the-mechanism-is-auditable', 'cafaye_probe_credentials:token_digest',
+  (select string_agg(table_name || ':' || digest_column, ',' order by table_name)
+     from cafaye.credential_tables()),
+  'cafaye.credential_tables() must name every table carrying a credential resolution path, and the column each one resolves by. It reads the POLICIES rather than a list, so it cannot be satisfied by a mechanism that records nothing; and it is the only audit this mechanism claims — the digest is transaction-local, so WHO resolved is not auditable here and is not claimed'
+);
+
+-- The resolve policy is written like every other policy in this file, and neither
+-- property is visible in what it returns.
+select pg_temp.cafaye_assert(
+  'credential/resolve-policy-names-the-roles', '0',
+  (select count(*)::text
+     from pg_policy p
+    where p.polrelid = 'pg_temp.cafaye_probe_credentials'::regclass
+      and p.polname = 'cafaye_probe_credentials_cafaye_resolve'
+      and (p.polroles = '{0}'::oid[]
+           or not (p.polroles @> ARRAY[
+                 (select oid from pg_roles where rolname = current_user || '_app')::oid,
+                 (select oid from pg_roles where rolname = current_user)::oid
+               ]::oid[]))),
+  'the credential resolve policy must name the login role and the owner explicitly, exactly as the four account policies do. A policy left at the default is TO PUBLIC, which evaluates it for every role on the cluster'
+);
+
+select pg_temp.cafaye_assert(
+  'credential/resolve-policy-is-written-for-the-init-plan', '0',
+  (select count(*)::text
+     from pg_policy p
+    where p.polrelid = 'pg_temp.cafaye_probe_credentials'::regclass
+      and p.polname = 'cafaye_probe_credentials_cafaye_resolve'
+      and strpos(
+            replace(replace(replace(
+              lower(coalesce(pg_get_expr(p.polqual, p.polrelid), '')),
+              ' ', ''), E'\n', ''), E'\t', ''),
+            '(select') = 0),
+  'the credential resolve policy must wrap the digest call in (select …) like every other policy here, for the reason the account policies do: one evaluation per statement against one per candidate row'
+);
 
 -- ===========================================================================
 -- THE WRITE SIDE. A `using` clause filters the row out and matches nothing; it

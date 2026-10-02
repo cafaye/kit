@@ -91,6 +91,22 @@
           "why": "The sweep, and the only thing that keeps a service honest as it grows: a table added next month with an account_id column and no policies is named on the next run, which is the moment before it matters."
         },
         {
+          "token": "create or replace function cafaye.protect_credential_table",
+          "why": "THE CREDENTIAL ENTRY POINT, and it is ONE call that protects the table exactly as `protect_table` does and then adds a fifth `for select` policy whose qualifier is the digest the caller presented. A table whose access path is \u2018find the row by an unguessable value and learn the account from it\u2019 cannot be scoped by an account it has not computed yet: `identity` measured zero rows, and a 401, for every scoped token. The policy carries the SAME predicate the caller\u2019s query carries, which is what makes `select *` return that one row rather than the whole table. DECISIONS.md MD24 records the BYPASSRLS-role and SECURITY-DEFINER alternatives as dead for this substrate, with the reasons."
+        },
+        {
+          "token": "create or replace function cafaye.begin_credential",
+          "why": "The second transaction-local GUC, and the cost of the credential path stated rather than hidden: a pool must not hand one resolution\u2019s digest to the next connection, exactly as `begin_account/1` must not hand one tenant\u2019s identity to the next. It takes a text digest the caller has ALREADY computed, so Postgres never learns the secret and gains no ability to derive one."
+        },
+        {
+          "token": "(select cafaye.current_credential_digest())",
+          "why": "The `(select ...)` wrapping on the fifth policy too, for the same measured reason as the four account policies: one evaluation per statement against one per candidate row. Required as a string because the correct spelling is one literal in one function, and a rule about parsing rendered qualifiers would be a second parser for a value this repository already owns."
+        },
+        {
+          "token": "create or replace function cafaye.credential_tables",
+          "why": "THE AUDIT, and the reason the mechanism\u2019s scope is auditable rather than ambient: one query answers \u2018which tables in this database can be read with no account\u2019. It reads the POLICIES rather than a list, so it cannot be satisfied by a mechanism that records nothing. It deliberately does NOT answer who resolved \u2014 the digest is transaction-local \u2014 because a claim this file cannot honour is a comment pretending to be a control."
+        },
+        {
           "token": "not c.relforcerowsecurity",
           "why": "The sweep reads pg_class itself rather than trusting that protect_table ran. A sweep that only knew about tables it had created itself would be satisfied by a sweep that creates nothing."
         }
@@ -115,16 +131,16 @@
         "set local role",
         "cafaye.begin_account",
         "cafaye.unprotected_tables()",
-        "pg_temp.cafaye_assert"
+        "pg_temp.cafaye_assert",
+        "cafaye.begin_credential"
       ],
       "requiredWhy": [
         "`set local role` is how the two halves of the assertion set are reached — the login role and the owner — and both halves are load-bearing and neither is obvious. Without the LOCAL form the role change refuses to run at all. Inside a transaction it is undone by any `exception` block it was issued from, which is a harness that silently tests the wrong role and reports a green proof; the first version of this file made exactly that mistake, by wrapping the refusals in a SECURITY DEFINER recorder that ran them as the OWNER and so succeeded at disabling the boundary it was asserting nobody could disable.",
-        "",
         "`cafaye.begin_account` is the identity seam being USED rather than read about. Every read denial in the file is meaningless without it: with no identity set, every row is hidden and every denial assertion passes.",
-        "",
         "`cafaye.unprotected_tables()` is the sweep being exercised rather than trusted, and it carries the assertion set's only POSITIVE CONTROL: that the sweep really does report a table with an account_id column and no policies. Without it the sweep's empty result is satisfied by a sweep that reports nothing at all, which is the same shape as an isolation test that only asserts \"no identity reads zero rows\".",
-        "",
         "`pg_temp.cafaye_assert` is the file's own recorder. Required by name because the results are collected by a function this file defines in `pg_temp`, and a proof whose results are collected by something else is a proof whose result format is whatever that something else produces — which is precisely what the six drivers would then have to know about."
+        ,
+        "`cafaye.begin_credential` is the credential seam being USED, and it is in this list because the credential half of the assertion set is meaningless as prose without it: with no digest open, every credential read is denied and the twelve rows that prove a resolution works would pass for the same wrong reason the first four would. Every read denial in this file is a claim about what a session MAY do AFTER it opens a context, and the context is the part that is easiest to leave out."
       ],
       "spine": [
         "login/no-identity-reads-no-rows",
@@ -176,19 +192,16 @@
       "These are the settings a service adds to SURVIVE a pooler, and kit runs",
       "no pooler. Each one is a real setting with a real purpose; none of them has",
       "a purpose here.",
-      "",
       "They are forbidden rather than merely discouraged because their cost is",
       "invisible: `prepare: :unnamed` and `default_query_exec_mode=",
       "simple_protocol` both disable named prepared statements, which makes every",
       "execution re-parse and re-plan. A service carrying one of them is SLOWER",
       "and looks fine, and the only way to notice is to look for the flag.",
-      "",
       "A check that lists them is also the cheapest possible tripwire for the",
       "real failure: somebody reading a blog post, or a copied `docker-compose.yml`",
       "from a company that does run PgBouncer, adding a pooler workaround to a",
       "generated config in a fleet that has no pooler. The diff is one line and",
       "the flag is in this file.",
-      "",
       "`track_extra_parameters`, `server_reset_query` and `max_prepared_statements`",
       "are in the list because they are pgbouncer.ini KEYWORDS: a service carrying",
       "one of them has, in effect, configured a pooler it does not have."

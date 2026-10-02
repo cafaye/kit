@@ -14,7 +14,10 @@ it.
 
 ```
 substrate.sql     apply once, as the OWNER role.  the identity seam,
-                  protect_table/2, and the sweep.
+                  protect_table/2, the credential seam
+                  (protect_credential_table/3, begin_credential/1,
+                  current_credential_digest/0), the credential audit, and the
+                  sweep.
 assertions.txt    the manifest. What the proof is supposed to assert, by name.
 isolation.sql     the assertion set. Run it; it answers with one row per
                   assertion, and a driver compares the NAMES against the manifest.
@@ -92,6 +95,125 @@ holds many accounts has two boundaries, and the inner one was the one nobody had
    not change core's `schemas/tenant-isolation.schema.json`** — the declaration
    half already existed and is unaffected.
 
+6. **If a table is resolved by an unguessable value** — an API key, an invitation
+   token — call `cafaye.protect_credential_table('<table>', '<digest_column>')`
+   *instead of* `protect_table`, and open the resolution with
+   `cafaye.begin_credential($1)` in the same transaction as the lookup. One call,
+   same size as `protect_table`'s, and it is not an extra step: without it every
+   scoped credential in the service authenticates as 401 "not found". Read
+   [the section below](#the-third-trap-a-credential-table-cannot-be-scoped-by-an-account-it-does-not-have-yet)
+   first, including the list of what it cannot do.
+
+## THE THIRD TRAP: a credential table cannot be scoped by an account it does not have yet
+
+A **credential table** — `api_keys`, `account_invitations`, `oidc_clients` — is
+scoped by an account like every other table, and it still does not work. Its access
+path is *"find the row by an unguessable value and learn the account from it"*, so
+the account is **what the query is for**, and a query cannot be scoped by the thing
+it is trying to compute. `identity` measured this against its real protected
+`api_keys` table, as the OWNER:
+
+| | rows seen |
+|---|---|
+| **no identity — the state a request presenting a scoped token is in** | **0** |
+| identity = the credential's own account | 1 |
+| identity = another tenant's identity | 0 |
+
+The first line is the finding. A request presenting `cafaye_…` has not resolved
+the token yet, so it has no account, so the lookup authenticating it reads nothing,
+`ErrNoRows` becomes "not found", and the HTTP layer answers **401**. Every machine
+credential, refused as though it did not exist — the quietest possible failure, and
+one a green suite cannot see, because a test fixture built with `LIKE … INCLUDING
+ALL` has no policies at all.
+
+### The mechanism: one policy whose qualifier is the digest you presented
+
+```sql
+select cafaye.protect_credential_table('api_keys', 'token_digest');
+```
+
+One call, the same size as `protect_table`'s. It protects the table exactly as
+`protect_table` does — same four policies, same `ENABLE`, same `FORCE`, same index
+on `account_id` — and then adds a fifth:
+
+```sql
+create policy api_keys_cafaye_resolve on api_keys
+  for select to <owner>, <service>_app
+  using (token_digest = (select cafaye.current_credential_digest()))
+```
+
+and the caller opens the resolution the way it opens the account:
+
+```sql
+begin;
+select cafaye.begin_credential($1);          -- the digest it already computed
+select … from api_keys where token_digest = $1;   -- the row returns
+commit;                                     -- the digest expires with it
+```
+
+The caller passes the value it was going to query with anyway. Postgres is given a
+string to compare against a column: it never learns the secret, never learns how it
+was derived, and gains no ability to compute one.
+
+**The predicate is in the policy, not only in the caller's query, and that is the
+whole design.** Policies combine permissively, so a policy that merely said *"a
+credential session may select this table"* would be the defect: a table-wide
+`SELECT`, and every key in the database browsable with the one query this mechanism
+exists to prevent. So the honest semantics are:
+
+> **A resolution session may read exactly the credential row whose digest it
+> presented, and nothing else in the database.**
+
+`select * from api_keys` inside one of these sessions returns **that one row**.
+Every other table reads zero rows.
+
+### What it cannot do — all five, so nobody finds them
+
+1. **It cannot tell a secret from a label.** It widens a read to the row whose
+   value you presented; whether that value is *unguessable* is the service's
+   knowledge, not the substrate's. On `oidc_clients`, where `client_id` is an
+   identifier rather than a secret, **this is the wrong mechanism** — do not apply
+   it there on the strength of the invitation case. The invariant that keeps this
+   from becoming a general bypass is exactly the limitation: *you can only widen a
+   read to a row you could already name.*
+2. **It cannot write.** `for select`, and no write counterpart: a resolution session
+   meets the ordinary write policies, whose `with check` still demands an account
+   identity. A service cannot mint a credential while resolving one.
+3. **It does not open any other table.** It is a policy on one named table.
+   `account_users` still reads zero rows.
+4. **It is a second GUC.** `begin_credential/1` is transaction-local for the same
+   reason `begin_account/1` is — the six drivers hold pools, and a session-level
+   digest survives the pool and hands one resolution's credential to the next
+   connection. It is set in exactly one function, so a service has exactly one
+   place that writes it.
+5. **It is not audited at runtime, and does not claim to be.** The digest is
+   transaction-local and leaves nothing behind. What *is* auditable is the scope:
+
+   ```sql
+   select * from cafaye.credential_tables();
+   --  table_schema | table_name | digest_column
+   ```
+
+   which answers *"which tables in this database can be read with no account"* in
+   one query rather than by searching the source. It reads the policies, not a
+   list, so it cannot be satisfied by a mechanism that records nothing.
+
+### What it was instead of, and why — `DECISIONS.md` (MD24)
+
+- **A `BYPASSRLS` role.** This is Supabase's answer, and it is right for Supabase's
+  topology: `service_role` is created `nologin noinherit bypassrls`, granted only
+  to `authenticator`, and holds **no policies of its own** — what bounds it is who
+  may assume it and what it has been granted. kit has neither half of that
+  structure: there is **one** per-request role and no separate service layer, so a
+  bypass role here is a bypass over the whole service database, held by the role
+  every request already authenticates as. Read the reference; do not copy the shape.
+- **A `SECURITY DEFINER` function.** Does not work under `FORCE` — `FORCE` applies
+  to the *definer*, and only `BYPASSRLS` skips RLS. A proposal of this shape is
+  the `BYPASSRLS` option wearing a friendlier hat.
+- **Dropping `FORCE` on credential tables.** The table above, on the one table
+  holding every machine credential.
+- **Leaving `api_keys` unprotected.** The boundary stops covering credentials.
+
 ## THE TRAP: `FORCE ROW LEVEL SECURITY`
 
 Postgres exempts a table's **owner** from its own row-level-security policies.
@@ -165,9 +287,26 @@ the login role's non-ownership real, two assertions about how the policies are
 control**, because an empty sweep result is otherwise satisfied by a sweep that
 reports nothing.
 
+And **fifteen more for the credential half**, which is the same dual-role shape
+over the one table whose access path is *"find the row by an unguessable value and
+learn the account from it"*: six per role — no resolution context reads nothing, a
+resolution by digest works **with no account identity at all**, the resolution
+**cannot browse**, a digest you did not present resolves nothing, it **does not
+open another table**, and it **cannot write** — plus three that no denial can see,
+which are the audit query naming the table, the resolve policy naming its roles,
+and the resolve policy being written wrapped.
+
+Two of those fifteen are the ones a permissive implementation fails.
+`resolution-cannot-browse` is satisfied by nothing except a policy carrying the
+digest predicate, and it needs a credential fixture with **two** rows: with one,
+"the table" and "that row" are the same set and a table-wide `SELECT` passes it.
+`resolution-does-not-open-another-table` is satisfied by nothing except a mechanism
+scoped to one table — a `BYPASSRLS` role returns `probe_things`' rows from inside a
+resolution session, which is the ambient bypass this directory exists to prevent.
+
 `assertions.txt` is the manifest, and every driver compares the names it got back
-against it **in both directions**. A count would not do: a count of 24 is
-compatible with 24 of the wrong 24.
+against it **in both directions**. A count would not do: 39 is compatible with 39
+of the wrong 39.
 
 ## Cross-tenant access is absence, not refusal
 
@@ -185,8 +324,14 @@ about the account.
    `FORCE` removed its exemption and no policy names it without one. That is the
    correct posture and it is the adoption cost: a migration that backfills rows
    sets the identity (`set local role <service>_app; select
-   cafaye.begin_account(…)`) or goes through a `SECURITY DEFINER` function. It
-   fails loudly and immediately, which is the good direction.
+   cafaye.begin_account(…)`) and reads exactly one account's rows. It fails loudly
+   and immediately, which is the good direction.
+
+   **It does not get better with a `SECURITY DEFINER` function**, which is the
+   natural next thought and is wrong: `FORCE` applies to the **definer** too, so a
+   function owned by the table's owner is subject to that table's policies and
+   reads zero rows as well. Only `BYPASSRLS` skips RLS, and no service role has
+   one. The identity is the whole answer.
 
 2. **`begin_account/1` is transaction-local.** Outside an explicit transaction it
    expires at the end of the statement that set it, so a caller reaching the
