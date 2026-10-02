@@ -17,7 +17,7 @@
 #   breaks on the first `bin/dev up`; this is the answer to that for the account
 #   boundary, which cannot be checked any other way.
 #
-# SIX THINGS, and the last five are what make the first one mean something:
+# NINE THINGS, and the last five are what make the first one mean something:
 #
 #   1. every assertion in isolation.sql passes.        (the property)
 #   2. the CONTROL: with `FORCE ROW LEVEL SECURITY` removed, the OWNER half of the
@@ -44,6 +44,12 @@
 #   8. every rule in that advisor FIRES on a fixture built to trip it, naming
 #      itself and the table it fired on.                (a detective that has
 #      never fired is a detective you cannot trust)
+#   9. THE AUDIT ANSWERS EVERY ROLE THE SAME. `cafaye.credential_tables()` is
+#      read as the owner, as the cluster's admin role and as the non-owner LOGIN
+#      role; the three answers must be identical AND non-empty.  (8: an audit
+#      whose answer depends on the reader's `search_path` reports "no credential
+#      path in this database" to the one role whose `"$user"` schema is `cafaye`,
+#      which is the most expensive reading in the file to believe)
 #
 #   Assertion 2 is the expensive and the important one. It is the control this
 #   repository's rules insist on: a control that never runs differently proves
@@ -872,6 +878,122 @@ left="$(psql_in "$ALPHA" "$ALPHA" \
 say "   kit_advisor_fixture dropped, asserted gone."
 
 # ---------------------------------------------------------------------------
+# ASSERTION 8 — THE AUDIT ANSWERS THE SAME TO EVERY ROLE THAT ASKS.
+#
+# `cafaye.credential_tables()` is the one query that answers "which tables in this
+# database can be read with no account", and `isolation.sql` asserts it as the
+# session's own role — which on a real cluster is the owner's, a role with no
+# schema of its own. So the audit was only ever measured from the one reader it
+# happened to be correct for.
+#
+# The trap is the READER, not the SQL. `pg_get_expr` drops the schema from a name
+# the reader can resolve, and what a reader can resolve is their `search_path` —
+# and `"$user"` is a search_path entry. So the SAME policy deparses
+# `cafaye.current_credential_digest()` for `alpha` (no `alpha` schema exists) and
+# `current_credential_digest()` for `cafaye` (whose `"$user"` schema IS the
+# `cafaye` schema the substrate creates). An audit written against that text
+# returns everything to one role and NOTHING to the cluster's own admin role,
+# which reads as "this database has no credential path at all" to exactly the
+# reader most likely to act on it.
+#
+# TWO HALVES, and the second is what stops the first from being vacuous:
+#
+#   A. THE PROPERTY. Three readers — the owner, the cluster's admin role, and the
+#      non-owner LOGIN role — must get the SAME answer, and that answer must be
+#      non-empty. Agreement alone is satisfiable by a function that returns
+#      nothing to everybody, which is a green assertion about an audit that has
+#      stopped working.
+#   B. THE CONTROL. The two spellings must actually DIFFER on this cluster, or
+#      half A is asserting nothing about the mechanism it names. A red here is
+#      true rather than a flake: it says Postgres no longer deparses by the
+#      reader's visibility, and this suite's control needs rewriting because the
+#      reason it exists has changed.
+#
+# `public.api_keys` is the fixture — assertion 6's credential table, still in
+# place — and the printed column is the deparsed policy itself, because the whole
+# claim is about that text differing between two sessions that share one policy.
+say ""
+say "== assertion 8: the credential audit reports the same tables to every role"
+
+audit_deparse="select coalesce(pg_get_expr(polqual, polrelid), '')
+                   from pg_policy
+                  where polrelid = 'public.api_keys'::regclass
+                    and polname = 'api_keys_cafaye_resolve'"
+audit_rows="select coalesce(string_agg(table_schema || '.' || table_name || ' -> ' || digest_column,
+                                        ', ' order by table_name),
+                           '(no rows)')
+              from cafaye.credential_tables()"
+
+alpha_deparse="$(psql_in "$ALPHA" "$ALPHA" "$audit_deparse")"
+admin_deparse="$(psql_in cafaye "$ALPHA" "$audit_deparse")"
+alpha_rows="$(psql_in "$ALPHA" "$ALPHA" "$audit_rows")"
+admin_rows="$(psql_in cafaye "$ALPHA" "$audit_rows")"
+login_rows="$(psql_in "${ALPHA}_app" "$ALPHA" "$audit_rows")"
+
+say "   as $ALPHA (owner, \"\$user\" schema does not exist):"
+say "     policy reads   : $alpha_deparse"
+say "     the audit says : $alpha_rows"
+say "   as cafaye (cluster admin, \"\$user\" schema IS cafaye):"
+say "     policy reads   : $admin_deparse"
+say "     the audit says : $admin_rows"
+say "   as ${ALPHA}_app (non-owner LOGIN, owns nothing):"
+say "     the audit says : $login_rows"
+
+case "$admin_rows" in
+  '(no rows)') say ""; say "FAIL: cafaye.credential_tables() returned NOTHING to the cluster's admin role."
+    say "      That is the reading this assertion exists to prevent: an admin auditing"
+    say "      credentials is told the database has no table resolvable without an"
+    say "      account, because \"\$user\" is a search_path entry and the substrate's"
+    say "      policies deparse unqualified for this role. The fix is in"
+    say "      templates/database/tenancy/substrate.sql — read its"
+    say "      credential_tables() comment — not in this file."
+    fail "the credential audit answers one role and not another" ;;
+esac
+[ "$alpha_rows" = "$admin_rows" ] || {
+  say ""; say "FAIL: the credential audit disagrees with itself about the same database."
+  say "      as $ALPHA: $alpha_rows"
+  say "      as cafaye: $admin_rows"
+  say "      An audit whose answer depends on WHO ASKS is not an audit; it is a"
+  say "      function of the reader's search_path."
+  fail "the credential audit depends on the role reading it"
+}
+[ "$alpha_rows" = "$login_rows" ] || {
+  say ""; say "FAIL: the credential audit disagrees with the non-owner LOGIN role."
+  say "      as $ALPHA:     $alpha_rows"
+  say "      as ${ALPHA}_app: $login_rows"
+  fail "the credential audit depends on the role reading it"
+}
+say "   three roles, one answer — the audit no longer depends on who is reading."
+say "   and it is not the empty answer: the admin role's answer is asserted"
+say "   NON-EMPTY, because three roles agreeing on nothing proves only that the"
+say "   audit has stopped working."
+
+case "$admin_deparse" in
+  *cafaye.current_credential_digest*) admin_qualified=1 ;;
+  *) admin_qualified=0 ;;
+esac
+case "$alpha_deparse" in
+  *cafaye.current_credential_digest*) alpha_qualified=1 ;;
+  *) alpha_qualified=0 ;;
+esac
+if [ "$alpha_qualified" = "$admin_qualified" ]; then
+  say ""
+  say "FAIL: the control for assertion 8 did not fire. The substrate's policy deparses"
+  say "      the SAME way for both roles, so the reader-dependence this assertion"
+  say "      guards against is not happening on this cluster and half A is asserting"
+  say "      nothing about it. Either Postgres changed how it qualifies a name a"
+  say "      reader can resolve — in which case this control needs rewriting, because"
+  say "      its reason has changed — or the fixture is not the policy it claims to be."
+  say "      as cafaye: qualified=$admin_qualified   as $ALPHA: qualified=$alpha_qualified"
+  fail "the reader-dependence control cannot fire"
+fi
+say "   control: the trap is LIVE on this cluster — one policy, two renderings, and"
+say "     as cafaye: $admin_deparse     (qualified=$admin_qualified)"
+say "     as $ALPHA: $alpha_deparse   (qualified=$alpha_qualified)"
+say "   and the audit above is identical for both anyway. That is the whole"
+say "   assertion: the function no longer reads the text that differs."
+
+# ---------------------------------------------------------------------------
 say ""
 say "PASS: kit's account boundary is enforced by Postgres, and the enforcement is"
 say "      proven able to fail."
@@ -883,3 +1005,4 @@ say "      an unprotected table in the substrate's own schema: named, proof red.
 say "      the database's own advisor on the substrate's own two tables: 0 ERROR, 0 WARN."
 say "      a hand-written permissive policy on api_keys: the exemption released it."
 say "      all 8 rules, each fired on a fixture built to trip it, each naming its table."
+say "      the credential audit, read as three roles: one answer, and not an empty one."
