@@ -33,3 +33,8 @@ PASS self_test: breakage 27: a language job no longer lints at all — caught by
 PASS self_test: breakage 28: the lint step is advisory (continue-on-error) — a report, not a gate — caught by `lint/ + the workflow  (every lint step is a gate on kit config)`
 PASS self_test: breakage 28b: the lint step swallows its exit status with `|| true` — caught by `lint/ + the workflow  (every lint step is a gate on kit config)`
 PASS self_test: breakage 29: the kit checkout is gone, so `--config` names nothing — caught by `lint/ + the workflow  (every lint step is a gate on kit config)`
+PASS self_test: breakage 30: kit config silently drops correctness linters the policy names — caught by `lint/ + the workflow  (every lint step is a gate on kit config)`
+PASS self_test: breakage 31: a service carries a lint config INCONSISTENT with kit, not merely present — caught by `lint drift  (a service config is compared to kit, not merely forbidden)`
+PASS self_test: breakage 31b: a service config that MATCHES kit is not a failure — the gate is green on an unbroken tree
+tests/self_test.sh: line 2375: eck: command not found
+EXIT=127

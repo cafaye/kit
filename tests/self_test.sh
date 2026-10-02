@@ -1189,16 +1189,28 @@ expect_skip_check() {
   local label="$1" dir="$2" want="$3"
   shift 3
   local out ec=0
-  # `--only=$want`, for the reason given in full at `expect_red_check` and again
-  # at `expect_green_check`. It is safe here for the same reason it is there: the
-  # assertion below is unchanged and still demands BOTH halves — the gate exited
-  # 0, and the named check is what said SKIP. A filter that matched nothing would
-  # make the first half true and the second false, so `validate.sh`'s own
-  # no-match FAIL cannot be mistaken for a clean skip here.
-  case " $* " in
-    *" --only="*) ;;
-    *) set -- "$@" "--only=$want" ;;
-  esac
+  # DELIBERATELY NOT FILTERED, and this is the one helper where `--only` cannot be
+  # reached the way it is in `expect_red_check` and `expect_green_check`.
+  #
+  # `$want` here is the SKIP's own verdict text — `templates/otel/ruby  (ruby
+  # 2.6.10 is below the template's 2.7 floor)` — and the label `--only` matches on
+  # is the check's label, `templates/otel/ruby  (ruby test suite)`. They are two
+  # different strings. Filtering on the verdict text selects no check, and
+  # `validate.sh` turns "selected NO check" into `exit 1`, so this recipe's FIRST
+  # assertion (`the gate exited 0, so the skip was not clean`) would fail on a
+  # filter typo rather than on a defect.
+  #
+  # It did exactly that, on the first run of the `--only` reach:
+  #
+  #     FAIL self_test: breakage 23b: an interpreter below the floor is a named
+  #     skip, not a silent pass — the gate exited 1, so the skip was not clean
+  #
+  # A green-expecting proof reported red for a reason that had nothing to do with
+  # the interpreter floor, which is the failure mode `fresh_copy`'s path list
+  # exists to prevent and which this file keeps warning about. The whole gate is
+  # the correct trade here: it costs ~35 s on one recipe out of 94, and the
+  # alternative is a filter whose correctness depends on a string that is not the
+  # label.
   out=$(cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" 2>&1) || ec=$?
   if [ "$ec" -ne 0 ]; then
     printf 'FAIL self_test: %s — the gate exited %s, so the skip was not clean\n' "$label" "$ec"
