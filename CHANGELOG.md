@@ -13,6 +13,49 @@ it without a copy (see kit-12 below).
 
 ## Unreleased
 
+### Added — the gate can now say where its own time went
+
+- **`KIT_PROFILE=<file>` writes a timing profile of any gate run, and
+  `tests/profile_report.py` renders it.** A gate that takes ten minutes cannot be
+  improved from intuition, and every claim about which part is slow is a claim
+  about a measurement nobody else can take on the same tree — so the measurement
+  is part of the gate rather than something a worker hand-assembles with `date`
+  calls and a scratch file.
+
+- **One TSV row per timed region, in four kinds that are never summed together.**
+  `check` (a serial check), `cpu` (a `check_par` child — these OVERLAP, so their
+  sum is an upper bound on the region, not its duration), `tier` (a
+  `bounded_check`), `phase` (the interval between two `section` headers) and
+  `verdict`. The phase rows are the safety net: a tier that is a bare `report`
+  over a heredoc spawns no command at all, so the per-check rows cannot see it
+  and the phase rows can. A profile whose rows add up to more than the run is a
+  profile that has been read wrong, so `cpu` rows are flagged in the table.
+
+- **The self-test's rows are attributed to a BREAKAGE, not to the gate.** Every
+  recipe runs a whole `tests/validate.sh` in a throwaway copy, and those copies
+  inherit `KIT_PROFILE` — so without a tag the most expensive phase in the run
+  would be a column of rows whose labels are indistinguishable from the gate's
+  own. `tests/self_test.sh` exports `KIT_PROFILE_TAG` per breakage, and the
+  report sums each copy's rows into one number per breakage, with the copy's
+  interpreter-resolution cost broken out because it is the part 94 copies all
+  pay and none of them chose.
+
+- **Off by default, and off means off.** Every measurement site reads
+  `_t0=0; [ -n "$_PROFILE" ] && _t0="$(_pf_now)"`, so with the variable unset the
+  clock is never read and no process is spawned — which is a real design
+  constraint rather than a nicety, because a profiler that makes the run it
+  profiles slower reports its own overhead as the gate's cost. The clock is
+  integer milliseconds from `perl -MTime::HiRes` rather than `awk`: an `awk`-per-
+  measurement version would have added ~38,000 processes to a run that spawns
+  ~19,000 checks, and its numbers would have been wrong in the direction that
+  matters. `kit_total` runs on the EXIT trap so the table's denominator is a
+  measurement rather than the reader's arithmetic over rows that are
+  individually correct and collectively incomplete.
+
+- **It is not a gate.** Nothing in the profiler can change a verdict, and a
+  profiling run is not a substitute for a plain one — the run that printed the
+  table is still the run whose exit status counts.
+
 ### Added — the account boundary, shipped once in kit
 
 - **`templates/database/tenancy/substrate.sql`.** The account boundary inside one

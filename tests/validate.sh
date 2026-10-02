@@ -50,7 +50,12 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 TMP="$(mktemp -d "${TMPDIR:-/tmp}/kit-validate.XXXXXX")"
-trap 'rm -rf "$TMP"' EXIT
+# The profile is closed on the way OUT, on every exit path, because the tail of a
+# run — the summary, and any check after the last `section` header — is otherwise
+# an unmeasured gap between the last row and the reader's stopwatch. `kit_total`
+# and `kit_phase` are defined further down and are no-ops when `KIT_PROFILE` is
+# unset, so this costs the ordinary gate nothing at all.
+trap 'kit_phase "END OF RUN (no section header after this point)"; kit_total; rm -rf "$TMP"' EXIT
 
 # The one path the whole repo agrees on, read by every check that looks at the
 # reusable workflow. It is a variable rather than a literal repeated in a dozen
@@ -162,6 +167,130 @@ while [ "$#" -gt 0 ]; do
   shift
 done
 
+# ---------------------------------------------------------------------------
+# profiling — where the run's seconds actually went
+# ---------------------------------------------------------------------------
+#
+# WHY IT IS HERE AND WHY IT IS OFF BY DEFAULT. A gate that takes ten minutes
+# cannot be improved from intuition: every claim about which part is slow is a
+# claim about a measurement nobody can take again on the same tree. So the
+# measurement is part of the gate rather than a thing the packet's worker had to
+# hand-assemble with `date` calls and a scratch file.
+#
+# OFF BY DEFAULT, and off means off: every measurement site is one line of the
+# form `_t0=0; [ -n "$_PROFILE" ] && _t0="$(_pf_now)"`, so with `KIT_PROFILE`
+# unset the sites cost one `[` and one assignment and NO process — the clock is
+# never read. That is a real cost to design for and not a hypothetical one: a
+# profiler that made the run it profiles materially slower is a profiler whose
+# numbers are wrong in the direction that matters.
+#
+# WHAT IT RECORDS, and what it deliberately does not. One TSV row per timed
+# region: kind, label, seconds, and an inherited tag. The tag is how a row from
+# inside a self-test breakage is told apart from a row from the gate itself —
+# `KIT_PROFILE_TAG` is exported by `tests/self_test.sh` per breakage, so the
+# profile attributes time to a BREAKAGE and not merely to a check name that 94
+# copies all share. Rows are appended with `>>`, which is atomic for lines this
+# short, and every writer in the tree is short enough to stay under one `PIPE_BUF`.
+#
+# FOUR KINDS, and why there are four rather than one.
+#   check   a serial `check`/`check_verbose` — wall time of ONE command.
+#   cpu     a `check_par` child — time of one parallel check. THESE OVERLAP: their
+#           sum is an upper bound on the parallel region, not its elapsed time.
+#           Collapsing them with the serial rows would double-count and produce a
+#           profile that adds up to more than the run, which is the one thing a
+#           profile must never do.
+#   tier    a `bounded_check` — a whole heavy script, self_test included.
+#   phase   the interval between two `section` headers. THE SAFETY NET: a tier
+#           that is a bare `report` over a heredoc spawns no command at all, so
+#           the check rows cannot see it, and the phase row can.
+#   verdict a `report_par` — a loop reaching its verdict from a `[ -x ]`. ~0s by
+#           construction; recorded so the table accounts for every printed line.
+#
+# NOT A GATE. Nothing here can change a verdict, and a profiling run is not a
+# substitute for a plain one: `tests/profile_report.py` reads the TSV this writes
+# and prints the table, and the run that printed the table is still the run whose
+# exit status counts. The profile is an annotation of a run, not a check of its
+# own — a file that could fail a build for being slow would be a speed gate, and
+# this is not one.
+_PROFILE="${KIT_PROFILE:-}"
+_pf_tag="${KIT_PROFILE_TAG:-}"
+
+# `_pf_now` prints integer MILLISECONDS. It is NOT `date +%s.%N`: macOS `date`
+# has no `%N` and returns a literal `N`, and it is NOT bash's `$EPOCHREALTIME`
+# because the gate must run on the bash 3.2 that ships with macOS and in slim
+# containers, where that variable does not exist. `perl` with Time::HiRes is
+# present wherever the gate's own `awk`/`sed` dependencies are.
+#
+# MILLISECONDS AND NOT A DECIMAL, and the reason is the one cost that would have
+# silently corrupted every number here. An earlier version computed each duration
+# with `awk`, which is a second process spawn per measurement — and the run being
+# measured spawns roughly 19,000 checks across `self_test`'s 94 breakages, so
+# the profiler would have added ~38,000 processes to the run and reported its own
+# overhead as the gate's cost. Integer arithmetic in the shell is not slower than
+# awk for one subtraction; it is 38,000 fewer processes. With the profile off,
+# `_pf_now` is never called at all.
+if [ -n "$_PROFILE" ]; then
+  _pf_now() { perl -MTime::HiRes=time -e 'printf "%d", time*1000'; }
+else
+  _pf_now() { printf '0'; }
+fi
+
+# kit_profile <kind> <label> <start_ms> — one TSV row, or nothing at all.
+kit_profile() {
+  [ -n "$_PROFILE" ] || return 0
+  local ms=$(( $(_pf_now) - $3 ))
+  [ "$ms" -lt 0 ] && ms=0
+  printf '%s\t%s\t%d.%03d\t%s\n' "$1" \
+    "$(printf '%s' "$2" | tr '\t' ' ')" \
+    "$((ms / 1000))" "$((ms % 1000))" "$_pf_tag" >>"$_PROFILE"
+}
+
+# The per-check rows are only as good as the thing they hang off, and the phases
+# are what a reader of a ten-minute run actually thinks in — the phase rows are
+# the safety net for the check rows, and every phase sums to the whole run.
+_pf_last=0
+if [ -n "$_PROFILE" ]; then
+  _pf_last="$(_pf_now)"
+fi
+_pf_start="$_pf_last"
+# `_pf_mark` / `_pf_kind` — the unit of work currently in flight, and which of the
+# four kinds it is. `report` reads both and re-arms the mark; see the comment
+# there. Both are 0 / `check` with the profiler off, and nothing reads them.
+_pf_mark=0
+_pf_kind=check
+
+# kit_phase <name> — close the interval since the last marker, open a new one.
+kit_phase() {
+  [ -n "$_PROFILE" ] || return 0
+  local now prev
+  prev="$_pf_last"
+  now="$(_pf_now)"
+  local ms=$((now - prev))
+  [ "$ms" -lt 0 ] && ms=0
+  printf 'phase\t%s\t%d.%03d\t%s\n' "$1" "$((ms / 1000))" "$((ms % 1000))" "$_pf_tag" >>"$_PROFILE"
+  _pf_last="$now"
+}
+
+# kit_total — the run's own wall clock, on the EXIT path, so the table's
+# denominator is a measurement rather than the reader's arithmetic over rows that
+# are individually correct and collectively incomplete (a run killed by
+# `timeout` mid-check has no row for the check that was still running).
+kit_total() {
+  [ -n "$_PROFILE" ] || return 0
+  # Declared and assigned SEPARATELY, and that is not style. `local a="$(f)" b=$((a))`
+  # computes `b` from the `a` that was already in scope, because `local` takes
+  # effect only after the whole list is evaluated — so the arithmetic silently ran
+  # against the previous call's timestamp and produced a negative duration, which
+  # then clamped to 0.000. A total that reads 0.000 is worse than no total.
+  local now ms
+  now="$(_pf_now)"
+  ms=$((now - _pf_start))
+  [ "$ms" -lt 0 ] && ms=0
+  printf 'total\tFULL RUN (first line of the script to the exit trap)\t%d.%03d\t%s\n' \
+    "$((ms / 1000))" "$((ms % 1000))" "$_pf_tag" >>"$_PROFILE"
+}
+
+
 # The gate installs its own dependencies. Not `shellcheck` and not `node` —
 # those stay optional and reported as SKIPs when absent — but PyYAML, without
 # which not one check in this file can run, and yamllint, which kit's own
@@ -186,6 +315,8 @@ fi
 . "$ROOT/tests/bootstrap.sh"
 kit_bootstrap_python "$ROOT"
 export KIT_PYTHON="$PY"
+
+kit_phase "00 bootstrap: resolve the interpreter and install deps"
 
 # gitleaks' pinned version, for the check messages below. Read from bootstrap.sh
 # rather than re-declared, because two places holding a version number is how the
@@ -218,6 +349,24 @@ fails=0
 skips=0
 
 report() {
+  # THE ONE PLACE A VERDICT CLOSES AN INTERVAL. Every `PASS`/`FAIL`/`SKIP` line
+  # this gate prints comes through here — from `check`, from `check_verbose`, from
+  # `bounded_check`, and from the arms that reach a verdict from a `[ -x ]` with no
+  # command at all. Timing the helpers instead would have left a hole exactly
+  # where the second version's `--only` smoke test put one: forty PASS lines and
+  # not a single row. A hole in a profile reads as "cheap" to everyone who reads
+  # the table later, so the emitter is the measurement site.
+  #
+  # `_pf_mark` is "the millisecond the current unit of work started", and emitting
+  # RE-ARMS it to now: a `report` reached after an inline computation therefore
+  # measures that computation rather than nothing at all, and a verdict that ran
+  # no command is honestly reported as a near-zero `report_direct` row. `_pf_mark`
+  # is 0 when no unit of work is in flight — `par_flush` clears it before it
+  # prints, because each parallel child's own `cpu` row already covers that time.
+  if [ -n "$_PROFILE" ] && [ "$_pf_mark" != 0 ]; then
+    kit_profile "$_pf_kind" "$2" "$_pf_mark"
+    _pf_mark="$(_pf_now)"
+  fi
   printf '%-4s %s\n' "$1" "$2"
   case "$1" in
     FAIL) fails=$((fails + 1)) ;;
@@ -258,11 +407,17 @@ check() { # check <label> <command...>
   # after. Capturing the status first and branching on it afterwards looks
   # equivalent and is not — it turns every FAIL into a truncated run whose last
   # line is a check, which is precisely the shape a reader has to guess at.
+  _t0=0
+  [ -n "$_PROFILE" ] && _t0="$(_pf_now)"
+  _pf_mark="$_t0"
+  _pf_kind=check
   if out="$("$@" 2>&1)"; then
     status=0
   else
     status=$?
   fi
+  # The ROW is written by `report` below, which is where every verdict is
+  # emitted; the mark set above is all this function owes the profile.
   if [ "$status" -eq 0 ]; then
     report PASS "$label"
     # A check that reports WHICH SPEC it verified is a different statement from
@@ -307,7 +462,15 @@ check() { # check <label> <command...>
 check_verbose() { # check_verbose <label> <proof-regex> <command...>
   local label="$1" proof="$2" out ec=0
   shift 2
+  _t0=0
+  [ -n "$_PROFILE" ] && _t0="$(_pf_now)"
+  _pf_mark="$_t0"
+  _pf_kind=check
   out="$("$@" 2>&1)" || ec=$?
+  # `check_verbose` runs a command exactly as `check` does and reports exactly as
+  # `check` does, so leaving it unmarked would have produced a table with a hole
+  # where a real cost was — and a hole is read as "cheap" by everyone who reads
+  # the table later.
   if [ "$ec" -eq 0 ]; then
     report PASS "$label"
     printf '%s\n' "$out" | grep -E "$proof" | sed 's/^/       /' || true
@@ -317,7 +480,16 @@ check_verbose() { # check_verbose <label> <proof-regex> <command...>
   fi
 }
 
-section() { printf '\n-- %s\n' "$1"; }
+section() {
+  # The PHASE marker, taken here because `section` is the one chokepoint every
+  # phase boundary already passes through: instrumenting it means no phase can be
+  # missed by forgetting to add a line, which is the failure mode a hand-placed
+  # marker has. It writes to the profile file and prints nothing, so the gate's
+  # own output — which `--only` and `self_test.sh` both read — is byte-identical
+  # with the profiler on and off. Only `kit_phase`'s FILE is touched.
+  kit_phase "$1"
+  printf '\n-- %s\n' "$1"
+}
 
 # ---------------------------------------------------------------------------
 # parallel checks — bounded, ordered, and provably the same verdict
@@ -417,7 +589,22 @@ check_par() {
   # `par_flush`'s answer to that is the one thing this helper must never do,
   # which is call a check that did not finish a pass. Turning errexit off INSIDE
   # the child scopes the change to the three lines that need it.
-  ( set +e; "$@" >"$slot.out" 2>&1; printf '%s\n' "$?" >"$slot.status" ) &
+  #
+  # The clock is read INSIDE the child, not around the `&`. A parent's wall time
+  # for a backgrounded spawn is the time to SPAWN, not the time the check took,
+  # so measuring there would have made every parallel check look like a
+  # millisecond — which is precisely the shape of measurement that argues for
+  # deleting the concurrency. These rows are recorded as `cpu` rather than
+  # `check` because they OVERLAP: their sum is an upper bound on the parallel
+  # region, not its elapsed time, and the `phase` row is what says how long the
+  # region really took. Collapsing the two would double-count and produce a
+  # profile that adds up to more than the run, which is the one thing a profile
+  # must never do.
+  ( set +e
+    _t0=0; [ -n "$_PROFILE" ] && _t0="$(_pf_now)"
+    "$@" >"$slot.out" 2>&1; _ec=$?
+    kit_profile cpu "$label" "$_t0"
+    printf '%s\n' "$_ec" >"$slot.status" ) &
   par_pids="$par_pids $!"
   par_slots="$par_slots $slot"
   # The bound. `wait` on the OLDEST pid rather than `wait -n` (bash 4.3+; kit's
@@ -495,6 +682,21 @@ report_par() {
     *) printf '1\n' >"$slot.status" ;;
   esac
   : >"$slot.out"
+  # Recorded, so a loop that reaches its verdict from a `[ -x ]` rather than a
+  # command is still a ROW in the profile instead of a silent gap. Its duration is
+  # genuinely ~0: this arm spawned nothing, and the time it spent is already
+  # inside the `phase` row that covers the loop.
+  #
+  # The clock is read HERE, at the top of the write, rather than being taken from
+  # the enclosing phase marker. An earlier version passed `$_pf_last`, which made
+  # every one of these rows report the age of the whole SECTION — so a region with
+  # 300 no-op verdicts would have appeared to cost 300 × the phase's duration, and
+  # the profile would have summed to far more than the run it measured. A profile
+  # that does not add up is worse than no profile: it is one a reader stops
+  # believing.
+  _t0=0
+  [ -n "$_PROFILE" ] && _t0="$(_pf_now)"
+  kit_profile verdict "$label" "$_t0"
 }
 
 # par_flush — wait for every outstanding check, then report them in order.
@@ -502,6 +704,12 @@ par_flush() {
   while [ -n "$par_pids" ]; do
     par_reap
   done
+  # Cleared, not re-armed: every check in a parallel region has already written
+  # its own `cpu` or `verdict` row from inside its child, timed where it ran.
+  # Leaving a mark live here would make `par_flush`'s deferred `report` calls
+  # measure the flush loop itself and charge it to whichever check happened to be
+  # last — the same double-count the `cpu` kind exists to prevent.
+  [ -n "$_PROFILE" ] && _pf_mark=0
   local i=1 label status out
   while [ "$i" -le "$par_count" ]; do
     local slot="$par_dir/$i"
@@ -749,8 +957,14 @@ bounded_check() {
     bounded_ran=$((bounded_ran + 1))
     # `--kill-after` so a tier that ignores SIGTERM is still ended: without it
     # the bound is only a request, and the whole point is that the run ENDS.
+    _t0=0; [ -n "$_PROFILE" ] && _t0="$(_pf_now)"
+    _pf_mark="$_t0"
+    _pf_kind=tier
     out="$("$runner" --kill-after=30s "$bound" "$@" 2>&1)" || ec=$?
   else
+    _t0=0; [ -n "$_PROFILE" ] && _t0="$(_pf_now)"
+    _pf_mark="$_t0"
+    _pf_kind=tier
     out="$("$@" 2>&1)" || ec=$?
   fi
   if [ "$ec" -eq 0 ]; then
@@ -762,6 +976,14 @@ bounded_check() {
     # 124 is `timeout`'s own code for "the bound was reached", and it is the
     # only status here that means the command's verdict is unknown.
     bounded_hit=$((bounded_hit + 1))
+    # `BOUND` prints through `printf` rather than `report` — `report` counts
+    # FAIL/SKIP and a bound is neither — so the row is emitted here or not at all.
+    # A tier that hit its ceiling and left no row is precisely the tier whose cost
+    # a reader most needs, because it is the one that decides how long the run is.
+    if [ -n "$_PROFILE" ] && [ "$_pf_mark" != 0 ]; then
+      kit_profile tier "$label" "$_pf_mark"
+      _pf_mark="$(_pf_now)"
+    fi
     printf '%-4s %s\n' BOUND "$label"
     printf '       exceeded its %ss bound on this machine. The tier did not finish, so\n' "$bound"
     printf '       the claim it exists to prove is UNEXERCISED — this is not a defect in\n'
@@ -779,6 +1001,7 @@ bounded_check() {
 # ===========================================================================
 # phase: static
 # ===========================================================================
+kit_phase "10 static: every artifact parses, and the strictness decisions hold"
 
 if [ "$RUN_STATIC" -eq 1 ]; then
   # erb_yaml_ok <file> — a Kamal config TEMPLATE renders, and the result is YAML.
@@ -9658,6 +9881,7 @@ fi
 # phase: telemetry — execute the traceparent templates
 # ===========================================================================
 
+kit_phase "20 telemetry: the six traceparent suites, executed"
 if [ "$RUN_TELEMETRY" -eq 1 ]; then
   # Formatting is part of the template: a service that copies a template
   # formatted differently from its neighbours is a template that reads as ours.
@@ -9866,6 +10090,7 @@ fi
 # phase: observability — the two proofs that need a real collector
 # ===========================================================================
 
+kit_phase "30 observability: the claims worth nothing unexercised"
 if [ "$RUN_OBSERVABILITY" -eq 1 ]; then
   section 'observability: the redaction boundary, against a real collector'
 
@@ -9955,6 +10180,7 @@ fi
   # called these "the property rather than the shape", but the block shipped
   # wrapped in `if [ "$RUN_STATIC" -eq 1 ]`, which would let a static-analysis
   # skip silently drop the fail-closed proof. A gate that skips is not green.
+kit_phase "40 classifier + staleness + fetch + tenancy, executed"
 check 'tests/classify_test.sh  (19 cases, incl. the fail-closed property)' \
   bash "$ROOT/tests/classify_test.sh"
 
@@ -10074,6 +10300,7 @@ fi
 # It also gates on its own toolchains, unlike every other phase: a skip here
 # means the claim "kit's lint configs work" went untested, and a claim nobody
 # ran is a rumour. See the script's own footer.
+kit_phase "50 lint: the four linters, run against fixtures that must fail them"
 section 'lint: kit configs, executed against fixtures that must fail them'
 if [ "$RUN_LINT" -eq 0 ]; then
   report SKIP 'lint_test.sh  (--no-lint)'
@@ -10086,6 +10313,7 @@ fi
 # phase: self_test — prove the gate can go red
 # ===========================================================================
 
+kit_phase "60 self_test: n whole gates, one per breakage"
 if [ "$RUN_SELF_TEST" -eq 1 ]; then
   section 'self_test: this gate is able to fail'
   # The numbers in this label are COUNTED from self_test.sh's recipes rather than
@@ -10271,6 +10499,7 @@ fi
 
 # ---------------------------------------------------------------------------
 
+kit_phase "70 summary"
 printf '\n'
 # FOUR COUNTS, and the reason there are four is the reason this summary exists
 # at all. `PASS` and `FAIL` are verdicts about the tree. `SKIP` is a verdict

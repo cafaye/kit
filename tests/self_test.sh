@@ -777,6 +777,15 @@ expect_red() {
     return 0
   fi
   _shard_ran=$((_shard_ran + 1))
+  # PROFILE TAG, and it is the whole reason a profile can say anything about
+  # this phase. Every recipe runs a whole `tests/validate.sh` in a throwaway copy
+  # and those copies inherit `KIT_PROFILE` from the environment — so with the tag
+  # set, every row a child writes is attributed to the BREAKAGE rather than to
+  # the gate, which is otherwise indistinguishable from the gate's own ~200 rows
+  # of identically-named checks. Without it the profile has one column and the
+  # most expensive phase in the run is a column of repetitions.
+  KIT_PROFILE_TAG="self_test $1"
+  export KIT_PROFILE_TAG
   local label="$1" dir="$2"
   shift 2
   if (cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" >/dev/null 2>&1); then
@@ -827,6 +836,15 @@ expect_red_check() {
     return 0
   fi
   _shard_ran=$((_shard_ran + 1))
+  # PROFILE TAG, and it is the whole reason a profile can say anything about
+  # this phase. Every recipe runs a whole `tests/validate.sh` in a throwaway copy
+  # and those copies inherit `KIT_PROFILE` from the environment — so with the tag
+  # set, every row a child writes is attributed to the BREAKAGE rather than to
+  # the gate, which is otherwise indistinguishable from the gate's own ~200 rows
+  # of identically-named checks. Without it the profile has one column and the
+  # most expensive phase in the run is a column of repetitions.
+  KIT_PROFILE_TAG="self_test $1"
+  export KIT_PROFILE_TAG
   local label="$1" dir="$2" want="$3"
   shift 3
   local out ec=0
@@ -994,6 +1012,15 @@ expect_green_check() {
     return 0
   fi
   _shard_ran=$((_shard_ran + 1))
+  # PROFILE TAG, and it is the whole reason a profile can say anything about
+  # this phase. Every recipe runs a whole `tests/validate.sh` in a throwaway copy
+  # and those copies inherit `KIT_PROFILE` from the environment — so with the tag
+  # set, every row a child writes is attributed to the BREAKAGE rather than to
+  # the gate, which is otherwise indistinguishable from the gate's own ~200 rows
+  # of identically-named checks. Without it the profile has one column and the
+  # most expensive phase in the run is a column of repetitions.
+  KIT_PROFILE_TAG="self_test $1"
+  export KIT_PROFILE_TAG
   local label="$1" dir="$2" want="$3" needle="$4"
   shift 4
   local out ec=0
@@ -1034,6 +1061,15 @@ expect_red_script() {
     return 0
   fi
   _shard_ran=$((_shard_ran + 1))
+  # PROFILE TAG, and it is the whole reason a profile can say anything about
+  # this phase. Every recipe runs a whole `tests/validate.sh` in a throwaway copy
+  # and those copies inherit `KIT_PROFILE` from the environment — so with the tag
+  # set, every row a child writes is attributed to the BREAKAGE rather than to
+  # the gate, which is otherwise indistinguishable from the gate's own ~200 rows
+  # of identically-named checks. Without it the profile has one column and the
+  # most expensive phase in the run is a column of repetitions.
+  KIT_PROFILE_TAG="self_test $1"
+  export KIT_PROFILE_TAG
   local label="$1" dir="$2" script="$3" want="${5:-}"
   shift 3
   # The optional 4th argument (always pass an empty one) is where a script's own
@@ -1078,6 +1114,15 @@ expect_green_script() {
     return 0
   fi
   _shard_ran=$((_shard_ran + 1))
+  # PROFILE TAG, and it is the whole reason a profile can say anything about
+  # this phase. Every recipe runs a whole `tests/validate.sh` in a throwaway copy
+  # and those copies inherit `KIT_PROFILE` from the environment — so with the tag
+  # set, every row a child writes is attributed to the BREAKAGE rather than to
+  # the gate, which is otherwise indistinguishable from the gate's own ~200 rows
+  # of identically-named checks. Without it the profile has one column and the
+  # most expensive phase in the run is a column of repetitions.
+  KIT_PROFILE_TAG="self_test $1"
+  export KIT_PROFILE_TAG
   local label="$1" dir="$2" script="$3"
   shift 3
   local out
@@ -1113,6 +1158,15 @@ expect_skip_check() {
     return 0
   fi
   _shard_ran=$((_shard_ran + 1))
+  # PROFILE TAG, and it is the whole reason a profile can say anything about
+  # this phase. Every recipe runs a whole `tests/validate.sh` in a throwaway copy
+  # and those copies inherit `KIT_PROFILE` from the environment — so with the tag
+  # set, every row a child writes is attributed to the BREAKAGE rather than to
+  # the gate, which is otherwise indistinguishable from the gate's own ~200 rows
+  # of identically-named checks. Without it the profile has one column and the
+  # most expensive phase in the run is a column of repetitions.
+  KIT_PROFILE_TAG="self_test $1"
+  export KIT_PROFILE_TAG
   local label="$1" dir="$2" want="$3"
   shift 3
   local out ec=0
@@ -1156,6 +1210,15 @@ expect_green() {
     return 0
   fi
   _shard_ran=$((_shard_ran + 1))
+  # PROFILE TAG, and it is the whole reason a profile can say anything about
+  # this phase. Every recipe runs a whole `tests/validate.sh` in a throwaway copy
+  # and those copies inherit `KIT_PROFILE` from the environment — so with the tag
+  # set, every row a child writes is attributed to the BREAKAGE rather than to
+  # the gate, which is otherwise indistinguishable from the gate's own ~200 rows
+  # of identically-named checks. Without it the profile has one column and the
+  # most expensive phase in the run is a column of repetitions.
+  KIT_PROFILE_TAG="self_test $1"
+  export KIT_PROFILE_TAG
   local label="$1" dir="$2"
   shift 2
   local out ec=0
@@ -1196,6 +1259,15 @@ expect_red_lang() {
     return 0
   fi
   _shard_ran=$((_shard_ran + 1))
+  # PROFILE TAG, and it is the whole reason a profile can say anything about
+  # this phase. Every recipe runs a whole `tests/validate.sh` in a throwaway copy
+  # and those copies inherit `KIT_PROFILE` from the environment — so with the tag
+  # set, every row a child writes is attributed to the BREAKAGE rather than to
+  # the gate, which is otherwise indistinguishable from the gate's own ~200 rows
+  # of identically-named checks. Without it the profile has one column and the
+  # most expensive phase in the run is a column of repetitions.
+  KIT_PROFILE_TAG="self_test $1"
+  export KIT_PROFILE_TAG
   local label="$1" dir="$2" lang="$3" file="$4" old="$5" new="$6"
   local work="$WORK/mutant-$lang"
 
