@@ -377,6 +377,22 @@
 #         86 proofs did not notice. So the rule now covers kit's own harnesses
 #         too, statically, and 87 is the proof that it does.
 #
+# 88. THE SECOND TENANT, which is the case every other breakage in this file
+#         structurally cannot reach. All of them prove that ONE service gets a
+#         database; this is the first to ask what happens when a second name is
+#         appended, and it exists because that question had never been asked and
+#         the answer was wrong. `KIT_POSTGRES_DATABASES="billing neighbour"`
+#         provisioned ONE database named `billingneighbour` and reported
+#         success, because a `tr -d '[:space:]'` standing in front of
+#         `require_identifier` deleted the space before the validator could
+#         refuse it. Measured on a live cluster, not inferred.
+#
+#         It gets its own number rather than joining 84-87 above because that
+#         block is about the cluster provisioning NOTHING, and this is about it
+#         provisioning the wrong THING while reporting itself healthy. Different
+#         defect, different fix — and a header number that covers two of those
+#         is a number that cannot say which recipe a line describes.
+#
 # 61-62. THE LICENCE, in the two ways the grant stops being unambiguous. A
 #         licence is only unambiguous when exactly ONE place in a repository can
 #         declare one.
@@ -3328,9 +3344,26 @@ fi
 
 base88="$(fresh_copy kit-88)"
 # Put the OLD parse back: strip ALL whitespace, so two names fuse into one.
+#
+# THE MUTATION IS LINE 144, NOT THE `service=` ASSIGNMENT, and getting that wrong
+# is what made this proof vacuous for one merge cycle — it stayed GREEN on a tree
+# carrying the exact defect it exists to catch.
+#
+# The fix for the fused name is not "stop using `tr -d`". It is TWO things: the
+# outer trim at 144 keeps only the edges, and the `case` at 147 REFUSES a name
+# that still holds whitespace inside it. The `service="$trimmed"` assignment at
+# 156 is downstream of that refusal and is never reached for a fused name — the
+# script has already exited 1 at 152. So mutating 156 puts the old `tr -d` back
+# in a line that never runs, the refusal still fires, the test stays green, and
+# the proof reports success while reintroducing nothing at all.
+#
+# Mutating 144 is the defect itself: `trimmed` becomes "billingneighbour", the
+# `case` sees no whitespace, nothing is refused, and one database named after
+# both services is provisioned by a stack that reports itself healthy. Measured
+# both ways; the 144 mutation is the one that goes red.
 edit "$base88/templates/compose/postgres/initdb/10-cluster.sh" \
-  'service="$trimmed"' \
-  'service="$(printf '"'"'%s'"'"' "$entry" | tr -d '"'"'[:space:]'"'"')"'
+  'trimmed="$(printf '"'"'%s'"'"' "$entry" | sed -e '"'"'s/^[[:space:]]*//'"'"' -e '"'"'s/[[:space:]]*$//'"'"')"' \
+  'trimmed="$(printf '"'"'%s'"'"' "$entry" | tr -d '"'"'[:space:]'"'"')"'
 expect_red_script 'breakage 88: two tenants separated by a space fuse into one database' \
   "$base88" tests/multi_tenant_split_test.sh '' \
   'REFUSING'
