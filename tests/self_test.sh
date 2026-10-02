@@ -3702,47 +3702,64 @@ edit "$base92/templates/database/tenancy/assertions.txt" \
 expect_red_check 'breakage 92: the assertion manifest and the proof stop agreeing' \
   "$base92" "$TENANCY" --static-only
 
-# 93. The advisor rule that grades the LIVE DATABASE, with the exclusion that
-# makes it a rule rather than an alarm removed. `security_definer_view` is the
-# one ERROR/SEC detection the Supabase reference carries that kit had no lint for,
-# and the way it goes quiet is the way every rule in this file goes quiet: a
-# condition that no longer holds, rather than one that is wrong.
+# 93. THE ADVISOR AND THE PROOF THAT IT FIRES, STOPPED AGREEING. `advisor.sql`
+# is the only thing in the account boundary that grades the LIVE DATABASE, and
+# every rule in it is graded by a fixture in `tests/tenancy_test.sh` — a script
+# `--static-only` never runs. So before this check the two lists were compared by
+# nothing: a rule could be renamed, or its trip fixture renamed with it, and
+# every static check in this repository stayed green while the suite proved a
+# rule that no longer existed.
 #
-# THE MUTATION IS THE `having`, and it is the whole rule. Every clause of the
-# `where` is a NARROWING — no security_invoker, at least one RLS'd table
-# reachable, a login role that can SELECT it — and they exist so the rule does
-# not fire on every view in a schema, which is how a security rule gets switched
-# off. Deleting the `having count(*) filter (where relrowsecurity) > 0` is
-# therefore the smallest possible break: the SQL still installs, still parses,
-# still returns rows, and every fixture it is asked about still produces output.
-# It simply no longer requires the view to read anything protected.
+# THE MUTATION IS THE RULE'S OWN NAME, in the union arm that produces it. That is
+# deliberately the smallest thing that moves: the SQL still installs, still
+# parses, still returns rows, and the rule is still every bit as correct. It just
+# no longer agrees with the fixture that trips it — which is the exact shape of
+# the drift this catches, and the drift is silent in the worst direction, since a
+# renamed rule is a rule whose proof no longer runs rather than a rule that is
+# broken.
 #
-# WHY THIS IS A `validate.sh` BREAKAGE AND NOT A `tenancy_test.sh` ONE, which is
-# the judgement worth recording. The proof that this rule can fire lives in
-# `tests/tenancy_test.sh`, which needs a real cluster and is not run by
-# `validate.sh --static-only`. So a mutation proved against the static gate has
-# to be one the static gate can SEE, and it can see this one because
-# `tenancy_contract_check` reads `advisor.sql`'s rule names and asserts they
-# agree with the fixtures in the test that trips them. Renaming the rule out of
-# the union arm is the mutation for THAT check; stripping the `having` is the
-# mutation for the proof. This recipe does the second, and asserts the first's
-# check goes red -- which proves the agreement is real rather than a string both
-# files happen to share.
+# AND WHAT THIS RECIPE DOES NOT CLAIM, which is worth as much as what it does.
+# The FIRST version of this mutation stripped the rule's `having` — the
+# condition that requires the view to read something protected — on the theory
+# that removing the narrowing would make the rule fire everywhere and that this
+# check could see it. Measured: the gate stayed GREEN. The check compares rule
+# NAMES, so a rule that is present, correctly named and no longer selective is
+# invisible to it by construction. A static check that read rule bodies would
+# have to parse SQL, which is the parse whose misses are silent and which this
+# file has already declined three times (advisor.sql is SKIPped by the parser
+# loop with a note saying `tests/tenancy_test.sh` is its check).
 #
-# `delete`, not `sed`, for the same reason breakage 90 uses it: the file
-# explains this rule in prose that quotes the shape, so a text mutation is
-# satisfiable by a comment. This one replaces the whole `having` clause with a
-# literal `true`, which no comment can satisfy.
+# So the two properties are proved by two different files, deliberately:
+#   * THAT THE RULE FIRES, and does not misfire -> tests/tenancy_test.sh, which
+#     runs a real cluster and asserts both positives AND six negatives.
+#   * THAT THE ADVISOR AND ITS PROOF AGREE -> this check, statically.
+# Neither substitutes for the other, and this recipe says which is which rather
+# than claiming a mutation it cannot make.
 base93="$(fresh_copy kit-93)"
 edit "$base93/templates/database/tenancy/advisor.sql" \
-  "  having count(*) filter (where relrowsecurity) > 0
-     and exists (select 1 from api_roles r
-                  where has_table_privilege(r.rolname, min(view_reads.view_oid), 'SELECT'))
-" "  having true
-"
-expect_red_check 'breakage 93: the advisor rule can no longer tell whether a view reads a protected table' \
+  "  select 'security_definer_view'::text as name,
+         'ERROR'::text as level," \
+  "  select 'security_definer_view_v2'::text as name,
+         'ERROR'::text as level,"
+expect_red_check 'breakage 93: the advisor and the fixtures that trip its rules stop agreeing' \
   "$base93" "$TENANCY" --static-only
 
+# 93. THE ADVISOR AND THE PROOFS THAT TRIP ITS RULES STOP AGREEING. The last
+#     hole of the account boundary's own gate: `advisor.sql` is the only thing
+#     here that grades the LIVE DATABASE, its rules are proved by fixtures in
+#     `tests/tenancy_test.sh`, and `--static-only` runs neither. So nothing
+#     compared the two lists, and a rule renamed with its fixture left the whole
+#     static gate green while the suite proved a rule that no longer existed.
+#     `tenancy_contract_check` now compares the rule NAMES both ways.
+#
+#     This is the SECOND check on the account boundary, and not a third: the one
+#     that proves the RULES FIRE is `tests/tenancy_test.sh` and cannot be a
+#     static check, and the first attempt at this recipe mutated the rule's
+#     `having` clause instead of its name — and the gate stayed GREEN, because a
+#     rule that is present, correctly named and no longer selective is invisible
+#     to a check that compares names. Measured, and written down at the recipe
+#     rather than quietly corrected: the mutation a check can see is not always
+#     the mutation that matters, and the two are proved by two files.
 base68="$(fresh_copy kit-68)"
 edit "$base68/templates/compose/.env.example" \
   'KIT_POSTGRES_TAG=17' 'KIT_POSTGRES_TAG=16.6-alpine'
