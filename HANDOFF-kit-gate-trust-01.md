@@ -56,25 +56,30 @@ end-to-end `bash tests/self_test.sh` with an over-provisioned shard.
 **41 assertions, exit 0, ~23s.** Wired into `tests/validate.sh` phase 40 as a
 `bounded_check` (300s), deliberately not behind `RUN_STATIC`.
 
-**MEASUREMENT (the packet asked for this explicitly).** 97 breakages before my
-two, numbered **sparsely**: 1..62 and 68..93, with **63–67 unused**.
+**MEASUREMENT (the packet asked for this explicitly).** Suite after this packet:
+**99 breakages, numbered 1..95, 90 distinct numbers. Numbers 63–67 are unused**
+(left by a renumbering).
 
-```
-n=1  2  3  4  5  7  8  62  -> every one partitions all 97 exactly once, n/n included
-```
+| n | total | min | max | empty shards |
+| --- | --- | --- | --- | --- |
+| 4 | 99 | 23 | 26 | none |
+| 8 | 99 | 11 | 14 | none |
+| 62 | 99 | 1 | 4 | none |
+| 64 | 99 | 0 | 4 | **63, 64** |
 
-They partition **evenly by residue, not by count.** For `n=4` the shards are
-`num ≡ 1,2,3,0 (mod 4)` over 97 labels → **25 / 24 / 24 / 24**. That is the
-correct answer: shards differ by at most one recipe, and no shard is empty.
+**They partition evenly to within the ±3 that residue-sharding 99 by 4 necessarily
+has** (`26/25/25/23`), and **no shard is empty for any n ≤ 62.** Under the old
+arithmetic `n=4` gave `25/24/24/0` — and that `0` is the shard that reported PASS.
 
-**A finding I did not expect: the largest gap-free `n` is 62, not 93.**
-Breakage numbers 63–67 do not exist (left by a renumbering), so for any
-`n ∈ 64..93`, shard 64 asks for `num ≡ 64 (mod n)` and there is no such breakage
-— **shard 64 is empty for every `n` in that range**, and a gate asked for 90
-shards would run fewer recipes than it was told and never say so. Same defect as
-the packet's, one level up. Measured and printed by the check rather than assumed,
-and left to the summary's existing `ran ZERO` FAIL — the startup guard refuses
-only the provably-impossible case (`n` above the highest number).
+**A finding I did not expect: the largest gap-free `n` is 62, not 95.**
+Because numbers 63–67 do not exist, for any `n ∈ 63..95` the shards numbered
+63…67 ask for residue classes no breakage is in — at `n=64`, **shards 63 and 64 are
+empty**, and a gate asked for 90 shards would run fewer recipes than it was told and
+never say so. Same defect as the packet's, one level up: an `n` that is
+arithmetically legal and covers less than it appears to. Measured and printed by the
+check rather than assumed, and left to the summary's existing `ran ZERO` FAIL — the
+startup guard refuses only the provably-impossible case (`n` above the highest
+number).
 
 **Two new breakages** (`94`, `95`), the only two in the suite that mutate
 `self_test.sh` itself:
@@ -85,6 +90,14 @@ only the provably-impossible case (`n` above the highest number).
   so the recipe cannot pass on a mutation that emptied a *different* shard.
 - `95` — the over-provision refusal `if [ "$_shard_n" -gt … ]` → `if false;`.
   Proves the safety net is still load-bearing, separately from the arithmetic.
+
+**Both verified to fire, by hand**, on throwaway copies rather than by waiting for
+a 99-gate suite: 94 exits 1 with `FAIL  2 shard(s): 2 ran ZERO … and shard 2/n is
+one of them -- THE SHIPPED DEFECT`; 95 exits 1 with `FAIL  an over-provisioned
+shard count: KIT_SELF_TEST_SHARD=1/96 was ACCEPTED`. `edit` replaces only the
+**first** occurrence (`body.replace(old, new, 1)`), which matters because both
+recipes' search strings also appear inside the recipes themselves and the code line
+precedes them.
 
 ### Defect 2 — the canary was red on master (FIXED, measured green)
 
@@ -137,9 +150,20 @@ including `no tenant_id reached a measurement attribute` and
 ## What I ran, and what I did not
 
 **Ran**
-- `bash tests/shard_test.sh` — 41 assertions, exit 0, ~23s
-- `bash tests/canary_test.sh` — **exit 0**, green end to end
-- `bash tests/validate.sh --static-only` — see "Worktree state"
+- `bash tests/shard_test.sh` — **41 assertions, 0 FAIL, exit 0**, ~23s
+- `bash tests/canary_test.sh` — **exit 0**, 13 PASS / 0 FAIL, green end to end
+- `bash tests/validate.sh --static-only` — **`PASS: every check passed.`, exit 0**,
+  **230 PASS / 0 FAIL / 6 SKIP**
+- Both new breakages, by hand, on mutated throwaway copies
+
+**A process failure worth recording, because it is this packet's own subject.**
+The first `validate.sh --static-only` run exited **127** with
+`line 10538: second: command not found`. That was **mine**, not the tree's: I
+edited `tests/validate.sh` while it was running, and bash reads a script
+incrementally by byte offset, so it resumed mid-word. Re-run against an untouched
+file: green. A gate reporting a status that is about the *run* rather than the
+tree — which is exactly what a `BOUND` verdict exists to distinguish, and exactly
+what I produced by accident.
 
 **Deliberately did NOT run**
 - **The whole unsharded `self_test.sh`** (99 whole gates; would not fit the hour)
@@ -147,8 +171,9 @@ including `no tenant_id reached a measurement attribute` and
   `tests/stack_live_test.sh` share the docker daemon and network, and the packet
   records shard 7 failing on that collision alone. I ran everything sequentially.
 - A real multi-shard measurement of *recipes executed*, which would have needed
-  several shards. **The partition is proved over all 99 labels without running
-  them**; the residue split (`25/24/24/24` at n=4) is arithmetic, not a guess.
+  several shard runs. **The partition is proved over all 99 labels without running
+  them**, and the per-shard counts above are derived from the same `_shard_claims`
+  that decides the partition — stated as derivation, not dressed up as a run.
 
 **Known red, not mine:** `TestTheCoverageExclusionIsOnlyGeneratedCode` in
 `identity`, a separate repository.

@@ -281,14 +281,32 @@ for n in $NSS; do
   # EXACTLY ONCE and COMPLETE, from the same tally: a breakage claimed by two
   # shards is a partition that overlaps, and one claimed by none is a partition
   # with a hole. Counted rather than eyeballed because both are quiet.
+  #
+  # The names are TRUNCATED, and that is not politeness. An off-by-one makes EVERY
+  # label unclaimed at once, so the first version of this message printed all 99
+  # of them on one line and buried the two findings above it -- a check whose
+  # failure output is a wall of text is a check nobody reads, and the count is the
+  # part that carries the diagnosis.
   dupes=""
   missing=""
+  missing_count=0
+  # The short name is the LABEL, not the line: several recipes carry their
+  # arguments on the same line, so truncating at the first colon still leaves
+  # `"'breakage 1: ... \"$one\" --static-only"` in the message.
+  short_of() { printf 'breakage %s' "${1##*breakage }"; }
+  _short=""
   for label in "${LABELS[@]}"; do
     got="$(printf '%s\n' "$out" | grep -cF "	$label" || true)"
     case "${got:-0}" in
       1) ;;
-      0) missing="$missing $label" ;;
-      *) dupes="$dupes $label(x$got)" ;;
+      0)
+        missing_count=$((missing_count + 1))
+        if [ "$missing_count" -le 3 ]; then
+          _short="$(short_of "$label")"
+          missing="$missing ${_short%%:*}"
+        fi
+        ;;
+      *) dupes="$dupes $(short_of "$label" | cut -d: -f1)(x$got)" ;;
     esac
   done
   if [ -n "$dupes" ]; then
@@ -296,8 +314,8 @@ for n in $NSS; do
   else
     pass "n=$n: no breakage is claimed twice"
   fi
-  if [ -n "$missing" ]; then
-    fail "n=$n: these breakages are claimed by NO shard, so n shards do not cover the suite:$missing"
+  if [ "$missing_count" -ne 0 ]; then
+    fail "n=$n: $missing_count breakage(s) are claimed by NO shard, so the n shards do not cover the suite:$missing$([ "$missing_count" -gt 3 ] && printf ' ... and %s more' "$((missing_count - 3))")"
   else
     pass "n=$n: the $n shards cover all $SUITE_SIZE numbered breakages"
   fi
