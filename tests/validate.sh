@@ -1097,6 +1097,15 @@ PY
       #   syntax that was not Ruby because nothing looked at it, and every one of
       #   these six was written from scratch in this packet with no toolchain
       #   resolving its imports — so a parse on any machine is worth having.
+      # Markdown. Named rather than globbed, and deliberately so: the `*)` arm would
+      # report `SKIP … (no parser for this file type)` on every run, and a
+      # permanently-reported skip is a gap nobody fixes, which is the whole reason
+      # the skip exists. This README's check is the presence check above it, which
+      # asserts it is there — and a README has no syntax to be wrong about. The
+      # same treatment templates/kamal/README.md gets, for the same reason.
+      "$ROOT"/templates/database/tenancy/README.md)
+        report_par PASS "$path  (markdown; the presence check is its check)"
+        ;;
       "$ROOT"/templates/database/tenancy/substrate.sql | \
       "$ROOT"/templates/database/tenancy/isolation.sql)
         # No parser for this file type HERE, deliberately: see above. Reported

@@ -93,9 +93,13 @@ defmodule TenancyTest do
     else
       {:ok, conn} = Postgrex.start_link(dsn: dsn)
 
-      # Postgrex sends a multi-statement string as a simple query, which is the
-      # protocol that accepts one.
-      Postgrex.query!(conn, @script, [])
+      # `Postgrex.SimpleQuery`, not `Postgrex.query`. A batch of statements has to
+      # go over the SIMPLE protocol, and `Postgrex.query/4` is the extended one —
+      # which binds its input into a single prepared statement and refuses a script.
+      # `SimpleQuery.query!/3` is the documented way to send one, and naming it
+      # explicitly is the difference between "the driver will work this out" and a
+      # driver that changes its mind in a minor release.
+      Postgrex.SimpleQuery.query!(conn, @script, [])
 
       %{rows: rows} = Postgrex.query!(conn, @results, [])
 

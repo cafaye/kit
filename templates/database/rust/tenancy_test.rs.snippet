@@ -64,10 +64,22 @@ fn here() -> PathBuf {
 /// The proof, run whole and unexamined. It opens a transaction and leaves it open,
 /// because two of the things it does refuse to do outside one; every object it
 /// creates is TEMPORARY, so nothing survives the session either way.
-async fn run_script(client: &Client) -> Result<(), tokio_postgres::Error> {
+///
+/// `Box<dyn Error>` rather than `tokio_postgres::Error`, and that is a compile
+/// error caught by reading rather than by a test: reading the file is an
+/// `std::io::Error` and tokio-postgres' error type implements `From` for neither
+/// it nor anything else, so `?` on the `read_to_string` would not compile the
+/// moment the crate resolved. `Box<dyn std::error::Error>` converts both, and the
+/// caller's `.expect(...)` reports them the same way.
+///
+/// This is also the honest limit of `tests/validate.sh`'s parse of this file: it
+/// filters E0432 and E0433 (unresolved crates) and reports nothing else, because a
+/// dependency-free kit produces those two by design — so a TYPE error in this file
+/// is invisible to the gate, and the gate says so rather than pretending otherwise.
+async fn run_script(client: &Client) -> Result<(), Box<dyn std::error::Error>> {
     let script = fs::read_to_string(here().join("isolation.sql"))?;
-    // tokio-postgres' `simple_query` is the simple query protocol, which is the one
-    // that accepts a multi-statement batch — `query` binds them into a single
+    // tokio-postgres' `simple_query` IS the simple query protocol, which is the
+    // one that accepts a multi-statement batch — `query` binds them into a single
     // prepared statement and rejects a script.
     client.simple_query(&script).await?;
     Ok(())

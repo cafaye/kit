@@ -233,8 +233,14 @@
       "source": "templates/database/tenancy/isolation.sql",
       "dest": "db/tenancy/isolation.sql",
       "bundle": [
-        ["templates/database/tenancy/isolation.sql", "db/tenancy/isolation.sql"],
-        ["templates/database/tenancy/assertions.txt", "db/tenancy/assertions.txt"]
+        {
+          "source": "templates/database/tenancy/isolation.sql",
+          "dest": "db/tenancy/isolation.sql"
+        },
+        {
+          "source": "templates/database/tenancy/assertions.txt",
+          "dest": "db/tenancy/assertions.txt"
+        }
       ],
       "optional": true
     },
