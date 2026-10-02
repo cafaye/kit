@@ -3767,6 +3767,26 @@ counted=$(grep -cE '^ *expect_red(_check|_lang|_script)? +.breakage +[0-9]+[a-z]
 total=$(grep -cE '^ *expect_(red|green)(_check|_lang|_script)? +.breakage +[0-9]+[a-z]*:|^ *expect_skip_check +.breakage +[0-9]+[a-z]*:' "$0" || true)
 green_check=$(grep -cE '^ *expect_green_check +.breakage +[0-9]+[a-z]*:' "$0" || true)
 
+# `total` and `_shard_ran` COUNTED DIFFERENT THINGS, and the check that compares
+# them was therefore red on a tree where every proof ran.
+#
+# `total` greps for labels of the form `breakage N:`, so it counted 93. But the
+# one helper whose label is NOT of that form is `expect_green 'unbroken tree'`
+# — the CONTROL, the assertion that an unmutated tree is green. It is a real,
+# required evaluation and it increments `_shard_ran` like every other call, so the
+# run side read 94. Every proof had been evaluated and the suite still failed,
+# naming eleven that never ran.
+#
+# That is the worst shape this file has: a check that manufactures a shortage
+# out of its own counting rule. A reader who believed it would go looking for
+# missing proofs that are all present.
+#
+# So the declaration side counts what the run side counts — every helper
+# invocation — and `total` keeps its narrower meaning for the breakdown below,
+# which is arithmetic about BREAKAGES and would be thrown off by a control that
+# is not one.
+declared=$(grep -cE '^ *expect_(red|green|skip)(_check|_lang|_script)? +.' "$0" || true)
+
 # THE CLAIM BELOW IS "EVERY RECIPE WAS EVALUATED", AND UNTIL THIS LINE IT WAS
 # NOT CHECKED. It was asserted from the SOURCE — `total` is a `grep` of the
 # recipes this file contains — while the number of recipes that actually RAN was
@@ -3792,9 +3812,9 @@ green_check=$(grep -cE '^ *expect_green_check +.breakage +[0-9]+[a-z]*:' "$0" ||
 # against the count that EXIST, and a shortfall is a failure in its own right —
 # named as a shortfall, because "the suite failed" would send somebody looking for
 # a broken check instead of at the eleven proofs that never ran.
-if [ "$_shard_ran" -ne "$total" ]; then
-  echo "FAIL: self_test — the file declares $total breakage(s) but only $_shard_ran were EVALUATED."
-  echo "       $((total - _shard_ran)) recipe(s) never ran. A suite that stops early and"
+if [ "$_shard_ran" -ne "$declared" ]; then
+  echo "FAIL: self_test — the file declares $declared evaluation(s) but only $_shard_ran were EVALUATED."
+  echo "       $((declared - _shard_ran)) recipe(s) never ran. A suite that stops early and"
   echo "       reports success is worse than no suite, because it is believed."
   echo "       Look for an environment failure ABOVE this line (a full disk, a missing"
   echo "       tool, a deleted worktree) rather than for a broken check: the checks that"
@@ -3804,4 +3824,4 @@ if [ "$_shard_ran" -ne "$total" ]; then
 fi
 
 echo "PASS: self_test — all $total breakages hold ($counted assert red, $((total - counted - green_check)) assert a green gate with a named skip, $green_check assert a green gate with a named finding), and the unbroken tree is green."
-echo "       Every recipe above was EVALUATED — $_shard_ran ran against $total declared, and the two are compared rather than assumed: 0 environment failures, 0 skipped for a missing toolchain."
+echo "       Every recipe above was EVALUATED — $_shard_ran ran against $declared declared ($total breakages and the unbroken-tree control), and the two are compared rather than assumed: 0 environment failures, 0 skipped for a missing toolchain."
