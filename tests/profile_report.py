@@ -27,6 +27,7 @@ CHECK = "check"
 CPU = "cpu"
 TIER = "tier"
 VERDICT = "verdict"
+TOTAL = "total"
 
 # The self-test's own rows are prefixed by the tag `tests/self_test.sh` sets, so
 # the two populations can be told apart without a schema change. A row with no
@@ -83,6 +84,12 @@ def selftest_by_breakage(inner):
     """
     per = {}
     for kind, label, secs, tag in inner:
+        # The copy's OWN `total` row spans the whole copy and therefore contains
+        # every other row it wrote. Summing it with them would double the phase,
+        # so it is read for the printout and left out of the arithmetic — the
+        # same reason `cpu` rows are never added to `phase` rows.
+        if kind == TOTAL:
+            continue
         name = tag[len(SELFTEST_PREFIX):]
         entry = per.setdefault(name, {"total": 0.0, "rows": 0, "boot": 0.0})
         entry["total"] += secs
@@ -131,6 +138,20 @@ def main(argv=None):
 
     gate, inner = bucket(rows)
 
+    # The run's own wall clock, written on the EXIT trap. It is the DENOMINATOR:
+    # every table below is rows that sum to some part of it, and a profile whose
+    # rows account for most of a run is trustworthy in a way that one accounting
+    # for 40% of it is not. When it disagrees with the sum, the gap is time
+    # inside a check whose row was never written — a run killed mid-check, which
+    # is exactly what a `timeout` bound produces.
+    for kind, label, secs, _ in gate:
+        if kind == TOTAL:
+            print(f"\n== wall clock of the gate that wrote this file: {secs:.2f}s")
+    inner_totals = [r[2] for r in inner if r[0] == TOTAL]
+    if inner_totals:
+        print(f"   of which the self-test's {len(inner_totals)} copies spent "
+              f"{sum(inner_totals):.1f}s in total, {sum(inner_totals) / len(inner_totals):.1f}s each")
+
     # The gate's own phases, in wall time. This is the table a reader of a
     # ten-minute run thinks in: it cannot double-count, because a phase row is
     # emitted once per phase and covers everything the phase did.
@@ -141,7 +162,7 @@ def main(argv=None):
     )
     render(
         "the GATE's own checks and bounded tiers (excludes the self-test's copies)",
-        [r for r in gate if r[0] != PHASE],
+        [r for r in gate if r[0] not in (PHASE, TOTAL)],
         args.top,
     )
 
@@ -159,7 +180,7 @@ def main(argv=None):
         print(f"{e['total']:9.2f}  {e['boot']:7.2f}  {e['rows']:5d}  {name[:78]}")
 
     grand = sum(r[2] for r in gate if r[0] == PHASE) + total
-    print(f"\n   accounted: {grand:.1f}s of measured phase time "
+    print(f"\n   accounted: {grand:.1f}s of the gate's own phase time "
           f"({sum(r[2] for r in gate if r[0] == PHASE):.1f}s gate + {total:.1f}s self-test)")
     print("   the difference from the run's wall time is the check rows that are not")
     print("   phases, the argument parsing, and whatever the parent shell spent.")
