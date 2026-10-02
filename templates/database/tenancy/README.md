@@ -347,6 +347,15 @@ about the account.
   `account_id` column", which is the fleet's vocabulary (core's D7) and misses a
   service that spells it `tenant_id`. A service holding no customer rows is core's
   **honest zero** and needs none of this.
+- **That a schema the substrate was never applied to holds no account-scoped
+  table.** The sweep's scope is the schemas `protect_table` protected, plus
+  `cafaye` and the session's temporary schema, so customer rows in a schema no
+  `protect_table` call named are outside it. The alternative — a whole-database
+  scan — was measured on `identity` and it reports **every other test's fixture
+  schema**: its test helper clones tables with `LIKE … INCLUDING ALL`, which does
+  not copy row-level security, so a correct database produced a red proof and the
+  count moved with how many neighbours were mid-flight. A sweep that cannot stay
+  green on a correct database is one an adopter works around rather than reads.
 - **That the six drivers run.** kit's gate PARSES them and runs the assertion set
   they run; executing each driver needs that language's driver library resolving,
   which is a service's gate's job. The drivers are deliberately thin, which is

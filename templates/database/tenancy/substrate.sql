@@ -541,7 +541,8 @@ begin
 end
 $caf$;
 
--- SWEEP: every account-scoped table in this database, protected or not.
+-- SWEEP: every account-scoped table in the schemas THIS SUBSTRATE OWNS,
+-- protected or not.
 --
 -- Returns one row per table that is NOT, so a caller can report all of them
 -- rather than the first. It returns rather than raising because a caller that
@@ -553,22 +554,78 @@ $caf$;
 -- `account_id` column and no policies appears here on the next run, which is the
 -- moment before it matters.
 --
+-- THE SCOPE IS THE SCHEMAS THE SUBSTRATE WAS APPLIED IN, and that is the whole
+-- difference between this function and a scan of every table in the database.
+-- The property being asserted is "every account-scoped table THE SERVICE
+-- INSTALLED is protected", and its input is the set of tables the substrate was
+-- applied to — a whole-database scan is one way to compute that set, and it is
+-- the way that breaks every adopter.
+--
+-- MEASURED, on identity: its test helper builds a private fixture schema per
+-- test by cloning tables with `LIKE … INCLUDING ALL`, and `LIKE` does not copy
+-- row-level security. Each fixture therefore carries an `account_id` column and
+-- no policies. A whole-database sweep named every one of them, so a correct
+-- database produced a red proof — and the count moved with how many neighbouring
+-- tests were mid-flight (5 on one run, 21 on the next), which is what says it
+-- was a reach rather than a defect. A sweep that cannot stay green on a correct
+-- database is a sweep nobody reads, and one that goes red for somebody else's
+-- fixtures is a sweep an adopter has to work around, which is worse.
+--
+-- THE SCOPE IS DERIVED, NOT RECORDED, and the difference is the reason an
+-- adopter needs no migration to get the fix. There is no registry table, because
+-- a registry would have to be created by the NEW substrate and every database
+-- that has applied the OLD one does not have it — so the fix would only arrive
+-- with a migration, and the proofs it is meant to repair are the thing that
+-- decides whether the migration is needed. Instead the scope is read back out of
+-- what the substrate ALREADY wrote: `protect_table` names its policies
+-- `<table>_cafaye_<command>` and creates an index beside them, so every schema
+-- the substrate was applied in is discoverable from the catalog, with nothing
+-- new to install and nothing to remember to update.
+--
 -- Extension-owned tables are excluded (`pg_depend.deptype = 'e'`): pgvector,
 -- PostGIS and friends ship their own tables with their own grants, and reporting
 -- a table this substrate cannot protect would train the reader to ignore the
--- sweep. `cafaye` is excluded because it holds functions, not rows.
+-- sweep.
 --
--- TEMPORARY TABLES ARE NOT EXCLUDED, and that is deliberate. `pg_temp%` would be
--- the tidier-looking predicate, and it is the one that would have hidden this
--- file's own control: a temp table with an account_id column and no policies is
--- genuinely unprotected, it is exactly the shape a service's test fixture has,
--- and the definition the fleet agreed on is "has an account_id column" with no
--- exceptions a reader has to remember.
+-- TEMPORARY TABLES ARE NOT EXCLUDED, and that is deliberate. A temp table with an
+-- `account_id` column and no policies is genuinely unprotected, it is exactly
+-- the shape a service's test fixture has, and `isolation.sql` plants one on
+-- purpose as its sweep's control. It is safe to INCLUDE this file's own session's
+-- temporary schema for the reason a fixture schema is not: temporary objects are
+-- per-session, so no other session — not another test, not another service — can
+-- put a table in scope by creating one. `pg_temp` is the alias; the real schema
+-- is named `pg_temp_N`, which is why this is a prefix test and not an equality.
 create or replace function cafaye.unprotected_tables()
 returns table (table_schema text, table_name text, why text)
 language sql
 stable
 as $caf$
+  with scoped(nspname) as (
+    -- (1) The substrate's own schema. It holds functions rather than rows, so
+    --     this contributes nothing today; it is here so that a table added to
+    --     `cafaye` later cannot be quietly unowned by the exclusion this query
+    --     used to carry.
+    select 'cafaye'::name
+    -- (2) This session's temporary schema, where `isolation.sql` plants its
+    --     control table. Per-session, so it can never carry another session's.
+    union
+    select n.nspname
+      from pg_namespace n
+     where n.nspname = 'pg_temp' or left(n.nspname, 8) = 'pg_temp_'
+    -- (3) Every schema the substrate was applied IN, read back from the policies
+    --     `protect_table` wrote. A schema qualifies when it holds at least one
+    --     table this substrate protected, which is what makes the scope the
+    --     service's own tables rather than a list somebody maintains: a new
+    --     account-scoped table added NEXT MONTH to a schema already in scope is
+    --     named on the next run, with nothing having been updated anywhere.
+    union
+    select n.nspname
+      from pg_namespace n
+      join pg_class c on c.relnamespace = n.oid
+      join pg_policy p on p.polrelid = c.oid
+     where c.relkind = 'r'
+       and p.polname ~ '_cafaye_(select|insert|update|delete)$'
+  )
   select n.nspname::text,
          c.relname::text,
          case
@@ -582,7 +639,7 @@ as $caf$
   left join pg_depend d on d.objid = c.oid and d.deptype = 'e'
   where c.relkind = 'r'
     and d.objid is null
-    and n.nspname not in ('pg_catalog', 'information_schema', 'pg_toast', 'cafaye')
+    and n.nspname in (select s.nspname from scoped s)
     and exists (
       select 1 from pg_attribute a
       where a.attrelid = c.oid and a.attname = 'account_id' and not a.attisdropped
@@ -633,4 +690,14 @@ $caf$;
 --     misses a service that spells it `tenant_id` and protects it by hand. A
 --     service with no account-scoped tables at all is the honest zero, and
 --     core's `tenancy.honest-zero` finding is what says so out loud.
+--
+--   * That a SCHEMA the substrate was never applied to holds no account-scoped
+--     table. The sweep's scope is the schemas it protected, plus its own and
+--     `pg_temp`, so customer rows kept in a schema no `protect_table` call ever
+--     named are outside it. That is the trade, and it is a deliberate one: the
+--     alternative reports every other session's test fixture, which is how a
+--     correct database ends up with a red proof and how an adopter ends up
+--     carrying a workaround for a bug that was upstream. A service whose account
+--     tables span schemas the substrate has not met is a service that has not
+--     protected them, and `protect_table` is one call per table.
 -- ---------------------------------------------------------------------------
