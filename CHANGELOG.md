@@ -15,6 +15,27 @@ it without a copy (see kit-12 below).
 
 ### Fixed
 
+- **four self-test recipes asserted a string the check does not emit.** All four
+  were *correct checks* on *correct mutations* whose recipe could not tell either
+  from a failure, and all four reported "the gate went red, but NOT via …" —
+  three of them while printing the needle two lines above the complaint.
+
+  `expect_red_check` matches `FAIL $want`, so the needle has to be the check's
+  **label**. Breakages 75, 76 and 77 asserted the finding's own wording
+  (`"which is the image kit's stack already ships"`, `"promises a command the
+  script does not dispatch"`), and those strings are printed as indented detail
+  lines *under* the `FAIL <label>` header. Breakage 71 asserted
+  `the connection budget  (max_connections covers` against a label that read
+  `max_connions` — a misspelling of a setting that does not exist, in the one line
+  a reader greps for to learn what a check measures.
+
+  Two consequences beyond the four recipes. The `max_connions` label is corrected
+  to `max_connections`, which is the variable the check reads. And a check label
+  that a self-test asserts is now a **contract**: renaming one silently un-proofs
+  the breakage, which is the same coupling as the `callable path` check and is now
+  written down in `AGENTS.md` with the diagnostic to use next time — read the real
+  FAIL line before assuming the check missed the defect.
+
 - **the connection-contract check was satisfied by a comment.** It tested
   `if key not in body` over the whole snippet, and the go snippet's header says
   "1. `application_name` — THE ONE THAT IS NOT OPTIONAL". So deleting the single

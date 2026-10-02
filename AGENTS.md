@@ -287,6 +287,26 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   six that needs this: the other five refuse an old toolchain themselves, at
   build time, with a message naming their own requirement. Ruby 2.6 is the only
   one that loads the template happily and raises on first use.
+- **A self-test needle must be a thing the check EMITS.** `expect_red_check`
+  matches `FAIL $want`, so `$want` has to be the check's **label** — not the
+  wording of its finding, and not a paraphrase of either. Two failures on kit-22,
+  both from recipes whose *check* was correct:
+  - Breakages 75/76/77 asserted the finding's text
+    (`"which is the image kit's stack already ships"`,
+    `"promises a command the script does not dispatch"`). Those strings are
+    printed as **indented detail lines under** the `FAIL <label>` header, so
+    `FAIL $want` never matched and all three reported "the gate went red, but NOT
+    via …" **while printing the needle two lines above the complaint**. A check
+    that works, a mutation that works, and a recipe that cannot tell either from a
+    failure.
+  - Breakage 71 asserted `the connection budget  (max_connections covers` against
+    a label that read `max_connions` — a misspelling of a setting that does not
+    exist, in the one line a reader greps for to learn what a check measures.
+  - So: the needle is the label, and **a label a self-test asserts is a contract.**
+    Renaming one silently un-proofs the breakage, which is the same coupling as
+    the `callable path` check. When a recipe reports "red, but not via `<label>`",
+    read the actual FAIL line before assuming the check missed the defect — the
+    three failures above were all in the recipe.
 - **`self_test` hits its 90-minute bound on a busy box, and a `BOUND` tier is
   not evidence about the breakages it never reached.** This repository's machine
   runs several kit gates at once, and the self-test is *n* whole gates in

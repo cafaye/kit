@@ -2939,8 +2939,24 @@ base75="$(fresh_copy kit-75)"
 seventyfive_fixture="$(fixture_fleet stale-image-only)"
 break_stale_copy_no_ports "$seventyfive_fixture"
 export KIT_FLEET="$seventyfive_fixture"
+# The needle is the CHECK LABEL, not the finding's wording — and that is the
+# correction, because the first version of this recipe asserted the finding text
+# and was therefore WRONG for a reason that had nothing to do with the check it
+# was proving. `expect_red_check` matches `FAIL $want`, and the finding is not in
+# the label: it is an indented detail line under it.
+#
+#     FAIL fleet  (no stale copy, no weakened boundary, …)
+#            - alpha/db: runs 'postgres:17', which is the image kit's stack …
+#
+# So the recipe reported "the gate went red, but NOT via `which is the image
+# kit's stack already ships`" while printing that exact string two lines above the
+# complaint — which is the signature of the 64K pipe-buffer defect this file
+# already documents, except here the cause is the needle rather than the reader.
+# The general rule, and it is the same one as `reportUnusedDisableDirectives`: a
+# needle has to be a thing the check actually EMITS, and the check emits its
+# label.
 expect_red_check 'breakage 75: a service runs its own postgres IMAGE, with no port to catch it' \
-  "$base75" "which is the image kit's stack already ships" --static-only
+  "$base75" 'fleet  (no stale copy, no weakened boundary' --static-only
 unset KIT_FLEET
 
 # ---------------------------------------------------------------------------
@@ -2979,7 +2995,7 @@ if stripped == body:
 open(path, "w", encoding="utf-8").write(stripped)
 PYEOF
 expect_red_check 'breakage 76: bin/dev does not dispatch a command four files tell you to run' \
-  "$base76" 'promises a command the script does not dispatch' --static-only
+  "$base76" 'bin/dev  (every command the documentation promises' --static-only
 
 base77="$(fresh_copy kit-77)"
 "$PY" - "$base77/templates/bin/dev.sh" <<'PYEOF'
@@ -3000,7 +3016,7 @@ open(path, "w", encoding="utf-8").write(
 )
 PYEOF
 expect_red_check 'breakage 77: bin/dev takes a command whose subcommand four files promise is gone' \
-  "$base77" 'promises a command the script does not dispatch' --static-only
+  "$base77" 'bin/dev  (every command the documentation promises' --static-only
 
 printf '\n'
 # TWO skip kinds, counted apart, because they are two different problems and one

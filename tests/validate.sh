@@ -3548,7 +3548,14 @@ print(
 )
 PY
   }
-  check 'the connection budget  (max_connions covers the declared topology)' connection_budget_check
+  # `max_connections`, which is the variable this check actually reads
+  # (`KIT_POSTGRES_MAX_CONNECTIONS`) and the GUC it compares. The label said
+  # `max_connions` — a different spelling of a thing that does not exist, in the
+  # one line a reader greps for when they want to know what this check measures.
+  # Self-test breakage 71 asserts the label as its needle, so the label is a
+  # contract: renaming it silently un-proofs the breakage, which is the same
+  # coupling as the `callable path` check and worth the same discipline.
+  check 'the connection budget  (max_connections covers the declared topology)' connection_budget_check
 
   # Every database snippet must PARSE in its own language, and the parse has to
   # be the LANGUAGE's own — a regex is not a parser.
