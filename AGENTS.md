@@ -650,11 +650,12 @@ ever find it.
 
 ## Adding a language
 
-1. Add `<lang>` to the `language` input's `options` in
+1. Add `<lang>` to the `language` **gate job's** `case` statement in
    `.github/workflows/ci.reusable.yml` **first**, and watch the suite go red.
-   That one edit is the whole trigger: `validate.sh` reads the options out of
-   the workflow and, for each one, requires a Dockerfile, a `bin/prime` and a
-   `[tools]` pin. There is no second list to keep in step — that is the point.
+   That one edit is the whole trigger: `validate.sh` reads the case statement
+   out of the workflow and, for each value it names, requires a Dockerfile, a
+   `bin/prime` and a `[tools]` pin. There is no second list to keep in step —
+   that is the point.
 2. Add the job: `.github/workflows/ci.reusable.yml`, guarded by
    `if: ${{ inputs.language == '<lang>' }}`.
 3. Add the other three artifacts: `docker/Dockerfile.<lang>`,
@@ -662,6 +663,20 @@ ever find it.
    `templates/mise.toml`.
 4. Add the language to the README's adoption table and checklist.
 5. Re-run the gate until green.
+
+**Why the gate job and not an `options:` list.** `workflow_call` inputs accept
+`description`, `required`, `type` and `default`, and nothing else. `options:` is
+a `workflow_dispatch` feature — a dropdown for a human clicking a button — and
+writing it under `workflow_call` makes GitHub reject **the whole workflow
+file**, not just the input. Every service in the fleet calls this file, so the
+result is not one broken repository; it is every repository's CI starting zero
+jobs and reporting success. That is not hypothetical: it is what kit carried
+from 2026-09-30 until kit-33.
+
+The gate job is also the stronger guarantee. With `options:`, a value outside
+the list was not expressible; without it, a typo like `language: golang`
+matches no `if:` condition, every language job skips, and the run goes green
+having tested nothing. The gate job fails that run instead.
 
 `bun` is the worked example: it was added because `guard` carried a standing
 note that it hand-rolled a whole workflow for want of a `bun` job. All four
@@ -671,13 +686,13 @@ Half a language is worse than none: the whole point of kit is that every repo
 that adopts it gets the same thing.
 
 `none` is not a language and is deliberately exempt from the four-artifacts
-rule: it is the option for a repository with no service manifest, and it runs
+rule: it is the value for a repository with no service manifest, and it runs
 that repository's own `tests/validate.sh`. It exists because without it `kit`
 could not call this workflow — every `language` value named a toolchain this
 repository does not have, which left the repository that defines the standard
-structurally excluded from using it. If you add a job for a new option, the
+structurally excluded from using it. If you add a job for a new value, the
 `ci_check` block in `tests/validate.sh` must know about it in the same commit:
-an `option` with no `job` is a green build that ran nothing.
+a value with no `job` is a green build that ran nothing.
 
 ## Deploy and backup are Kamal's, and kit generates the CONFIG
 

@@ -52,20 +52,33 @@ on:
   workflow_call:
     inputs:
       language:
+        # THE LEGAL VALUES ARE IN THIS PROSE BECAUSE `workflow_call` HAS NO
+        # `options` KEY, and saying so is cheaper than the two days it cost.
+        #
+        # This file carried an `options:` list here from 2026-09-30 until
+        # kit-33. `options` is a `workflow_dispatch` input feature;
+        # `workflow_call` inputs accept only `description`, `required`, `type`
+        # and `default`. GitHub rejects the WHOLE FILE at parse time for an
+        # unknown key, so the result was not "the language picker is missing" —
+        # it was that no job in this file ever started, for any caller, in any
+        # repository. Every service in the fleet calls this file, so the whole
+        # fleet's CI was a zero-check-run failure for two days and the run
+        # summary said only "This run likely failed because of a workflow file
+        # issue."
+        #
+        # The list is still enforced, by a job rather than by a picker: see the
+        # `language` job below, which fails on a value that is not one of the
+        # eight. That is a STRONGER guarantee than the picker was, because an
+        # unknown value used to skip all eight language jobs and leave a green
+        # run that had tested nothing.
         description: >-
           Toolchain to build, lint, and test. One job runs; the rest skip. Use
-          'none' for a repository with no service manifest at all.
+          'none' for a repository with no service manifest at all. One of:
+          'go', 'ruby', 'elixir', 'python', 'node', 'bun', 'rust', 'none'.
+          Anything else fails the `language` job rather than quietly running
+          no toolchain at all.
         required: true
         type: string
-        options:
-          - go
-          - ruby
-          - elixir
-          - python
-          - node
-          - bun
-          - rust
-          - none
       # The kit ref the LINT CONFIGS are read from, as opposed to the ref this
       # workflow file itself was fetched at.
       #
@@ -261,6 +274,60 @@ env:
 # ===========================================================================
 
 jobs:
+  # -------------------------------------------------------- the language gate
+  # THIS JOB IS THE REPLACEMENT FOR A DROPDOWN, and it is a stronger guarantee
+  # than the dropdown was.
+  #
+  # `workflow_call` inputs have no `options` key. That is not a limitation to
+  # work around in the UI, it is the reason a wrong value could previously pass
+  # SILENTLY: every language job is gated on `inputs.language == '<name>'`, so a
+  # caller who wrote `language: golang` — or `Go`, or `nodejs`, or a trailing
+  # space — matched no job, ran no toolchain, and got a run whose only steps
+  # were telemetry, secrets and zizmor. Those three can be green on a
+  # repository that has never been compiled. The header above says "Every job
+  # is gated on `inputs.language`, so exactly one runs per call", and nothing
+  # verified that one did.
+  #
+  # It has no `if:`, deliberately. Every other job in this file is conditional
+  # on the very value this one checks, so gating this one on it would mean the
+  # check runs exactly when it is not needed and is skipped exactly when it is.
+  #
+  # It is a required check, not an advisory one, and it is deliberately the
+  # FIRST job: a caller who misspells their toolchain learns it in seconds
+  # rather than after waiting out a full suite that never ran.
+  language:
+    name: language
+    runs-on: ubuntu-latest
+    steps:
+      - name: the language is one this file has a job for
+        # `${{ }}` is deliberately NOT interpolated into this body. zizmor's
+        # `template-injection` audit is right that it should not be, and the
+        # idiomatic fix is to pass it through `env:` and read the variable.
+        env:
+          REQUESTED: ${{ inputs.language }}
+        run: |
+          set -euo pipefail
+          case "$REQUESTED" in
+            go|ruby|elixir|python|node|bun|rust|none)
+              echo "language: $REQUESTED"
+              ;;
+            '')
+              echo "::error::no language was passed. This input is required; see" >&2
+              echo "::error::the workflow_call block at the top of this file." >&2
+              exit 1
+              ;;
+            *)
+              echo "::error::language '$REQUESTED' is not one this workflow has a" >&2
+              echo "::error::job for. Every job below is gated on" >&2
+              echo "::error::inputs.language == '<name>', so a value that matches" >&2
+              echo "::error::none of them runs NO toolchain and leaves a run that" >&2
+              echo "::error::looks green. One of:" >&2
+              echo "::error::  go  ruby  elixir  python  node  bun  rust  none" >&2
+              echo "::error::'none' is for a repository with no service manifest." >&2
+              exit 1
+              ;;
+          esac
+
   # ----------------------------------------------------- configuration-only
   # `language: none` — a repository with no service manifest. No go.mod, no
   # Gemfile, no pyproject.toml: the seven jobs above each open with a manifest

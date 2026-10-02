@@ -11,7 +11,7 @@
 #   *different* check, so a passing self_test means the checks are independent
 #   and not one lucky assertion standing in for all of them.
 #
-# THE SEVENTY-NINE BREAKAGES, and one GREEN control (20 from the tier work, 21
+# THE EIGHTY BREAKAGES, and one GREEN control (20 from the tier work, 21
 #                               from the fan-out work, 24-26 from the fleet gate,
 #                               27-32c from the lint work, 33-40 from the
 #                               staleness/parity work, 41-51 from the secrets
@@ -20,7 +20,9 @@
 #                               work, 75 from the rename that disarmed the
 #                               fleet check, 76-77 from the bin/dev commands the
 #                               documentation promises, 78-79 from the second
-#                               callable standard; 18 shared before the
+#                               callable standard, 89 from the `options:` key
+#                               that took the fleet's CI down for two days
+#                               without a red check; 18 shared before the
 #                               lint packet)
 #   1. delete a language template   -> the artifact-presence check goes red
 #   68. .env.example's Postgres tag disagrees with compose's default -> the
@@ -3107,6 +3109,38 @@ YAML
 export KIT_FLEET="$eightythree_fixture"
 expect_red_check 'breakage 83: a service overrides the shared cluster POSTGRES_USER' \
   "$base" "$FLEETCHECK" --static-only
+
+# ---------------------------------------------------------------------------
+# 89. A `workflow_call` INPUT DECLARING A KEY `workflow_call` DOES NOT HAVE.
+#
+# THE DEFECT THAT WAS ACTUALLY SHIPPED, and the only one in kit's history that
+# took the whole fleet's CI down without a single red check.
+#
+# `ci.reusable.yml` carried an `options:` list under its `language` input from
+# 2026-09-30 until kit-33. `options:` is a `workflow_dispatch` feature;
+# `workflow_call` accepts `description`, `required`, `type` and `default` and
+# nothing else. GitHub rejects an unknown key AT PARSE TIME and refuses the
+# WHOLE FILE -- not the job, not the input, the file. Every service in the fleet
+# calls this workflow, so from that date until the fix, every CI run in every
+# repository started zero jobs and reported zero check runs while all 200+
+# static checks stayed green. Nothing was red because nothing ran.
+#
+# This recipe re-adds the exact key to the exact input. If it is not caught, the
+# check this packet added cannot see the class of failure that actually
+# happened, and the fleet can be down for days again without a single signal.
+# ---------------------------------------------------------------------------
+CALLABLE_INPUTS='reusable workflows  (workflow_call inputs use only documented keys)'
+base89="$(fresh_copy kit-89)"
+"$PY" - "$base89/.github/workflows/ci.reusable.yml" <<'PY1'
+import sys
+path = sys.argv[1]
+s = open(path).read()
+anchor = "        required: true\n        type: string\n"
+i = s.index(anchor) + len(anchor)
+open(path, "w").write(s[:i] + "        options:\n          - go\n          - ruby\n" + s[i:])
+PY1
+expect_red_check 'breakage 89: a workflow_call input declares `options`, which GitHub rejects for the whole file' \
+  "$base89" "$CALLABLE_INPUTS" --static-only
 
 # Cleared, because `export` is not scoped to a command the way `VAR=v cmd` is, and
 # the final recipe above would otherwise leave the fixture in the environment for

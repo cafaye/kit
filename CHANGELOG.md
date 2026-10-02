@@ -52,6 +52,68 @@ it without a copy (see kit-12 below).
   line, prose that merely *discusses* markers mid-sentence, six angle brackets,
   and a binary file carrying the bytes.
 
+### Fixed — an `options:` key GitHub does not accept had silently stopped the whole fleet's CI from running
+
+- **`.github/workflows/ci.reusable.yml`, five checks in `tests/validate.sh`,
+  `AGENTS.md`, and `tests/self_test.sh`. Found by `actionlint`, not by a failing
+  check — which is the point of the last part of this entry.**
+
+  The `language` input carried an `options:` list from 2026-09-30 until now.
+  `workflow_call` inputs accept `description`, `required`, `type` and
+  `default`; `options:` belongs to `workflow_dispatch`, which is a different
+  event with a different schema. GitHub does not ignore an unknown key under
+  `workflow_call` — it **rejects the entire workflow file at parse time.**
+
+  Every service in the fleet calls this workflow. So from that date until this
+  commit, every CI run in every repository started **zero jobs** and reported
+  **zero check runs**, while all 200+ of kit's static checks stayed green.
+  Nothing was red because nothing ran. The workflow file was not merely
+  degraded; it was not a workflow.
+
+- **`actionlint` named it in one line and 214 checks did not:**
+  ```
+  .github/workflows/ci.reusable.yml:60:9: unexpected key "options" for inputs at
+  workflow_call event. expected one of "default", "description", "required", "type"
+  ```
+  A sweep of every workflow in the fleet found this one file and no other.
+
+- **The fix is a job, not a list.** `options:` was doing one job — rejecting a
+  value no language job handles — and it did it by making the value
+  unexpressible. Without a dropdown that guarantee is gone: `language: golang`
+  matches no `if: inputs.language == '…'` condition, so all eight language jobs
+  skip and the run goes green having tested nothing. A new first job named
+  `language` now runs unconditionally and `case`es the value, failing the run on
+  anything it does not recognise. That is strictly stronger than the dropdown:
+  the dropdown was a UI affordance, this is a gate.
+
+- **A new check, `reusable workflows (workflow_call inputs use only documented
+  keys)`, so the class cannot recur.** It is deliberately **not** a full Actions
+  schema validator — it cannot know about expression contexts, runner labels or
+  `uses:` resolution — and it asserts exactly one property: every key directly
+  under a `workflow_call` input is one GitHub documents for that event. Its
+  message names `options` and says what to do instead, because a message naming
+  the key is one the next author can act on.
+
+- **Five checks were reading the illegal key, which is how the defect stayed
+  invisible.** `ci_check`, `kit_languages`, `mise_check`, `tier_declaration_check`
+  and `tier_demand_check` all read the `options:` list as *the* list of languages
+  kit ships — and `tests/artifacts.json`'s `{lang}` check read it too. Removing
+  an illegal key correctly turned all five red. They now read the gate job's
+  `case` statement, which is where the enumeration actually lives, so the list
+  and the thing that enforces it are the same object rather than two copies that
+  can drift.
+
+- **Each of those five now refuses to pass on an empty list.** Deleting or
+  renaming the gate job used to make every one of them loop zero times and
+  report success — the same failure mode as the outage itself, one level down.
+  Verified by mutation: with the gate job renamed away, **six** checks go red
+  (it was two before the guards were added). A check that could not ask its
+  question now says so.
+
+- **`tests/self_test.sh` breakage 89** re-adds the exact key to the exact input
+  and asserts that named check catches it. The proof failed before the check
+  existed and passes after; the unbroken tree is green on both sides.
+
 ### Fixed — kit's own remediation advice was telling services to make themselves a cluster superuser
 
 - **`tests/fleet_check.py`, `README.md`, `templates/AGENTS.md`,

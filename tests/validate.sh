@@ -1661,8 +1661,15 @@ SNIPPETS
   section 'static: every language ships all four artifacts'
   kit_languages() {
     # Kept in step with ci_check's `languages` list below. Both read the CI
-    # workflow's `language` options, so there is exactly one place to add a
-    # language and the workflow cannot claim one the tree does not have.
+    # workflow's `language` gate job -- the case statement that rejects an
+    # unrecognised value -- so there is exactly one place to add a language and
+    # the workflow cannot claim one the tree does not have.
+    #
+    # It USED to read the `options:` list under the input. That key is not
+    # legal under `workflow_call`; GitHub rejected the whole file, and every
+    # check that read it was reading a key the file was not allowed to carry.
+    # The gate job's case statement is where the enumeration actually lives now,
+    # so it is what everything reads.
     #
     # `$2` is the option that means "no language" and so ships no artifacts.
     # It is skipped here rather than being special-cased out of the workflow,
@@ -1671,6 +1678,7 @@ SNIPPETS
     # The path arrives as argv[3] rather than being written out again here: a
     # second copy of this string is a second thing to forget to move.
     "$PY" - "$ROOT" "$CONFIG_ONLY" "$WORKFLOW" <<'PY'
+import re
 import sys
 
 import yaml
@@ -1678,22 +1686,51 @@ import yaml
 skip = sys.argv[2]
 with open(sys.argv[3], encoding="utf-8") as fh:
     doc = yaml.safe_load(fh)
-triggers = doc.get("on") or doc.get(True) or {}
-call = (triggers.get("workflow_call") or {}).get("inputs") or {}
-for lang in ((call.get("language") or {}).get("options") or []):
-    if lang != skip:
-        print(lang)
+jobs = doc.get("jobs") or {}
+script = "\n".join(
+    str(s.get("run") or "") for s in ((jobs.get("language") or {}).get("steps") or [])
+    if isinstance(s, dict)
+)
+# One case arm per language: `go|ruby|...)` on its own line. Reading the
+# enumeration from the thing that enforces it is the point -- a list that lives
+# only in a check is a list nothing enforces.
+#
+# An EMPTY enumeration is an error here, not an empty result. Every caller of
+# this function loops over what it prints, so a gate job that was renamed or
+# deleted would turn four checks into four silent passes -- the exact way this
+# file used to lose a signal. A check that could not ask its question says so.
+found = [
+    name
+    for arm in re.findall(r"^\s*([a-z|]+)\)\s*$", script, re.M)
+    for name in arm.split("|")
+    if name and name != skip
+]
+if not found:
+    sys.exit(
+        "the reusable workflow has no `language` gate job naming any language, "
+        "so no language artefact can be checked. Reading zero languages is not "
+        "the same as there being none"
+    )
+for name in found:
+    print(name)
 PY
   }
 
-  while IFS= read -r lang; do
-    [ -n "$lang" ] || continue
-    if otel_required "docker/Dockerfile.$lang" "templates/bin-prime/$lang.sh"; then
-      report PASS "$lang  (Dockerfile + bin/prime present)"
-    else
-      report FAIL "$lang  (Dockerfile + bin/prime present)"
-    fi
-  done < <(kit_languages)
+  # The consumers below loop over this function's output, so an empty output is
+  # an empty loop and an empty loop is a silent pass. `kit_languages` exits
+  # non-zero in that case, and that is reported rather than swallowed.
+  _kit_langs="$(kit_languages)" ||
+    report FAIL "every language  (the language list could not be read at all)"
+  if [ -n "$_kit_langs" ]; then
+    while IFS= read -r lang; do
+      [ -n "$lang" ] || continue
+      if otel_required "docker/Dockerfile.$lang" "templates/bin-prime/$lang.sh"; then
+        report PASS "$lang  (Dockerfile + bin/prime present)"
+      else
+        report FAIL "$lang  (Dockerfile + bin/prime present)"
+      fi
+    done <<<"$_kit_langs"
+  fi
 
   # mise.toml pins every language too. Checked by parsing the TOML rather than
   # grepping, so a key that appears in a comment does not count as a pin — a
@@ -1709,10 +1746,28 @@ with open(sys.argv[3], encoding="utf-8") as fh:
     import yaml
 
     doc = yaml.safe_load(fh)
-triggers = doc.get("on") or doc.get(True) or {}
-call = (triggers.get("workflow_call") or {}).get("inputs") or {}
-# `none` is the absence of a toolchain; there is no mise tool to pin for it.
-langs = [x for x in ((call.get("language") or {}).get("options") or []) if x != config_only]
+# The language gate job's case statement is where the enumeration lives. It
+# used to be an `options:` list under the `workflow_call` input, which is not a
+# legal key there -- GitHub refused the entire file, and these checks were
+# reading a key the file was not allowed to carry.
+jobs = doc.get("jobs") or {}
+gate = "\n".join(
+    str(s.get("run") or "")
+    for s in ((jobs.get("language") or {}).get("steps") or [])
+    if isinstance(s, dict)
+)
+langs = [
+    name
+    for arm in re.findall(r"^\s*([a-z|]+)\)\s*$", gate, re.M)
+    for name in arm.split("|")
+    if name and name != config_only
+]
+if not langs:
+    problems.append(
+        "the reusable workflow's `language` gate job names no language, so this "
+        "check could not ask its question. Reading zero languages is not the "
+        "same as there being none"
+    )
 
 source = open(f"{root}/templates/mise.toml", encoding="utf-8").read()
 # Only the [tools] table, and only its own lines: a version mentioned in a
@@ -5205,16 +5260,33 @@ for lang in languages:
     if cond is None or f"inputs.language == '{lang}'" not in cond:
         problems.append(f"job {lang} is no longer gated on its language input")
 
-# A caller can only pass what `options` allows, so an option with no job is a
-# green build that ran nothing, and a job with no option is a job no repo can
-# reach. The two lists are the same list — plus the one option that names the
-# absence of a language, which has a job of its own.
-options = ((call.get("language") or {}).get("options")) or []
-if sorted(options) != sorted(languages + [config_only]):
+# A caller can pass anything, so the job that REJECTS an unknown value is what
+# makes "an option with no job" impossible. `workflow_call` has no `options:`
+# key -- that is a `workflow_dispatch` feature, and GitHub refuses the whole
+# file if you write it here -- so the enumeration kit used to declare and then
+# enforce has to be enforced by a job that runs instead.
+#
+# So the `language` job is the list now, and this is the check that it still
+# names every language the file has a job for. A language added to `languages`
+# above without a case arm there is a language a caller can ask for that runs
+# nothing.
+gate = jobs.get("language")
+if not isinstance(gate, dict):
     problems.append(
-        f"`language` options {sorted(options)} do not match the job set "
-        f"{sorted(languages + [config_only])}"
+        "no `language` job: without it an unrecognised value skips every "
+        "language job's `if:` and leaves a green run that tested nothing"
     )
+else:
+    script = "\n".join(
+        str(s.get("run") or "") for s in (gate.get("steps") or []) if isinstance(s, dict)
+    )
+    # Every language, plus `none`, must appear in the gate's case statement.
+    for name in languages + [config_only]:
+        if not re.search(rf"(^|[\s|(]){re.escape(name)}(\)|[\s|])", script, re.M):
+            problems.append(
+                f"the `language` job does not accept `{name}`: it is not one of "
+                f"the values its case statement handles"
+            )
 
 # `none` is what lets a repository with no service manifest adopt this
 # workflow at all, and kit is such a repository. It gets the same treatment as
@@ -5308,9 +5380,28 @@ import yaml
 root, config_only, workflow = sys.argv[1], sys.argv[2], sys.argv[3]
 with open(workflow, encoding="utf-8") as fh:
     doc = yaml.safe_load(fh)
-triggers = doc.get("on") or doc.get(True) or {}
-call = (triggers.get("workflow_call") or {}).get("inputs") or {}
-langs = [x for x in ((call.get("language") or {}).get("options") or []) if x != config_only]
+# Read the language gate job's case statement, not an `options:` list: `options`
+# is a `workflow_dispatch` key, GitHub rejects the whole workflow file if it
+# appears under `workflow_call`, and the enumeration it used to hold now lives
+# in the job that rejects an unrecognised value.
+jobs = doc.get("jobs") or {}
+gate = "\n".join(
+    str(st.get("run") or "")
+    for st in ((jobs.get("language") or {}).get("steps") or [])
+    if isinstance(st, dict)
+)
+langs = [
+    name
+    for arm in re.findall(r"^\s*([a-z|]+)\)\s*$", gate, re.M)
+    for name in arm.split("|")
+    if name and name != config_only
+]
+if not langs:
+    problems.append(
+        "the reusable workflow's `language` gate job names no language, so this "
+        "check could not ask its question. Reading zero languages is not the "
+        "same as there being none"
+    )
 
 tier_readme = os.path.join(root, "templates", "tier", "README.md")
 if not os.path.isfile(tier_readme):
@@ -5427,6 +5518,7 @@ PY
   #     not exist is a check nobody could satisfy honestly.
   tier_demand_check() {
     "$PY" - "$ROOT" "$CONFIG_ONLY" "$WORKFLOW" <<'PY'
+import re
 import sys
 
 import yaml
@@ -5437,7 +5529,24 @@ with open(workflow, encoding="utf-8") as fh:
 triggers = doc.get("on") or doc.get(True) or {}
 call = (triggers.get("workflow_call") or {}).get("inputs") or {}
 jobs = doc.get("jobs") or {}
-langs = [x for x in ((call.get("language") or {}).get("options") or []) if x != config_only]
+gate = "\n".join(
+    str(st.get("run") or "")
+    for st in ((jobs.get("language") or {}).get("steps") or [])
+    if isinstance(st, dict)
+)
+langs = [
+    name
+    for arm in re.findall(r"^\s*([a-z|]+)\)\s*$", gate, re.M)
+    for name in arm.split("|")
+    if name and name != config_only
+]
+
+if not langs:
+    sys.exit(
+        "the reusable workflow's `language` gate job names no language, so this "
+        "check could not ask its question. Reading zero languages is not the "
+        "same as there being none"
+    )
 
 
 def strip_shell_comments(src):
@@ -6905,18 +7014,23 @@ problems = staleness.validate_table_against_kit(table, root)
 # language and the exact defect kit's own "half a language is worse than none"
 # rule is about.
 # The languages, read the way the rest of this file reads them: as YAML, from
-# the workflow's real `options`. `validate.sh` already requires PyYAML and
-# already loads this workflow several times, so parsing it here is not a new
+# the workflow's own `language` gate job. `validate.sh` already requires PyYAML
+# and already loads this workflow several times, so parsing it here is not a new
 # dependency — it is the difference between asking the question and grepping
-# for it. The first version of this used a regex over the raw text, matched
-# nothing because `description:` sits between the key and `options:`, and
-# reported a FAILURE — which was the check being right about its own blindness
-# and wrong about the tree. A check that could not parse the thing it is
-# checking must say so, and here it did.
+# for it.
 #
-# `none` is excluded: it is not a language, it is the option for a repository
+# It used to read an `options:` list under the input. That key is not legal
+# under `workflow_call` — GitHub rejects the whole file — so this check was
+# reading a key the workflow was not allowed to carry, and would have reported
+# "could not check" the moment the file was made legal. The enumeration now
+# lives in the case statement of the job that rejects an unrecognised value,
+# which is the only place it is actually enforced.
+#
+# `none` is excluded: it is not a language, it is the value for a repository
 # with no service manifest, and `templates/bin-prime/none.sh` does not exist and
 # should not.
+import re
+
 import yaml
 
 workflow = os.path.join(root, ".github", "workflows", "ci.reusable.yml")
@@ -6924,15 +7038,22 @@ languages = set()
 try:
     with open(workflow, encoding="utf-8") as fh:
         doc = yaml.safe_load(fh) or {}
-    triggers = doc.get("on") or doc.get(True) or {}
-    declared = ((triggers.get("workflow_call") or {}).get("inputs") or {})
-    options = ((declared.get("language") or {}).get("options")) or []
-    languages = {o for o in options if o and o != "none"}
+    gate = "\n".join(
+        str(st.get("run") or "")
+        for st in (((doc.get("jobs") or {}).get("language") or {}).get("steps") or [])
+        if isinstance(st, dict)
+    )
+    languages = {
+        name
+        for arm in re.findall(r"^\s*([a-z|]+)\)\s*$", gate, re.M)
+        for name in arm.split("|")
+        if name and name != "none"
+    }
 except (OSError, yaml.YAMLError) as exc:
     problems.append(f"the reusable workflow could not be parsed: {exc}")
 if not languages:
     problems.append(
-        "the reusable workflow declares no `language` options, so the "
+        "the reusable workflow's `language` job names no languages, so the "
         "{lang}-interpolated artefacts cannot be checked for every language. A "
         "check that could not ask its question must not report a pass"
     )
@@ -8194,6 +8315,98 @@ PY3
   # exists to catch, one level up: a name that has stopped matching what it is
   # about.
   check "reusable workflows  (callable: exists, on: workflow_call, docs agree)" callable_check
+
+  # -------------------------------------------------------------------------
+  # A workflow file GitHub REJECTS is invisible here by default, and it is the
+  # most expensive kind of invisible this gate has.
+  #
+  # WHAT HAPPENED. From 2026-09-30 until kit-33, `ci.reusable.yml` declared an
+  # `options:` list under its `workflow_call` `language` input. `options` is a
+  # `workflow_dispatch` feature; `workflow_call` inputs accept only
+  # `description`, `required`, `type` and `default`. GitHub rejects the ENTIRE
+  # FILE at parse time for an unknown key — not the one input, the file — so
+  # every job in it failed to start, for every caller, in every repository.
+  #
+  # WHY NOTHING CAUGHT IT FOR TWO DAYS. Every check in this gate read the
+  # workflow as TEXT and every one of them was satisfied: the file existed, it
+  # declared `workflow_call`, the documented call matched, the inputs matched.
+  # What none of them asked was whether the file is a workflow GitHub can run.
+  # Meanwhile the run summary said only "This run likely failed because of a
+  # workflow file issue" and the check suite reported zero check runs, so the
+  # badge was red in a way that looked like infrastructure rather than like a
+  # defect in the tree. Every static check was green throughout.
+  #
+  # WHAT THIS CHECK IS, PRECISELY, because a check that claims more than it does
+  # is the defect it exists to catch. It is NOT a GitHub Actions schema
+  # validator and it will not catch every way a workflow can be invalid — it
+  # cannot know about expression contexts, runner labels, or a `uses:` that
+  # resolves to nothing. It asserts ONE property, and the one it asserts is the
+  # one that was actually violated: every key directly under a `workflow_call`
+  # input is one GitHub documents for that event.
+  #
+  # `options` is named in the message because it is the key that was written, it
+  # is the one every author reaches for, and a message naming the key is a
+  # message the next author can act on.
+  workflow_inputs_check() {
+    "$PY" - "$ROOT" $REUSABLE_WORKFLOWS <<'PY1'
+import sys, yaml
+
+root, reusables = sys.argv[1], sys.argv[2].split()
+
+# Documented for `workflow_call`. `options` and the dropdown UI belong to
+# `workflow_dispatch`; they are not a smaller version of the same thing, they
+# are a different event's schema, and GitHub's parser knows the difference and
+# refuses the file.
+ALLOWED = {"description", "required", "type", "default"}
+
+problems = []
+for rel in reusables:
+    path = f"{root}/{rel}"
+    try:
+        doc = yaml.safe_load(open(path))
+    except Exception as exc:
+        problems.append(f"{rel}: does not parse as YAML ({exc})")
+        continue
+    if not isinstance(doc, dict):
+        problems.append(f"{rel}: is not a mapping at the top level")
+        continue
+    # `on:` parses as the boolean True under YAML 1.1, and PyYAML follows
+    # YAML 1.1. Both spellings are accepted so this check does not depend on
+    # which one the file happened to use.
+    on = doc.get("on", doc.get(True))
+    if not isinstance(on, dict):
+        problems.append(f"{rel}: has no `on:` block")
+        continue
+    call = on.get("workflow_call")
+    if call is None:
+        problems.append(f"{rel}: declares no `workflow_call`")
+        continue
+    inputs = call.get("inputs") or {}
+    for name, spec in inputs.items():
+        if not isinstance(spec, dict):
+            problems.append(f"{rel}: input `{name}` is not a mapping")
+            continue
+        for key in spec:
+            if key not in ALLOWED:
+                hint = ""
+                if key == "options":
+                    hint = (
+                        "  `options` is a `workflow_dispatch` feature."
+                        " `workflow_call` has no dropdown,\n  and the legal"
+                        " values belong in the `description:` -- enforce them"
+                        " with a job,\n  because an unrecognised value skips"
+                        " every `if: inputs.x == ...` gate and\n  leaves a green"
+                        " run that tested nothing."
+                    )
+                problems.append(
+                    f"{rel}: input `{name}` declares `{key}`, which is not one"
+                    f" of GitHub's `workflow_call` input keys{hint}"
+                )
+if problems:
+    sys.exit("; ".join(problems))
+PY1
+  }
+  check "reusable workflows  (workflow_call inputs use only documented keys)" workflow_inputs_check
 
   # -------------------------------------------------------------------------
   # Secrets. Two scanners and two different questions, and this section is the
