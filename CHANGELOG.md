@@ -13,6 +13,65 @@ it without a copy (see kit-12 below).
 
 ## Unreleased
 
+### Changed — the sweep no longer assumes it owns the database
+
+- **`cafaye.unprotected_tables/0` is scoped to the schemas the substrate was
+  applied in**, plus `cafaye` and the session's temporary schema. It scanned
+  every table in the database, so the assertion set assumed it owned the
+  database: true in `tests/tenancy_test.sh`, false for every adopter whose tests
+  build private fixture schemas.
+
+  **Measured, on `identity`** — which adopted this substrate and whose whole-suite
+  run then failed kit's own control:
+
+  ```
+  sweep/the-only-finding-is-the-control
+    expected "cafaye_probe_unprotected:row level security is not enabled"
+    actual   "...,account_users:...,api_keys:...,oidc_clients:..."
+  ```
+
+  `relforcerowsecurity` is `t` on all five real tables. Those names are
+  `identity`'s **fixture** schemas, built by a test helper cloning tables with
+  `LIKE … INCLUDING ALL` — and `LIKE` does not copy row-level security, so each
+  fixture carries an `account_id` column and no policies. The count moved per run
+  (5, then 21) with how many neighbouring tests were mid-flight, which is the
+  evidence that it was a reach rather than a defect.
+
+- **The scope is DERIVED from the catalog, not recorded in a table**, and that is
+  what makes it an adopter's fix rather than an adopter's migration. A registry
+  table would have to be created by the new substrate, so the repair would arrive
+  only with a migration — decided by the very proof it repairs. Instead the scope
+  is read back out of what the substrate already wrote: `protect_table` names its
+  policies `<table>_cafaye_<command>`, so every schema it was applied in is
+  discoverable from `pg_policy` with nothing new to install.
+
+- **The scope is per SCHEMA, not per table**, deliberately: a table added next
+  month to a schema already in scope is still named, so the sweep keeps its
+  growth-guard property rather than only its adopter-safety one. Scoping to
+  `cafaye` + `pg_temp` alone — the obvious minimal fix — was rejected: it sweeps
+  no real table in any adopter, so its positive control and its empty result are
+  both satisfied by a sweep that could never have run.
+
+- **`tests/tenancy_test.sh` gained two assertions, and neither means anything
+  alone.** `0b` plants `identity`'s shape — a private fixture schema cloned with
+  `LIKE … INCLUDING ALL` — and requires the proof to stay green and the sweep to
+  name neither of its tables. `5` plants an unprotected account-scoped table in a
+  schema the substrate **does** own, permanently, and requires the proof to go
+  red. Narrow the scope to `pg_temp` alone and `0b` passes forever while `5` goes
+  red: which is the only reason `5` exists. Both read the catalog before
+  asserting on it, so neither can be satisfied by a fixture that failed to
+  install.
+
+- **`string_agg` over the sweep carries an explicit `order by`.** The expected
+  value is a string, and a string built from an unordered aggregate is a red on a
+  correct database whenever the planner is in a different mood.
+
+- **No assertion NAME changed**, so `assertions.txt` and the six drivers are
+  untouched, and no enforcement changed: `protect_table`, `begin_account`, the
+  four policies and `FORCE ROW LEVEL SECURITY` are not in the diff. `FORCE`
+  control re-measured: **6 reds before, 6 reds after**, every one an `owner/` or
+  `sweep/` row, with the `login/` half green throughout.
+
 ### Added — the account boundary, shipped once in kit
 
 - **`templates/database/tenancy/substrate.sql`.** The account boundary inside one
