@@ -393,8 +393,33 @@ case "$cmd" in
   --args) emit_args ;;
   --write) write_stamp "${1:-/app/kit-provenance.json}" ;;
   --verify)
-    [ "$#" -ge 1 ] || { printf '%s: --verify needs an image reference\n' "$PROG" >&2; exit 64; }
-    emit_verify "$1" "${2:-}"
+    # `--verify IMAGE [--expect-revision SHA]`. The flag is PARSED rather than
+    # read positionally, and that is not tidiness: the first version took $2 as
+    # the expectation, so `--verify IMG --expect-revision SHA` compared the
+    # revision against the literal string "--expect-revision" and reported a
+    # mismatch on an image that was correct. A check whose flag form is wrong
+    # fails in the direction that looks like the bug it was written to catch.
+    shift 0 2>/dev/null || true
+    v_image=''
+    v_expect=''
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --expect-revision)
+          [ "$#" -ge 2 ] || { printf '%s: --expect-revision needs a value\n' "$PROG" >&2; exit 64; }
+          v_expect="$2"
+          shift 2
+          ;;
+        --expect-revision=*) v_expect="${1#*=}"; shift ;;
+        -*) printf '%s: unknown flag %s\n' "$PROG" "$1" >&2; exit 64 ;;
+        *)
+          [ -z "$v_image" ] || { printf '%s: --verify takes one image reference\n' "$PROG" >&2; exit 64; }
+          v_image="$1"
+          shift
+          ;;
+      esac
+    done
+    [ -n "$v_image" ] || { printf '%s: --verify needs an image reference\n' "$PROG" >&2; exit 64; }
+    emit_verify "$v_image" "$v_expect"
     ;;
   --fields) printf '%s\n' $FIELDS ;;
   -h | --help)
