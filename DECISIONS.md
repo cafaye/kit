@@ -912,6 +912,23 @@ the same reason: a list of what is forbidden, written down separately, is a list
 that goes stale, and a rule covering only the cases its author remembered has a
 hole shaped like the next packet.
 
+****The one literal left standing, and why.** A sweep of all 69 `edit` statements
+for a version literal, a prerelease, a `## <version>` heading, a `### <subsection>`
+name, a port, a template path and an image tag found: **0, 0, 0, 0** for the first
+four, 2 ports (`5432:5432`, `65532:65532`), 29 template paths, and **1** remaining
+`## Unreleased` — in breakage 98's create branch. It is left there deliberately,
+and the asymmetry is the reason:
+
+    an `## Unreleased` in an ANCHOR       -> the recipe dies at the next release
+    an `## Unreleased` in a REPLACEMENT   -> the recipe writes an out-of-date name
+
+Only the first is a lost proof. Deriving a heading name from nothing would mean
+deriving it from the convention it is the convention, which is circular; and the
+one place it appears is on the replacement side, where a rename changes the text
+written and not whether the mutation applies. The recipe says so in a comment,
+because a rule with a documented exception is a rule and a rule with an
+undocumented one is a surprise.
+
 **The two shapes rejected inside the scan, both measured.**
 
 1. *Only the anchor.* A recipe that anchors on `$v` and writes `3.0.0` as the

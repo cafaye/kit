@@ -4634,12 +4634,19 @@ expect_red_check 'breakage 97: a MINOR bump declares a breaking change' \
 # sweep missed: its anchor was `## Unreleased\n\n### Added`, so it died the same
 # day 96, 97 and 99 did, for a DIFFERENT reason — `a5f8746` inserted
 # `### Changed` as the first subsection under Unreleased and the recipe never
-# mentioned it. It also has a bomb the literal hides: the next release renames
+# mentioned it. It also had a bomb the literal hid: the next release renames
 # `## Unreleased` to the version it became, and at that point "a `### Breaking`
 # under a section no version covers" is a section this recipe has to CREATE
-# rather than find. Both branches below produce the same property; only the
-# state of the copy differs, and neither reads a spelling this repository can
-# change without taking the recipe with it.
+# rather than find, which is the branch below.
+#
+# BOTH BRANCHES ANCHOR ON A DERIVED HEADING, and that is the asymmetry worth
+# being precise about: the one remaining `## Unreleased` literal is on the
+# REPLACEMENT side of the create branch, so renaming the convention would change
+# what this recipe writes and not whether it applies. A literal in an anchor is
+# a recipe that dies; a literal in a replacement is a recipe that writes an
+# out-of-date name. The first is a lost proof and the second is a cosmetic bug,
+# and only the first is worth deriving — so this one is left written down and
+# said out loud rather than defended by a helper.
 base98="$(fresh_copy kit-98)"
 v98_head="$(grep -m1 '^## ' "$base98/CHANGELOG.md")"
 v98_body="${v98_head#\#\# }"
