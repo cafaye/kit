@@ -491,6 +491,35 @@ section() {
   printf '\n-- %s\n' "$1"
 }
 
+# only_wanted <label> — 0 when `--only` selects this label, 1 when it excludes it.
+#
+# WHY IT IS A HELPER RATHER THAN A FIFTH COPY OF THE `case`. `check`,
+# `check_par`, `report_par` and `bounded_check` each carry their own copy of this
+# branch, and this packet found a check that had NONE: `tests/kamal_test.sh` is
+# invoked by a bare `bash`, so its 24 runs of the real `kamal`/`kamal-backup`
+# binaries happened on EVERY invocation of the gate — including the 86 self-test
+# copies that were asked for one cheap check and had already been told, by name,
+# to run one. 55.6% of a child gate's startup floor, unfilterable. Measured in
+# `PROFILE-startup-floor.md`.
+#
+# The accounting is the part that must not drift: `ONLY_RAN` and `ONLY_SKIPPED`
+# are what the summary line prints and what the `--only` refusal at the end of the
+# file reads, so a filtered run that selected nothing is still a FAIL rather than
+# a quiet zero. A fifth copy would have been one more place for that to be wrong.
+only_wanted() {
+  [ -z "$ONLY_MATCH" ] && return 0
+  case "$1" in
+    *"$ONLY_MATCH"*)
+      ONLY_RAN=$((ONLY_RAN + 1))
+      return 0
+      ;;
+    *)
+      ONLY_SKIPPED=$((ONLY_SKIPPED + 1))
+      return 1
+      ;;
+  esac
+}
+
 # ---------------------------------------------------------------------------
 # parallel checks — bounded, ordered, and provably the same verdict
 # ---------------------------------------------------------------------------
@@ -1936,17 +1965,38 @@ OTEL
   # Ruby is a normal machine and the gate must not demand one. A skip in the
   # telemetry or lint phases is fatal; here it is not, for that reason, and the
   # summary line is how the gap stays visible.
+  #
+  # AND IT ANSWERS `--only`, which it did not do until this packet. The call
+  # below is a bare `bash` rather than a `bounded_check`, so for the whole life
+  # of the check the filter could not reach it and the 24 real-binary runs
+  # happened on every invocation — 3.8 s, 55.6% of the child gate's floor
+  # (`PROFILE-startup-floor.md`), paid 86 times over by copies that had been told
+  # to run one check. `only_wanted` is the guard; the LABEL it filters on is
+  # `kamal_test`, the same needle `tests/self_test.sh` passes to
+  # `expect_red_check` as `$KAMALCHECK`, and every label this block can print
+  # contains that substring — so breakages 78, 79 and 82 keep selecting it and
+  # keep going red through it.
+  #
+  # What this costs, stated rather than hidden: on a FILTERED copy
+  # `tests/kamal_test.sh` does not run, exactly as `check`, `check_par` and
+  # `bounded_check` already did not run. `ONLY_SKIPPED` counts it and the
+  # summary line prints the exclusion, so the gap is loud. On an UNFILTERED run
+  # — the gate itself, and all nine self-test copies that run a whole gate —
+  # this changes nothing at all: same command, same output, same verdict.
   if have kamal && have kamal-backup && have ruby; then
-    if bash "$ROOT/tests/kamal_test.sh" >"$TMP/kamal_test.log" 2>&1; then
-      # The script's own last line is its count, and that count is the point:
-      # a reader who wants to know how much of the claim was exercised should not
-      # have to open a second file. The leading `PASS: ` is stripped because
-      # `report` prints its own verdict, and "PASS PASS:" is the kind of small
-      # wrongness that trains a reader to skim past a line that matters.
-      report PASS "$(sed 's/^PASS: //' "$TMP/kamal_test.log" | tail -1)"
-    else
-      report FAIL 'kamal_test  (the generated config is accepted by the real binaries)'
-      sed 's/^/       /' "$TMP/kamal_test.log" | tail -20
+    if only_wanted 'kamal_test'; then
+      if bash "$ROOT/tests/kamal_test.sh" >"$TMP/kamal_test.log" 2>&1; then
+        # The script's own last line is its count, and that count is the point:
+        # a reader who wants to know how much of the claim was exercised should
+        # not have to open a second file. The leading `PASS: ` is stripped
+        # because `report` prints its own verdict, and "PASS PASS:" is the kind
+        # of small wrongness that trains a reader to skim past a line that
+        # matters.
+        report PASS "$(sed 's/^PASS: //' "$TMP/kamal_test.log" | tail -1)"
+      else
+        report FAIL 'kamal_test  (the generated config is accepted by the real binaries)'
+        sed 's/^/       /' "$TMP/kamal_test.log" | tail -20
+      fi
     fi
   else
     report SKIP 'kamal + kamal-backup + ruby not installed  (the generated config was validated by nothing)'
