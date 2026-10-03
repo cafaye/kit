@@ -8762,6 +8762,431 @@ PY
   }
   check 'LICENSE  (MIT, and nothing in the tree can disagree with it)' license_check
 
+  # ---------------------------------------------------------------------------
+  # THE VERSION STRING IS THE PROMISE, AND IT IS DERIVED
+  # ---------------------------------------------------------------------------
+  #
+  # kit is adopted by COPY and by `uses:` at a ref, so "is 2.4.0 safe to take?"
+  # is the only question a consumer has, and until this check it was answered by
+  # a person reading a diff. kit also had no version at all: the changelog said
+  # so in its own first paragraph ("kit has no releases yet and no semver
+  # contract"), which is an honest sentence and an unusable one — the tier was
+  # documentation, so nothing could fail when the documentation was wrong.
+  #
+  # `VERSION` is one line and it is the ONLY place the version is written. Three
+  # tiers, derived from the two versions and never asserted anywhere:
+  #
+  #   breaking   MAJOR moved. A consumer must read what changed, and must be
+  #              given a MIGRATION, because "read the diff" is the thing this
+  #              whole mechanism exists to stop asking of people.
+  #   additive   MINOR moved. Something was added; nothing a consumer holds was
+  #              taken away.
+  #   invisible  PATCH moved. A consumer may take it without reading anything,
+  #              which is what "invisible" has to mean for it to be worth
+  #              deriving.
+  #
+  # WHY THESE THREE, AND NOT FOUR, AND NOT A BOOLEAN
+  #
+  # The rule of thumb is that the number you do NOT have to read is the size of
+  # the promise, so the tiers have to be the three sizes of change there are.
+  # A fourth tier would be a claim about something this repository cannot
+  # observe — the difference between "invisible" and "safe" is a difference
+  # about the CONSUMER's code, which kit does not have. And a boolean
+  # (`breaking: true|false`) is what cafaye has today and it is what the
+  # research calls the weakest form of this: it answers "did anything break?"
+  # with one bit, so it cannot say WHICH surface broke, so a consumer reading it
+  # still has to open the diff. The tier is derived from the number the consumer
+  # already has, which is the property that makes it checkable at all.
+  #
+  # WHY A VERSION STRING THIS CHECK REFUSES
+  #
+  # `2.4.0-rc1` and `v2.4.0` are BOTH refused rather than guessed at, and both
+  # refusals are deliberate:
+  #   * a prerelease suffix is exactly where "what tier is this" stops having an
+  #     answer — semver puts `2.4.0-rc1` BELOW `2.4.0`, which means the derived
+  #     tier would change meaning when the suffix is dropped, so the string stops
+  #     being the source of truth for its own promise. kit has no prerelease
+  #     story and a refused version string is the honest answer to "which tier is
+  #     rc1 in", where guessing is the expensive one.
+  #   * `v` is the TAG spelling, not the version spelling. `kit.ref` accepts
+  #     `v<semver>` because that is a git tag, and this file is not a git tag.
+  #     A `v` here means somebody pasted the tag where the version goes, which
+  #     is precisely the hand-written-number drift this replaces.
+  #
+  # Both surface as `unknown`, and `unknown` is a FAILURE. A string the
+  # function cannot place must not be given a tier, because a tier that is a
+  # guess is the fail-open direction and this repository's rule is to fail
+  # closed.
+  #
+  # WHY THE DERIVATION IS A FUNCTION AND NOT PROSE
+  #
+  # A table in this comment is a table somebody can read and nobody has to
+  # agree with. `stability_tier` is asserted against a published table by the
+  # check below it, so a change to the rule that is not a change to the table is
+  # a red gate — and that is the whole difference between a standard and a
+  # convention.
+  stability_tier() {
+    stability_parse "$1" || { printf 'unknown\n'; return 0; }
+    local _fm=$STAB_MAJOR _fm2=$STAB_MINOR _fp=$STAB_PATCH
+    stability_parse "$2" || { printf 'unknown\n'; return 0; }
+    if [ "$STAB_MAJOR" -lt "$_fm" ] ||
+      { [ "$STAB_MAJOR" -eq "$_fm" ] && [ "$STAB_MINOR" -lt "$_fm2" ]; } ||
+      {
+        [ "$STAB_MAJOR" -eq "$_fm" ] && [ "$STAB_MINOR" -eq "$_fm2" ] &&
+          [ "$STAB_PATCH" -lt "$_fp" ]
+      }; then
+      # A version that went backwards. Not a fourth tier: nothing about a
+      # consumer's risk changes, which is precisely why it is named separately
+      # and refused rather than folded into one of the three.
+      printf 'retracted\n'
+    elif [ "$STAB_MAJOR" -gt "$_fm" ]; then
+      printf 'breaking\n'
+    elif [ "$STAB_MINOR" -gt "$_fm2" ]; then
+      printf 'additive\n'
+    elif [ "$STAB_PATCH" -gt "$_fp" ]; then
+      printf 'invisible\n'
+    else
+      printf 'none\n'
+    fi
+  }
+
+  # stability_parse <string> — three whole-number components, and nothing else.
+  # Sets STAB_MAJOR/MINOR/PATCH on success. `10#` because `08` is a syntax error
+  # in arithmetic and a version is not a place where a leading zero is worth an
+  # octal surprise.
+  stability_parse() {
+    local s="${1:-}" a b c
+    unset STAB_MAJOR STAB_MINOR STAB_PATCH
+    case "$s" in
+      *[!0-9.]* | '') return 1 ;;
+    esac
+    IFS=. read -r a b c <<<"$s"
+    case "$a$b$c" in
+      '' | *[!0-9]*) return 1 ;;
+    esac
+    [ -n "$a" ] && [ -n "$b" ] && [ -n "$c" ] || return 1
+    # A leading zero is refused rather than read as a number. `01.4.0` and
+    # `1.4.0` are the same version to a comparator and two different strings to
+    # a consumer, so a string that means two things is not a source of truth.
+    # Per COMPONENT, not on the concatenation: `1.0.0` joined reads `1000` and a
+    # pattern over that matches a version that has no leading zero at all.
+    local comp
+    for comp in "$a" "$b" "$c"; do
+      if [ "${#comp}" -gt 1 ]; then
+        case "$comp" in
+          0[0-9]*) return 1 ;;
+        esac
+      fi
+    done
+    STAB_MAJOR=$((10#$a))
+    STAB_MINOR=$((10#$b))
+    STAB_PATCH=$((10#$c))
+    return 0
+  }
+
+  # The published table. A row is (from, to, expected, why the row is here).
+  # Every row is a case the function gets WRONG for a different reason if the
+  # derivation is loosened, which is what makes it a table rather than three
+  # examples.
+  stability_tier_table_check() {
+    local problems=0 rows
+    rows='1.0.0 2.0.0 breaking  a MAJOR moved: read this one
+1.0.0 1.4.0 additive  something arrived, nothing a consumer holds left
+1.0.0 1.0.1 invisible  take it without reading anything
+1.0.0 1.0.0 none      no bump at all: nothing is promised because nothing moved
+2.0.0 1.9.0 retracted a version went backwards, which is refused rather than tiered
+1.0.0 2.0.0-rc1 unknown a prerelease suffix changes the meaning of the number
+1.0.0 v1.4.0 unknown a tag is not a version string
+1.0.0 1.4 unknown two components is not a version
+1.0.0 "" unknown no version is not a tier
+1.0.0 01.4.0 unknown a leading zero is arithmetic here and prose there'
+    local row from to want why got
+    while IFS= read -r row; do
+      [ -n "$row" ] || continue
+      # shellcheck disable=SC2086 # four fields, read into four names
+      set -- $row
+      from="$1"
+      to="$2"
+      want="$3"
+      why="$4"
+      got="$(stability_tier "$from" "$to")"
+      if [ "$got" != "$want" ]; then
+        printf '  %s -> %s derived %s, the published table says %s. %s\n' \
+          "$from" "$to" "$got" "$want" "$why" >&2
+        problems=$((problems + 1))
+      fi
+    done <<<"$rows"
+    if [ "$problems" -ne 0 ]; then
+      return 1
+    fi
+    printf '10 version pairs derive the tier they are published with; VERSION parses as %s\n' \
+      "$(head -1 "$ROOT/VERSION" 2>/dev/null || printf 'ABSENT')"
+  }
+  check 'stability tiers  (derived from two version strings, never asserted)' stability_tier_table_check
+
+  # The GATE. What the tier requires is not a paragraph, it is a set of files
+  # this check reads, so a tier crossing without its discharge is a red build.
+  stability_gate_check() {
+    local version from tier problems=0
+    if [ ! -f "$ROOT/VERSION" ]; then
+      printf 'VERSION does not exist. kit is adopted by copy, so the version string is the only thing a consumer has to go on, and a repository without one answers nothing.\n' >&2
+      return 1
+    fi
+    # One line, one version. A file with a trailing comment or a second version
+    # is two sources of truth, which is the failure this file exists to remove.
+    # Counted as non-blank LINES rather than bytes, because a file with no
+    # trailing newline is still one line and that is a text-file convention
+    # rather than a second version.
+    if [ "$(grep -c '[^[:space:]]' "$ROOT/VERSION")" != "1" ]; then
+      printf 'VERSION is not exactly one line. One line, one number: a second version or a comment in this file is a second place the promise can be written.\n' >&2
+      problems=$((problems + 1))
+    fi
+    if ! version="$(head -1 "$ROOT/VERSION")"; then
+      version=''
+    fi
+    if ! stability_parse "$version"; then
+      printf 'VERSION reads %s, which is not MAJOR.MINOR.PATCH. kit has no prerelease spelling and no leading-v spelling; a version this check cannot place cannot carry a promise it could not derive.\n' "${version:-<empty>}" >&2
+      return 1
+    fi
+
+    # WHERE THE PREVIOUS VERSION COMES FROM, AND WHY AN OVERRIDE EXISTS
+    #
+    # `git show HEAD:VERSION` is the honest answer: the version that was
+    # committed is the version consumers have, and the working tree is the one
+    # being proposed. KIT_STABILITY_FROM overrides it so that a throwaway copy
+    # with no git history — and a release rehearsal — can say what it is
+    # pretending to be. An override that disagrees with the file is still gated
+    # on, because the rule being checked does not depend on where the number
+    # came from.
+    from="${KIT_STABILITY_FROM:-}"
+    if [ -z "$from" ]; then
+      from="$(git -C "$ROOT" show HEAD:VERSION 2>/dev/null | head -1 || true)"
+    fi
+    if [ -z "$from" ]; then
+      # The first version under the contract. Nothing is compatible with
+      # nothing, so there is no tier to derive — and the checks below are the
+      # whole requirement, which is why they do not depend on this branch.
+      tier=initial
+    else
+      tier="$(stability_tier "$from" "$version")"
+    fi
+    case "$tier" in
+      breaking | additive | invisible | none | initial) ;;
+      *)
+        printf 'the bump from %s to %s derives the tier %s, which is not a promise a consumer can be given. A version this check cannot tier is a red build, not a guess.\n' \
+          "${from:-<none>}" "$version" "$tier" >&2
+        return 1
+        ;;
+    esac
+
+    # (1) The version has to be RECORDED, at every tier including invisible.
+    #     "Invisible" is a promise about the consumer's time, and it is kept by
+    #     the entry existing; a patch bump nobody wrote down is a patch bump
+    #     nobody can have checked.
+    if ! grep -qxF "## $version" "$ROOT/CHANGELOG.md"; then
+      printf 'CHANGELOG.md has no "## %s" section. A version bump has to say what it did, and this is the record a consumer reads instead of a diff.\n' "$version" >&2
+      problems=$((problems + 1))
+    fi
+
+    # (2) The version sections must be in descending order and the top one must
+    #     BE the version. Without this the file is a list in whatever order the
+    #     history produced, and "which version am I reading" is a question with
+    #     no answer. Read with a process substitution rather than a pipe because
+    #     a pipe would run this in a subshell and throw away every finding — and
+    #     `mapfile` is not in the bash 3.2 this repository is read with.
+    local prev='' v first='' bad_order=0
+    while IFS= read -r v; do
+      if [ -z "$first" ]; then
+        first="$v"
+      elif [ "$v" = "$version" ]; then
+        printf 'CHANGELOG.md lists %s below %s. The sections are read newest-first, and a version that is not on top is a version nobody reads first.\n' "$v" "$prev" >&2
+        bad_order=1
+      fi
+      if [ -n "$prev" ]; then
+        if stability_parse "$prev" && stability_parse "$v"; then
+          if [ "$(stability_tier "$v" "$prev")" = none ] ||
+            [ "$(stability_tier "$v" "$prev")" = retracted ]; then
+            printf 'CHANGELOG.md lists %s above %s, so the sections are not in descending order.\n' "$prev" "$v" >&2
+            bad_order=1
+          fi
+        fi
+      fi
+      prev="$v"
+    done < <(grep '^## ' "$ROOT/CHANGELOG.md" | sed 's/^## //' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true)
+    if [ "$bad_order" -ne 0 ]; then
+      problems=$((problems + 1))
+    fi
+    if [ "$first" != "$version" ]; then
+      printf 'the newest version section in CHANGELOG.md is %s and VERSION is %s. Those are the same fact written twice, and they disagree.\n' "${first:-<none>}" "$version" >&2
+      problems=$((problems + 1))
+    fi
+
+    # (3) THE TIER'S OWN REQUIREMENT.
+    #
+    #     breaking needs a MIGRATION, not a changelog line. A consumer who
+    #     adopted kit by copy cannot apply a sentence; the migration is the only
+    #     artefact that can tell them what to change, so it is the thing the
+    #     tier owes them and the thing that is checked for.
+    if [ "$tier" = breaking ]; then
+      if ! awk -v want="$version" '
+        $0 == "## " want { inside = 1; next }
+        /^## / { inside = 0 }
+        inside && /^### Breaking/ { found = 1 }
+        END { exit(found ? 0 : 1) }' "$ROOT/CHANGELOG.md"; then
+        printf 'the bump to %s is a MAJOR, which derives the tier `breaking`, and its section names nothing that breaks. A breaking release whose breaking part is unwritten is a release whose promise is unchecked.\n' "$version" >&2
+        problems=$((problems + 1))
+      fi
+      if [ ! -f "$ROOT/MIGRATIONS.md" ] ||
+        ! grep -qxF "## $version" "$ROOT/MIGRATIONS.md" 2>/dev/null; then
+        printf 'the bump to %s is a MAJOR, so it owes a consumer a MIGRATION, and MIGRATIONS.md has no "## %s" section. Read the diff is what this version number is supposed to replace.\n' "$version" "$version" >&2
+        problems=$((problems + 1))
+      fi
+    fi
+    # additive owes the consumer its promise too: a MINOR says nothing was taken
+    # away, and that is a claim about the section as much as about the tree.
+    if [ "$tier" = additive ]; then
+      if awk -v want="$version" '
+        $0 == "## " want { inside = 1; next }
+        /^## / { inside = 0 }
+        inside && /^### Breaking/ { found = 1 }
+        END { exit(found ? 0 : 1) }' "$ROOT/CHANGELOG.md"; then
+        printf 'the bump to %s is a MINOR, which derives the tier `additive`, and its section declares a breaking change. A breaking change is a MAJOR bump; if it is really additive, the heading is a lie.\n' "$version" >&2
+        problems=$((problems + 1))
+      fi
+    fi
+
+    # (4) THE RULE THAT NEEDS NO PREDECESSOR, and it is the load-bearing one.
+    #
+    #     Every `### Breaking` heading in the file must sit under a version
+    #     whose MAJOR is greater than the MAJOR of the section above it, and
+    #     never under `## Unreleased`. So the promise holds for the WHOLE
+    #     history, not only for the bump being released now: a breaking entry
+    #     filed under a MINOR — or parked in Unreleased where it is covered by
+    #     no version at all — is a red build even when the current VERSION is
+    #     untouched. This is the rule that makes the promise checkable rather
+    #     than documented, and it is why the check does not only ask about the
+    #     version in VERSION.
+    local cur='' above_major='' bad=0
+    while IFS= read -r line; do
+      case "$line" in
+        '## '*) cur="${line#\#\# }" ;;
+        '### Breaking'*)
+          if [ "$cur" = Unreleased ]; then
+            printf 'CHANGELOG.md declares a breaking change under `## Unreleased`, which is covered by no version at all. Until the release that carries it is a MAJOR, it is a breaking change with no version attached to it.\n' >&2
+            bad=1
+          elif ! stability_parse "$cur"; then
+            printf 'CHANGELOG.md declares a breaking change under the heading "## %s", which is not a version, so no bump can be checked against it.\n' "$cur" >&2
+            bad=1
+          else
+            above_major="$(grep '^## ' "$ROOT/CHANGELOG.md" | sed 's/^## //' | grep -B1 -xF "$cur" | head -1 || true)"
+            if [ -n "$above_major" ] && stability_parse "$above_major"; then
+              local pm=$((10#${above_major%%.*}))
+              if [ "$STAB_MAJOR" -le "$pm" ]; then
+                printf 'CHANGELOG.md declares a breaking change under %s, and the section above it is %s. A breaking change that does not move MAJOR is not a versioned promise; that is the entire rule this file enforces.\n' "$cur" "$above_major" >&2
+                bad=1
+              fi
+            fi
+          fi
+          ;;
+      esac
+    done <"$ROOT/CHANGELOG.md"
+    if [ "$bad" -ne 0 ]; then
+      problems=$((problems + 1))
+    fi
+
+    if [ "$problems" -ne 0 ]; then
+      return 1
+    fi
+    # The summary names what the derived tier OWED and that it is there, so the
+    # PASS row is a measurement rather than the word "fine". A plain case into a
+    # variable rather than a `$( )` wrapping a multi-line case: the command
+    # substitution does not survive the newlines, and it printed a shell syntax
+    # error into a PASS row on the first run of it.
+    local owed='nothing — this is the first version under the contract'
+    case "$tier" in
+      breaking) owed='a MAJOR owes a MIGRATION, and one is there' ;;
+      additive) owed='a MINOR declares nothing broken' ;;
+      invisible) owed='a PATCH is invisible by the definition of the tier' ;;
+      none) owed='no bump since the last commit, so nothing is promised' ;;
+    esac
+    printf 'VERSION %s, tier `%s` from %s; changelog sections descend and the top one is the version; %s\n' \
+      "$version" "$tier" "${from:-nothing, so this is the first version under the contract}" "$owed"
+  }
+  check 'stability gate  (a version bump pays for the tier it derives)' stability_gate_check
+
+  # RESERVED. One check, one direction: a retired name must still be gone. The
+  # rule it enforces and why the fourth hygiene rule is INVERTED here rather
+  # than copied is in the file's own header.
+  reserved_check() {
+    local problems=0 count=0 line kind name retired
+    if [ ! -f "$ROOT/RESERVED" ]; then
+      printf 'RESERVED does not exist. Retiring a template path without leaving a tombstone is how the same path comes back meaning something else, and nothing else in this tree would notice.\n' >&2
+      return 1
+    fi
+    while IFS= read -r line; do
+      case "$line" in
+        '' | \#*) continue ;;
+      esac
+      count=$((count + 1))
+      # The leading word is the ledger's own `reserved` marker, so the KIND is
+      # the second field. Reading $1 as the kind made every entry declare kind
+      # "reserved", which is a ledger that checks one thing and reports another.
+      case "$line" in
+        reserved\ *)
+          ;;
+        *)
+          printf 'a RESERVED entry does not begin with `reserved`: %s\n' "$line" >&2
+          problems=$((problems + 1))
+          continue
+          ;;
+      esac
+      # shellcheck disable=SC2086 # two leading fields, then key="value" pairs
+      set -- $line
+      shift
+      kind="${1:-}"
+      name="${2:-}"
+      retired=''
+      shift 2 2>/dev/null || true
+      for kv in "$@"; do
+        case "$kv" in
+          retired_in=*) retired="${kv#retired_in=}" ;;
+        esac
+      done
+      case "$line" in
+        *reason=*owner=*since=*)
+          ;;
+        *)
+          printf 'a RESERVED entry does not carry reason, owner and since: %s\n' "$line" >&2
+          problems=$((problems + 1))
+          ;;
+      esac
+      if [ "$kind" != path ]; then
+        printf 'RESERVED entry %s declares kind %s, and no check implements that kind. A kind nobody checks is an entry that reads as protection and provides none.\n' "${name:-<no name>}" "${kind:-<none>}" >&2
+        problems=$((problems + 1))
+        continue
+      fi
+      if [ -z "$name" ] || [ -z "$retired" ]; then
+        printf 'a RESERVED entry is missing its name or its retired_in: %s\n' "$line" >&2
+        problems=$((problems + 1))
+        continue
+      fi
+      if ! stability_parse "$retired"; then
+        printf 'RESERVED entry %s retires in %s, which is not a version, so nothing can be checked against it.\n' "$name" "$retired" >&2
+        problems=$((problems + 1))
+        continue
+      fi
+      if [ -e "$ROOT/$name" ]; then
+        printf 'RESERVED says %s was retired in %s, and it is in the tree. This is the check the file exists for: a tombstone nothing enforces is a note.\n' "$name" "$retired" >&2
+        problems=$((problems + 1))
+      fi
+    done <"$ROOT/RESERVED"
+    if [ "$problems" -ne 0 ]; then
+      return 1
+    fi
+    printf '%s reserved name(s), every one of them absent from the tree\n' "$count"
+  }
+  check 'reserved tombstones  (a retired name stays dead)' reserved_check
+
   # The README's own examples must call the workflow the README says it does.
   #
   # Every yaml block in the README that contains `uses: cafaye/kit/` is a

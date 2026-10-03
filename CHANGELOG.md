@@ -1,17 +1,74 @@
 # Changelog
 
-All notable changes to `kit` are recorded here. kit has no releases yet and no
-semver contract — it is consumed by *calling*
+All notable changes to `kit` are recorded here, and **the version is in
+`VERSION`**: one line, one number, and it is the only place the version is
+written. kit is adopted by *calling*
 `.github/workflows/ci.reusable.yml@master` and by *copying* files out of
-`docker/` and `templates/`. `lint/` is the exception and no longer belongs to
-that sentence: the reusable workflow reads it at run time, so a service inherits
-it without a copy (see kit-12 below).
+`docker/` and `templates/`, so "is 2.4.0 safe to take?" is the only question a
+consumer has, and the answer is **derived from that number** rather than
+described in a paragraph:
+
+| the bump | the tier | what a consumer may do |
+| --- | --- | --- |
+| MAJOR | `breaking` | read `MIGRATIONS.md` for the version. A MAJOR bump without a migration section is a red build |
+| MINOR | `additive` | take it. Something arrived; nothing a consumer holds went away |
+| PATCH | `invisible` | take it without reading anything |
+
+`tests/validate.sh` derives those three from the two version strings with one
+function (`stability_tier`), asserts it against a published table, and gates the
+release on the tier's requirement — so the promise is checkable rather than
+documented. `RESERVED` is the same idea for the other half of the question: a
+name kit has retired, kept dead.
+
+`lint/` is not consumed by copy at all, and does not belong to the sentence
+above: the reusable workflow reads it at run time, so a service inherits it
+without a copy (see kit-12 below).
 
 > Entries under **Earlier**, and the three `workflows/ci.reusable.yml` bullets
 > below, record the path the file had *at the time*. It was
-> `workflows/ci.reusable.yml` until the move recorded in Unreleased/Changed.
+> `workflows/ci.reusable.yml` until the move recorded in 1.0.0/Changed.
 
 ## Unreleased
+
+_(nothing yet — everything below is what 1.0.0 is.)_
+
+## 1.0.0
+
+### Added
+
+- **`VERSION`, and three tiers derived from it rather than asserted beside it.**
+  kit is consumed by copy and by `uses:` at a ref, so a consumer's only question
+  is whether a version is safe to take, and until this it was answered by a
+  person reading a diff — in every repository, forever. The numbers did not mean
+  anything consistent either (`0.0.0` in four manifests, per-repo versions, no
+  version at all here), so a consumer who learned the rule in one place could not
+  apply it in the next.
+  - The **source of truth is `VERSION`**, not a service manifest. A service's
+    manifest describes that service; nine of them carry no `version` key on
+    purpose, and none of them would be a place to record how safe it is to take
+    *kit*. The two numbers are different questions and they stay in different
+    files.
+  - `1.0.0` and not `0.x`: in semver `0.x` *means* "unstable, anything may
+    change", which is the sentence this removes, and a version a consumer has to
+    re-read the meaning of is not a source of truth.
+  - A version string this check cannot place is a **red build**, not a guess:
+    `2.4.0-rc1` and `v2.4.0` are both refused, and `v2.4.0 -> 1.9.0` is a
+    retraction rather than a fourth tier. The reasons are in
+    `tests/validate.sh`.
+  - The tier a release **owes** is a file, not a sentence: a MAJOR bump needs a
+    `MIGRATIONS.md` section for its version, and a `### Breaking` heading in the
+    changelog is only legal under a version whose MAJOR actually moved — under
+    `## Unreleased` it is covered by no version at all, and that is a failure.
+- **`RESERVED` — a tombstone for every name kit retires.** `buf`'s `reserved` and
+  Kubernetes' `+k8s:deprecated` are the two references and they are **not the same
+  mechanism**: buf's is a WIRE tombstone (a retired field *number* must never be
+  reused, because the bytes still mean the old thing) and k8s's is a LIFECYCLE
+  marker on a field that is still there. kit has no encoding, so the wire half
+  does not transfer; what does transfer is the weaker half both of them enforce,
+  which is the half that matters when a service's copy outlives the decision — **a
+  retired name stays retired**. The file is in the `skip-allowlist` dialect, with
+  the fourth hygiene rule inverted: a reserved name that EXISTS is the failure.
+  Two entries, both from kit-20's withdrawn backup distribution.
 
 ### Fixed
 
