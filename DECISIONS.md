@@ -862,3 +862,84 @@ anecdote is the thing that made somebody go and take it.
 the answer was "for nothing, 104 times" — which is a different defect from "the
 expensive thing is slow", and the only response to the second one that does not
 stop measuring is the one that removes the work.
+
+---
+
+## MD31 — **a recipe may not spell a version; it may only DERIVE one, and the rule is a text scan over `tests/self_test.sh`**
+
+**The defect, in one sentence.** Four recipes anchored their `edit` on the
+literal `1.0.0`, so one release — `92a1127`, moving `VERSION` to `2.0.0` — killed
+the only proofs kit has of its own release discipline, and reported each of them
+as `the recipe no longer applies to its copy`, which reads as a harness
+complaint rather than as four lost proofs.
+
+**Why derivation and not a corrected literal.** Rewriting the four anchors to
+`2.0.0` is a fix that re-arms the identical bomb for `3.0.0`, and it is green in
+the meantime. A derived mutation cannot drift: `copy_version <dir>` reads the
+version out of the copy and `bump <v> <major|minor>` computes the destination, so
+the recipe exercises the same property at whatever version the tree carries. The
+forward test is the proof, and it is a separate measurement from the suite's:
+simulate the release, then require each recipe to apply AND bite.
+
+**Why the check is a SCAN OF THE SOURCE and not a guard at suite start.** The
+packet offered two shapes. Both make the next bump a non-event; they differ in
+*when* they say so and in what they cost.
+
+| | scan of the source (chosen) | guard at suite start (rejected) |
+| --- | --- | --- |
+| when it speaks | at authoring time, in the same gate run | after the copy exists, per recipe |
+| cost | one text pass | a full set of throwaway copies |
+| what it can name | the recipe, the file, the literal | a resolved anchor, no literal |
+| if it is deleted | a vacuous rule, which the check itself catches | a suite that runs anyway |
+
+A guard at suite start is the same information one step later, and it cannot say
+*which* recipe or *why* at the moment somebody is writing one — which is the
+moment the decision is cheap. It was also the more expensive of the two by the
+ratio the self-test already pays 107 times.
+
+**And the check is NOT "be louder".** `edit` already refuses an unmatched anchor
+loudly, naming the file; the packet says so explicitly. The job here is not a
+louder refusal, it is making the class impossible — and that is the whole reason
+the check runs on the source rather than on a failure. At the moment `edit`
+refuses, the recipe is already dead and the damage is done. A refusal cannot
+catch that; only a rule that runs before anyone writes the recipe can.
+
+**What it derives rather than asserts.** The set of files in scope is read out of
+the recipes themselves — every path `edit` is handed that resolves to `VERSION`
+or `CHANGELOG.md` — so a version recipe written next year brings itself under the
+rule without anybody editing the check. This is `self_test_live_tier`'s move for
+the same reason: a list of what is forbidden, written down separately, is a list
+that goes stale, and a rule covering only the cases its author remembered has a
+hole shaped like the next packet.
+
+**The two shapes rejected inside the scan, both measured.**
+
+1. *Only the anchor.* A recipe that anchors on `$v` and writes `3.0.0` as the
+   destination has the same fuse — the literal stops existing the moment the tree
+   moves past it — and is invisible to an anchor-only rule. So the scan covers
+   every argument of the call. Measured red on the anchor alone and on the
+   destination alone, separately.
+2. *Any `\d+\.\d+\.\d+` anywhere in the file.* That matches the prose — this
+   repository's documentation legitimately names versions — and a check that
+   fires on the explanation of why a literal is wrong is a check that fires on
+   its own documentation. Comments are excluded, measured: a literal moved into a
+   comment does not fire.
+
+**The limit, stated rather than caveated.** The scan reads *arguments*, so a
+version literal that reaches a recipe through a variable is invisible:
+
+    v_part="2.0"; edit "$baseNN/VERSION" "$v_part" "$v_part.0.0"      -> GREEN
+    v96_major="2.0"."0.0"                                            -> GREEN
+
+Both were measured, and both are reported in `REPORT-kit-version-recipe-drift-01.md`
+rather than left as a footnote. Neither is obfuscation a careful author reaches
+for, and closing them means either re-implementing bash's expansion (which fires
+on correct code and teaches the reader to ignore the check) or parsing recipe
+blocks by brace and backslash counting — the same fragility `self_test_live_tier`
+already removed a containment assertion over. The rule is worth more honest than
+airtight: it catches the class as it was actually written.
+
+**The rule.** *A version a recipe writes is a fact about the copy, not a fact
+about the day the recipe was typed.* Anything a routine repository change moves —
+a version, a changelog heading — is derived from the tree being mutated, and a
+check over the recipes says so before the release rather than after it.
