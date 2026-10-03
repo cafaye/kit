@@ -12085,7 +12085,7 @@ print(
 )
 PY
   }
-  check 'tests/  (no docker tier hardcodes a project, container, volume or host port name; every shared namespace is derived from the run)' \
+  check 'tests/  (no docker tier hardcodes a project, container, volume, image or host port name; every shared namespace is derived from the run)' \
     docker_tier_project_name
 
 
