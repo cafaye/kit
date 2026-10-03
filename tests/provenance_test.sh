@@ -357,6 +357,25 @@ case "$3" in
     # measured from the real image on the machine that wrote this suite.
     printf '%s\n' '{"org.opencontainers.image.created":"2026-04-10T03:06:38.682Z","org.opencontainers.image.revision":"700fc117a2fd01ac0201deaa6fa69c5557acb04f","org.opencontainers.image.source":"https://github.com/oven-sh/bun"}'
     exit 0 ;;
+  inheritshape)
+    # THE FIXTURE THAT MAKES THE OWNERSHIP CHECK PROVABLE, and it exists because
+    # the first version of this suite got it wrong in the exact way this
+    # repository's header warns about. `inherit` above is refused by the SHAPE
+    # check — its source is a URL — so it never reaches the namespace check, and
+    # deleting the namespace check left this suite GREEN. A control satisfiable
+    # by two different checks proves the gate can go red and says nothing about
+    # either; breakage 103 was unprovable against `inherit` and green on the
+    # mutation it names.
+    #
+    # So this one is a base image that stamps its OCI labels in kit's OWN
+    # grammar: `owner/repo`, 40 hex, RFC3339 to the second, and nothing in
+    # `com.cafaye.kit.*`. Every field PASSES shape. The one thing wrong with it
+    # is that nobody in kit wrote it, and only the namespace check can say so.
+    # Real publishers do this: the grammar kit chose is the grammar these labels
+    # use when they are not a URL, which is precisely why shape cannot be the
+    # thing that catches them.
+    printf '%s\n' '{"org.opencontainers.image.created":"2026-10-03T09:20:00Z","org.opencontainers.image.revision":"0123456789abcdef0123456789abcdef01234567","org.opencontainers.image.source":"oven-sh/bun"}'
+    exit 0 ;;
   ours) printf '%s\n' '{"com.cafaye.kit.source.dirty":"clean","com.cafaye.kit.template.version":"v0.1.0","org.opencontainers.image.created":"2026-10-03T09:20:00Z","org.opencontainers.image.revision":"0123456789abcdef0123456789abcdef01234567","org.opencontainers.image.source":"cafaye/guard"}'
     exit 0 ;;
   foreign) printf '%s\n' '{"com.cafaye.kit.source.dirty":"clean","com.cafaye.kit.template.version":"v0.1.0","org.opencontainers.image.created":"2026-10-03T09:20:00Z","org.opencontainers.image.revision":"0123456789abcdef0123456789abcdef01234567","org.opencontainers.image.source":"oven-sh/bun"}'
@@ -421,6 +440,20 @@ verify_says() {
 verify_exits 6 'D1 inherited base-image labels are refused with NO flags at all' inherit
 verify_says 'oven-sh/bun' 'D1b the refusal NAMES Bun rather than us' 6 inherit
 verify_exits 6 'D2 inherited labels are refused even asserting our own repo' inherit --expect-source cafaye/guard
+
+# THE CASE THAT ONLY OWNERSHIP CAN SEE, and the one that makes breakage 103
+# provable. Every field here passes the shape grammar — `owner/repo`, 40 hex,
+# RFC3339 to the second — and there is nothing in `com.cafaye.kit.*`. So the
+# shape loop finds nothing to complain about and the namespace check is the ONLY
+# thing that can refuse it.
+#
+# This pair is a CONTROL and its own control, and both directions are asserted
+# because only one of them being true would leave the check unproven:
+#   - D2a: it is refused with no flags at all (the check fires);
+#   - D2b: it is refused WITHOUT --expect-source (so the refusal is not the
+#     warning, and not the flag doing the work).
+verify_exits 6 'D2a a stamp in kit'"'"'s own grammar but with NO kit namespace is refused' inheritshape
+verify_says 'BASE' 'D2b and the refusal is the NAMESPACE one, not shape and not the warning' 6 inheritshape
 
 # A FOREIGN BUT WELL-FORMED source: `oven-sh/bun` is two clean lowercase
 # segments with exactly one slash, so it passes every grammar in the file. This
