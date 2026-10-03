@@ -8,3 +8,7 @@ tests/.bin/
 __pycache__/
 *.pyc
 .DS_Store
+
+# The fingerprint cache: one gate's verdicts, keyed by content. Local, never
+# committed, and safe to delete at any time -- deleting it costs one slow run.
+.kit/cache/
