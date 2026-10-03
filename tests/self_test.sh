@@ -842,11 +842,25 @@ $2"*) return 0 ;;
   esac
 }
 
+# _stale_edit accumulates the recipes whose `edit` found nothing to replace. It
+# is emptied by every shard guard that declines a recipe, so it can only ever be
+# read by the check that owns the breakage which set it.
+_stale_edit=""
+
 # edit <file> <old> <new> — a textual breakage that FAILS LOUDLY if the source
 # has been refactored past it. A self_test that silently stops breaking
 # anything is worse than no self_test, so an unmatched edit is an error here.
+#
+# IT RECORDS RATHER THAN EXITS, and the loudness moved into `expect_red*`. The
+# reason is the shard guard, and it was a real failure: `edit` runs EAGERLY,
+# before the `expect_red*` call that is the only thing which knows which shard
+# owns the recipe. So one stale recipe in one shard aborted every other shard —
+# `KIT_SELF_TEST_SHARD=1/8` died on breakage 98's recipe having proved nothing
+# about the twelve breakages it had already run. A rotten recipe is still
+# evidence, but only against the shard that owns it, and it is reported as a
+# FAIL of that breakage rather than as the death of the suite.
 edit() {
-  "$PY" - "$1" "$2" "$3" <<'PY'
+  if ! "$PY" - "$1" "$2" "$3" <<'PY'
 import sys
 
 path, old, new = sys.argv[1], sys.argv[2], sys.argv[3]
@@ -855,6 +869,9 @@ if old not in body:
     sys.exit(f"self_test: breakage no longer applies to {path}: {old!r} not found")
 open(path, "w", encoding="utf-8").write(body.replace(old, new, 1))
 PY
+  then
+    _stale_edit="$_stale_edit"$'\n'"    $1"
+  fi
 }
 
 # expect_red <label> <dir> <validate.sh args...>
@@ -862,6 +879,18 @@ expect_red() {
   # Shard guard: a recipe outside this shard is not run at all, and is not
   # counted as a pass. See KIT_SELF_TEST_SHARD above.
   if ! _shard_claims "$1"; then
+    _stale_edit=''
+    return 0
+  fi
+  # A recipe whose `edit` matched nothing was EVALUATED, and what it evaluated to
+  # is "this breakage no longer exists". Counting it as ran and reporting it as a
+  # FAIL is the honest reading: the check below would otherwise pass by proving
+  # that an unmutated tree is green. See `_stale_edit` above.
+  if [ -n "$_stale_edit" ]; then
+    printf 'FAIL self_test: %s — the recipe no longer applies to its copy:%s\n' "$1" "$_stale_edit"
+    _stale_edit=''
+    failures=$((failures + 1))
+    _shard_ran=$((_shard_ran + 1))
     return 0
   fi
   _shard_ran=$((_shard_ran + 1))
@@ -921,6 +950,18 @@ expect_red_check() {
   # Shard guard: a recipe outside this shard is not run at all, and is not
   # counted as a pass. See KIT_SELF_TEST_SHARD above.
   if ! _shard_claims "$1"; then
+    _stale_edit=''
+    return 0
+  fi
+  # A recipe whose `edit` matched nothing was EVALUATED, and what it evaluated to
+  # is "this breakage no longer exists". Counting it as ran and reporting it as a
+  # FAIL is the honest reading: the check below would otherwise pass by proving
+  # that an unmutated tree is green. See `_stale_edit` above.
+  if [ -n "$_stale_edit" ]; then
+    printf 'FAIL self_test: %s — the recipe no longer applies to its copy:%s\n' "$1" "$_stale_edit"
+    _stale_edit=''
+    failures=$((failures + 1))
+    _shard_ran=$((_shard_ran + 1))
     return 0
   fi
   _shard_ran=$((_shard_ran + 1))
@@ -1097,6 +1138,18 @@ expect_green_check() {
   # Shard guard: a recipe outside this shard is not run at all, and is not
   # counted as a pass. See KIT_SELF_TEST_SHARD above.
   if ! _shard_claims "$1"; then
+    _stale_edit=''
+    return 0
+  fi
+  # A recipe whose `edit` matched nothing was EVALUATED, and what it evaluated to
+  # is "this breakage no longer exists". Counting it as ran and reporting it as a
+  # FAIL is the honest reading: the check below would otherwise pass by proving
+  # that an unmutated tree is green. See `_stale_edit` above.
+  if [ -n "$_stale_edit" ]; then
+    printf 'FAIL self_test: %s — the recipe no longer applies to its copy:%s\n' "$1" "$_stale_edit"
+    _stale_edit=''
+    failures=$((failures + 1))
+    _shard_ran=$((_shard_ran + 1))
     return 0
   fi
   _shard_ran=$((_shard_ran + 1))
@@ -1187,6 +1240,18 @@ expect_red_script() {
   # Shard guard: a recipe outside this shard is not run at all, and is not
   # counted as a pass. See KIT_SELF_TEST_SHARD above.
   if ! _shard_claims "$1"; then
+    _stale_edit=''
+    return 0
+  fi
+  # A recipe whose `edit` matched nothing was EVALUATED, and what it evaluated to
+  # is "this breakage no longer exists". Counting it as ran and reporting it as a
+  # FAIL is the honest reading: the check below would otherwise pass by proving
+  # that an unmutated tree is green. See `_stale_edit` above.
+  if [ -n "$_stale_edit" ]; then
+    printf 'FAIL self_test: %s — the recipe no longer applies to its copy:%s\n' "$1" "$_stale_edit"
+    _stale_edit=''
+    failures=$((failures + 1))
+    _shard_ran=$((_shard_ran + 1))
     return 0
   fi
   _shard_ran=$((_shard_ran + 1))
@@ -1240,6 +1305,18 @@ expect_green_script() {
   # Shard guard: a recipe outside this shard is not run at all, and is not
   # counted as a pass. See KIT_SELF_TEST_SHARD above.
   if ! _shard_claims "$1"; then
+    _stale_edit=''
+    return 0
+  fi
+  # A recipe whose `edit` matched nothing was EVALUATED, and what it evaluated to
+  # is "this breakage no longer exists". Counting it as ran and reporting it as a
+  # FAIL is the honest reading: the check below would otherwise pass by proving
+  # that an unmutated tree is green. See `_stale_edit` above.
+  if [ -n "$_stale_edit" ]; then
+    printf 'FAIL self_test: %s — the recipe no longer applies to its copy:%s\n' "$1" "$_stale_edit"
+    _stale_edit=''
+    failures=$((failures + 1))
+    _shard_ran=$((_shard_ran + 1))
     return 0
   fi
   _shard_ran=$((_shard_ran + 1))
@@ -1284,6 +1361,18 @@ expect_skip_check() {
   # Shard guard: a recipe outside this shard is not run at all, and is not
   # counted as a pass. See KIT_SELF_TEST_SHARD above.
   if ! _shard_claims "$1"; then
+    _stale_edit=''
+    return 0
+  fi
+  # A recipe whose `edit` matched nothing was EVALUATED, and what it evaluated to
+  # is "this breakage no longer exists". Counting it as ran and reporting it as a
+  # FAIL is the honest reading: the check below would otherwise pass by proving
+  # that an unmutated tree is green. See `_stale_edit` above.
+  if [ -n "$_stale_edit" ]; then
+    printf 'FAIL self_test: %s — the recipe no longer applies to its copy:%s\n' "$1" "$_stale_edit"
+    _stale_edit=''
+    failures=$((failures + 1))
+    _shard_ran=$((_shard_ran + 1))
     return 0
   fi
   _shard_ran=$((_shard_ran + 1))
@@ -1358,6 +1447,18 @@ expect_green() {
   # fixing silently — a helper that does not count is a helper a sharded run
   # silently skips while still claiming a number.
   if ! _shard_claims "$1"; then
+    _stale_edit=''
+    return 0
+  fi
+  # A recipe whose `edit` matched nothing was EVALUATED, and what it evaluated to
+  # is "this breakage no longer exists". Counting it as ran and reporting it as a
+  # FAIL is the honest reading: the check below would otherwise pass by proving
+  # that an unmutated tree is green. See `_stale_edit` above.
+  if [ -n "$_stale_edit" ]; then
+    printf 'FAIL self_test: %s — the recipe no longer applies to its copy:%s\n' "$1" "$_stale_edit"
+    _stale_edit=''
+    failures=$((failures + 1))
+    _shard_ran=$((_shard_ran + 1))
     return 0
   fi
   _shard_ran=$((_shard_ran + 1))
@@ -1407,6 +1508,18 @@ expect_red_lang() {
   # Shard guard: a recipe outside this shard is not run at all, and is not
   # counted as a pass. See KIT_SELF_TEST_SHARD above.
   if ! _shard_claims "$1"; then
+    _stale_edit=''
+    return 0
+  fi
+  # A recipe whose `edit` matched nothing was EVALUATED, and what it evaluated to
+  # is "this breakage no longer exists". Counting it as ran and reporting it as a
+  # FAIL is the honest reading: the check below would otherwise pass by proving
+  # that an unmutated tree is green. See `_stale_edit` above.
+  if [ -n "$_stale_edit" ]; then
+    printf 'FAIL self_test: %s — the recipe no longer applies to its copy:%s\n' "$1" "$_stale_edit"
+    _stale_edit=''
+    failures=$((failures + 1))
+    _shard_ran=$((_shard_ran + 1))
     return 0
   fi
   _shard_ran=$((_shard_ran + 1))
@@ -4194,13 +4307,13 @@ expect_red_check 'breakage 97: a MINOR bump declares a breaking change' \
 base98="$(fresh_copy kit-98)"
 edit "$base98/CHANGELOG.md" '## Unreleased
 
-_(nothing yet' '## Unreleased
+### Added' '## Unreleased
 
 ### Breaking
 
 - parked here, where no version covers it.
 
-_(nothing yet'
+### Added'
 expect_red_check 'breakage 98: a breaking change sits under Unreleased, where no version covers it' \
   "$base98" 'stability gate' --static-only
 
