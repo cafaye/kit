@@ -12,10 +12,11 @@ those three tiers into `report SKIP` rows naming the flag, and one wrapper in
 `tests/self_test.sh` that sets it for every child gate. No bound was widened.
 
 **The result:** 23b's dependency on three docker stacks is gone. Its own gate run
-was executed **six times before and six times after**: three of the six before
-came back `exit 1`, none of the six after did. The saving is **~130 s per whole
-suite**, measured twice, and §5 says why the 760 s difference between the two
-*suites* is not evidence of anything.
+was executed **six times before and seven times after**: three of the six before
+came back `exit 1`, none of the seven after did. The gate is **`exit 0`** — 108 of
+108, all 107 breakages hold. The saving is **~130 s per whole suite**, measured
+twice, and §5 says why the 760 s difference between the two *suites* is not
+evidence of anything.
 
 ---
 
@@ -306,11 +307,26 @@ scratch directories as a fleet.
 | --- | --- | --- | --- | --- | --- |
 | BEFORE-1 | pristine `master` `ec13376` | 08:12:38 | 1774 s = 29 m 34 s | 100 | 5 — **23b** + 96–99 |
 | BEFORE-2 | pristine `master` `ec13376` | 10:05 | 2071 s = 34 m 31 s | 101 | 4 — 96–99 |
-| AFTER-1 | `worker/kit-selftest-live-tier-01` | 09:14:29 | **1189 s = 19 m 49 s** | 101 | 4 — 96–99 |
-| AFTER-2 | `worker/kit-selftest-live-tier-01` | 09:34:18 | **1137 s = 18 m 57 s** | 101 | 4 — 96–99 |
+| AFTER-1 | this branch | 09:14:29 | 1189 s = 19 m 49 s | 101 | 4 — 96–99 |
+| AFTER-2 | this branch | 09:34:18 | 1137 s = 18 m 57 s | 101 | 4 — 96–99 |
+| **AFTER-3** | this branch **as it now stands** | 11:00 | 1825 s = 30 m 25 s | **108** | **0 — exit 0** |
 
-The four failures in every AFTER run, and in BEFORE-2, are the pre-existing ones
-in §7. **BEFORE-1 is the only run in which 23b is red.**
+AFTER-3 is the run that can answer "is the gate green", because a sibling packet
+(`kit-version-recipe-drift-01`) landed the §7 fix while this session was
+measuring. It is not comparable to AFTER-1/AFTER-2 by wall clock — it is a
+different tree doing four more recipes' worth of work — and it is not comparable
+to BEFORE-1/BEFORE-2 for the same reason.
+
+Its closing line, which is the one worth having:
+
+```
+PASS: self_test — all 107 breakages hold (103 assert red, 3 assert a green gate
+with a named skip, 1 assert a green gate with a named finding), and the unbroken
+tree is green.
+       Every recipe above was EVALUATED — 108 ran against 108 declared (107
+breakages and the unbroken-tree control), and the two are compared rather than
+assumed: 0 environment failures, 0 skipped for a missing toolchain.
+```
 
 ### The honest reading, and why the headline number is not the headline
 
@@ -319,10 +335,10 @@ it, and here is the arithmetic that says so.**
 
 The saving the change can possibly account for is bounded by the three tiers'
 cost in the **one** gate of 93 that ran them, and the gate's own profiler puts
-that at **127.1 s**. The whole-suite difference is ~760 s — six times the
-attributable saving — and the two `master` runs differ from *each other* by 297 s
-on the same tree. So the instrument is not fine enough: on a shared box, a
-whole-suite duration is a measurement of the box as much as of the tree.
+that at **127.1 s**. The whole-suite differences between the pairs (760 s, 660 s,
+and −90 s for AFTER-3 against the *same branch*) are all larger than, or of the
+opposite sign to, the attributable saving. So the instrument is not fine enough:
+on a shared box, a whole-suite duration measures the box as much as the tree.
 
 The attributable number, measured back to back on the same box state with
 nothing else of this session's running, is one gate:
@@ -414,21 +430,20 @@ PASS: every check passed.
 note: 12 check(s) skipped — reported above, never hidden.
 ```
 
-### After — inside the deep tier, twice
+### After — inside the deep tier, three times
 
 ```
 PASS self_test: breakage 23b: an interpreter below the floor is a named skip, not a silent pass — reported as `templates/otel/ruby  (ruby 2.6.10 is below the template's 2.7 floor)`, and named the --no-live skips too
 ```
 
-**Runs actually performed.** Two deep tiers on `master`, two on this branch, four
-standalone before-samples, four standalone after-samples, one paired before/after
-sample, one `--no-live` and one unflagged whole gate for §4(1)–(3), six
-mutations of the new check, and three earlier probe runs.
+**Runs actually performed.** Two deep tiers on `master`, three on this branch,
+four standalone before-samples, four standalone after-samples, one paired
+before/after sample, one `--no-live` and one unflagged whole gate for §4(1)–(3),
+six mutations of the new check, and three earlier probe runs.
 
-**23b's own gate run was executed six times before and six times after: three of
-the six before (exit 1, so the recipe's first assertion fails), none of the six
-after.** One of the six after runs is a *whole suite*, and it is the one the
-packet asked for twice.
+**23b's own gate run was executed six times before and seven times after: three
+of the six before exited 1, none of the seven after did.** Three of the seven
+after are whole-suite runs, which is what the packet asked for twice.
 
 ---
 
@@ -463,10 +478,28 @@ unrelated change ends up in one commit. It is loud rather than silent — which 
 the only reason leaving it is defensible — and it is recorded here with the exact
 lines so whoever owns the version string has it.
 
-**These four are unchanged by this packet** and appear in every AFTER run, and in
-one of the two BEFORE runs. **A top-level `bash tests/validate.sh` on this branch
-is therefore `exit 1`**, and the honest way to read this packet's gate results is
-`4 failures, unchanged from `master`, all of them this §7`.
+**These four were unchanged by this packet**, and appear in AFTER-1, AFTER-2 and
+one of the two BEFORE runs.
+
+### …and then a sibling packet fixed them, and the gate went green
+
+While this session was measuring, `kit-version-recipe-drift-01` landed
+`30b1708 breakages 96/97/98/99 derive their version from the copy, not from
+1.0.0` plus `ab8114e no recipe may spell a version; a check says so before the
+sixth one is written`. **AFTER-3 was run afterwards, on purpose, and the gate is
+`exit 0` with `--no-live` in place** (§5):
+
+```
+PASS: self_test — all 107 breakages hold (103 assert red, 3 assert a green gate
+with a named skip, 1 assert a green gate with a named finding), and the unbroken
+tree is green.
+```
+
+So the two things this report needed to say about the gate's colour are: on
+`master` it was red on 96–99 *and* intermittently on 23b; on this branch, as it
+now stands, it is green. Two of the five AFTER-1/AFTER-2 failures in this report's
+own tables are already history, and saying so is more useful than quietly
+leaving the tables to imply otherwise.
 
 ---
 
@@ -506,9 +539,11 @@ Recorded in full in `DECISIONS.md` (MD30); summarised because the packet asked.
   whole-suite wall clock varies by ~300 s between runs of the *same* tree, which
   is larger than the effect, so the reliability claim rests on the six
   before/after executions of 23b's own gate rather than on the suite totals.
-* **`self_test` is `exit 1` on this branch, and so is `master`** — the four
-  failures in §7. The claim this packet makes is "one fewer failure than
-  `master`, and a different one", not "the gate is green".
+* **`self_test` on this branch as it now stands is `exit 0`** — 108 of 108,
+  `all 107 breakages hold`, 0 environment failures, 0 skipped for a missing
+  toolchain (§5, AFTER-3). It was red on 96–99 when this report's other AFTER
+  runs were taken, and those four were fixed by a sibling packet mid-session
+  (§7).
 * **`--no-live` is set in exactly one place.** That is enforced by a check, but
   the check is a reader, not a type system: a spawn the regex does not recognise
   is a spawn the check cannot see. It is deliberately loose about the path and
