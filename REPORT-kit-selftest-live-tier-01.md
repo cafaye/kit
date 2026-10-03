@@ -11,9 +11,11 @@ it cannot name a script that has been renamed and it cannot rot.
 those three tiers into `report SKIP` rows naming the flag, and one wrapper in
 `tests/self_test.sh` that sets it for every child gate. No bound was widened.
 
-**The result:** 23b's dependency on three docker stacks is gone. Deep tier
-**1774 s → §5**, and 23b itself went from **1 red in 1 run** to **0 red in 5 runs**
-(§4, §6).
+**The result:** 23b's dependency on three docker stacks is gone. Its own gate run
+was executed **six times before and six times after**: three of the six before
+came back `exit 1`, none of the six after did. The saving is **~130 s per whole
+suite**, measured twice, and §5 says why the 760 s difference between the two
+*suites* is not evidence of anything.
 
 ---
 
@@ -39,7 +41,7 @@ PASS tests/self_test.sh  (0 of the recipes name a live tier; every child gate op
        0 of 107 recipe invocations name a live tier; 1 child-gate spawn, opted out of all 3
 ```
 
-**So the answer to "do any of the 104 breakage recipes need the live tier at all?"
+**So the answer to "do any of the breakage recipes need the live tier at all?"
 is no, and it is no twice over**: not one of them *names* a live check, and only
 one of them ever *reached* it.
 
@@ -97,21 +99,24 @@ FAIL self_test: breakage 23b: an interpreter below the floor is a named skip, no
 Byte-for-byte the packet's failure. Five failures in that run; 23b is one of them
 (§7 has the other four).
 
-### 2.2 Standalone, on pristine `master`, the same command three times
+### 2.2 Standalone, on pristine `master`, the same command four times
 
-A byte copy of `master`, the same `ruby` stub reporting 2.6.10, and the recipe's
-own invocation `bash tests/validate.sh --language=ruby --no-self-test`:
+A byte copy of `master` in a directory of its own, the same `ruby` stub reporting
+2.6.10, and the recipe's own invocation
+`bash tests/validate.sh --language=ruby --no-self-test`:
 
 | sample | wall | verdict |
 | --- | --- | --- |
 | 1 | 241 s | **RED** — `canary_test.sh` **and** `stack_live_test.sh` FAIL |
 | 2 | 282 s | green — all three live tiers PASS |
 | 3 | 231 s | green — all three live tiers PASS |
+| 4 | 239 s | live tiers green; `exit 1` on `tenancy_test.sh` (leftover docker network, §5) |
 
 So the packet's premise ("green standalone, red at position 23 of 104") held on
-the manager's box and **does not hold on this one**: the live tier is
-intermittent here at roughly 1 in 3, and it is intermittent *inside one gate run*
-with nothing else of mine running.
+the manager's box and **does not hold on this one**: inside the deep tier 23b is
+red in 1 of 2 runs, and of four standalone runs one is red on the live tier and
+one more is red on a *different* docker tier's leftover state. Nothing else of
+this session's was running for samples 2, 3 and 4.
 
 ### 2.3 And it is not a timeout
 
@@ -190,12 +195,12 @@ Every one proved red by mutation, each naming its line:
 
 | | mutation | verdict |
 | --- | --- | --- |
-| A | a recipe's needle becomes `tests/stack_live_test.sh  (…)` | **FAIL** — `1 recipe invocation(s) name a live tier out of canary_test.sh, no_telemetry_in_readiness.sh, stack_live_test.sh: line 2472 names \`stack_live_test.sh\`` |
+| A | a recipe's needle becomes `tests/stack_live_test.sh  (…)` | **FAIL** — `1 recipe invocation(s) name a live tier out of canary_test.sh, no_telemetry_in_readiness.sh, stack_live_test.sh: line 2472 names 'stack_live_test.sh'` |
 | B | the wrapper loses `KIT_NO_LIVE=1` | **FAIL** — `line 1013 spawns the gate without KIT_NO_LIVE=1` |
 | C | a sixth helper spawns the gate | **FAIL** — `appears 2 time(s) outside comments (line 1011, line 1017)` |
 | D | …the same, naming the gate by path | **FAIL** — `appears 2 time(s) … (line 1011, line 1017)` |
 | E | a helper runs `bash -n tests/validate.sh` | **PASS** — not a spawn |
-| F | `kit_child_gate` is renamed | **FAIL** — `defines no \`kit_child_gate()\`` |
+| F | `kit_child_gate` is renamed | **FAIL** — `defines no kit_child_gate()` |
 
 **One of those six is a check that went red on correct work while it was being
 written**, and it is worth recording. Containment ("the spawn is inside
@@ -292,40 +297,78 @@ tier	tests/shard_test.sh  (the n shards partition the suite, shard n/n included)
 
 ## 5. Wall clock, before and after
 
-Whole `tests/self_test.sh`, end to end, on this machine, each from a tree of its
-own (a copy's *parent* is its fleet — `fresh_copy`'s rule, learned the hard way
-when a scratch parent made a copy's `lint drift` check read my own scratch
-directories as a fleet).
+Whole `tests/self_test.sh`, end to end, on this machine. Each run is a tree of
+its own: `fresh_copy`'s rule that a copy's **parent** is its fleet, learned the
+hard way when a scratch parent made a copy's `lint drift` check read my own
+scratch directories as a fleet.
 
-| run | tree | wall | result |
-| --- | --- | --- | --- |
-| **BEFORE** | pristine `master` (`ec13376`) | **1774 s = 29 m 34 s** | exit 1 — 100 PASS, 5 FAIL |
-| **AFTER #1** | `worker/kit-selftest-live-tier-01` | §5-1 | §5-1 |
-| **AFTER #2** | `worker/kit-selftest-live-tier-01` | §5-2 | §5-2 |
+| run | tree | started | wall | PASS | FAIL |
+| --- | --- | --- | --- | --- | --- |
+| BEFORE-1 | pristine `master` `ec13376` | 08:12:38 | 1774 s = 29 m 34 s | 100 | 5 — **23b** + 96–99 |
+| BEFORE-2 | pristine `master` `ec13376` | 10:05 | 2071 s = 34 m 31 s | 101 | 4 — 96–99 |
+| AFTER-1 | `worker/kit-selftest-live-tier-01` | 09:14:29 | **1189 s = 19 m 49 s** | 101 | 4 — 96–99 |
+| AFTER-2 | `worker/kit-selftest-live-tier-01` | 09:34:18 | **1137 s = 18 m 57 s** | 101 | 4 — 96–99 |
 
-23b's own gate run, same command, same box:
+The four failures in every AFTER run, and in BEFORE-2, are the pre-existing ones
+in §7. **BEFORE-1 is the only run in which 23b is red.**
 
-| | samples | wall |
-| --- | --- | --- |
-| before | 241 s (red), 282 s, 231 s | mean 251 s |
-| after | 147 s, 102 s, 102 s | mean 117 s |
+### The honest reading, and why the headline number is not the headline
 
-**The honest reading of the wall clock: it barely moves, and that is not the
-point.** The saving is 127 s of 1774 s on the deep tier — about **7%** — because
-only one gate of 93 was paying it. What the fix buys is that 23b's verdict no
-longer depends on an intermittent tier (§2.3): before, 2 of 4 samples were red;
-after, 0 of 5 were. A suite whose one green-expecting proof is a coin flip is not
-a suite with a slow gate, it is a suite with a broken proof.
+Naively: 1923 s mean before, 1163 s mean after, a 40% saving. **Do not believe
+it, and here is the arithmetic that says so.**
+
+The saving the change can possibly account for is bounded by the three tiers'
+cost in the **one** gate of 93 that ran them, and the gate's own profiler puts
+that at **127.1 s**. The whole-suite difference is ~760 s — six times the
+attributable saving — and the two `master` runs differ from *each other* by 297 s
+on the same tree. So the instrument is not fine enough: on a shared box, a
+whole-suite duration is a measurement of the box as much as of the tree.
+
+The attributable number, measured back to back on the same box state with
+nothing else of this session's running, is one gate:
+
+```
+BEFORE  pristine master, live tier ON     EXIT=1  239 s
+AFTER   this branch, KIT_NO_LIVE=1         EXIT=0  108 s
+                                        delta = 131 s
+```
+
+against the profiler's 127.1 s for the three tiers. **130 s, twice measured,
+two ways.**
+
+Standalone samples of the same gate across the session, for the spread:
+
+| | samples (wall) |
+| --- | --- |
+| before | 241 s (red), 282 s, 231 s, 239 s |
+| after | 147 s, 102 s, 102 s, 108 s |
+
+### One datum about the tiers themselves, not about this packet
+
+In BEFORE-4 — the live tiers all green — the gate still exited 1:
+
+```
+FAIL tests/tenancy_test.sh  (no identity, another tenant and its own tenant — …)
+       FAIL: the shared cluster did not come up. Last lines:
+               Network kit-tenancy_platform Error Error response from daemon:
+               network with name kit-tenancy_platform already exists
+```
+
+Leftover docker state from the run immediately before it. `tenancy_test.sh` is
+not idempotent against a network a previous run left behind, which is a second
+reason this box needs one gate at a time and a third reason 23b should not be
+carrying a docker tier it does not assert.
 
 ---
 
 ## 6. 23b, before and after
 
-**Recipe invocation, in both cases
+**Recipe invocation in both cases:**
 `bash tests/validate.sh --language=ruby --no-self-test` with a `ruby` stub
-reporting 2.6.10, through `kit_child_gate` (which is the only difference).**
+reporting 2.6.10 — on `master` directly, and on this branch through
+`kit_child_gate`, which is the only difference.
 
-### Before — inside the deep tier, on pristine `master`
+### Before — the deep tier, run 1 of 2
 
 ```
 FAIL self_test: breakage 23b: an interpreter below the floor is a named skip, not a silent pass — the gate exited 1, so the skip was not clean
@@ -333,29 +376,37 @@ FAIL self_test: breakage 23b: an interpreter below the floor is a named skip, no
        FAIL: 1 check(s) failed.
 ```
 
-### Before — the same scenario standalone, three times
+### Before — the deep tier, run 2 of 2
+
+```
+PASS self_test: breakage 23b: an interpreter below the floor is a named skip, not a silent pass — reported as `templates/otel/ruby  (ruby 2.6.10 is below the template's 2.7 floor)`
+```
+
+### Before — the same scenario standalone, four times
 
 ```
 sample 1  EXIT=1  241s  FAIL tests/canary_test.sh  / FAIL tests/stack_live_test.sh
 sample 2  EXIT=0  282s  PASS ×3
 sample 3  EXIT=0  231s  PASS ×3
+sample 4  EXIT=1  239s  live tiers PASS; FAIL tests/tenancy_test.sh (leftover docker network, §5)
 ```
 
-### After — the same scenario standalone, three times
+### After — the same scenario standalone, four times
 
 ```
 sample 1  EXIT=0  147s
 sample 2  EXIT=0  102s
 sample 3  EXIT=0  102s
+sample 4  EXIT=0  108s
 ```
 
 each carrying **two kinds of skip, both named**:
 
 ```
 SKIP templates/otel/ruby  (ruby 2.6.10 is below the template's 2.7 floor)
-SKIP tests/canary_test.sh  (a canary secret reaches no exporter)  (NOT RUN — --no-live, or KIT_NO_LIVE=1: …)
-SKIP tests/no_telemetry_in_readiness.sh  (collector killed, service still serves)  (NOT RUN — --no-live, or KIT_NO_LIVE=1: …)
-SKIP tests/stack_live_test.sh  (the fetched stack runs; a trace and a metric land)  (NOT RUN — --no-live, or KIT_NO_LIVE=1: …)
+SKIP tests/canary_test.sh  (a canary secret reaches no exporter)  (NOT RUN — --no-live, or KIT_NO_LIVE=1: the observability live tier was opted out and this claim is UNEXERCISED)
+SKIP tests/no_telemetry_in_readiness.sh  (collector killed, service still serves)  (NOT RUN — --no-live, or KIT_NO_LIVE=1: the observability live tier was opted out and this claim is UNEXERCISED)
+SKIP tests/stack_live_test.sh  (the fetched stack runs; a trace and a metric land)  (NOT RUN — --no-live, or KIT_NO_LIVE=1: the observability live tier was opted out and this claim is UNEXERCISED)
 ```
 
 ```
@@ -363,14 +414,21 @@ PASS: every check passed.
 note: 12 check(s) skipped — reported above, never hidden.
 ```
 
-### After — inside the deep tier
+### After — inside the deep tier, twice
 
-§5-1, §5-2.
+```
+PASS self_test: breakage 23b: an interpreter below the floor is a named skip, not a silent pass — reported as `templates/otel/ruby  (ruby 2.6.10 is below the template's 2.7 floor)`, and named the --no-live skips too
+```
 
-**Runs actually performed:** one pristine-`master` deep tier; three standalone
-before-samples; three standalone after-samples; one `--no-live` and one unflagged
-whole gate for §4(1)–(3); two deep tiers on this branch (§5). **23b's own gate
-run was executed seven times in total, four before and three after.**
+**Runs actually performed.** Two deep tiers on `master`, two on this branch, four
+standalone before-samples, four standalone after-samples, one paired before/after
+sample, one `--no-live` and one unflagged whole gate for §4(1)–(3), six
+mutations of the new check, and three earlier probe runs.
+
+**23b's own gate run was executed six times before and six times after: three of
+the six before (exit 1, so the recipe's first assertion fails), none of the six
+after.** One of the six after runs is a *whole suite*, and it is the one the
+packet asked for twice.
 
 ---
 
@@ -405,7 +463,10 @@ unrelated change ends up in one commit. It is loud rather than silent — which 
 the only reason leaving it is defensible — and it is recorded here with the exact
 lines so whoever owns the version string has it.
 
-**These four are unchanged by this packet** and appear in every AFTER run too.
+**These four are unchanged by this packet** and appear in every AFTER run, and in
+one of the two BEFORE runs. **A top-level `bash tests/validate.sh` on this branch
+is therefore `exit 1`**, and the honest way to read this packet's gate results is
+`4 failures, unchanged from `master`, all of them this §7`.
 
 ---
 
@@ -440,9 +501,14 @@ Recorded in full in `DECISIONS.md` (MD30); summarised because the packet asked.
   and the fetched collector config verified byte for byte. This packet removes
   the self-test's exposure to it and does nothing about its cause. It deserves
   its own.
-* **One deep tier is one data point, and the packet says so.** §5 carries two
-  on this branch and one on `master`. Four more samples of 23b's own gate run are
-  behind them, which is where the reliability claim actually comes from.
+* **One deep tier is one data point, and the packet says so.** §5 carries two on
+  this branch and two on `master`, and the honest reading of them is in §5: the
+  whole-suite wall clock varies by ~300 s between runs of the *same* tree, which
+  is larger than the effect, so the reliability claim rests on the six
+  before/after executions of 23b's own gate rather than on the suite totals.
+* **`self_test` is `exit 1` on this branch, and so is `master`** — the four
+  failures in §7. The claim this packet makes is "one fewer failure than
+  `master`, and a different one", not "the gate is green".
 * **`--no-live` is set in exactly one place.** That is enforced by a check, but
   the check is a reader, not a type system: a spawn the regex does not recognise
   is a spawn the check cannot see. It is deliberately loose about the path and
