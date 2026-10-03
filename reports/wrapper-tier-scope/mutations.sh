@@ -63,7 +63,21 @@ fi
 echo "guard: $(wc -l <"$GUARD" | tr -d ' ') lines extracted from tests/validate.sh"
 echo
 
-restore() { git checkout -- tests/ 2>/dev/null || true; }
+# `restore` runs `git checkout` on tests/, and that is a loaded gun: the EXIT trap
+# fires on the STOP path too, so a run that refused to start because tests/ was
+# dirty still checked tests/ out — discarding whatever uncommitted edit the caller
+# was about to commit. It cost one real edit and one commit message describing text
+# that was never in the file, which is this packet's own subject aimed at the
+# harness instead of the guard.
+#
+# So it is ARMED, not installed: `MUTATED` is set only once `mutate` has actually
+# written something, and a run that never mutated anything never touches the tree.
+MUTATED=0
+restore() {
+  [ "$MUTATED" -eq 1 ] || return 0
+  git checkout -- tests/ 2>/dev/null || true
+  MUTATED=0
+}
 trap 'restore; rm -rf "$TMP"' EXIT
 
 if ! git diff --quiet -- tests/; then
@@ -106,6 +120,7 @@ mutate() {
   local label="$1" file="$2" from="$3" to="$4"
   cases=$((cases + 1))
   restore
+  MUTATED=1
 
   if ! timeout 60 python3 - "$file" "$from" "$to" <<'PY'
 import sys

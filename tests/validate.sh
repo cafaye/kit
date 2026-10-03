@@ -11668,6 +11668,23 @@ def code_lines(path):
 # check that fires on its own documentation.
 DOCKER_USE = re.compile(r"\bdocker\s+(?:compose|run|rm|volume|network)\b")
 
+# WHERE A NAMESPACE CAN BE PASSED, which is wider than DOCKER_USE by exactly the
+# subcommands the newer rules read. It is used for ONE question only - "is this
+# variable handed to docker anywhere in this file" - and NOT for `examined`, which
+# stays on DOCKER_USE so the emptiness finding below keeps counting exactly what it
+# counted before.
+#
+# That asymmetry is measured rather than tidiness. With DOCKER_USE as the
+# declaration rule's predicate, `GOOD_IMAGE="kit-provenance-test-$$:good"` was not
+# fed to docker by the check's own reckoning, because `docker build` is not one of
+# DOCKER_USE's five subcommands - so removing the `$$` from it produced no finding,
+# and the mutation case written to catch exactly that reported NOT BITTEN. Widening
+# `examined` at the same time would have made the emptiness finding harder to fire,
+# which is the wrong direction to reach in.
+NAMES_IN_DOCKER = re.compile(
+    r"\bdocker\s+(?:compose|run|rm|volume|network|build|image|rmi|create|tag)\b"
+)
+
 # WHAT A SCRIPT *TOUCHES*, which is a WIDER question than what it brings up, and
 # it has to be wider or the emptiness finding below is dead code — a rule whose
 # predicate is the tier predicate cannot fire, and a rule that cannot fire is the
@@ -11873,7 +11890,7 @@ for name in scripts:
     # still bite.
     fed_to_docker = set()
     for n, body in logical:
-        if not DOCKER_USE.search(body):
+        if not NAMES_IN_DOCKER.search(body):
             continue
         for var in re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", body):
             fed_to_docker.add(var)
