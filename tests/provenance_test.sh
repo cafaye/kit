@@ -1,0 +1,328 @@
+#!/usr/bin/env bash
+#
+# kit — the provenance stamp's own proof. Three things, in the order they fail.
+#
+#   A. THE GRAMMAR. Every shape that could leak into a registry-stamped label is
+#      REFUSED, by shape, and the refusal names the field and the rule. This is
+#      the redaction half of P3-18 and it is the part people skip.
+#   B. THE THREE AGREE. The field list, the OCI label keys and the JSON the file
+#      sink writes are ONE fact stated in three places. This reads all three and
+#      fails when they disagree -- and it needs no docker, because it is a
+#      comparison of what the scripts EMIT, not of an image.
+#   C. THE BUILD. A real image, built from a real Dockerfile, with both sinks
+#      compared and the consumer check required to go red on a wrong commit.
+#      SKIPs loudly without docker, per the rule that a check which ran nothing
+#      is not a pass.
+#
+# WHY NO DOCKER IN (A) AND (B). They are the security claims, and a security
+# claim that is only executed where docker happens to be installed is a claim
+# whose coverage depends on the machine. Both are pure text in, pure exit status
+# out.
+set -uo pipefail
+
+ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
+STAMP="$ROOT/docker/provenance.sh"
+TMP=$(mktemp -d "${TMPDIR:-/tmp}/kit-provenance-test.XXXXXX")
+trap 'rm -rf "$TMP"' EXIT
+
+_pass=0
+_fail=0
+_skip=0
+
+pass() { _pass=$((_pass + 1)); printf 'PASS %s\n' "$1"; }
+fail() { _fail=$((_fail + 1)); printf 'FAIL %s\n' "$1"; }
+skip() { _skip=$((_skip + 1)); printf 'SKIP %s\n' "$1"; }
+
+# `contains` — a shell `case` over a string already in memory, NEVER a pipe.
+# `printf '%s\n' "$out" | grep -q` closes the pipe on its first match, `printf`
+# dies of SIGPIPE, and `set -o pipefail` promotes 141 to the pipeline's status,
+# so the verdict flips on the SIZE of the output rather than on what is in it.
+contains() { case "$1" in *"$2"*) return 0 ;; *) return 1 ;; esac; }
+
+# stamp <field> <value> — validate one field in isolation, print its output.
+stamp() {
+  env -u KIT_PROVENANCE_SOURCE -u KIT_PROVENANCE_REVISION -u KIT_PROVENANCE_BUILT_AT \
+    -u KIT_PROVENANCE_SOURCE_DIRTY -u KIT_PROVENANCE_TEMPLATE_VERSION \
+    "KIT_PROVENANCE_$(printf '%s' "$1" | tr '[:lower:]' '[:upper:]')=$2" \
+    sh "$STAMP" --validate 2>&1
+}
+
+# --- A. the grammar ----------------------------------------------------------
+#
+# A GOOD stamp, so every refusal below is measured against a control that is
+# green. Without it a suite where --validate is broken entirely and refuses
+# everything would pass every refusal case.
+GOOD_REV=0123456789abcdef0123456789abcdef01234567
+
+control_out="$(stamp revision "$GOOD_REV")"
+if [ $? -eq 0 ] && ! contains "$control_out" refusing; then
+  pass "control: a 40-hex revision is accepted, so the refusals below mean something"
+else
+  fail "control: a 40-hex revision was NOT accepted: $control_out"
+fi
+
+# REFUSALS. Each is `field value why`. The value is the leak shape; the third
+# column is what the fleet would learn if it reached the registry.
+#
+# The shape that CANNOT be refused is a branch name in `source` — `owner/branch`
+# is shape-identical to `owner/repo` — and there is a case for it below, named
+# as a case rather than hidden.
+refuse() {
+  local field="$1" value="$2" why="$3" out ec
+  out="$(stamp "$field" "$value")"
+  ec=$?
+  if [ "$ec" -eq 0 ]; then
+    fail "redaction: $field=$value was STAMPED — $why"
+    return
+  fi
+  if ! contains "$out" "refusing to stamp $field"; then
+    fail "redaction: $field=$value was refused but not by name (got: $out) — $why"
+    return
+  fi
+  pass "redaction: $field=$value refused ($why)"
+}
+
+# A developer's email. Nothing in the grammar set admits '@'.
+refuse source 'kaka@cafaye.com' 'a developer identity, and an email-shaped string'
+# An absolute local path. Six segments and a leading slash; `source` has a budget
+# of exactly ONE slash.
+refuse source '/Users/kaka/Code/any/moon' 'a local working directory'
+# An internal hostname with a port. `source` carries NO host at all.
+refuse source 'pg.corp.internal:5432' 'an internal hostname'
+# A full URL. Two slashes over budget, and a scheme the field does not admit.
+refuse source 'https://github.corp/cafaye/identity' 'a URL, so a host we do not control'
+# A relative path.
+refuse source '../cafaye/identity' 'a relative path'
+# A credential. Not hex-40, and not two clean segments.
+refuse revision 'ghp_16C7aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa' 'a credential in the revision field'
+# A branch in the REVISION field — refused, unlike in `source`.
+refuse revision 'worker/kit-provenance-01' 'a branch name where a commit is claimed'
+# A short sha. 7 hex is what git prints by default and it is not enough to
+# identify a commit 2^33 commits later.
+refuse revision '0123456' 'a short sha, which git prints by default'
+# Uppercase hex. A stamp that varies in case for one commit is a stamp two
+# consumers can disagree about.
+refuse revision '0123456789ABCDEF0123456789ABCDEF01234567' 'uppercase hex, which two consumers would spell differently'
+# An email in the timestamp field.
+refuse built_at 'kaka@cafaye.com' 'a developer identity in the timestamp field'
+# A local-time timestamp with a zone offset: ambiguous in a label nobody parses
+# carefully, and `date -u` is one flag.
+refuse built_at '2026-10-03 09:20:00+01:00' 'a non-RFC3339, zone-offset timestamp'
+# The dirty FILE LIST. The field is a flag and the grammar admits no path.
+refuse source_dirty 'modified: go/cmd/service/main.go' 'a dirty file list, which is a local path'
+# A dirty flag spelled freely.
+refuse source_dirty 'yes' 'a boolean spelled freely rather than clean/dirty'
+# An unversioned template version.
+refuse template_version '0.1.0' 'a template version with no v prefix'
+
+# THE SHAPE THAT CANNOT BE REFUSED, asserted rather than omitted.
+#
+# `owner/branch` is shape-identical to `owner/repo`, so no grammar separates
+# them and pretending one would is the kind of claim that reads as coverage and
+# is not. The suite therefore ASSERTS THE HONEST ANSWER: it is accepted as a
+# source, and it is not a leak — the registry already publishes that exact string
+# as a tag, to exactly the population that can read the stamp.
+stamp source 'worker/kit-provenance-01' >/dev/null 2>&1
+if [ $? -eq 0 ]; then
+  pass "the asymmetry, asserted: a branch-shaped source is accepted, because no grammar can tell it from owner/repo and the registry publishes it as a tag anyway"
+else
+  fail "the asymmetry: a branch-shaped source was refused — if this ever becomes true the header in docker/provenance.sh is WRONG and must be rewritten, not the grammar"
+fi
+
+# AN EMPTY VALUE IS `unknown`, NOT A STAMP AND NOT A REFUSAL.
+#
+# A developer's local `docker build` passes nothing and must not be refused for
+# it. That leniency is real and it is bounded by the next two cases.
+unset_out="$(env -u KIT_PROVENANCE_SOURCE -u KIT_PROVENANCE_REVISION -u KIT_PROVENANCE_BUILT_AT \
+  -u KIT_PROVENANCE_SOURCE_DIRTY -u KIT_PROVENANCE_TEMPLATE_VERSION \
+  sh "$STAMP" --validate 2>&1)"
+if [ $? -eq 0 ]; then
+  pass "an unstamped local build is accepted (every field falls back to unknown)"
+else
+  fail "an unstamped local build was REFUSED: $unset_out"
+fi
+
+# --- B. the three agree ------------------------------------------------------
+#
+# ONE FACT, THREE PLACES. `FIELDS` in the script, the LABEL keys in seven
+# Dockerfiles, and the JSON keys `--write` emits. A reader who needs to know
+# what a label is called has three places to look and this is what stops them
+# from disagreeing — the "assert the AGREEMENT, not the presence of a file"
+# rule, applied to the stamp.
+#
+# It needs no docker because it compares what the scripts EMIT.
+
+# The OCI label keys, written out here rather than read out of a Dockerfile, so
+# that a Dockerfile which lost one of them is a finding and not a new normal.
+
+# --write's JSON keys, read out of a real write rather than out of the source.
+expected_labels='org.opencontainers.image.source
+org.opencontainers.image.revision
+org.opencontainers.image.created
+com.cafaye.kit.source.dirty
+com.cafaye.kit.template.version'
+
+env -u KIT_PROVENANCE_SOURCE -u KIT_PROVENANCE_REVISION -u KIT_PROVENANCE_BUILT_AT \
+  -u KIT_PROVENANCE_SOURCE_DIRTY -u KIT_PROVENANCE_TEMPLATE_VERSION \
+  sh "$STAMP" --write "$TMP/probe.json" >/dev/null 2>&1
+written_keys="$(sed -n 's/^  "\([a-z_]*\)":.*/\1/p' "$TMP/probe.json" | sort | tr '\n' ' ')"
+
+expected_keys='built_at revision source source_dirty template_version '
+if [ "$written_keys" = "$expected_keys" ]; then
+  pass "the file sink writes exactly the five fields, and nothing else"
+else
+  fail "the file sink wrote [$written_keys], expected [$expected_keys]"
+fi
+
+langs='bun elixir go node python ruby rust'
+for lang in $langs; do
+  df="$ROOT/docker/Dockerfile.$lang"
+  if [ ! -f "$df" ]; then
+    fail "agreement: $df does not exist"
+    continue
+  fi
+  # `grep -oE`, not `sed`. Two failures were in this line before it worked, and
+  # both are worth recording because both read as "every Dockerfile is broken":
+  #   - a pattern anchored at the start of the line sees only the FOUR
+  #     continuation lines, because the FIRST key sits after the `LABEL `
+  #     keyword. It reported five missing and the Dockerfiles were fine.
+  #   - BSD sed has no `\|` alternation, so the alternation matched NOTHING at
+  #     all and every language failed identically. Identical failures across
+  #     seven inputs is the signature of the CHECK being wrong, not the tree.
+  # Comment lines are stripped first, per the same rule `strip_shell_comments`
+  # exists for: a comment that NAMES a label key is documentation, not a label.
+  got="$(grep -v '^[[:space:]]*#' "$df" |
+    grep -oE '(org\.opencontainers\.image\.[a-z]+|com\.cafaye\.kit\.[a-z.]+)=' |
+    sed 's/=$//' | sort -u | tr '\n' ' ')"
+  want="$(printf '%s\n' "$expected_labels" | sort | tr '\n' ' ')"
+  if [ "$got" != "$want" ]; then
+    fail "agreement: Dockerfile.$lang labels [$got] != the script's [$want]"
+    continue
+  fi
+  # Every label must be fed by an ARG of the matching name, or it expands to
+  # empty — and an empty label is a stamp that is present and says nothing.
+  missing=''
+  for key in org.opencontainers.image.source org.opencontainers.image.revision \
+    org.opencontainers.image.created com.cafaye.kit.source.dirty \
+    com.cafaye.kit.template.version; do
+    case "$key" in
+      org.opencontainers.image.source) arg='KIT_PROVENANCE_SOURCE' ;;
+      org.opencontainers.image.revision) arg='KIT_PROVENANCE_REVISION' ;;
+      org.opencontainers.image.created) arg='KIT_PROVENANCE_BUILT_AT' ;;
+      com.cafaye.kit.source.dirty) arg='KIT_PROVENANCE_SOURCE_DIRTY' ;;
+      com.cafaye.kit.template.version) arg='KIT_PROVENANCE_TEMPLATE_VERSION' ;;
+    esac
+    grep -q "^ARG $arg=" "$df" || missing="$missing $arg"
+  done
+  if [ -n "$missing" ]; then
+    fail "agreement: Dockerfile.$lang has label(s) with no ARG:$missing — they would expand to empty"
+  else
+    pass "agreement: Dockerfile.$lang declares all five labels and all five ARGs"
+  fi
+done
+
+# The Dockerfiles must STAMP, not merely declare: a template that lists the
+# ARGs and forgets the LABEL ships an image whose provenance is a file nothing
+# outside the container can read.
+for lang in $langs; do
+  df="$ROOT/docker/Dockerfile.$lang"
+  grep -q '^LABEL org.opencontainers.image.source=' "$df" ||
+    fail "stamp: Dockerfile.$lang declares the provenance ARGs but no LABEL"
+  grep -q 'provenance.sh --write' "$df" ||
+    fail "stamp: Dockerfile.$lang writes no provenance file"
+done
+pass "stamp: all seven Dockerfiles write both sinks (per-language findings above, if any)"
+
+# --- C. the build ------------------------------------------------------------
+#
+# The only part that needs docker, and the only part that can prove the CONSUMER
+# side. It builds a real image from the real Dockerfile and requires the check
+# to go red on a wrong commit — a check that has only ever been seen green is a
+# check nobody knows can fail.
+
+if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
+  skip "build: no docker, so the two sinks were not compared on a real image and --verify was not exercised"
+else
+  GO=0123456789abcdef0123456789abcdef01234567
+  BAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
+  fixture="$TMP/svc"
+  mkdir -p "$fixture/docker" "$fixture/cmd/service"
+  cp "$ROOT/docker/Dockerfile.go" "$ROOT/docker/entrypoint.sh" "$ROOT/docker/provenance.sh" "$fixture/docker/"
+  printf 'module svc\n\ngo 1.24\n' >"$fixture/go.mod"
+  : >"$fixture/go.sum"
+  printf 'package main\n\nfunc main() {}\n' >"$fixture/cmd/service/main.go"
+
+  # `-f` gets an ABSOLUTE path: `docker build -f docker/Dockerfile` resolved
+  # against something other than the context and read a 2-byte file on this box.
+  if docker build -q -f "$fixture/docker/Dockerfile.go" -t kit-provenance-test:good \
+    --build-arg KIT_PROVENANCE_SOURCE=cafaye/identity \
+    --build-arg KIT_PROVENANCE_REVISION="$GO" \
+    --build-arg KIT_PROVENANCE_BUILT_AT=2026-10-03T09:20:00Z \
+    --build-arg KIT_PROVENANCE_SOURCE_DIRTY=clean \
+    --build-arg KIT_PROVENANCE_TEMPLATE_VERSION=v0.1.0 \
+    "$fixture" >/dev/null 2>&1; then
+    pass "build: a real image built from docker/Dockerfile.go with all five build args"
+  else
+    fail "build: docker/Dockerfile.go did not build with the provenance block in it"
+    printf '\n%d passed, %d failed, %d skipped\n' "$_pass" "$_fail" "$_skip"
+    exit 1
+  fi
+
+  # THE TWO SINKS MUST AGREE. A stamp that disagrees with itself is worse than no
+  # stamp, because a reader trusts whichever one they happened to look at.
+  l_rev="$(docker image inspect kit-provenance-test:good \
+    --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null)"
+  cid="$(docker create kit-provenance-test:good 2>/dev/null)"
+  f_rev=""
+  if [ -n "$cid" ]; then
+    f_rev="$(docker cp "$cid:/app/kit-provenance.json" - 2>/dev/null | tar -xO kit-provenance.json 2>/dev/null |
+      sed -n 's/.*"revision": "\([^"]*\)".*/\1/p')"
+    docker rm -f "$cid" >/dev/null 2>&1
+  fi
+  if [ -n "$l_rev" ] && [ "$l_rev" = "$f_rev" ] && [ "$l_rev" = "$GO" ]; then
+    pass "sinks: the label and the file name the same commit on a real image"
+  else
+    fail "sinks: label=[$l_rev] file=[$f_rev] expected=[$GO] — a stamp that disagrees with itself is worse than none"
+  fi
+
+  # THE RED PROOFS. Three different exit codes, and each one is asserted
+  # separately because a check that returns the same code for "wrong commit" and
+  # for "no labels" cannot tell a consumer which of the two happened.
+  sh "$STAMP" --verify kit-provenance-test:good --expect-revision "$GO" >/dev/null 2>&1
+  [ $? -eq 0 ] && pass "verify: the expected commit exits 0" || fail "verify: the expected commit did NOT exit 0"
+
+  red="$(sh "$STAMP" --verify kit-provenance-test:good --expect-revision "$BAD" 2>&1)"
+  ec=$?
+  if [ "$ec" -ne 0 ] && contains "$red" "$BAD"; then
+    pass "verify: a WRONG commit exits $ec and names both commits — this is the check being able to fail"
+  else
+    fail "verify: a wrong commit exited $ec (want non-zero) with [$red]"
+  fi
+
+  # An unstamped image. Built from a Dockerfile with no block, so this is a real
+  # pre-stamp image rather than a missing one.
+  printf 'FROM debian:12-slim\nCMD ["true"]\n' >"$TMP/plain.Dockerfile"
+  docker build -q -f "$TMP/plain.Dockerfile" -t kit-provenance-test:plain "$TMP" >/dev/null 2>&1
+  red2="$(sh "$STAMP" --verify kit-provenance-test:plain 2>&1)"
+  ec2=$?
+  if [ "$ec2" -ne 0 ] && contains "$red2" "no labels"; then
+    pass "verify: an image with no stamp exits $ec2 and says so — distinct from the wrong-commit answer"
+  else
+    fail "verify: an unstamped image exited $ec2 with [$red2]"
+  fi
+
+  # The leniency boundary: `unknown` must fail an ASSERTION even though it is
+  # accepted at build time. That asymmetry is the design.
+  red3="$(sh "$STAMP" --verify kit-provenance-test:good --expect-revision unknown 2>&1)"
+  ec3=$?
+  if [ "$ec3" -ne 0 ] && contains "$red3" "unknown"; then
+    pass "verify: an image stamped unknown FAILS an assertion — unstamped is fine to create and not fine to assert about"
+  else
+    fail "verify: asserting `unknown` exited $ec3 with [$red3]"
+  fi
+
+  docker rmi -f kit-provenance-test:good kit-provenance-test:plain >/dev/null 2>&1
+fi
+
+printf '\n%d passed, %d failed, %d skipped\n' "$_pass" "$_fail" "$_skip"
+[ "$_fail" -eq 0 ]

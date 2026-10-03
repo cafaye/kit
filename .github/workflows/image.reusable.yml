@@ -147,6 +147,19 @@ on:
         required: false
         type: string
         default: 'type=gha'
+      kit-version:
+        description: >-
+          The version of kit's TEMPLATES that shaped this image, stamped as
+          `com.cafaye.kit.template.version`. It is the one field that says
+          which build STANDARD produced the bytes rather than which source they
+          came from, and it is an input rather than a constant because kit is
+          not an org-wide lockfile: a service pins the template version it
+          adopted, and a wrong value here is refused by the grammar rather than
+          published. Empty means `unknown`, which is honest and is asserted
+          against rather than accepted by a consumer.
+        required: false
+        type: string
+        default: ''
     outputs:
       digest:
         description: >-
@@ -243,6 +256,32 @@ jobs:
             org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
             org.opencontainers.image.revision=${{ github.sha }}
 
+      # THE STAMP'S FIELDS, resolved through the stamper rather than assembled
+      # here. This step exists so that the REFUSAL is real: `github.repository`
+      # is `owner/repo` verbatim and `github.sha` is a sha, but an
+      # `if: [ -z … ]` over them is a check nobody can exercise, and the
+      # grammars are what actually keep a hostname or a path out of a registry.
+      # Every value goes in through `env`, never into the script body —
+      # zizmor's `template-injection` audit is right about that, and the header
+      # explains the same point for the `resolve image` step above.
+      - name: stamp provenance
+        id: provenance
+        env:
+          KIT_PROVENANCE_SOURCE: ${{ github.repository }}
+          KIT_PROVENANCE_REVISION: ${{ github.sha }}
+          KIT_PROVENANCE_TEMPLATE_VERSION: ${{ inputs.kit-version }}
+        run: |
+          set -euo pipefail
+          KIT_PROVENANCE_BUILT_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            KIT_PROVENANCE_SOURCE_DIRTY=clean \
+            sh docker/provenance.sh --validate
+          {
+            echo "source=$KIT_PROVENANCE_SOURCE"
+            echo "revision=$KIT_PROVENANCE_REVISION"
+            echo "built_at=$KIT_PROVENANCE_BUILT_AT"
+            echo "template_version=$KIT_PROVENANCE_TEMPLATE_VERSION"
+          } >>"$GITHUB_OUTPUT"
+
       - name: build
         uses: docker/build-push-action@v6
         with:
@@ -252,11 +291,41 @@ jobs:
           push: ${{ inputs.push && github.event_name != 'pull_request' }}
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
+          # THE STAMP. Every build arg the seven Dockerfiles declare, passed
+          # explicitly, including the ones this workflow already knew: the
+          # revision IS `github.sha`, which is what `org.opencontainers.image.
+          # revision` said above and what nothing read.
+          #
+          # The build args are passed rather than left to the `labels:` block
+          # above because the DOCKERFILE is the only sink both build paths go
+          # through. The e2e artifacts are pushed by `bin/e2e-stack
+          # publish-siblings` with a bare `docker build`, which never runs this
+          # workflow — so a stamp that lives only in the `labels:` input is
+          # absent from exactly the images this packet is about. `labels:` is
+          # kept, and writes the same two keys, because it is the path that
+          # works for a caller with a Dockerfile of its own.
+          #
+          # `KIT_PROVENANCE_SOURCE_DIRTY` is `clean`, not derived: a checkout at
+          # a push event IS the pushed commit, so "dirty" would be a claim this
+          # job cannot honestly make in either direction. Refusing to guess is
+          # the stamp's whole discipline applied to itself.
+          build-args: |
+            KIT_PROVENANCE_SOURCE=${{ steps.provenance.outputs.source }}
+            KIT_PROVENANCE_REVISION=${{ steps.provenance.outputs.revision }}
+            KIT_PROVENANCE_BUILT_AT=${{ steps.provenance.outputs.built_at }}
+            KIT_PROVENANCE_SOURCE_DIRTY=clean
+            KIT_PROVENANCE_TEMPLATE_VERSION=${{ steps.provenance.outputs.template_version }}
           cache-from: ${{ inputs.cache-from }}
           cache-to: ${{ inputs.cache-to }}
           # Both on. The cost is two extra referrers on the manifest; the
           # absence is an artifact nobody can audit later, which is the more
           # expensive direction for anything we are about to sell.
+          #
+          # The provenance attestation is NOT the stamp a consumer reads, and
+          # `docker/provenance.sh`'s header says why at length: reading one
+          # fetches a referrer from the registry, and these images are consumed
+          # out of a plain-HTTP local registry. It stays on because it costs one
+          # manifest entry and answers a different question.
           provenance: mode=max
           sbom: true
 

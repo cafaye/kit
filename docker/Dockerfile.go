@@ -83,6 +83,32 @@ RUN go build -trimpath -ldflags="-s -w" -o /out/service ./cmd/${SERVICE_NAME}
 
 FROM debian:${RUNTIME_DEBIAN_VERSION}-slim AS runtime
 WORKDIR /app
+
+# --- the provenance stamp (kit) ----------------------------------------------
+# Five ARGs, one file, five labels. WHICH formats this could have been, and the
+# grammar that decides what may be stamped at all, are in docker/provenance.sh
+# — do not restate them here, copy the script and read its header.
+#
+# `LABEL ${VAR}` is deliberately NOT used: buildkit does not word-split an
+# expansion in a LABEL, so `LABEL ${STAMP}` fails with "must have two arguments"
+# (measured). One ARG cannot carry five labels, so there are five.
+#
+# The defaults are `unknown` rather than empty, and that is the point: an image
+# built with no --build-arg still carries the KEYS, because a missing label is
+# indistinguishable from an image built before this existed.
+ARG KIT_PROVENANCE_SOURCE=unknown
+ARG KIT_PROVENANCE_REVISION=unknown
+ARG KIT_PROVENANCE_BUILT_AT=unknown
+ARG KIT_PROVENANCE_SOURCE_DIRTY=unknown
+ARG KIT_PROVENANCE_TEMPLATE_VERSION=unknown
+COPY docker/provenance.sh /usr/local/lib/kit/provenance.sh
+RUN chmod +x /usr/local/lib/kit/provenance.sh \
+    && /usr/local/lib/kit/provenance.sh --write /app/kit-provenance.json
+LABEL org.opencontainers.image.source="${KIT_PROVENANCE_SOURCE}" \
+      org.opencontainers.image.revision="${KIT_PROVENANCE_REVISION}" \
+      org.opencontainers.image.created="${KIT_PROVENANCE_BUILT_AT}" \
+      com.cafaye.kit.source.dirty="${KIT_PROVENANCE_SOURCE_DIRTY}" \
+      com.cafaye.kit.template.version="${KIT_PROVENANCE_TEMPLATE_VERSION}"
 COPY --from=build /out/service /app/service
 COPY docker/entrypoint.sh /app/kit-entrypoint
 # Numeric, not a named user: this base ships no unprivileged account, and a

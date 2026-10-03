@@ -295,5 +295,28 @@ else
   migrate
 fi
 
+# --- 3b. name the artifact ---------------------------------------------------
+#
+# ONE line, before the service takes over, and it is the difference between an
+# image that carries provenance and one that merely has it.
+#
+# The image labels are in the image CONFIG, which a running process cannot reach
+# — there is no docker socket and no CLI in here — so without this the thing
+# running could not say what it was built from, and "stamp the artifact so the
+# thing running can name what it was built from" would have been half true. The
+# file sink exists for exactly this line, and this line is why it is not
+# decorative.
+#
+# It is one `sed`, not a parse, and a stamp that cannot be read does NOT stop a
+# service booting: an unreadable stamp is a fact about the image, while a refusal
+# to start is a fact about the deploy, and an image must be able to boot far
+# enough to be diagnosed. `docker/provenance.sh --verify` is where an unreadable
+# stamp IS a failure — that is a consumer ASSERTING about an artifact, which is a
+# different act from an artifact booting.
+if [ -r /app/kit-provenance.json ]; then
+  kit_provenance="$(sed -n 's/.*"revision": "\([^"]*\)".*/\1/p' /app/kit-provenance.json 2>/dev/null || true)"
+  log "built from ${kit_provenance:-an unstamped revision} — full stamp in /app/kit-provenance.json"
+fi
+
 # --- 4. serve -----------------------------------------------------------------
 exec "$@"
