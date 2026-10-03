@@ -138,8 +138,8 @@ host port. `mutations.sh` is its proof: it breaks one property at a time, requir
 the gate to go red **and name the site**, then restores and re-asserts green. It
 refuses to start on a dirty tree, which is how it caught itself mid-write.
 
-It is here rather than in prose because the guard was **wrong three times** and the
-mutation suite is the only reason any of them was found:
+It is here rather than in prose because the guard was **wrong four times** and the
+mutation suite plus one run of the gate are the only reason any of them was found:
 
 | what the guard did | what it missed |
 |---|---|
@@ -147,6 +147,17 @@ mutation suite is the only reason any of them was found:
 | detected bring-up per LINE | `… \` + `up -d` is ONE command; tenancy dropped out of scope entirely |
 | read use sites only | `CONTROL_C="kit-isolation-control"` makes every use read a derived `$CONTROL_C` |
 | called an inline `$$` a literal | fired on `deploy_test.sh`'s decoy volume, which *is* unique to the run |
+| sat inside `if [ "$RUN_SELF_TEST" -eq 1 ]` | `--static-only` sets that to 0, so **the static phase was green on a tree with a hardcoded name in it** — and 84 of the 93 self-test recipes run the gate that way |
+
+The last row is the one the mutation suite could **not** catch, and it is worth
+naming why: `mutations.sh` invokes the gate with `--only`, and `--only` selects a
+check by label without skipping its phase. A guard can therefore be fully bitten
+by every mutation and still not run in the phase that matters. It was found by
+running the plain static gate and looking for the check in the output rather than
+by reading where the check had been put.
+
+Four times in one packet, reading the code and running it disagreed. That is the
+argument for the mutation script existing at all.
 
 A guard reading correctly is not evidence that it *is* correct, and neither is one
 that has never been seen to fail. Seven mutations, seven reds:
