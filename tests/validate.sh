@@ -874,6 +874,140 @@ version_at_least() {
 
 
 # ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# the fingerprint cache — P0-3 and P0-4, wired to one real tier
+# ---------------------------------------------------------------------------
+#
+# WHAT THIS IS. `tests/fingerprint.py` can build a manifest, store a record and
+# decide a hit. On its own it is a library: it changes nothing about how long
+# the gate takes. These two functions are the wiring, and they are the only
+# place in the tree where a recorded verdict is allowed to stand in for a run.
+#
+# WHY IT IS OFF BY DEFAULT. Not for caution — for measurement. Every claim this
+# mechanism makes is a claim about WALL CLOCK, and a cache that cannot be
+# switched off cannot be measured, because the second run is the only evidence
+# and it is indistinguishable from the first if the first was already warm. So
+# the cache is `on` by default and off with `KIT_FINGERPRINT=0`, and the report
+# quotes both numbers because the honest before-number is the one with it off.
+#
+# WHERE THE RECORD LIVES, and why it is overridable. `$KIT_CACHE_DIR` if set,
+# else `.kit/cache/gate` under the tree. The override exists for `self_test`,
+# which runs 94 whole COPIES of this tree: a cache scoped to a copy is deleted
+# with the copy and can never be hit by the copy after it, so the 94 breakages
+# would each pay full price for the ~113 checks they share with each other.
+# One shared cache directory is what lets copy 57 skip the checks copy 23
+# already ran — which is P0-1 ("run every gate exactly once") arriving as a side
+# effect of P0-4 rather than as a second mechanism.
+#
+# WHAT IS CACHEABLE IS DECIDED BY THE DECLARATION, not by a heuristic. A
+# declaration that cannot be built is not a silent miss: the tier runs, and the
+# reason is printed, because a cache that quietly stops caching is a cache whose
+# miss rate nobody is watching.
+_KF_ENABLED=1
+case "${KIT_FINGERPRINT:-on}" in
+  0|off|no|false) _KF_ENABLED=0 ;;
+esac
+
+_kf_dir() {
+  if [ -n "${KIT_CACHE_DIR:-}" ]; then
+    printf '%s' "$KIT_CACHE_DIR"
+  else
+    printf '%s/.kit/cache/gate' "$ROOT"
+  fi
+}
+
+# The check's identity is the FIRST TOKEN of its label, which is the same string
+# `--only` matches on and the same string `self_test.sh` names in `--only=<id>`.
+# One id, written once, read by three callers — a second spelling of it would be
+# a second thing to keep in step.
+_kf_id() {
+  printf '%s' "${1%% *}"
+}
+
+# bounded_check records its outcome in these two, so that a caller wrapping it
+# can store the record without re-running the tier to find out how it went. Set
+# UNCONDITIONALLY at the top of the reporting half rather than in each branch:
+# a variable left holding the PREVIOUS tier's status is how a red tier gets a
+# green record written for it.
+KIT_CACHE_LAST_EXIT=""
+KIT_CACHE_LAST_OUT=""
+
+kit_cached_check() { # <label> <bound> <inputs-csv> <outputs-csv> <command...>
+  local label="$1" bound="$2" inputs="$3" outputs="$4"
+  shift 4
+  [ "$_KF_ENABLED" -eq 1 ] || { bounded_check "$label" "$bound" "$@"; return $?; }
+
+  # The `--only` filter, FIRST, and for the same reason `bounded_check` applies
+  # it first: a tier nobody asked about must not have a record written for it,
+  # because the record would describe a run that never happened.
+  if [ -n "$ONLY_MATCH" ]; then
+    case "$label" in
+      *"$ONLY_MATCH"*) ONLY_RAN=$((ONLY_RAN + 1)) ;;
+      *)
+        ONLY_SKIPPED=$((ONLY_SKIPPED + 1))
+        return 0
+        ;;
+    esac
+  fi
+
+  local id cdir man tmpout
+  id="$(_kf_id "$label")"
+  cdir="$(_kf_dir)"
+  # The id is a PATH -- `tests/fetch_test.sh` -- so it cannot be a filename
+  # until the slashes are folded. Same fold `fingerprint.py` applies to the
+  # record's own name, which is why the two agree without either being told the
+  # other's rule.
+  man="$cdir/manifests/$(printf '%s' "$id" | tr '/ ' '__').json"
+  mkdir -p "$cdir/manifests" 2>/dev/null || true
+
+  # A declaration that will not build is a defect in the DECLARATION, and the
+  # only honest response is to run the tier and say so. `|| true` with a loud
+  # note, rather than `set -e` taking the gate down over a cache.
+  if ! "$PY" "$ROOT/tests/fingerprint.py" --root "$ROOT" --cache-dir "$cdir" manifest \
+        --check "$id" --inputs "$inputs" --outputs "$outputs" \
+        --command "$*" --out "$man" 2>"$cdir/manifest.err"; then
+    printf '       note: the fingerprint declaration for %s did not build, so this\n' "$id"
+    printf '       tier ran uncached. The declaration is:\n'
+    sed 's/^/         /' "$cdir/manifest.err"
+    bounded_check "$label" "$bound" "$@"
+    return $?
+  fi
+
+  # The skip. One extra process (or two) in exchange for not running the tier,
+  # and the exchange only happens on a hit, so the miss path pays for the hit
+  # path and never the other way round.
+  if "$PY" "$ROOT/tests/fingerprint.py" --root "$ROOT" --cache-dir "$cdir" \
+        lookup --manifest "$man" >"$cdir/replay.txt" 2>"$cdir/lookup.err"; then
+    bounded_ran=$((bounded_ran + 1))
+    report PASS "$label"
+    printf '       (skipped: the fingerprint is unchanged and the declared outputs are\n'
+    printf '        still on disk — %s)\n' "$(_kf_id "$label")"
+    if [ -s "$cdir/replay.txt" ]; then
+      sed 's/^/       /' "$cdir/replay.txt"
+    fi
+    return 0
+  fi
+
+  # A MISS, a CORRUPT record and a FOREIGN record all land here, and all three
+  # mean the same thing: run it. The distinction is in the stderr the lookup
+  # already printed, so the log says WHY it re-ran without this function having
+  # to know how to tell the three apart.
+  [ -s "$cdir/lookup.err" ] || true
+  bounded_check "$label" "$bound" "$@"
+  local ec=$?
+  ec="$KIT_CACHE_LAST_EXIT"
+
+  # A tier that hit its BOUND leaves the claim it exists to prove unexercised.
+  # Recording that as a green would be the exact lie P0-4 forbids, so a BOUND
+  # (124) and a FAIL are recorded with their own exit code and can therefore
+  # never be a hit — `lookup` refuses any record whose exit is not 0.
+  tmpout="$cdir/manifests/$(printf '%s' "$id" | tr '/ ' '__').out"
+  printf '%s' "$KIT_CACHE_LAST_OUT" >"$tmpout"
+  "$PY" "$ROOT/tests/fingerprint.py" --root "$ROOT" --cache-dir "$cdir" record \
+    --manifest "$man" --exit "$ec" --stdout-file "$tmpout" 2>/dev/null || true
+  rm -f "$tmpout"
+  return 0
+}
 # bounded_check <label> <bound-seconds> <command...>
 # ---------------------------------------------------------------------------
 #
@@ -967,6 +1101,12 @@ bounded_check() {
     _pf_kind=tier
     out="$("$@" 2>&1)" || ec=$?
   fi
+  # Published UNCONDITIONALLY, before any branch, so that a caller wrapping this
+  # to store a fingerprint record cannot read the PREVIOUS tier's status. A
+  # variable left holding an earlier value is how a red tier gets a green
+  # record written for it, and the cache would then hand that green back.
+  KIT_CACHE_LAST_EXIT="$ec"
+  KIT_CACHE_LAST_OUT="$out"
   if [ "$ec" -eq 0 ]; then
     report PASS "$label"
     if [ -n "$out" ]; then
@@ -10979,6 +11119,9 @@ check 'tests/classify_test.sh  (19 cases, incl. the fail-closed property)' \
 #
 # Bounded, like the other executed proofs, because it forks once per shard index
 # and the largest safe n (62) is 62 of them. Measured ~23s.
+check 'tests/fingerprint_test.sh  (the skip is proven able to be WRONG: outputs deleted, one byte changed, a corrupt record, a foreign version)' \
+  bash "$ROOT/tests/fingerprint_test.sh"
+
 bounded_check 'tests/shard_test.sh  (the n shards partition the suite, shard n/n included)' \
   300 bash "$ROOT/tests/shard_test.sh"
 
@@ -11015,7 +11158,10 @@ check 'tests/provenance_test.sh  (11 leak shapes refused; both sinks agree; --ve
   bash "$ROOT/tests/provenance_test.sh"
 
 section 'fetch: the pinned kit ref resolves, and a moving one is refused'
-check 'tests/fetch_test.sh  (a pin fetches, a branch is refused, offline is real)' \
+kit_cached_check 'tests/fetch_test.sh  (a pin fetches, a branch is refused, offline is real)' \
+  120 \
+  'tests/fetch_test.sh,templates/bin/dev.sh,VERSION' \
+  '' \
   bash "$ROOT/tests/fetch_test.sh"
 
 section 'tenancy: how one shared cluster is split into per-service databases'

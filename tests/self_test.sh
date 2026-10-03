@@ -529,6 +529,12 @@
 #   98. `### Breaking` under Unreleased         -> no version covers it at all
 #   99. VERSION `1.0.0-rc1`                     -> the string cannot be placed
 #   100. a reserved path back in the tree       -> the tombstone means nothing
+#   101. the OUTPUTS conjunct deleted from the skip -> a cache with no work on
+#        disk answers HIT anyway. This is the one that earns the cache: every
+#        other breakage here proves a check can fail, and this one proves the
+#        cache can be CAUGHT failing. A skip that has never been caught lying is
+#        a skip nobody should trust, and the mutation deletes the clause that
+#        turns "the fingerprint matches" into "do nothing".
 #
 # Both are `expect_red_script` against `tests/shard_test.sh`, which is a proof
 # rather than a gate over a tree for the same reason `classify_test.sh` is: the
@@ -4481,3 +4487,26 @@ fi
 
 echo "PASS: self_test — all $total breakages hold ($counted assert red, $((total - counted - green_check)) assert a green gate with a named skip, $green_check assert a green gate with a named finding), and the unbroken tree is green."
 echo "       Every recipe above was EVALUATED — $_shard_ran ran against $declared declared ($total breakages and the unbroken-tree control), and the two are compared rather than assumed: 0 environment failures, 0 skipped for a missing toolchain."
+
+# 101. The skip stops requiring the work to still be there.
+#
+# The single most expensive thing a cache can do is hand back a green for work
+# it never did, and the clause that prevents it is the cheapest one in the file:
+# the record stored the SET of paths its output globs matched, and the lookup
+# re-checks that set before answering. Delete that comparison and the cache
+# keeps working perfectly on every case it can still see -- a cold cache is still
+# a miss, a changed input is still a miss, a corrupt record is still refused --
+# and it goes wrong in exactly one case, which is the case that matters: a tree
+# whose outputs were deleted while its inputs did not change.
+#
+# So the mutation is invisible to everything else in this file, and it is caught
+# by `tests/fingerprint_test.sh` proofs 1a and 1b, which assert that a matching
+# fingerprint over a tree with no outputs is NOT a hit. The assertion is written
+# as an exit CODE rather than as a sentence so that a recipe that stopped
+# applying would go red on itself instead of passing on a mutation it no longer
+# reaches -- the defect breakage 2 and 4 already paid for once.
+base101="$(fresh_copy kit-101)"
+edit "$base101/tests/fingerprint.py" \
+  '    if now_paths != record["output_paths"]:' '    if False:  # the clause this breakage deletes'
+expect_red_check 'breakage 101: the outputs conjunct is deleted from the skip, so a cache with no work on disk still answers HIT' \
+  "$base101" 'fingerprint_test' --static-only
