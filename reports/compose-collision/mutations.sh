@@ -32,9 +32,20 @@ fi
 
 restore() { git checkout -- tests/ 2>/dev/null || true; }
 
-# expect_red <label> <file> <python-mutation>
+# Restore on ANY exit, not only on the verdicts. This script exists to leave the
+# tree exactly as it found it, and the first version of it did not: an unbound
+# variable aborted the run after mutation (1) had been applied and left a
+# hardcoded `--project-name` sitting in tests/isolation_test.sh, which is the exact
+# defect this packet fixes, introduced by the proof that the defect is guarded.
+trap 'restore' EXIT
+
+# expect_red <label> <file>
+#
+# The mutation is applied by the caller BEFORE this is called and restored by this
+# function once the verdict is in. Two arguments rather than three because a
+# mutation is a multi-line edit that does not belong in an argument list.
 expect_red() {
-  local label="$1" file="$2" mutation="$3" out ec
+  local label="$1" file="$2" out ec
   out="$(bash tests/validate.sh --only="$LABEL" 2>&1)"; ec=$?
   if [ "$ec" -eq 0 ]; then
     printf 'NOT BITTEN  %s\n' "$label"
