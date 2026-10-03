@@ -1,5 +1,74 @@
 ## Unreleased
 
+### Fixed
+
+- **The VERSION gate's own gate: a `### Breaking` heading was compared against
+  the wrong section of the changelog, and the comparison was vacuous.** Rule (4)
+  resolves the version a breaking heading is checked against with `grep -B1`,
+  which is the section **above** it. The section above a version is whatever was
+  released *after* it, which says nothing about whether that version was allowed
+  to break anything; the version it was released *against* — and the only fact
+  "a breaking change moves MAJOR" is a claim about — is the section **below**,
+  because the changelog is newest-first. Two measured consequences:
+  - **The clause had never executed.** The only `### Breaking` in this tree is
+    under `## 2.0.0`, whose section above is `## Unreleased`, which
+    `stability_parse` refuses — so the comparison short-circuited every time. A
+    rule this file calls "the load-bearing one" had never once run.
+  - **And it went red on a correct tree.** Rename `## Unreleased` to `## 2.1.0`
+    and set `VERSION` to 2.1.0 — an additive release that breaks nothing — and
+    the gate failed, reporting `2.0.0`'s *legal* `### Breaking` against the
+    `2.1.0` written after it.
+
+  Separately, `-B1` on the first entry of a list returns that entry itself, so
+  the newest section was compared against its own MAJOR and `MAJOR <= MAJOR` was
+  true by construction — visible as breakage 96's mutation reporting "the section
+  above it is 4.0.0" about 4.0.0. And `stability_parse` returns no value; it
+  sets globals, so parsing the neighbour **overwrote** `STAB_MAJOR` before the
+  test read it, making the test `[ neighbour -le neighbour ]`. The wrong
+  neighbour was `Unreleased`, which fails to parse, which short-circuited — so
+  the clause was dead *and* vacuous at once, and each defect hid the other.
+  Fixing only the neighbour turns a dead clause into one that fires forever, and
+  did: with `below` correct and the aliasing left alone, this tree's own legal
+  `### Breaking` went red. Fixed together, and the message now reads "which was
+  released against" because that is the fact being checked. Five trees, one
+  property each; see `REPORT-kit-version-recipe-drift-01.md`.
+
+- **Breakages 96, 97 and 99 died on `92a1127` and nobody could read it as
+  related.** All four version-gate recipes spelled their `edit` anchor as the
+  literal `1.0.0`, so the commit that correctly shipped breakage 98's fix as a
+  release — and so moved `VERSION` to `2.0.0` — took three proofs with it, and
+  reported `the recipe no longer applies to its copy`. That sentence reads as a
+  harness complaint; what it meant was *the only proof that a MAJOR bump owes a
+  migration has stopped running*. The commit's own message names 31b, 23b and
+  59, because those breakages' symptoms were legible and these four had none.
+  Rewriting the anchors to `2.0.0` would have been green and would have re-armed
+  the same bomb for `3.0.0`, so the versions are now **derived**:
+  `copy_version <dir>` reads the version out of the copy and
+  `bump <v> <major|minor>` computes the destination, refusing any string it
+  cannot decompose rather than deriving from a guess.
+
+- **Breakage 98 carried a second time bomb the version sweep did not see.** Its
+  anchor was `## Unreleased\n\n### Added`, so it failed the same day for a
+  *different* reason — `a5f8746` inserted `### Changed` as the first subsection
+  and the recipe never mentioned it — and the next release renames that heading
+  to a version, at which point the section it has to mutate is one it has to
+  *create*. Both states are now handled and neither reads a spelling this
+  repository can change.
+
+### Added
+
+- **A gate over the gate: no recipe may anchor on a bare version literal.** The
+  four recipes above were corrected, and corrected recipes are correct until the
+  next bump — so `tests/validate.sh` now refuses a version literal in any
+  argument of any `edit` that touches `VERSION` or `CHANGELOG.md`, naming the
+  line, the file, the literal, and whether it is the version the tree is at or
+  one it has never been at. The set of files in scope is **derived** from the
+  recipes, so the next version recipe covers itself. It is not a louder `edit`:
+  `edit` already refuses an unmatched anchor, and by the time it does the recipe
+  is dead. This runs before anyone writes one. Its measured limits — a literal
+  reaching a recipe through a variable is invisible to a scan of arguments — are
+  recorded in `DECISIONS.md` (MD31) and in the report rather than footnoted.
+
 ### Changed
 
 - **`tests/validate.sh` grew `--no-live`, and the 104 throwaway gates in

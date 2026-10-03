@@ -9408,7 +9408,7 @@ PY
     #     untouched. This is the rule that makes the promise checkable rather
     #     than documented, and it is why the check does not only ask about the
     #     version in VERSION.
-    local cur='' above_major='' bad=0
+    local cur='' below='' bad=0
     while IFS= read -r line; do
       case "$line" in
         '## '*) cur="${line#\#\# }" ;;
@@ -9420,11 +9420,72 @@ PY
             printf 'CHANGELOG.md declares a breaking change under the heading "## %s", which is not a version, so no bump can be checked against it.\n' "$cur" >&2
             bad=1
           else
-            above_major="$(grep '^## ' "$ROOT/CHANGELOG.md" | sed 's/^## //' | grep -B1 -xF "$cur" | head -1 || true)"
-            if [ -n "$above_major" ] && stability_parse "$above_major"; then
-              local pm=$((10#${above_major%%.*}))
-              if [ "$STAB_MAJOR" -le "$pm" ]; then
-                printf 'CHANGELOG.md declares a breaking change under %s, and the section above it is %s. A breaking change that does not move MAJOR is not a versioned promise; that is the entire rule this file enforces.\n' "$cur" "$above_major" >&2
+            # THE PREDECESSOR IS THE SECTION BELOW, and this line used to read
+            # ABOVE. Measured, both halves, because the fix is the opposite
+            # direction and a wrong neighbour is a check that reports the wrong
+            # thing confidently.
+            #
+            # "A breaking change moves MAJOR" is a claim about the bump that
+            # PRODUCED the version, so the version it has to be compared with is
+            # the one it was released against — and the changelog is
+            # newest-first, so that is the section BELOW. The section above a
+            # version is whatever was released AFTER it, which says nothing at
+            # all about whether the version was allowed to break anything.
+            #
+            # Two measured consequences of reading the wrong neighbour, both on
+            # this repository and neither hypothetical:
+            #
+            #   (a) IT WAS DEAD. The only `### Breaking` on this tree is under
+            #       `## 2.0.0`, and the section above that is `## Unreleased` —
+            #       which `stability_parse` refuses, so the comparison never ran
+            #       and the clause this file calls "the load-bearing one" never
+            #       executed even once.
+            #
+            #   (b) IT FIRED FALSELY ON A CORRECT TREE. Rename `## Unreleased`
+            #       to `## 2.1.0` and set VERSION to 2.1.0 — an ordinary
+            #       additive release that breaks nothing — and the gate went
+            #       red: "CHANGELOG.md declares a breaking change under 2.0.0,
+            #       and the section above it is 2.1.0". 2.0.0's `### Breaking`
+            #       is legal, because 2.0.0 was released against 1.0.0 and its
+            #       MAJOR moved. The check was punishing a section for a release
+            #       written after it.
+            #
+            # And `-B1` on the FIRST entry of a list returns that entry itself,
+            # so the newest section was compared against its own MAJOR and the
+            # test `MAJOR <= MAJOR` was true by construction. It fired on
+            # breakage 96's own mutation, reporting 4.0.0 against 4.0.0.
+            #
+            # So: `sed -n 2p` over `grep -A1`, which is the section below, and
+            # EMPTY when the section is the oldest — nothing is compatible with
+            # nothing, so there is no bump to check and no clause to run. The
+            # list is filtered to version sections first, so a heading that is
+            # not a version can never become a predecessor.
+            below="$(grep '^## ' "$ROOT/CHANGELOG.md" | sed 's/^## //' |
+              grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' |
+              grep -A1 -xF "$cur" | sed -n '2p' || true)"
+            # `STAB_MAJOR` IS CAPTURED BEFORE `stability_parse "$below"`, and that
+            # ordering is the whole of the second defect here. `stability_parse`
+            # does not return a value — it leaves the numbers in globals and
+            # UNSETS them first — so parsing the predecessor OVERWRITES
+            # STAB_MAJOR with the PREDECESSOR's MAJOR. The comparison then reads
+            # `[ predecessor_major -le predecessor_major ]`, which is true by
+            # construction, so the clause reported a violation every time it
+            # executed and could never report anything else.
+            #
+            # It never executed on this tree, which is the only reason a vacuous
+            # clause survived: the neighbour it compared against was
+            # `## Unreleased`, and `stability_parse` refuses that, so the `&&`
+            # short-circuited before the test. The clause was DEAD and VACUOUS at
+            # the same time, and each defect hid the other. Fixing only the
+            # neighbour would have turned a dead clause into a permanently-firing
+            # one, which is the more dangerous of the two and is exactly what my
+            # first attempt at this fix did: with `below` resolved correctly, this
+            # repository's own LEGAL `### Breaking` under `## 2.0.0` went red.
+            local cur_major=$STAB_MAJOR
+            if [ -n "$below" ] && stability_parse "$below"; then
+              local pm=$((10#${below%%.*}))
+              if [ "$cur_major" -le "$pm" ]; then
+                printf 'CHANGELOG.md declares a breaking change under %s, which was released against %s. A breaking change that does not move MAJOR is not a versioned promise; that is the entire rule this file enforces.\n' "$cur" "$below" >&2
                 bad=1
               fi
             fi
@@ -11779,6 +11840,130 @@ PY
   }
   check 'tests/self_test.sh  (every documented breakage has a recipe, and vice versa)' \
     self_test_claims
+
+  # NO RECIPE MAY ANCHOR ON A BARE VERSION LITERAL.
+  #
+  # WHY THIS IS A CHECK AND NOT A CONVENTION. `edit` already refuses an anchor it
+  # cannot find, loudly, naming the file — so nothing here is about being louder.
+  # It is about making the class impossible rather than about detecting one
+  # instance, and the difference is the whole argument:
+  #
+  #   Four recipes anchored their mutations on the literal `1.0.0`. The next
+  #   release moved VERSION to 2.0.0 and all four reported
+  #   `the recipe no longer applies to its copy`, which reads as a harness
+  #   complaint rather than as "the only proof that a MAJOR bump owes a migration
+  #   has stopped running". Four proofs of kit's own release discipline died on a
+  #   commit whose message named three OTHER breakages and none of these four.
+  #
+  # A refusal cannot catch that, because at the moment `edit` refuses, the recipe
+  # is already dead and the damage is done. This check runs on the SOURCE, so the
+  # sixth recipe to be written the same way is a red gate at authoring time rather
+  # than a dead proof at release time.
+  #
+  # WHY NOT THE OTHER SHAPE. The alternative in the packet — a guard at suite
+  # start that resolves each anchor against a copy and names the drift — is the
+  # same information one step later, and it costs a full set of copies to say what
+  # a text scan says for free. Worse, it cannot say WHICH recipe or WHY at the
+  # moment somebody is writing one. Decided and recorded in DECISIONS.md (MD31).
+  #
+  # DERIVED, NOT ASSERTED. The set of interesting files is read out of the
+  # recipes themselves — every path `edit` is handed that resolves to `VERSION` or
+  # `CHANGELOG.md` — so adding a version recipe brings itself under the rule
+  # without this file being edited. That is the same move as `self_test_live_tier`
+  # deriving the live tier from `live_check` invocations, and for the same reason:
+  # a list of what is forbidden, written down separately, is a list that goes
+  # stale, and a rule that only covers the recipes its author remembered is a rule
+  # with a hole shaped like the next packet.
+  self_test_no_version_literal() {
+    "$PY" - "$ROOT/tests/self_test.sh" "$ROOT/VERSION" <<'PY'
+import os
+import re
+import sys
+
+suite = open(sys.argv[1], encoding="utf-8").read()
+live_version = open(sys.argv[2], encoding="utf-8").read().strip()
+
+lines = suite.splitlines()
+# Comments are excluded because this file is mostly prose about versions, and a
+# check that fires on a comment explaining WHY a literal is wrong is a check that
+# fires on its own documentation.
+code = [(n, ln) for n, ln in enumerate(lines, 1) if ln.strip() and not ln.lstrip().startswith("#")]
+
+# Join a trailing `\`, because every recipe here is written across two or three
+# lines and a per-line scan would see half a string literal and match nothing.
+stmts, cur = [], None
+for n, ln in code:
+    if cur is None:
+        if re.match(r"^[ \t]*edit\s", ln):
+            cur = (n, [ln])
+    else:
+        cur[1].append(ln)
+    if cur is not None and not ln.rstrip().endswith("\\"):
+        stmts.append(cur)
+        cur = None
+
+# MAJOR.MINOR.PATCH, as three components and nothing else. `1.0.0-rc1` and
+# `v1.4.0` are deliberately NOT matched by the bare form: they cannot appear in
+# VERSION, so a recipe that writes one is asserting a string the tree forbids.
+# The gate's own `stability_parse` refuses both for the same reason.
+VERSION_LITERAL = re.compile(r"(?<![\w.$/-])(\d+\.\d+\.\d+)(?![\w.-])")
+
+# The files whose contents a release moves. `VERSION` is the version;
+# `CHANGELOG.md` carries the version headings and the `## Unreleased` section.
+INTERESTING = ("VERSION", "CHANGELOG.md")
+
+problems = []
+# Which recipes the rule is about, derived rather than written down: a recipe
+# that mentions one of these paths. Used only for the summary count, so the
+# number printed is a measurement of the file rather than a claim about it.
+guarded = set()
+for start, body_lines in stmts:
+    body = " ".join(body_lines)
+    # The path is the first quoted or bare word after `edit`.
+    m = re.search(r"edit\s+(\"[^\"]*\"|'[^']*'|\S+)", body)
+    if not m:
+        continue
+    path = m.group(1).strip("\"'")
+    if not path.endswith(INTERESTING):
+        continue
+    guarded.add(start)
+    # Every remaining argument, so the rule covers the REPLACEMENT as well as the
+    # anchor. A recipe that anchored on a variable and wrote a literal
+    # destination has the same fuse: the literal stops existing the moment the
+    # tree moves past it.
+    #
+    # DEDUPED, because the commonest form names the same version twice — once as
+    # the anchor and once as the destination — and two identical findings read as
+    # two problems where there is one. One recipe, one finding per version.
+    for lit in sorted(set(VERSION_LITERAL.findall(body))):
+        problems.append(
+            f"line {start}: the recipe editing `{os.path.basename(path)}` names the version "
+            f"literal `{lit}` ({'the tree is at ' + live_version if lit == live_version else 'a version this tree has never been at'}). "
+            "Derive it from the copy instead: `copy_version \"$baseNN\"` for the version it "
+            "carries and `bump <v> <major|minor>` for the destination. A literal here is a "
+            "time bomb whose fuse is one release, and the release that lights it takes this "
+            "recipe's proof with it while reporting a harness complaint rather than a lost proof."
+        )
+
+if not guarded:
+    problems.append(
+        "no recipe edits VERSION or CHANGELOG.md any more, so this check is asserting over "
+        "nothing. Either the version recipes were removed or this pattern has stopped "
+        "matching their calls; both mean the rule is no longer covering what it was written for."
+    )
+
+if problems:
+    for p in problems:
+        print("  -", p)
+    sys.exit(1)
+print(
+    f"{len(stmts)} mutation(s) in {len(guarded)} recipe(s) touching "
+    f"{', '.join(INTERESTING)}; 0 anchors a bare version literal, so the next bump is not an event"
+)
+PY
+  }
+  check 'tests/self_test.sh  (no recipe anchors on a bare version literal; every version a recipe writes is derived from its copy)' \
+    self_test_no_version_literal
 
   # The label carries both numbers and, deliberately, does not sum them into
   # "N breakages, N reds" the way it did while every recipe was red-expecting.

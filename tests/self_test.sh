@@ -990,6 +990,87 @@ PY
   fi
 }
 
+# copy_version <dir> — the version string the COPY carries.
+#
+# Out of the copy's own VERSION, never out of `$ROOT/VERSION`, and the reason is
+# the suite's own rule about copies: a copy is a throwaway tree and the whole
+# file depends on it being self-contained, so a recipe that read the version of
+# the tree it happens to be running in would be asserting a fact about the
+# machine rather than about the tree it is about to mutate. It is also why this
+# is a function of the copy rather than a variable read once at the top: a
+# suite-start read is correct only while every copy carries the same VERSION,
+# and `fresh_copy` copies the live tree so that is true today — but it is true
+# because of an accident of the copy list, not because anything says so, and a
+# copy that overrode VERSION to test the MAJOR rule would silently break it.
+#
+# WHY THIS FUNCTION EXISTS AT ALL is `92a1127`. It did the right thing — a
+# breaking change may not sit under `## Unreleased`, so the fix for breakage 98
+# IS a release, and it moved VERSION 1.0.0 -> 2.0.0 — and three breakages it
+# could not have read as related went with it. Its own message names 31b, 23b
+# and 59: the breakages whose SYMPTOMS were legible. Four more named no symptom
+# anyone could read, because "the recipe no longer applies to its copy" is a
+# harness complaint rather than "the only proof that a MAJOR bump owes a
+# migration has stopped running". Breakages 96, 97 and 99 anchored their
+# mutations on the literal `1.0.0`, so one release detonated all three.
+copy_version() {
+  printf '%s' "$(head -1 "$1/VERSION")"
+}
+
+# bump <version> <major|minor> — the next version of that kind, DERIVED.
+#
+# It refuses anything it cannot decompose rather than deriving from a guess,
+# because `${v%%.*}` on a string that is not N.N.N yields a version which looks
+# derived and is not, and a recipe that wrote THAT would go on proving nothing
+# while reading as though it had been fixed. The shape refused is the same one
+# `stability_parse` refuses in the gate — `01.4.0` is one string and two
+# numbers, and kit has no prerelease spelling — so the two cannot disagree about
+# what a version is.
+bump() {
+  local why='' major minor patch
+  if ! printf '%s' "$1" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+    why='it is not exactly three whole-number components'
+  else
+    major="${1%%.*}"
+    minor="${1#*.}"
+    minor="${minor%%.*}"
+    patch="${1##*.}"
+    # EACH COMPONENT IS CHECKED SEPARATELY, because the check is per component
+    # and concatenating them first makes `2.0.0` read as the string `200`, whose
+    # second character is a zero. A leading zero is one string and two numbers,
+    # which is the reason `stability_parse` refuses `01.4.0`: arithmetic on it is
+    # arithmetic on a typo, and `${1%%.*}` would carry the typo into the next
+    # version. The exemption for a bare `0` is the same one semver makes, and it
+    # is why `0.9.3` is a version this derives from rather than a refusal.
+    for part in "$major" "$minor" "$patch"; do
+      case "$part" in
+        '' | *[!0-9]*) why='a component is not a number' ;;
+        0?*) why='a component carries a leading zero' ;;
+      esac
+      [ -z "$why" ] || break
+    done
+  fi
+  if [ -n "$why" ]; then
+    printf 'self_test: cannot derive a %s bump from %s: %s. A recipe that derived from it anyway would write a version that looks derived and is not.\n' \
+      "$2" "${1:-<empty>}" "$why" >&2
+    return 1
+  fi
+  case "$2" in
+    # The INCREMENT is what makes this a bump rather than a projection of the
+    # current version: `2.0.0`'s next MAJOR is `3.0.0`, and a recipe that
+    # derived `2.0.0` would mutate nothing and prove nothing.
+    #
+    # `10#` because `08` is an invalid octal in bash's arithmetic evaluation, so
+    # a PATCH reaching 8 does not turn a version bump into a syntax error — the
+    # same reason `stability_tier` writes it that way.
+    major) printf '%s.0.0' "$((10#$major + 1))" ;;
+    minor) printf '%s.%s.0' "$major" "$((10#$minor + 1))" ;;
+    *)
+      printf 'self_test: bump takes major or minor, not %s\n' "$2" >&2
+      return 1
+      ;;
+  esac
+}
+
 # kit_child_gate <dir> <validate.sh args...> — the ONE way this file runs the gate.
 #
 # Every child gate gets `KIT_NO_LIVE=1`, i.e. `--no-live`, i.e. the observability
@@ -4475,31 +4556,43 @@ expect_red_script 'breakage 95: an over-provisioned shard is no longer refused a
 # rather than a paragraph. Each one names ONE check and mutates ONE thing, which
 # is the rule 75 exists for: a fixture that can go red two ways proves the gate
 # can go red and says nothing about which half fired.
+#
+# EVERY VERSION IN THE FOUR IS DERIVED FROM THE COPY, and that is the whole of
+# this section's repair. All four used to spell their mutation out of a literal
+# `1.0.0`, which made each of them a time bomb with a fuse of exactly one
+# release and this repository has now detonated one (see `copy_version`). What a
+# reader can no longer see at a glance is which concrete version each recipe
+# exercises today, and the answer is now printed by the gate in the copy rather
+# than written here: `bump` is a pure function of the copy's own VERSION, so the
+# numbers are in `VERSION` and `CHANGELOG.md` of the tree being mutated, and
+# `copy_version` refuses anything it cannot decompose rather than guessing.
 # ---------------------------------------------------------------------------
 
 # 96. A MAJOR bump that owes a MIGRATION and does not pay.
 #
-# VERSION is moved 1.0.0 -> 2.0.0 and the changelog grows a matching
-# `## 2.0.0` section that says it is breaking — so everything the tier DOES
-# require is present except the one artefact it is named after. No MIGRATIONS.md
-# exists in this repository, which is the point: a consumer who adopts kit by
-# copy cannot apply a sentence, and a MAJOR that ships without the migration is
-# exactly the "read the diff" answer this packet exists to delete.
+# VERSION is moved to the next MAJOR of whatever the copy carries, and the
+# changelog grows a matching section that says it is breaking — so everything
+# the tier DOES require is present except the one artefact it is named after.
+# No MIGRATIONS.md section exists for a version that has not shipped, which is
+# the point: a consumer who adopts kit by copy cannot apply a sentence, and a
+# MAJOR that ships without the migration is exactly the "read the diff" answer
+# this packet exists to delete.
+#
+# The mutation is DERIVED and the derivation is the point rather than a
+# convenience: a MAJOR of a MAJOR is what makes this recipe mean the same thing
+# at 2.0.0, at 3.0.0 and at 10.4.0. Spelling the destination instead would make
+# it prove only that a bump that is no longer possible still goes red.
 base96="$(fresh_copy kit-96)"
-edit "$base96/VERSION" '1.0.0' '2.0.0'
-edit "$base96/CHANGELOG.md" '## 1.0.0
-
-### Added' '## 2.0.0
+v96="$(copy_version "$base96")"
+v96_major="$(bump "$v96" major)"
+edit "$base96/VERSION" "$v96" "$v96_major"
+edit "$base96/CHANGELOG.md" "## $v96" "## $v96_major
 
 ### Breaking
 
-- the tier is `breaking` and this says so.
+- the tier is \`breaking\` and this says so.
 
-### Added
-
-## 1.0.0
-
-### Added'
+## $v96"
 expect_red_check 'breakage 96: a MAJOR bump ships without the MIGRATION the tier owes' \
   "$base96" 'stability gate' --static-only
 
@@ -4507,28 +4600,28 @@ expect_red_check 'breakage 96: a MAJOR bump ships without the MIGRATION the tier
 #
 # This is the rule the whole mechanism turns on, and it is the one that needs NO
 # predecessor to check: a `### Breaking` heading is legal only under a version
-# whose MAJOR actually moved. Here 1.1.0 is a MINOR and its section claims a
-# breaking change, so the promise "a MINOR takes nothing away" is falsified by
-# the repository's own changelog.
+# whose MAJOR actually moved. Here the MINOR's section claims a breaking change,
+# so the promise "a MINOR takes nothing away" is falsified by the repository's
+# own changelog.
+#
+# MINOR, not MAJOR, and derived: a MINOR is the bump that must not break, so a
+# MINOR that says it does is the only falsification of the additive promise. The
+# derivation keeps that true for whatever version the copy carries.
 base97="$(fresh_copy kit-97)"
-edit "$base97/VERSION" '1.0.0' '1.1.0'
-edit "$base97/CHANGELOG.md" '## 1.0.0
-
-### Added' '## 1.1.0
+v97="$(copy_version "$base97")"
+v97_minor="$(bump "$v97" minor)"
+edit "$base97/VERSION" "$v97" "$v97_minor"
+edit "$base97/CHANGELOG.md" "## $v97" "## $v97_minor
 
 ### Breaking
 
 - a MINOR bump that says it breaks something.
 
-### Added
-
-## 1.0.0
-
-### Added'
+## $v97"
 expect_red_check 'breakage 97: a MINOR bump declares a breaking change' \
   "$base97" 'stability gate' --static-only
 
-# 98. A `### Breaking` heading parked under `## Unreleased`.
+# 98. A `### Breaking` heading parked under a section no version covers.
 #
 # The subtler half of 97, and it is a different failure: nothing has been
 # released, so there is no version to check the bump against, and a breaking
@@ -4536,29 +4629,66 @@ expect_red_check 'breakage 97: a MINOR bump declares a breaking change' \
 # number carries. The version file is untouched — this mutation is entirely in
 # the changelog — which is what proves the rule reads the whole history rather
 # than only the bump being proposed.
+#
+# THE HEADING IS DERIVED, and this recipe held a second time bomb that the first
+# sweep missed: its anchor was `## Unreleased\n\n### Added`, so it died the same
+# day 96, 97 and 99 did, for a DIFFERENT reason — `a5f8746` inserted
+# `### Changed` as the first subsection under Unreleased and the recipe never
+# mentioned it. It also had a bomb the literal hid: the next release renames
+# `## Unreleased` to the version it became, and at that point "a `### Breaking`
+# under a section no version covers" is a section this recipe has to CREATE
+# rather than find, which is the branch below.
+#
+# BOTH BRANCHES ANCHOR ON A DERIVED HEADING, and that is the asymmetry worth
+# being precise about: the one remaining `## Unreleased` literal is on the
+# REPLACEMENT side of the create branch, so renaming the convention would change
+# what this recipe writes and not whether it applies. A literal in an anchor is
+# a recipe that dies; a literal in a replacement is a recipe that writes an
+# out-of-date name. The first is a lost proof and the second is a cosmetic bug,
+# and only the first is worth deriving — so this one is left written down and
+# said out loud rather than defended by a helper.
 base98="$(fresh_copy kit-98)"
-edit "$base98/CHANGELOG.md" '## Unreleased
-
-### Added' '## Unreleased
+v98_head="$(grep -m1 '^## ' "$base98/CHANGELOG.md")"
+v98_body="${v98_head#\#\# }"
+if printf '%s' "$v98_body" | grep -qE '^[0-9]+\.[0-9]+\.[0-9]+$'; then
+  # everything has been released, so no version-less section is left to park it
+  # under and this recipe adds one above the newest version
+  edit "$base98/CHANGELOG.md" "$v98_head" "## Unreleased
 
 ### Breaking
 
 - parked here, where no version covers it.
 
-### Added'
+$v98_head"
+else
+  # the copy still carries one, and WHICH `###` subsection follows it is not this
+  # recipe's business
+  edit "$base98/CHANGELOG.md" "$v98_head" "$v98_head
+
+### Breaking
+
+- parked here, where no version covers it."
+fi
 expect_red_check 'breakage 98: a breaking change sits under Unreleased, where no version covers it' \
   "$base98" 'stability gate' --static-only
 
 # 99. A version string that cannot be placed.
 #
-# `1.0.0-rc1` is the interesting one, and refusing it is a decision rather than
-# a strictness reflex: a prerelease suffix makes the derived tier change meaning
-# when the suffix is dropped, so the string stops being the source of truth for
+# A prerelease suffix is the interesting case, and refusing it is a decision
+# rather than a strictness reflex: a suffix makes the derived tier change
+# meaning when it is dropped, so the string stops being the source of truth for
 # its own promise. The check must fail closed rather than tier it, and it must
 # fail at the DOOR — before anything is derived from a string that means two
 # things.
+#
+# THE SUFFIX IS APPENDED TO THE COPY'S OWN VERSION, so it is a prerelease OF
+# whatever is current rather than of a version that stopped existing. A literal
+# `1.0.0-rc1` would have kept this recipe alive for exactly as long as the
+# tree stayed at 1.0.0, which is a property of the release calendar rather than
+# of the check.
 base99="$(fresh_copy kit-99)"
-edit "$base99/VERSION" '1.0.0' '1.0.0-rc1'
+v99="$(copy_version "$base99")"
+edit "$base99/VERSION" "$v99" "$v99-rc1"
 expect_red_check 'breakage 99: a prerelease version string is tiered instead of refused' \
   "$base99" 'stability gate' --static-only
 

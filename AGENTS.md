@@ -411,13 +411,39 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   - **96-100 are the VERSION STRING'S OWN GATE**, one property each: a MAJOR with
     no `MIGRATIONS.md` (96), a MINOR declaring `### Breaking` (97), that same
     heading parked under `## Unreleased` where no version covers it (98), a
-    `1.0.0-rc1` the derivation refuses rather than tiers (99), and a reserved name
+    prerelease the derivation refuses rather than tiers (99), and a reserved name
     back in the tree (100). **96 and 97 found a defect in the check itself**: it
     read its predecessor from `git show HEAD:VERSION`, which resolves to nothing
     in a throwaway copy, so both derived `initial` and stayed green — a gate
     whose verdict depends on a `.git` beside it verifies nothing on the machines
     that consume kit the way services do. The predecessor now comes from the
     changelog section below the current one. See `DECISIONS.md` (MD26).
+  - **Every version these four write is DERIVED from the copy, and that is a
+    rule with a gate behind it.** They used to spell their `edit` anchors as the
+    literal `1.0.0`, so `92a1127` — which correctly shipped 98's fix as a
+    release, and so moved `VERSION` to `2.0.0` — killed three of them and
+    reported each as `the recipe no longer applies to its copy`. That reads as a
+    harness complaint; it meant *the only proof that a MAJOR bump owes a
+    migration has stopped running*. `92a1127`'s message names 31b, 23b and 59,
+    because those had legible symptoms. Rewriting the anchors to `2.0.0` would
+    have been green and would have re-armed the bomb for `3.0.0`.
+    `copy_version <dir>` reads the version out of the copy and
+    `bump <v> <major|minor>` derives the destination, so the recipe means the
+    same thing at any version.
+    - **The check is over the RECIPES, not over a failure.** `edit` already
+      refuses an unmatched anchor loudly, and by the time it does the recipe is
+      dead and the damage is done; the new check refuses a bare version literal
+      in any argument of an `edit` touching `VERSION` or `CHANGELOG.md`, at
+      authoring time, with the line, the file and the literal in the message.
+      The files in scope are **derived** from the recipes, so the next version
+      recipe covers itself — see `self_test_no_version_literal` in
+      `tests/validate.sh`, `DECISIONS.md` (MD31), and the two measured holes in
+      `REPORT-kit-version-recipe-drift-01.md`.
+    - **98 carried a SECOND literal the version sweep could not see**: its
+      anchor was `## Unreleased\n\n### Added`, so `a5f8746` killed it the same
+      day for an unrelated reason, and the next release renames that heading to a
+      version, at which point the section to mutate is one the recipe has to
+      *create*. Both states are handled.
 - **A toolchain's floor is checked against the floor the ARTIFACT declares.**
   `KitOtel::RUBY_FLOOR` says what `templates/otel/ruby` needs and the gate reads
   that constant rather than restating the number. Below the floor is a loud,
@@ -963,10 +989,29 @@ Five rules, each of which is a thing that has to be true:
 - **The tier owes a FILE, not a sentence.** A MAJOR owes a `MIGRATIONS.md`
   section, because a consumer who adopted kit by copy cannot apply a sentence.
 - **`### Breaking` is legal only under a version whose MAJOR moved**, and never
-  under `## Unreleased`, where no version covers it. That rule needs no
-  predecessor, so it holds for the whole history rather than only for the bump
-  being released — which is what makes the promise checkable rather than
-  documented.
+  under `## Unreleased`, where no version covers it. It holds for the **whole
+  history**, not only for the bump being released — which is what makes the
+  promise checkable rather than documented.
+
+  It does need a predecessor, though, and this file used to claim it did not:
+  the version it is compared against is the one **below** it in the changelog,
+  because the changelog is newest-first and the claim is about the bump that
+  *produced* the version. The comparison ran against the section **above**, and
+  two things followed that nobody could see from a green suite. The clause had
+  **never executed** — the only `### Breaking` on this tree sits under
+  `## 2.0.0`, the section above it is `## Unreleased`, and `stability_parse`
+  refuses that, so it short-circuited every time — and an honest additive
+  release (`## Unreleased` renamed to `## 2.1.0`, nothing else changed) went
+  **red**, reporting `2.0.0`'s perfectly legal heading against a release
+  written after it. So the corrected sentence is the one above, and the clause
+  now has red proofs on five trees, one property each; see
+  `REPORT-kit-version-recipe-drift-01.md` and `CHANGELOG.md`.
+
+  **A rule that is checked over a list needs the RIGHT element of the list.**
+  The comparison was additionally vacuous — `stability_parse` returns no value,
+  it sets globals, so parsing the neighbour overwrote the value the test then
+  read — and being dead is what hid it. A clause can be simultaneously absent
+  and wrong, and a green suite is evidence about neither.
 - **`VERSION` is not a service manifest's job.** Nine services carry no `version`
   key on purpose and `identity` says why; that key describes the service, and
   "how safe is kit to take" is a different question. `1.0.0`, not `0.x`: in
