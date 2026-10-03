@@ -1269,6 +1269,22 @@ live_check() {
     bounded_check "$label" "$bound" "$@"
     return $?
   fi
+  # `--only` IS APPLIED HERE, FIRST, and only on this branch — and that asymmetry
+  # is the point rather than an oversight. When the tier runs, `bounded_check`
+  # applies the filter itself; applying it here as well would count every
+  # selected tier twice in `ONLY_RAN`. When the tier does NOT run there is no
+  # `bounded_check` call to filter, and a filtered run must not report three
+  # skips for checks it was told not to run: 98 of the 104 self-test recipes are
+  # `--only`-filtered, and `ONLY_SKIPPED` is a count a reader uses.
+  if [ -n "$ONLY_MATCH" ]; then
+    case "$label" in
+      *"$ONLY_MATCH"*) ONLY_RAN=$((ONLY_RAN + 1)) ;;
+      *)
+        ONLY_SKIPPED=$((ONLY_SKIPPED + 1))
+        return 0
+        ;;
+    esac
+  fi
   # `SKIP_EXIT` and NOT 0, deliberately. `bounded_check` publishes these two
   # unconditionally so a caller cannot read the previous tier's verdict, and this
   # is that publication. A tier that did not run has no verdict, and 0 would be a
@@ -11527,7 +11543,10 @@ if [ "$RUN_SELF_TEST" -eq 1 ]; then
   # (3) is the count this packet asked for, as a check rather than as a claim:
   # today it is 0, and it is 0 because every recipe asserts a verdict about ONE
   # named check — a collector config, a workflow, a linter, a reporter — and the
-  # observability live tier is not one of them.
+  # observability live tier is not one of them. It is 0 for a second reason the
+  # count cannot see: 98 of the recipes are `--only`-filtered and `bounded_check`
+  # honours the filter, so the opt-out changes the output of exactly ONE recipe
+  # in the suite — 23b, whose helper is deliberately unfiltered.
   self_test_live_tier() {
     "$PY" - "$ROOT/tests/validate.sh" "$ROOT/tests/self_test.sh" <<'PY'
 import re
