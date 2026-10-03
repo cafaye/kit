@@ -30,6 +30,39 @@ without a copy (see kit-12 below).
 
 ## Unreleased
 
+### Changed
+
+- **`tests/kamal_test.sh` now answers `--only`.** It was invoked by a bare
+  `bash` rather than through `bounded_check`, so its 24 cases against the real
+  `kamal` and `kamal-backup` binaries ran on **every** invocation of the gate —
+  including the 86 `self_test` copies that were told, by name, to run exactly
+  one check. Measured with the gate's own profiler: **3.805 s, 55.6% of a child
+  gate's startup floor**, on a floor measured at 6.850 s. The floor is now
+  **2.85 s** (paired, 3 runs per arm, same tree, same box), and 86 copies of
+  the floor is **≈ 343 s** off the suite.
+  - **No coverage is lost.** The filter was already the gate's contract for
+    `check`, `check_par`, `report_par` and `bounded_check`; this makes one more
+    check obey it. `ONLY_SKIPPED` counts the exclusion and the summary prints
+    it, a filter that selects nothing is still a hard `FAIL`, and an
+    **unfiltered** run — the gate itself and all nine whole-gate copies — is
+    unchanged: same command, same output, same verdict.
+  - **It also fixed a spurious failure breakages 78, 79 and 82 had been
+    printing on every run.** The check's label was derived from the script's own
+    output, so it did not exist until after the work was done, `--only=kamal_test`
+    selected **nothing**, and the gate printed a second
+    `FAIL: --only='kamal_test' selected NO check out of the suite.` The recipes
+    passed only because `expect_red_check` greps for its own needle and ignores
+    the next line. After: `1 check(s) ran, 94 excluded`.
+  - **And it withdraws a standing suggestion.** `REPORT-kit-cache-rollout-01.md`
+    §5 listed "interpreter resolution → resolved once" among the floor's fixes.
+    Measured: `00 bootstrap` is **0.040 s**, 0.6% of the floor. It cannot be
+    made to matter, and it is struck rather than left standing.
+  - The general lesson: **`--only` gates the verdict, not the work.** Before
+    wiring a check into the fingerprint cache, find out whether a filtered copy
+    is running it at all — a check that ignores the filter is charged to every
+    copy that asked for something else, and no input declaration reaches that.
+    See `REPORT-kit-startup-floor-01.md` and `PROFILE-startup-floor.md`.
+
 ### Added
 
 - **Rule 10 of the advisor: `rls_policy_correlated_membership` (WARN,
