@@ -58,7 +58,16 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 SUBSTRATE="$ROOT/templates/database/tenancy/substrate.sql"
 WORK="${TMPDIR:-/tmp}/kit-rlsperf.$$"
-C="kit-rlsperf-pg"
+# The container this tier owns. It was `kit-rlsperf-pg`, spelled out, and
+# `docker run --name` plus `docker rm -f` both take a BARE name that does not care
+# which run made it — so two concurrent runs were one container with two owners,
+# and one run's teardown removed the cluster the other was still measuring on.
+#
+# Found by the guard added for tests/isolation_test.sh and
+# tests/tenancy_test.sh, which is the argument for deriving the guard's scope from
+# the directory rather than from a list of the two files that were known to be
+# broken: this tier was not on anybody's list and is the same defect.
+C="kit-rlsperf-pg-$$"
 
 say() { printf '%s\n' "$*"; }
 fail() {

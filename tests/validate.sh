@@ -12142,12 +12142,20 @@ for name in scripts:
         pairs = code_lines(path)
     except OSError:
         continue
-    if not any(BRING_UP.search(ln) for _, ln in pairs):
+    # Over LOGICAL LINES, not over single lines, and that detail is the whole
+    # reason this rule works at all. `if ! docker compose --project-name … \` on
+    # one line and `up -d --wait postgres` on the next is ONE command; a
+    # per-line test asks each half a question neither can answer, finds no bring-up
+    # anywhere, and quietly drops the tier out of scope. tenancy_test.sh was
+    # excluded that way while a literal sat in it, and the mutation suite is what
+    # said so.
+    logical = logical_lines(pairs)
+    if not any(BRING_UP.search(body) for _, body in logical):
         continue
     tiers.append(name)
 
     # (2) THE NAMES THIS TIER OWNS, derived from its own assignments. Restricted
-    # to names that LOOK like namespaces — they carry a `kit-` prefix or a name
+    # to names that LOOK like namespaces — they carry a `kit-` prefix, or a name
     # ending in -control — so the rule does not trip over `failures=0` and the
     # other ordinary counters these files are full of.
     owned = {}
@@ -12161,12 +12169,29 @@ for name in scripts:
         if not (re.match(r"\s*[\"']?kit[-_]", rhs) or re.search(r"-control", rhs)):
             continue
         owned[var] = (n, rhs)
+        # A literal in the ASSIGNMENT is the same defect as a literal at the use
+        # site, and it is the harder one to see: `"$CONTROL_C"` looks derived at
+        # every use, so a rule that reads use sites alone passes on a tier whose
+        # control container is `kit-isolation-control` for every run on the
+        # machine. The mutation suite called this one NOT BITTEN. So the
+        # declaration is checked as well as the call.
+        #
+        # `WORK="${TMPDIR:-/tmp}/kit-isolation.$$"` is fine and is the shape most
+        # of these take: it carries `$$`, so it is derived. A name with neither
+        # `$` nor `$$` in it is the same literal wearing a variable's clothes.
+        if not is_derived(rhs):
+            problems.append(
+                f"{name}:{n}: `{var}=\"{rhs}\"` assigns a namespace LITERALLY, so every "
+                f"run of this tier shares it — two concurrent runs are one stack with two "
+                f"owners. Put the run's own name in it (`{var}=\"$PROJECT-…\"`), which is "
+                f"what the use sites below already read."
+            )
 
     # The rule itself, over USE SITES rather than over declarations. A tier is
     # allowed to derive its names anywhere it likes; what it may not do is hand
     # `docker` a literal in a shared namespace.
     examined = 0
-    for n, body in logical_lines(pairs):
+    for n, body in logical:
         if not DOCKER_USE.search(body):
             continue
         examined += 1
@@ -12185,7 +12210,7 @@ for name in scripts:
 
     # `docker volume rm X` takes a bare name and does not care which project made
     # it, so a literal there is a teardown reaching outside its own namespace.
-    for n, body in logical_lines(pairs):
+    for n, body in logical:
         m = re.search(r"\bdocker\s+volume\s+rm\s+(\S+)", body)
         if not m:
             continue
@@ -12201,7 +12226,7 @@ for name in scripts:
     # override. Checked on the code that writes it, not on the `.env.example` it
     # overrides, and only when the value is a bare literal — a tier that writes
     # `KIT_POSTGRES_PORT=$PGPORT` has derived it.
-    for n, body in logical_lines(pairs):
+    for n, body in logical:
         m = re.search(r"KIT_POSTGRES_PORT=\"?\$?\{?([A-Za-z0-9_$-]+)\"?", body)
         if not m:
             continue
@@ -12220,12 +12245,12 @@ for name in scripts:
     # derives one from the working directory, which two runs in one checkout also
     # share.
     brings_up = any(
-        re.search(r"docker\s+compose\b.*\bup\b", body) for _, body in logical_lines(pairs)
+        re.search(r"docker\s+compose\b.*\bup\b", body) for _, body in logical
     )
     if brings_up:
         names_a_project = any(
             re.search(r"docker\s+compose\b.*" + NAMESPACE_FLAGS, body)
-            for _, body in logical_lines(pairs)
+            for _, body in logical
         )
         if not names_a_project:
             problems.append(
