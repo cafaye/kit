@@ -10551,6 +10551,28 @@ bounded_check 'tests/shard_test.sh  (the n shards partition the suite, shard n/n
 # Deliberately OUTSIDE the `RUN_STATIC` guard, for the reason the classifier and
 # the staleness reporter are: these are the PROPERTY rather than the shape, and a
 # gate that skips is not green.
+section 'provenance: the stamp a pulled image carries, and what it refuses to carry'
+# P3-18's redaction half, and the reader half of P3-19.
+#
+# `tests/provenance_test.sh` is EXECUTED rather than grepped, for the same reason
+# `tests/multi_tenant_split_test.sh` is: the claim under test is that a shape is
+# REFUSED, and only running the stamper can show that. Eleven leak shapes — an
+# email, two local paths, an internal hostname, a URL, a relative path, a
+# credential, a branch where a commit is claimed, a short sha, uppercase hex, a
+# dirty FILE LIST — are each asserted to be refused BY NAME, against a control
+# that is green, so a stamper that refused everything would not pass.
+#
+# It also carries the consumer side, because that is where a stamp stops being
+# decorative: a real image is built from the real `docker/Dockerfile.go`, the
+# label and the file are compared, and `--verify` is required to exit non-zero on
+# a wrong commit and on an unstamped image — as two DIFFERENT codes, because a
+# check that returns one code for both cannot tell a consumer which happened.
+#
+# Outside the `RUN_STATIC` guard: a security claim that a static-analysis skip
+# drops is a security claim nobody ran.
+check 'tests/provenance_test.sh  (11 leak shapes refused; both sinks agree; --verify goes red on a wrong commit)' \
+  bash "$ROOT/tests/provenance_test.sh"
+
 section 'fetch: the pinned kit ref resolves, and a moving one is refused'
 check 'tests/fetch_test.sh  (a pin fetches, a branch is refused, offline is real)' \
   bash "$ROOT/tests/fetch_test.sh"
