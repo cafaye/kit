@@ -9408,7 +9408,7 @@ PY
     #     untouched. This is the rule that makes the promise checkable rather
     #     than documented, and it is why the check does not only ask about the
     #     version in VERSION.
-    local cur='' above_major='' bad=0
+    local cur='' below='' bad=0
     while IFS= read -r line; do
       case "$line" in
         '## '*) cur="${line#\#\# }" ;;
@@ -9420,11 +9420,72 @@ PY
             printf 'CHANGELOG.md declares a breaking change under the heading "## %s", which is not a version, so no bump can be checked against it.\n' "$cur" >&2
             bad=1
           else
-            above_major="$(grep '^## ' "$ROOT/CHANGELOG.md" | sed 's/^## //' | grep -B1 -xF "$cur" | head -1 || true)"
-            if [ -n "$above_major" ] && stability_parse "$above_major"; then
-              local pm=$((10#${above_major%%.*}))
-              if [ "$STAB_MAJOR" -le "$pm" ]; then
-                printf 'CHANGELOG.md declares a breaking change under %s, and the section above it is %s. A breaking change that does not move MAJOR is not a versioned promise; that is the entire rule this file enforces.\n' "$cur" "$above_major" >&2
+            # THE PREDECESSOR IS THE SECTION BELOW, and this line used to read
+            # ABOVE. Measured, both halves, because the fix is the opposite
+            # direction and a wrong neighbour is a check that reports the wrong
+            # thing confidently.
+            #
+            # "A breaking change moves MAJOR" is a claim about the bump that
+            # PRODUCED the version, so the version it has to be compared with is
+            # the one it was released against — and the changelog is
+            # newest-first, so that is the section BELOW. The section above a
+            # version is whatever was released AFTER it, which says nothing at
+            # all about whether the version was allowed to break anything.
+            #
+            # Two measured consequences of reading the wrong neighbour, both on
+            # this repository and neither hypothetical:
+            #
+            #   (a) IT WAS DEAD. The only `### Breaking` on this tree is under
+            #       `## 2.0.0`, and the section above that is `## Unreleased` —
+            #       which `stability_parse` refuses, so the comparison never ran
+            #       and the clause this file calls "the load-bearing one" never
+            #       executed even once.
+            #
+            #   (b) IT FIRED FALSELY ON A CORRECT TREE. Rename `## Unreleased`
+            #       to `## 2.1.0` and set VERSION to 2.1.0 — an ordinary
+            #       additive release that breaks nothing — and the gate went
+            #       red: "CHANGELOG.md declares a breaking change under 2.0.0,
+            #       and the section above it is 2.1.0". 2.0.0's `### Breaking`
+            #       is legal, because 2.0.0 was released against 1.0.0 and its
+            #       MAJOR moved. The check was punishing a section for a release
+            #       written after it.
+            #
+            # And `-B1` on the FIRST entry of a list returns that entry itself,
+            # so the newest section was compared against its own MAJOR and the
+            # test `MAJOR <= MAJOR` was true by construction. It fired on
+            # breakage 96's own mutation, reporting 4.0.0 against 4.0.0.
+            #
+            # So: `sed -n 2p` over `grep -A1`, which is the section below, and
+            # EMPTY when the section is the oldest — nothing is compatible with
+            # nothing, so there is no bump to check and no clause to run. The
+            # list is filtered to version sections first, so a heading that is
+            # not a version can never become a predecessor.
+            below="$(grep '^## ' "$ROOT/CHANGELOG.md" | sed 's/^## //' |
+              grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' |
+              grep -A1 -xF "$cur" | sed -n '2p' || true)"
+            # `STAB_MAJOR` IS CAPTURED BEFORE `stability_parse "$below"`, and that
+            # ordering is the whole of the second defect here. `stability_parse`
+            # does not return a value — it leaves the numbers in globals and
+            # UNSETS them first — so parsing the predecessor OVERWRITES
+            # STAB_MAJOR with the PREDECESSOR's MAJOR. The comparison then reads
+            # `[ predecessor_major -le predecessor_major ]`, which is true by
+            # construction, so the clause reported a violation every time it
+            # executed and could never report anything else.
+            #
+            # It never executed on this tree, which is the only reason a vacuous
+            # clause survived: the neighbour it compared against was
+            # `## Unreleased`, and `stability_parse` refuses that, so the `&&`
+            # short-circuited before the test. The clause was DEAD and VACUOUS at
+            # the same time, and each defect hid the other. Fixing only the
+            # neighbour would have turned a dead clause into a permanently-firing
+            # one, which is the more dangerous of the two and is exactly what my
+            # first attempt at this fix did: with `below` resolved correctly, this
+            # repository's own LEGAL `### Breaking` under `## 2.0.0` went red.
+            local cur_major=$STAB_MAJOR
+            if [ -n "$below" ] && stability_parse "$below"; then
+              local pm=$((10#${below%%.*}))
+              if [ "$cur_major" -le "$pm" ]; then
+                printf 'CHANGELOG.md declares a breaking change under %s, which was released against %s. A breaking change that does not move MAJOR is not a versioned promise; that is the entire rule this file enforces.\n' "$cur" "$below" >&2
                 bad=1
               fi
             fi
