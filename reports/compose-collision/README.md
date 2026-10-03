@@ -109,6 +109,62 @@ with nothing else wrong: a developer running the gate twice, or CI running two
 jobs on one daemon, gets a red that names `docker` rather than naming the
 collision.
 
+## AFTER: the same harness, the same two tiers
+
+Same script, same marker, same machine:
+
+    tenancy     A exit=0   B exit=0
+    isolation   A exit=0   B exit=0
+
+`after-{isolation,tenancy}-{A,B}.log` are those runs.
+
+**Both green is not the proof, on its own.** Two runs can both be green against
+ONE stack, which is the false pass worth fearing most here and which the BEFORE
+12-second stagger demonstrated in reverse: both tenancy runs reported PASS while
+sharing a cluster. So the clusters were counted while both were live:
+
+    kit-isolation-98792-postgres-1   0.0.0.0:15892->5432/tcp
+    kit-isolation-98380-postgres-1   0.0.0.0:15880->5432/tcp
+
+Two project namespaces, two host ports, two containers running at once — which is
+only possible if each run derived its own names. And `docker ps -a` after both
+exited shows nothing at all, so the teardown is still reaching only its own.
+
+## The guard, and the three ways it was wrong first
+
+`tests/validate.sh`'s `docker_tier_project_name` fails when a docker tier
+hardcodes a name in a shared namespace — project, container, volume or published
+host port. `mutations.sh` is its proof: it breaks one property at a time, requires
+the gate to go red **and name the site**, then restores and re-asserts green. It
+refuses to start on a dirty tree, which is how it caught itself mid-write.
+
+It is here rather than in prose because the guard was **wrong three times** and the
+mutation suite is the only reason any of them was found:
+
+| what the guard did | what it missed |
+|---|---|
+| anchored the scan at `^[ \t]*docker` | every bring-up site is `if ! docker compose …` — blind to the exact line the packet protects |
+| detected bring-up per LINE | `… \` + `up -d` is ONE command; tenancy dropped out of scope entirely |
+| read use sites only | `CONTROL_C="kit-isolation-control"` makes every use read a derived `$CONTROL_C` |
+| called an inline `$$` a literal | fired on `deploy_test.sh`'s decoy volume, which *is* unique to the run |
+
+A guard reading correctly is not evidence that it *is* correct, and neither is one
+that has never been seen to fail. Seven mutations, seven reds:
+
+    BITTEN  project name hardcoded at the bring-up site      isolation_test.sh:254
+    BITTEN  project name hardcoded at the TEARDOWN site       tenancy_test.sh:169
+    BITTEN  control container name hardcoded                  isolation_test.sh:78
+    BITTEN  control volume name introduced as a literal       tenancy_test.sh:109
+    BITTEN  host port pinned to a literal                     isolation_test.sh:249
+    BITTEN  a NEW tier, added with no edit to validate.sh     compose_collision_probe.sh:5
+    BITTEN  emptiness is a finding, not a silent pass
+    GREEN   the fixed tree, restored
+
+The sixth row is the derivation claim, measured: a brand-new tier file was caught
+without this directory being edited at all. And deriving the scope that way is
+what turned up the tier that was never on anybody's list —
+`tests/rls_perf_test.sh`, whose `C="kit-rlsperf-pg"` is a fixed container name.
+
 ## What this is not
 
 Not part of the gate, and it should not become one. This brings up two clusters
