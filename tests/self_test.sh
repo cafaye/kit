@@ -961,6 +961,59 @@ PY
   fi
 }
 
+# kit_child_gate <dir> <validate.sh args...> — the ONE way this file runs the gate.
+#
+# Every child gate gets `KIT_NO_LIVE=1`, i.e. `--no-live`, i.e. the observability
+# live tier is turned into three named `SKIP` lines instead of three docker stacks.
+#
+# WHY, MEASURED RATHER THAN ASSUMED, and the measurement is in three parts.
+#
+# 1. Nothing here needs it. Every one of the 104 recipes asserts a verdict about
+#    ONE named check — `templates/compose/otel-collector.yml`, `lint/ + the
+#    workflow`, `tests/classify.py`, `templates/parity-allowlist` — and not one of
+#    the needles names `canary_test.sh`, `no_telemetry_in_readiness.sh` or
+#    `stack_live_test.sh`. The count is 0 and it is a count a check derives rather
+#    than a comment asserting: `tests/validate.sh` reads the live tier's own three
+#    `live_check` invocations, and fails if any recipe invocation mentions one.
+#
+# 2. Only one recipe reached it anyway. `expect_red_check` filters every child
+#    down to the single check it is about (`--only=$want`), and `bounded_check`
+#    honours that filter, so the live tiers were already excluded from every
+#    filtered run. The single exception is `expect_skip_check` — deliberately
+#    unfiltered, because the string it must find is a SKIP's verdict text and not
+#    a check's label — and that is breakage 23b alone. One whole gate out of 104.
+#
+# 3. That one gate was ~half its own wall clock. Profiled on this branch
+#    (`KIT_PROFILE`, `--language=ruby --no-self-test`, an otherwise green run):
+#    255.2s total, of which canary 19.1 + no_telemetry_in_readiness 63.6 +
+#    stack_live 46.1 = 128.8s. It is green standalone and it went red at position
+#    23 of 104 on a loaded machine, because 20-odd other whole gates had already
+#    run and the tier it was waiting on was 900 seconds of docker under contention.
+#    That is not a defect in the recipe; it is the recipe paying for a tier it
+#    does not assert.
+#
+# WHY ONE FUNCTION AND NOT FIVE EDITS. A property written at five call sites is a
+# property that one of them will stop having, and nothing in this file would say
+# so — the suite would simply get slower and flakier, which is exactly the shape
+# of a regression nobody can see. So `bash tests/validate.sh` appears ONCE in this
+# file, inside this function, and `tests/validate.sh` fails if a second one
+# appears. The check is the enforcement; the function is the documentation.
+#
+# IT IS NOT SILENCE, and the difference is the whole point. `--no-live` makes each
+# of the three tiers a `report SKIP` naming the flag, counted in the child's skip
+# tally and repeated in the child's summary. A child gate therefore says "I did
+# not run these three, and here is why" rather than going quiet about them, which
+# is what keeps breakage 23b honest: it asserts the gate is GREEN *and names its
+# skip*, and it now names two kinds of skip instead of one.
+kit_child_gate() {
+  local dir="$1"
+  shift
+  (
+    cd "$dir" || exit 1
+    KIT_PYTHON="$PY" KIT_NO_LIVE=1 bash tests/validate.sh "$@"
+  )
+}
+
 # expect_red <label> <dir> <validate.sh args...>
 expect_red() {
   # Shard guard: a recipe outside this shard is not run at all, and is not
@@ -992,7 +1045,7 @@ expect_red() {
   export KIT_PROFILE_TAG
   local label="$1" dir="$2"
   shift 2
-  if (cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" >/dev/null 2>&1); then
+  if kit_child_gate "$dir" "$@" >/dev/null 2>&1; then
     printf 'FAIL self_test: %s — the gate stayed GREEN\n' "$label"
     failures=$((failures + 1))
   else
@@ -1086,7 +1139,7 @@ expect_red_check() {
     *" --only="*) ;;
     *) set -- "$@" "--only=$want" ;;
   esac
-  out=$(cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" 2>&1) || ec=$?
+  out=$(kit_child_gate "$dir" "$@" 2>&1) || ec=$?
   # A shell pattern, not `printf … | grep -qF`.
   #
   # `grep -q` exits the instant it matches, so a large `$out` gives `printf`
@@ -1308,7 +1361,7 @@ expect_green_check() {
   # and reading its verdict, and this recipe reading a verdict off disk.
   # `expect_skip_check` is the only other helper that asserts GREEN, and it
   # carries the same two tokens for the same reason.
-  out=$(cd "$dir" && KIT_PYTHON="$PY" KIT_FINGERPRINT=0 bash tests/validate.sh "$@" 2>&1) || ec=$?
+  out=$(export KIT_FINGERPRINT=0; kit_child_gate "$dir" "$@" 2>&1) || ec=$?
   if [ "$ec" -ne 0 ]; then
     printf 'FAIL self_test: %s — the gate went RED (exit %s), so the ceiling is not in force\n' \
       "$label" "$ec"
@@ -1518,7 +1571,7 @@ expect_skip_check() {
   # to produce. The interpreter floor is what is under test here, so a skip
   # answered off disk would be exactly the silent pass this recipe exists to
   # distinguish from a named one.
-  out=$(cd "$dir" && KIT_PYTHON="$PY" KIT_FINGERPRINT=0 bash tests/validate.sh "$@" 2>&1) || ec=$?
+  out=$(export KIT_FINGERPRINT=0; kit_child_gate "$dir" "$@" 2>&1) || ec=$?
   if [ "$ec" -ne 0 ]; then
     printf 'FAIL self_test: %s — the gate exited %s, so the skip was not clean\n' "$label" "$ec"
     printf '%s\n' "$out" | grep '^FAIL' | sed 's/^/       /'
@@ -1583,7 +1636,7 @@ expect_green() {
   shift 2
   local out ec=0
   if [ -d "$dir" ]; then
-    out="$(cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" 2>&1)" || ec=$?
+    out="$(kit_child_gate "$dir" "$@" 2>&1)" || ec=$?
   else
     # Distinct from a red gate, because it is: the tree is gone, not failing.
     printf 'FAIL self_test: %s — the throwaway copy %s does not exist\n' "$label" "$dir"

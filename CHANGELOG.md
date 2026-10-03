@@ -2,6 +2,41 @@
 
 ### Changed
 
+- **`tests/validate.sh` grew `--no-live`, and the 104 throwaway gates in
+  `tests/self_test.sh` use it.** Nobody had asked whether the self-test's child
+  gates need the observability live tier; the answer is that **0 of the 107
+  recipe invocations name one**. Every recipe asserts a verdict about ONE named
+  check — a collector config, a workflow, a linter, a reporter — and
+  `canary_test.sh` / `no_telemetry_in_readiness.sh` / `stack_live_test.sh` are
+  not among them. Exactly one recipe reached the tier anyway: breakage 23b,
+  because its helper (`expect_skip_check`) is deliberately unfiltered, since the
+  string it has to find is a SKIP's verdict text and not a check's label. That
+  one gate ran **128.8 s of docker out of 255.2 s** — profiled, measured, not
+  estimated — and it is the reason 23b, a green-expecting proof about the ruby
+  interpreter floor, went red at position 23 of 104 on a loaded machine while
+  being green standalone.
+  - `--no-live` turns the three tiers into `report SKIP` lines naming the flag:
+    counted in the skip tally, printed, and repeated in the summary with the
+    consequence in it. It is **not** `--no-observability`, which drops the two
+    cluster tiers too; those are a different claim at a tenth of the cost
+    (23.9 s measured), and the two sets have to stay separable.
+  - **No bound was widened.** The 900 s numbers are the same numbers. A bound
+    widened until it stops firing on a loaded machine stops answering the
+    question it exists to answer, and it does so invisibly — see `DECISIONS.md`
+    (MD30) for the three alternatives that were rejected and what each costs.
+  - The top-level gate is untouched: with no flag it still runs all three, and
+    `--help` says so. The opt-out is set in exactly one place,
+    `kit_child_gate`, and a new check fails if a second `bash tests/validate.sh`
+    spawn appears outside it, if that spawn loses `KIT_NO_LIVE=1`, or if any
+    recipe ever names a live tier.
+- **`bash tests/validate.sh --help` no longer prints
+  `kit_phase: command not found`.** The `EXIT` trap is armed ~120 lines before
+  `kit_phase` is *defined*, so the `--help` path ran a trap made of three
+  unknown commands. The temp directory is now removed explicitly and the trap
+  disarmed. `--help` also prints the whole leading comment block instead of a
+  hand-counted `sed -n '2,35p'` range that already cut a sentence in half — the
+  flag added above would have moved that cut by another line.
+
 - **`tests/kamal_test.sh` now answers `--only`.** It was invoked by a bare
   `bash` rather than through `bounded_check`, so its 24 cases against the real
   `kamal` and `kamal-backup` binaries ran on **every** invocation of the gate —
