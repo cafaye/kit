@@ -287,3 +287,25 @@ If the helper has to be a string body, the mitigation does not depend on the
 catalog carrying anything: **deny `INSERT`/`UPDATE` on the flags table from the
 login role**, so there is no writable input for the policy to decide from. That
 is the same remedy rule 4's `remediation` column prints.
+
+---
+
+## 6. A note for the manager: the red proof was committed into the template
+
+While this packet ran, a **second instance of the same worker was committing in
+this worktree**. It applied the same mutation to the real
+`templates/database/tenancy/advisor.sql` and committed it (`030985c`) rather than
+applying it to a throwaway copy — so the tree at HEAD carried
+`and false -- MUTATION: the pg_proc hop, deleted` in `policy_reaches`' recursive
+arm, which deletes the hop and turns assertion 7c red on `helper_routed`.
+
+`f305514` restores `advisor.sql` from `b39bd8f`. **The two files that matter are
+byte-identical to the tree the green run was taken against** — verified with
+`git diff --quiet b39bd8f HEAD -- templates/database/tenancy/advisor.sql
+tests/tenancy_test.sh`, both YES — so the green evidence above describes HEAD.
+
+Two commits on this branch (`1449918`, `030985c`) were written by that instance
+rather than by the thread that produced the rest of this packet. They are
+**content**-consistent with the measurement — the report, the handoff, the
+changelog entry and the red-proof log lines all agree with the SQL — but the
+manager should read them as unreviewed by a second pair of eyes.
