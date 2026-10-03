@@ -850,6 +850,14 @@ machine is quiet, which is a property of the machine. The flag is set in exactly
 one place, `kit_child_gate`, and a check fails if a second spawn appears without
 it or if any recipe ever names a live tier.
 
+**And the honest limit of the evidence.** The red at position 23 of 104 was
+*reported*; it did not reproduce on the machine this was built on, where 23b's
+gate run is green standalone and inside a full suite run. So the argument above
+rests on the **exposure** — measured: one whole gate out of the suite, 128.8 s
+of its 255.2 s in three docker stacks, asserting nothing about any of them —
+and not on a failure that was watched. The trade stands on the measurement; the
+anecdote is the thing that made somebody go and take it.
+
 **The rule.** *Ask what the expensive thing is being run FOR.* Nobody had, and
 the answer was "for nothing, 104 times" — which is a different defect from "the
 expensive thing is slow", and the only response to the second one that does not

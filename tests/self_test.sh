@@ -1015,11 +1015,16 @@ PY
 # 3. That one gate was ~half its own wall clock. Profiled on this branch
 #    (`KIT_PROFILE`, `--language=ruby --no-self-test`, an otherwise green run):
 #    255.2s total, of which canary 19.1 + no_telemetry_in_readiness 63.6 +
-#    stack_live 46.1 = 128.8s. It is green standalone and it went red at position
-#    23 of 104 on a loaded machine, because 20-odd other whole gates had already
-#    run and the tier it was waiting on was 900 seconds of docker under contention.
-#    That is not a defect in the recipe; it is the recipe paying for a tier it
-#    does not assert.
+#    stack_live 46.1 = 128.8s.
+#
+#    WHAT IS MEASURED AND WHAT IS REPORTED, kept apart on purpose. The profile
+#    above is measured here. The red at position 23 of 104 is REPORTED — it came
+#    with the packet, and it did not reproduce on this machine: 23b's own gate
+#    run is green here, standalone and in a full suite run. So what this comment
+#    claims is the EXPOSURE — one whole gate out of the suite, half of it docker,
+#    running a tier the recipe does not assert — and not a failure anyone here
+#    watched happen. `REPORT-kit-selftest-live-tier-01.md` §2 says the same thing
+#    with the numbers behind it, which is the point of writing it down twice.
 #
 # WHY ONE FUNCTION AND NOT FIVE EDITS. A property written at five call sites is a
 # property that one of them will stop having, and nothing in this file would say

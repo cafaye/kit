@@ -12,9 +12,11 @@
   because its helper (`expect_skip_check`) is deliberately unfiltered, since the
   string it has to find is a SKIP's verdict text and not a check's label. That
   one gate ran **128.8 s of docker out of 255.2 s** — profiled, measured, not
-  estimated — and it is the reason 23b, a green-expecting proof about the ruby
-  interpreter floor, went red at position 23 of 104 on a loaded machine while
-  being green standalone.
+  estimated — and it is the exposure behind 23b, a green-expecting proof about
+  the ruby interpreter floor, being reported red at position 23 of 104 in a full
+  suite run while green standalone. (That red did **not** reproduce on this
+  machine: 23b's own gate run is green here, standalone and inside a full suite
+  run. The claim is the exposure, not a failure anyone watched.)
   - `--no-live` turns the three tiers into `report SKIP` lines naming the flag:
     counted in the skip tally, printed, and repeated in the summary with the
     consequence in it. It is **not** `--no-observability`, which drops the two

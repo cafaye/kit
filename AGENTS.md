@@ -205,8 +205,12 @@ and only ONE recipe reached it at all — breakage 23b, whose helper is the one
 that cannot be `--only`-filtered, because the string it must find is a SKIP's
 verdict text rather than a check's label. Every other recipe is either
 `--static-only` or narrowed to the single check it asserts, and `bounded_check`
-honours `--only`. So contention, not a defect, made 23b red at position 23 of
-104 while it was green standalone.
+honours `--only`. So contention, not a defect, is what made 23b red at position
+23 of 104 in a full suite run while it was green standalone — **reported, not
+reproduced**: 23b's gate run is green on this machine, standalone and inside a
+full suite run, and the claim being made here is about the *exposure* (one whole
+gate, half of it docker, asserting nothing about any of it) rather than about a
+failure someone watched.
 
 **A skip that cannot be seen is a silent pass**, so the opt-out is three printed
 `SKIP` rows, three in the skip tally, and a summary line naming the claims the

@@ -23,8 +23,12 @@
 #   `tests/self_test.sh` is 104 whole gates — each of which used to bring up
 #   three docker stacks to learn one fact about one named check, on a machine
 #   that may also be running five other workers' gates. That is contention, and
-#   contention turned breakage 23b — a green-expecting proof about the ruby
-#   interpreter floor — red on recipe 23 of 104 while it was green standalone.
+#   contention is what turned breakage 23b — a green-expecting proof about the
+#   ruby interpreter floor — red at recipe 23 of 104 in a full suite run while
+#   it was green standalone. (REPORTED, not reproduced: 23b's gate run is green
+#   on this machine, standalone and in a full suite run. The claim is the
+#   EXPOSURE — one whole gate, half of it docker, asserting nothing about any of
+#   it — and REPORT-kit-selftest-live-tier-01.md §2 keeps the two apart.)
 #   The opt-out is the fix and the bound is not: a bound widened to accommodate
 #   the machine it runs on has stopped measuring the thing it was written for.
 #
