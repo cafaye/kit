@@ -503,7 +503,6 @@ policy_reaches as (
       -- nothing. `pg_depend` is finite, so this is belt and braces.
       where r.ref_class = 'pg_proc'::regclass
         and r.depth < 16
-        and false  -- MUTATION: the pg_proc hop, deleted
   )
   select policy_oid,
          ref_oid as dep_oid,
