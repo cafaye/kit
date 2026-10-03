@@ -11577,21 +11577,38 @@ code = [(n, ln) for n, ln in enumerate(lines, 1) if ln.strip() and not ln.lstrip
 
 problems = []
 
-# (1) One spawn, and it is `bash tests/validate.sh` rather than a path to it.
+# (1) One spawn, and it is the gate rather than a path to it. The pattern is
+# deliberately loose about the path -- `bash "$dir/tests/validate.sh"` is the same
+# spawn as `bash tests/validate.sh` and opts out of nothing -- and deliberately
+# excludes `bash -n`, which this file already uses to syntax-check a script and
+# which runs no gate.
 spawns = [
     (n, ln)
     for n, ln in code
-    if re.search(r"(?:^|\s|&&)bash tests/validate\.sh(?:\s|$)", ln)
+    if re.search(r"\bbash\b(?! +-n\b)[^|;&\n]*tests/validate\.sh", ln)
 ]
 if len(spawns) != 1:
     where = ", ".join("line %d" % n for n, _ in spawns) or "nowhere"
     problems.append(
-        f"`bash tests/validate.sh` appears {len(spawns)} time(s) outside comments in "
-        f"tests/self_test.sh ({where}); expected exactly 1. Every child gate must go "
-        "through kit_child_gate, or it does not get KIT_NO_LIVE=1."
+        f"a `bash … tests/validate.sh` spawn appears {len(spawns)} time(s) outside "
+        f"comments in tests/self_test.sh ({where}); expected exactly 1. Every child gate "
+        "must go through kit_child_gate, or it does not get KIT_NO_LIVE=1."
     )
 
-# (2) The one spawn is the wrapper, and the wrapper opts out.
+# (2) The one spawn opts out, and it lives in a wrapper that exists.
+#
+# CONTAINMENT IS DELIBERATELY NOT ASSERTED, and the reason is a mutation that
+# made this check red on correct work while it was being written. Locating the
+# spawn "inside `kit_child_gate`" needs either brace counting or "the nearest
+# function definition above it", and both are wrong the moment a definition is
+# written inside another definition's body — which bash accepts, which no linter
+# here flags, and which a reader can do by accident. The span version reported
+# the nested function as the enclosing one and blamed a function that spawns
+# nothing; a check that fires on a correct edit teaches the reader to ignore it,
+# which is this repository's own rule about `Naming/PredicateName` and about
+# keyword scans over comments. So the property here is the one that matters —
+# one spawn, and it carries the opt-out — plus the fact that the wrapper is
+# still there to carry the reasoning.
 if len(spawns) == 1:
     n, ln = spawns[0]
     if "KIT_NO_LIVE=1" not in ln:
@@ -11600,19 +11617,12 @@ if len(spawns) == 1:
             "the observability live tier — three docker stacks — for a recipe that "
             "asserts one named check."
         )
-    # The enclosing function by name. The spawn has to be INSIDE kit_child_gate
-    # and not merely near it, or a later edit can move it out and keep the env.
-    fn = None
-    for pln in reversed(lines[: n - 1]):
-        m = re.match(r"^([A-Za-z_][A-Za-z0-9_]*)\(\)\s*\{", pln)
-        if m:
-            fn = m.group(1)
-            break
-    if fn != "kit_child_gate":
+    if not any(re.match(r"^kit_child_gate\(\)\s*\{\s*$", ln) for ln in lines):
         problems.append(
-            f"line {n} spawns the gate from `{fn or 'top level'}`, not from "
-            "`kit_child_gate` — the wrapper is the documentation of the opt-out, "
-            "and a spawn outside it has neither."
+            "tests/self_test.sh defines no `kit_child_gate()`. One spawn of the gate is "
+            "not enough on its own: the wrapper is the single place that says what the "
+            "opt-out is and why, and a bare spawn in five helpers is a promise repeated "
+            "five times with nothing to check it."
         )
 
 # (3) No recipe names a live tier. Statements are joined on a trailing `\` because
