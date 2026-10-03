@@ -11917,11 +11917,24 @@ for name in scripts:
         # `WORK="${TMPDIR:-/tmp}/kit-isolation.$$"` is fine and is the shape most
         # of these take: it carries `$$`, so it is derived. A name with neither
         # `$` nor `$$` in it is the same literal wearing a variable's clothes.
+        # THE ADVICE HAS TO SURVIVE BEING READ ON THE VARIABLE IT NAMES. The
+        # suggestion used to be `{var}="$PROJECT-…"`, and on the three wrapper
+        # tiers added by this packet that renders as `PROJECT="$PROJECT-…"` for the
+        # file whose variable is *named* `PROJECT` — an instruction to assign a
+        # variable from itself, on the very line a reader is trying to fix. It was
+        # unreachable while only the five original tiers were in scope and none of
+        # them names its project variable `PROJECT`, so widening the tier set is
+        # what made it visible. A finding whose remedy is wrong is half a finding.
+        advice = (
+            f"{var}=\"$RUN-…\""
+            if var == "PROJECT"
+            else f"{var}=\"$PROJECT-…\""
+        )
         if not is_derived(rhs):
             problems.append(
                 f"{name}:{n}: `{var}=\"{rhs}\"` assigns a namespace LITERALLY, so every "
                 f"run of this tier shares it — two concurrent runs are one stack with two "
-                f"owners. Put the run's own name in it (`{var}=\"$PROJECT-…\"`), which is "
+                f"owners. Put the run's own name in it (`{advice}`), which is "
                 f"what the use sites below already read."
             )
 
