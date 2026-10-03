@@ -820,8 +820,38 @@ fresh_copy() {
   # and `reserved_check` read both by path, so a copy without them fails those
   # checks on every breakage — and the two green-expecting proofs (23b, 59) would
   # report a red for a reason that has nothing to do with the defect under test.
+  #
+  # `MIGRATIONS.md` is here for the same reason and was MISSING until
+  # provenance-ownership-01, which is the coupling this comment exists to
+  # describe biting a real packet rather than being a hypothetical.
+  #
+  #   The MAJOR rule reads MIGRATIONS.md by path and requires a `## <version>`
+  #   section under it. So the day a MAJOR shipped, every one of the ~107
+  #   throwaway copies became a tree where the current VERSION derives tier
+  #   `breaking` and owes a migration that is not there — and the suite
+  #   reported it as:
+  #
+  #     FAIL self_test: unbroken tree — the gate is RED on an unbroken tree
+  #
+  #   ...which is the control this file runs FIRST and the sentence that makes
+  #   every proof below it meaningless. The tree was not red. The COPY was, for
+  #   a reason that had nothing to do with any breakage, and the honest name for
+  #   that is the false green in reverse: a false RED that reads as "every proof
+  #   in this suite is worthless".
+  #
+  # Measured, and the diagnosis is only reachable because the control names the
+  # symptom rather than the cause:
+  #     $ bash tests/validate.sh --static-only            # on the real tree
+  #     EXIT=0, zero FAIL
+  #     $ bash tests/self_test.sh
+  #     FAIL self_test: unbroken tree — the gate is RED on an unbroken tree
+  #
+  # So the general rule is the one the comment above already states, and this is
+  # the second time this repository has paid it: **when a packet adds a file the
+  # gate reads by path, `fresh_copy`'s list is part of that packet.** A new
+  # check is not done until a throwaway copy can see the thing the check reads.
   for entry in .gitleaks.toml .github AGENTS.md README.md CHANGELOG.md LICENSE \
-    DECISIONS.md RESERVED VERSION core docker lint templates tests; do
+    DECISIONS.md MIGRATIONS.md RESERVED VERSION core docker lint templates tests; do
     [ -e "$ROOT/$entry" ] && cp -R "$ROOT/$entry" "$dst/"
   done
   # KIT_GITLEAKS, unlike the other two, must ALSO be resolved before the first
