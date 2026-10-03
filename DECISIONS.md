@@ -794,7 +794,7 @@ write.
 ## MD30 — **the self-test's child gates opt OUT of the observability live tier, and no bound was widened**
 
 `REPORT-kit-selftest-live-tier-01.md`, §6. This is a decision about **what the
-104 throwaway gates are allowed to run**, and the four available responses were
+105 labelled recipes are allowed to run**, and the four available responses were
 all worse than the one taken.
 
 **Not made: raising the 900s bounds** on `canary_test.sh`,

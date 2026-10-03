@@ -219,7 +219,7 @@ done
 
 # `KIT_NO_LIVE` is the same opt-out as `--no-live`, for the caller that cannot
 # put a flag on the command line — `tests/self_test.sh`, which runs the gate in
-# 104 throwaway copies and would otherwise have to thread the flag through five
+# 105 labelled copies and would otherwise have to thread the flag through five
 # helpers. Truthy values only, and `--no-live` above cannot be undone from here:
 # an opt-out that a later assignment could turn back on is not an opt-out.
 case "${KIT_NO_LIVE:-}" in
@@ -11548,9 +11548,13 @@ if [ "$RUN_SELF_TEST" -eq 1 ]; then
   # today it is 0, and it is 0 because every recipe asserts a verdict about ONE
   # named check — a collector config, a workflow, a linter, a reporter — and the
   # observability live tier is not one of them. It is 0 for a second reason the
-  # count cannot see: 98 of the recipes are `--only`-filtered and `bounded_check`
-  # honours the filter, so the opt-out changes the output of exactly ONE recipe
-  # in the suite — 23b, whose helper is deliberately unfiltered.
+  # count cannot see. Counted on this tree: of the 107 recipe invocations, 93 run
+  # the gate at all (6 `expect_red_lang` and 8 `_script` invocations never do),
+  # **84 of the 93 pass `--static-only`**, and the other 9 are all narrowed to
+  # the single check they assert by `expect_red_check`'s `--only` — except 23b,
+  # whose helper cannot be filtered because the string it must find is a SKIP's
+  # verdict text rather than a check's label. So the opt-out changes the output
+  # of exactly ONE recipe in the suite.
   self_test_live_tier() {
     "$PY" - "$ROOT/tests/validate.sh" "$ROOT/tests/self_test.sh" <<'PY'
 import re
@@ -11868,7 +11872,7 @@ fi
 if [ "$RUN_LIVE" -eq 0 ]; then
   echo "note: --no-live: the observability live tier (canary, collector-killed, fetched stack)"
   echo "       did NOT run. Three claims are UNEXERCISED by this run and no gate that a"
-  echo "       human or CI runs sets this flag; it exists for the 104 throwaway gates in"
+  echo "       human or CI runs sets this flag; it exists for the throwaway gates in"
   echo "       tests/self_test.sh, none of which asserts anything about those three."
 fi
 if [ "$fails" -ne 0 ]; then

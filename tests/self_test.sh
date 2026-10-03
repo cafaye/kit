@@ -997,20 +997,29 @@ PY
 #
 # WHY, MEASURED RATHER THAN ASSUMED, and the measurement is in three parts.
 #
-# 1. Nothing here needs it. Every one of the 104 recipes asserts a verdict about
-#    ONE named check — `templates/compose/otel-collector.yml`, `lint/ + the
-#    workflow`, `tests/classify.py`, `templates/parity-allowlist` — and not one of
-#    the needles names `canary_test.sh`, `no_telemetry_in_readiness.sh` or
-#    `stack_live_test.sh`. The count is 0 and it is a count a check derives rather
-#    than a comment asserting: `tests/validate.sh` reads the live tier's own three
-#    `live_check` invocations, and fails if any recipe invocation mentions one.
+# 1. Nothing here needs it. Every one of the 105 labelled recipes asserts a
+#    verdict about ONE named check — `templates/compose/otel-collector.yml`,
+#    `lint/ + the workflow`, `tests/classify.py`, `templates/parity-allowlist` —
+#    and not one of the needles names `canary_test.sh`,
+#    `no_telemetry_in_readiness.sh` or `stack_live_test.sh`. The count is 0 and
+#    it is a count a check derives rather than a comment asserting:
+#    `tests/validate.sh` reads the live tier's own three `live_check`
+#    invocations, and fails if any recipe invocation mentions one.
+#
+#    (105 labelled invocations, 103 distinct breakage numbers: 78 and 79 are each
+#    proven twice, once for the kamal config set and once for the callable
+#    standard. The count is `validate.sh`'s own, so it cannot drift from the
+#    label the gate prints.)
 #
 # 2. Only one recipe reached it anyway. `expect_red_check` filters every child
 #    down to the single check it is about (`--only=$want`), and `bounded_check`
 #    honours that filter, so the live tiers were already excluded from every
 #    filtered run. The single exception is `expect_skip_check` — deliberately
 #    unfiltered, because the string it must find is a SKIP's verdict text and not
-#    a check's label — and that is breakage 23b alone. One whole gate out of 104.
+#    a check's label — and that is breakage 23b alone. Counted on this tree, of the
+#    93 invocations that run the gate at all, 84 pass `--static-only` and the other
+#    9 are narrowed to the one check they assert; 23b is the single unfiltered one.
+#    One whole gate out of 93.
 #
 # 3. That one gate was ~half its own wall clock. Profiled on this branch
 #    (`KIT_PROFILE`, `--language=ruby --no-self-test`, an otherwise green run):
