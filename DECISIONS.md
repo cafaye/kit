@@ -755,3 +755,36 @@ commit, so the line changes no verdict until a declaration is traced input by
 input — a green light with nothing connected to it is not a saving. The cost of
 the choice is that the two uncached proofs pay their full gate forever; measured
 at one recipe each, that is the right side of the trade.
+
+## MD29 — **a rollout is sized against a MEASUREMENT, and a measurement the last packet made stale is not a measurement**
+
+`REPORT-kit-fingerprint-01.md` §5 handed the successor a rollout "as a list of
+declarations", and the brief behind it sized the prize at *"94 throwaway COPIES
+of the whole static phase, one per breakage"*.
+
+**Counted on this tree, that is nine copies, not ninety-four.** 103 recipes:
+86 `expect_red_check` (each runs `validate.sh --only=<ONE check>`), 8
+`expect_red_script` (the script alone, no gate at all), 6 `expect_red_lang`,
+1 `expect_red`, and the 2 green-expecting controls. `PROFILE-gate.md` had
+already found this in its §4 and its own header says its table should be
+re-derived — `kit-gate-speed-02` then converted 73 recipes to `expect_red_check`
+and **took the whole static phase out of three quarters of the suite**. The
+premise outlived the change that falsified it.
+
+**The measurement it needed is `PROFILE-child-gate.md`**, because a child gate's
+rows are attributed by breakage and the outer profile cannot see them. Measured,
+one whole-gate copy: the **top seven checks are 69.3 s of 103.2 s (67%)**, and a
+gate that runs **zero** checks still takes **11.07 s**.
+
+**What the choice costs, stated plainly.** Sizing the rollout against the stale
+premise overstates the prize by roughly 2×, and it misdirects the ORDER as well as
+the total: 96 of 118 checks are under 0.1 s and worth ~4 s together, so
+"cheapest-value first" spends a whole declaration budget on a tenth of a copy.
+A successor that reads the brief and not the profile will write thirty correct
+declarations for eleven seconds and call it a rollout.
+
+**The rule.** `DECISIONS.md` (MD21) already holds the line that kit's numbers are
+measured rather than argued. This is the same rule one packet downstream: a
+number that a later commit made false is a **stale premise**, not a conservative
+estimate, and the cost of carrying it is paid in declarations nobody needed to
+write.
