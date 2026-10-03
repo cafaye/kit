@@ -13,6 +13,44 @@ it without a copy (see kit-12 below).
 
 ## Unreleased
 
+### Added
+
+- **The provenance stamp (P3-18 + the reader half of P3-19).** A pulled
+  `:e2e` image could not say which commit was in it — a tag is a mutable name,
+  and every e2e tier now pulls one. `docker/provenance.sh` stamps five fields
+  into all seven `docker/Dockerfile.<lang>` templates:
+  `org.opencontainers.image.source`, `.revision`, `.created`,
+  `com.cafaye.kit.source.dirty`, `.template_version`.
+  - **Labels, not an attestation.** `image.reusable.yml` already set
+    `provenance: mode=max`, and it is the wrong answer for a *consumer*: reading
+    one fetches a referrer from the registry over the network, and the e2e
+    artifacts are pushed by a bare `docker build` that never runs that workflow,
+    so the stamp would be absent exactly where it is needed. The attestation
+    stays on — it costs one manifest entry and answers a different question.
+  - **Labels, not a manifest beside the image.** A side manifest joins two
+    independently mutable things, so "the registry and the source disagree"
+    becomes a state you cannot detect. A stamp has to be able to disagree
+    visibly.
+  - **Plus a file in the image**, because labels live in the image config and a
+    running process cannot reach them. `docker/entrypoint.sh` prints the revision
+    at boot; `tests/provenance_test.sh` asserts the two sinks agree.
+  - **Redaction is a closed grammar, not a denylist.** A value may be stamped
+    iff it matches the exact shape of its field, so there is no way to add a
+    field without writing its shape. Eleven leak shapes are asserted refused by
+    name against a green control. `source` admits exactly one `/`, which is what
+    makes `owner/repo` expressible and every path, URL, hostname and credential
+    inexpressible. The one shape no grammar can refuse — a branch-shaped
+    `source`, which is shape-identical to `owner/repo` — is asserted in the
+    suite and argued in the header rather than left to look covered.
+  - **It is provable able to fail.** `docker/provenance.sh --verify IMAGE
+    --expect-revision SHA` returns 5 on a wrong commit, 4 on an unstamped image
+    and 0 on the right one. Three distinct codes because one code for both
+    failures cannot tell a consumer which happened, and `unknown` fails an
+    assertion even though it is accepted at build time.
+  - `tests/provenance_test.sh`, 32 assertions, wired into the static phase.
+    Runs with no docker for the grammar and the agreement checks; SKIPs loudly
+    for the build.
+
 ### Fixed
 
 - **`KIT_SELF_TEST_SHARD=n/n` verified NOTHING and reported PASS.** The shard
