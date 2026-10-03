@@ -192,6 +192,28 @@
 --       owner-is-another-service are the same hole with a different blast
 --       radius. The detail names the owner so a reader who wants the narrower
 --       story has it.
+--
+--   * A FUNCTION BODY THAT THE CATALOG DOES NOT RECORD, and this is the one gap
+--       in this file that was measured rather than reasoned about, so it is in
+--       the first screen rather than in a rule's comment. Rule 4 follows a
+--       policy's qualifier through a called function, and it can follow it only
+--       as far as `pg_depend` goes. Measured on PostgreSQL 17.11
+--       (`measure-advisor-pgproc.sql`): a `BEGIN ATOMIC` helper records
+--       `pg_proc -> pg_class -> <the relation>` and rule 4 sees it; a helper
+--       written `language sql` with a STRING body, and a `plpgsql` helper,
+--       record NO relation at all -- the edge exists only in `prosrc`, as text.
+--
+--       So a `SECURITY DEFINER` helper written the ordinary way hides the table
+--       it reads from this rule, and no rule in this file sees it. That is not a
+--       missing regexp: catching it means matching table names in SQL TEXT,
+--       which fires on a table named in a comment, on a string literal, and on a
+--       table that has since been dropped -- a false-positive machine pointed at
+--       the one rule an adopter trusts about who may edit what. Rule 6 still
+--       fires on the helper ITSELF (`login_role_security_definer_executable`),
+--       which is the honest position: something sees it, and this rule does not
+--       claim to be the thing that does. A reader who needs the gap closed should
+--       read `prosrc` by hand in review, not trust a scan to have done it for
+--       them.
 
 -- ---------------------------------------------------------------------------
 -- rule 5's exemption, stated here because it is the only judgement in this file
@@ -317,6 +339,7 @@ policies as (
   select n.nspname,
          c.relname,
          c.oid as reloid,
+         p.oid as policy_oid,
          c.relrowsecurity,
          p.polname,
          p.polcmd,
@@ -413,6 +436,81 @@ normalized as (
          replace(replace(replace(lower(coalesce(po.qual, '')), ' ', ''), e'\n', ''), e'\t', '')          as n_qual,
          replace(replace(replace(lower(coalesce(po.with_check, '')), ' ', ''), e'\n', ''), e'\t', '') as n_check
   from policy_once po
+),
+
+-- (7b) WHAT A POLICY'S EXPRESSION REACHES -- DIRECTLY, OR THROUGH A FUNCTION IT
+--      CALLS. This is `view_reads`' walk, applied to rule 4's subject, and it is
+--      the same shape for the reason `view_reads` gives for being transitive: a
+--      second walk written a second way is a second thing to keep correct.
+--
+--      WHY IT EXISTS, IN ONE SENTENCE: `pg_depend` on a policy records the
+--      FUNCTION a policy calls, never the relation inside that function's body,
+--      so rule 4 goes silent on exactly the defect it exists for. Measured on
+--      this kit (the query and its rows are in `measure-advisor-pgproc.sql`):
+--
+--        pg_policy -> pg_proc   (deptype 'n', the helper)     -- one hop, then
+--        pg_policy -> pg_class  (deptype 'a', its own table)  -- nothing.
+--
+--      And the walk DOES NOT STOP AT `pg_proc`, because a function's own
+--      dependencies are in the same catalog and the same join: a `BEGIN ATOMIC`
+--      helper records `pg_proc -> pg_class -> <the relation>` and this walk
+--      follows it. See the block above rule 4 for what that closes and, in the
+--      file's own words, what it does not close.
+--
+--      THE SELF-REFERENCE EXCLUSION IS CARRIED INTO HOP 1 and nothing else.
+--      `recordDependencyOnSingleRelExpr` deliberately does not record a
+--      predicate's reference to its own table, so `using (account_id = ...)`
+--      produces no row here and the substrate's own policies stay silent. The
+--      exclusion is `not (pg_class and refobjid = polrelid)` rather than a
+--      second join filter, because a hop-2 relation that happens to BE the
+--      policy's own table is a different thing and is not excluded by accident.
+--
+--      HOP 2 IS ONLY TAKEN FROM A `pg_proc` REF. A relation reached in hop 1 is a
+--      relation and nothing depends on relations from here: the rule asks what
+--      the predicate READS, and a table's own dependencies are its indexes and
+--      its toast table. Taking the hop from `pg_class` as well would drag every
+--      index of every reached table into the walk and report them all.
+--
+--      `min(depth)` and `group by`, because `pg_depend` records one row per
+--      (object, reference) and a policy that reaches a table twice -- or reaches
+--      it both directly and through a helper -- records it twice. Measured on
+--      this fixture, `view_reads` had exactly this: `{plain, plain}`, one
+--      relation reported as two. The same aggregation is the same reason.
+policy_reaches as (
+  with recursive reached(policy_oid, ref_class, ref_oid, depth, through_proc) as (
+      select p.policy_oid, d.refclassid, d.refobjid, 1, null::oid
+      from policies p
+      join pg_depend d
+        on d.classid     = 'pg_policy'::regclass
+       and d.objid       = p.policy_oid
+       and d.refclassid in ('pg_class'::regclass, 'pg_proc'::regclass)
+       and not (d.refclassid = 'pg_class'::regclass and d.refobjid = p.reloid)
+    union
+      -- `through_proc` is the function this edge was taken FROM, and it is what
+      -- lets the finding say "reached through helper X" instead of only naming
+      -- the table. It is carried rather than recovered by a second join, because
+      -- recovering it means matching on `pg_depend` from the relation -- the
+      -- REVERSE direction -- which would name every function that reads the
+      -- table rather than every function the policy called to reach it.
+      select r.policy_oid, d.refclassid, d.refobjid, r.depth + 1, r.ref_oid
+      from reached r
+      join pg_depend d
+        on d.classid     = 'pg_proc'::regclass
+       and d.objid       = r.ref_oid
+       and d.refclassid = 'pg_class'::regclass
+      -- The depth bound is `view_reads`' bound for `view_reads`' reason: a
+      -- checker should not hang on a cycle, and a bound never reached costs
+      -- nothing. `pg_depend` is finite, so this is belt and braces.
+      where r.ref_class = 'pg_proc'::regclass
+        and r.depth < 16
+  )
+  select policy_oid,
+         ref_oid as dep_oid,
+         min(depth) as depth,
+         (array_agg(distinct through_proc) filter (where through_proc is not null))[1] as via_func
+  from reached
+  where ref_class = 'pg_class'::regclass
+  group by policy_oid, ref_oid
 ),
 
 -- (8) EVERY VIEW IN SCOPE, THE TABLES IT REACHES, AND WHETHER IT IS AN INVOKER.
@@ -706,31 +804,68 @@ rule_policy_always_true as (
 --    cosmetic: `recordDependencyOnSingleRelExpr` deliberately does not record
 --    self-references, so `using (account_id = ...)` produces no row here and the
 --    substrate's own policies are silent.
+--
+--    THE FUNCTION HOP, and this part was MEASURED rather than designed.
+--    `pg_depend` on a policy records a called FUNCTION and never the relation
+--    inside that function's body, so a `SECURITY DEFINER` helper made this rule
+--    go silent on exactly the defect it exists for. Three body kinds were created
+--    against PostgreSQL 17.11 and their `pg_depend` dumped; the SQL and the rows
+--    are `measure-advisor-pgproc.sql` and `measurement-pgproc.out` at the
+--    repository root, and the three answers are three different rules:
+--
+--      language sql, STRING body (`as $$ … $$`)   NOT RECORDED. `pg_depend` on
+--          the function carries ONE row, `refclassid = pg_namespace`. The
+--          body->relation edge exists only in `prosrc`, as TEXT.
+--
+--      language plpgsql                          NOT RECORDED. `pg_depend`
+--          carries `pg_language` and `pg_namespace`. Nothing else.
+--
+--      language sql, BEGIN ATOMIC body           RECORDED. `pg_proc ->
+--          pg_class -> <the relation>`, `deptype = 'n'`, because PG14+ parses
+--          that body at `CREATE FUNCTION` time.
+--
+--    SO THE HOP IS ONE JOIN, IT IS CORRECT, AND IT IS NOT THE WHOLE ANSWER. The
+--    residual is the finding rather than a footnote: the shape a hand-written
+--    helper actually takes is the FIRST row, and the catalog does not carry it.
+--    Catching that shape means reading `prosrc` and matching table names in SQL
+--    text, which is a different and worse rule -- a substring match fires on a
+--    table name inside a COMMENT, and this file's own recorded lesson is that a
+--    proof two checks could satisfy proves neither. So the hop ships and the scan
+--    does not, and "what this does not find" says so in the first screen of this
+--    file rather than leaving a reader to infer it from a rule's silence.
+--
+--    WHAT THE HOP COSTS, and this is a measurement rather than an assurance:
+--    `current_account_id()` and `current_credential_digest()` are the only
+--    functions the substrate's own policies call, neither reads a table, and
+--    assertion 7 of `tests/tenancy_test.sh` requires ZERO ERROR and zero WARN on
+--    the two tables the substrate wrote -- so a hop that lit up on them goes red
+--    in the suite rather than shipping quietly.
 -- ===========================================================================
 rule_references_user_metadata as (
   select 'rls_references_user_metadata'::text as name,
          'ERROR'::text as level,
          array['SECURITY']::text[] as categories,
-         'A policy takes an authorization input that the caller is able to edit. `user_metadata`-style claims are writable by the subject they describe, and a predicate that consults one decides access from something the caller controls. The catalog half of this rule reads pg_depend: a policy whose expression reaches outside its own table, into a table a login role may INSERT into or UPDATE, is flagged whatever that table is called.'::text as description,
-         format('Policy %I on %I.%I reads %s, and a login role holds INSERT/UPDATE on it. Whatever the policy decides from those rows, the caller can change. Rendered qualifier: %s',
+         'A policy takes an authorization input that the caller is able to edit. `user_metadata`-style claims are writable by the subject they describe, and a predicate that consults one decides access from something the caller controls. The catalog half of this rule reads pg_depend: a policy whose expression reaches outside its own table -- directly, or through a function it calls -- into a table a login role may INSERT into or UPDATE, is flagged whatever that table is called.'::text as description,
+         format('Policy %I on %I.%I reads %s%s, and a login role holds INSERT/UPDATE on it. Whatever the policy decides from those rows, the caller can change. Rendered qualifier: %s',
                 p.polname, n.nspname, c.relname,
                 array_to_string(array_agg(distinct dep_ns.nspname || '.' || dep_c.relname), ', '),
+                coalesce(' -- through function ' || array_to_string(
+                           array_agg(distinct (select pr.proname from pg_proc pr where pr.oid = prr.via_func)), ', '), ''),
                 coalesce(pg_get_expr(p.polqual, p.polrelid), '(none)'))::text as detail,
-         format('The identity has to arrive from somewhere the caller cannot write. cafaye.begin_account/1 carries it into a transaction-local GUC and cafaye.current_account_id() reads it; a flag table is a request, not an identity. Deny the grant (REVOKE INSERT, UPDATE ON <that table> FROM <the login role>) and decide from the account instead.', n.nspname, c.relname)::text as remediation,
+         format('The identity has to arrive from somewhere the caller cannot write. cafaye.begin_account/1 carries it into a transaction-local GUC and cafaye.current_account_id() reads it; a flag table is a request, not an identity. If the qualifier reaches the table through a function, that function has to be SECURITY INVOKER: a SECURITY DEFINER helper runs with its owner''s privileges and with that owner''s exemption from these policies, which is a wider hole than the one this row is about. Deny the grant (REVOKE INSERT, UPDATE ON <that table> FROM <the login role>) and decide from the account instead.', n.nspname, c.relname)::text as remediation,
          jsonb_build_object('schema', n.nspname, 'name', c.relname, 'type', 'policy',
                             'policy_name', p.polname,
-                            'reads', array_agg(distinct dep_ns.nspname || '.' || dep_c.relname)) as metadata,
+                            'reads', array_agg(distinct dep_ns.nspname || '.' || dep_c.relname),
+                            'via_functions', coalesce(
+                              array_agg(distinct (select pr.proname from pg_proc pr where pr.oid = prr.via_func))
+                              filter (where prr.via_func is not null), array[]::text[])) as metadata,
          format('rls_references_user_metadata_%s_%s_%s', n.nspname, c.relname, p.polname)::text as cache_key
   from pg_policy p
   join pg_class c on c.oid = p.polrelid
   join pg_namespace n on n.oid = c.relnamespace
   join scoped s on s.nspname = n.nspname
-  join pg_depend pd
-    on pd.classid = 'pg_policy'::regclass
-   and pd.objid = p.oid
-   and pd.refclassid = 'pg_class'::regclass
-   and pd.refobjid <> p.polrelid
-  join pg_class dep_c on dep_c.oid = pd.refobjid
+  join policy_reaches prr on prr.policy_oid = p.oid
+  join pg_class dep_c on dep_c.oid = prr.dep_oid
   join pg_namespace dep_ns on dep_ns.oid = dep_c.relnamespace
   where c.relkind = 'r'
     and dep_c.relkind = 'r'

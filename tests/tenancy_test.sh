@@ -806,6 +806,72 @@ create policy fixture_admin on kit_advisor_fixture.admin_only for select to publ
                    where f.account_id = admin_only.account_id and f.is_admin));
 grant select, insert, update on kit_advisor_fixture.profile_flags to public;
 
+-- (4) rls_references_user_metadata, THE FUNCTION HALF, and its CONTROL. Three
+-- objects, and the third is what makes the first two mean anything.
+--
+-- `writable_flags` is ONE table, caller-writable, and two policies reach it:
+--
+--   direct_policy   THE CONTROL, and it is not optional. The SAME table, reached
+--                   DIRECTLY, no function in the path. Without it, "rule 4 now
+--                   fires on a helper-routed policy" and "rule 4 fires on
+--                   everything" are the SAME observation -- and this repository
+--                   has already shipped a proof that exactly that pair of
+--                   readings was indistinguishable (AGENTS.md on breakage 75: a
+--                   green control two different checks could satisfy proves
+--                   neither). One table, two routes, one rule: the rule has to
+--                   answer differently about the ROUTE, or it is counting tables.
+--
+--   helper_routed   reached through a SECURITY DEFINER function. This is the
+--                   shape rule 4 was blind to, and `measure-advisor-pgproc.sql`
+--                   is the measurement that says so: pg_depend on the policy
+--                   names the FUNCTION, not the relation, so the walk has to
+--                   take a pg_proc hop to arrive here.
+--
+--   helper_opaque   the same table through a helper whose body the catalog does
+--                   NOT record -- a `language sql` STRING body, which is how a
+--                   hand-written helper is actually written, and the shape the
+--                   measurement says pg_depend cannot carry. It is here as a
+--                   NEGATIVE, asserted silent below, and it is the reason the
+--                   other two mean something: the rule fires on one route and
+--                   not the other, so it is reading the ROUTE and not the table.
+create table kit_advisor_fixture.writable_flags (
+  account_id uuid not null, is_admin boolean not null default false);
+create table kit_advisor_fixture.direct_policy (
+  id int primary key, account_id uuid not null);
+alter table kit_advisor_fixture.direct_policy enable row level security;
+create policy fixture_direct on kit_advisor_fixture.direct_policy for select to public
+  using (exists (select 1 from kit_advisor_fixture.writable_flags f
+                   where f.account_id = direct_policy.account_id and f.is_admin));
+
+create table kit_advisor_fixture.helper_routed (
+  id int primary key, account_id uuid not null);
+alter table kit_advisor_fixture.helper_routed enable row level security;
+-- BEGIN ATOMIC, and the choice is the measurement's: PG14+ parses that body at
+-- CREATE FUNCTION time, so pg_depend records pg_proc -> pg_class -> the flags
+-- table and the hop has something to follow. `helper_opaque` below is the same
+-- helper written the ordinary way, and the difference between the two is the
+-- whole finding.
+create function kit_advisor_fixture.may_read_admin() returns boolean
+  language sql stable security definer begin atomic
+  select exists (select 1 from kit_advisor_fixture.writable_flags f where f.is_admin);
+end;
+create policy fixture_via_helper on kit_advisor_fixture.helper_routed for select to public
+  using (kit_advisor_fixture.may_read_admin());
+
+create table kit_advisor_fixture.helper_opaque (
+  id int primary key, account_id uuid not null);
+alter table kit_advisor_fixture.helper_opaque enable row level security;
+create function kit_advisor_fixture.may_read_admin_opaque() returns boolean
+  language sql stable security definer
+  as $$ select exists (select 1 from kit_advisor_fixture.writable_flags f where f.is_admin) $$;
+create policy fixture_via_opaque_helper on kit_advisor_fixture.helper_opaque for select to public
+  using (kit_advisor_fixture.may_read_admin_opaque());
+
+grant select, insert, update on kit_advisor_fixture.writable_flags to public;
+grant select on kit_advisor_fixture.direct_policy to public;
+grant select on kit_advisor_fixture.helper_routed to public;
+grant select on kit_advisor_fixture.helper_opaque to public;
+
 -- (6) login_role_security_definer_executable: SECURITY DEFINER, callable without
 -- signing in as anything in particular. The substrate writes none — every function
 -- it owns is an invoker — which is what assertion 6 measured.
@@ -1071,6 +1137,8 @@ for pair in \
   'rls_disabled_in_public:reachable_no_rls' \
   'rls_policy_always_true:always_true' \
   'rls_references_user_metadata:admin_only' \
+  'rls_references_user_metadata:direct_policy' \
+  'rls_references_user_metadata:helper_routed' \
   'multiple_permissive_policies:always_true' \
   'login_role_security_definer_executable:escalate' \
   'auth_rls_initplan:bare_call' \
@@ -1091,9 +1159,72 @@ for pair in \
     fail "an advisor rule cannot fire"
   fi
 done
-say "   10 rules, 11 fixtures, every rule naming itself and the object it fired on."
+say "   10 rules, 13 fixtures, every rule naming itself and the object it fired on."
 say "   scoped to kit_advisor_fixture alone, so each one is proven specific and not"
 say "   satisfied by whichever other rule happened to return a row."
+
+# ---------------------------------------------------------------------------
+# ASSERTION 7c — THE FUNCTION HOP, ITS CONTROL, AND ITS OPPOSITE.
+#
+# The list above proves rule 4 CAN fire on a helper-routed policy. It cannot
+# prove the hop is what made it fire, and those are different defects: a rule
+# that fired on `helper_routed` because it fires on EVERY policy in the schema
+# satisfies the list identically. Three checks, and the second and third are the
+# ones with teeth:
+#
+#   1. the finding NAMES the function. `via_functions` is not decoration: it is
+#      the only column that says the route was a function, and a reader who is
+#      told "policy reads kit_advisor_fixture.writable_flags" and nothing else
+#      has to go and work out which of the two policies in this fixture is
+#      talking about a SECURITY DEFINER helper.
+#   2. THE CONTROL answers differently ON THE SAME TABLE. `direct_policy` reaches
+#      the SAME `writable_flags` with no function in the path, and its
+#      `via_functions` must be EMPTY. One table, two routes, opposite answers --
+#      so the rule is reading the route. Delete either check and this pair is
+#      one observation instead of two, which is the shape AGENTS.md calls a
+#      control two checks could satisfy.
+#   3. `helper_opaque` is SILENT, and this is the negative that decides whether
+#      the two positives mean anything. It reaches the same table through a
+#      helper whose body pg_depend does not record (measured:
+#      `measure-advisor-pgproc.sql`, a `language sql` STRING body records
+#      pg_namespace and nothing else). The rule must not fire on it, because the
+#      only way to fire is to read `prosrc` and match a table name in SQL text,
+#      and a rule that does that fires on a table named in a comment. So this
+#      silence is the LIMIT of the rule, asserted rather than apologised for, and
+#      rule 6 fires on the helper itself -- which is the honest position: a
+#      detector sees the helper, this rule does not claim to be the one.
+for pair in 'helper_routed:may_read_admin' 'direct_policy:'; do
+  obj="${pair%%:*}"
+  fn="${pair#*:}"
+  row="$(psql_in "$ALPHA" "$ALPHA" "
+    select coalesce((metadata->'via_functions')::text, '(null)') || ' | ' || detail
+      from cafaye.advisor_findings(string_to_array('kit_advisor_fixture', ',')::text[])
+     where name = 'rls_references_user_metadata'
+       and metadata->>'name' = '$obj'")"
+  [ -n "$row" ] || fail "no rls_references_user_metadata finding for $obj at all"
+  case "$row" in
+    *"$fn"*) ;;
+    *)
+      say "FAIL: the finding on $obj does not report via_functions containing '$fn'."
+      say "      got: $row"
+      fail "the finding does not say which route the policy took"
+      ;;
+  esac
+  say "   $obj -> via_functions ${fn:-'(empty, the control)'} on the SAME table"
+done
+
+if printf '%s\n' "$neg" | grep -q '^rls_references_user_metadata@helper_opaque$'; then
+  say "FAIL: rls_references_user_metadata fired on helper_opaque, and must not."
+  say "      That policy reaches the same caller-writable table through a helper whose"
+  say "      body pg_depend does NOT record, so the only way to reach it is to read"
+  say "      prosrc and match a table name in SQL text -- which fires on a table named"
+  say "      in a comment. A rule that reaches it that way cannot be told apart from a"
+  say "      rule that reaches everything."
+  fail "rls_references_user_metadata fired on a policy the catalog does not describe"
+fi
+say "   helper_opaque -> silent, and that is the rule's measured limit: the catalog"
+say "      does not carry a string body, so no rule reads one. See the"
+say "      \"what this does not find\" block in advisor.sql and REPORT-kit-advisor-pgproc-01.md."
 
 # ---------------------------------------------------------------------------
 # ASSERTION 7b — THE HONEST NEGATIVES OF ASSERTION 7.
