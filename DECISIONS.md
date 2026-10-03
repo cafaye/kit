@@ -644,3 +644,82 @@ both `true` and `on`). The static check proves the advisor and its proof
 rule passes the cluster suite's collection but not the static one. Neither file
 covers the other, and the report for this packet names which is which rather
 than claiming a single proof of both.
+
+---
+
+## MD26 — **the version string is the promise, and the tier is DERIVED from it**
+
+**The trade this packet did NOT make: the tier is not written down anywhere.**
+A consumer's only question about kit is whether a version is safe to take, and
+until `VERSION` existed the answer was a person reading a diff — in every
+repository, forever. Three tiers are now **derived** from two version strings by
+one function, asserted against a published table of ten pairs, and gated on.
+
+**Why three tiers and not four, and not a boolean.** The tiers are the three
+sizes of change there are, and the rule of thumb is that the number you do not
+have to read is the size of the promise. A fourth tier would be a claim about
+the CONSUMER's code, which kit does not have. A boolean — what cafaye has today
+— answers "did anything break?" with one bit, so it cannot say WHICH surface
+broke, so a reader still opens the diff; the tier is derived from the number the
+consumer already holds, which is the property that makes it checkable at all.
+
+**Why the source of truth is `VERSION` and not a service manifest.** A service's
+manifest describes that service. Nine of them carry no `version` key on purpose,
+`identity` says why in its own comments, and none of them is a place to record
+how safe it is to take *kit*. Two different questions, two different files.
+
+**Why `1.0.0` and not `0.x`.** In semver `0.x` *means* "unstable, anything may
+change" — the exact sentence this removes. A version a consumer has to re-read
+the meaning of is not a source of truth.
+
+**Why a version string this cannot place is a red build.** `2.4.0-rc1` is
+refused because a prerelease suffix makes the derived tier change meaning when
+the suffix is dropped, so the string stops carrying its own promise; `v2.4.0` is
+refused because `v` is the TAG spelling (`kit.ref` takes `v<semver>`) and this is
+not a git tag. Both are `unknown`, and `unknown` fails closed.
+
+**Why the tier owes a FILE.** A MAJOR owes a `MIGRATIONS.md` section, because a
+consumer who adopted kit by copy cannot apply a sentence. A `### Breaking`
+heading is legal only under a version whose MAJOR moved, and never under
+`## Unreleased`, where it is covered by no version at all. That last rule needs
+no predecessor, so the promise holds for the whole history rather than only for
+the bump being released — which is what makes it checkable rather than
+documented.
+
+**The defect the breakages found, recorded because the rule is the lesson.** The
+gate first read its predecessor from `git show HEAD:VERSION`. It resolves to
+nothing in a throwaway copy, so every version bump in an unpacked tarball
+derived `initial` and breakages 96 and 97 stayed GREEN. It now reads the
+changelog section below the current one — a version a consumer can SEE, and
+therefore the same fact the promise is about.
+
+## MD27 — **`RESERVED` adopts buf's tombstone and NOT k8s's deprecation, and says so**
+
+Two references adopted "reserved" independently, which is usually a sign the
+idea is load-bearing. Read closely, **they are not the same mechanism**, and the
+difference is the finding:
+
+- **buf's `reserved: 3, 7;` is a WIRE tombstone.** The field *number* is what
+  travels in the bytes, so a retired number may not be reused — otherwise an old
+  message and a new one decode the same bytes into two meanings. Its purpose is
+  to make DELETION non-breaking.
+- **Kubernetes' `+k8s:deprecated=width,protobuf=3` is a LIFECYCLE marker on a
+  field that is still there.** k8s does not delete an API; it deprecates, names
+  the replacement and the version, and leaves the type in place.
+
+**kit has no encoding, so buf's justification does not transfer** — there is no
+byte whose meaning a reused name would corrupt. What transfers is the weaker
+half both of them enforce, which is the half that matters when a service's copy
+outlives the decision: **a retired name stays retired.**
+
+**Why the deprecation half does not port either.** A comment in a copied YAML
+file is a comment in a copy — the adopter's file never learns it. And kit has no
+registry a deprecation could live in, since an artefact is fetched by ref or
+copied by hand. `templates/parity-allowlist` already carries that half for the
+fleet.
+
+**Why the fourth hygiene rule is INVERTED here.** In a skip allowlist, an entry
+matching nothing is a ratchet that only turns one way. For a tombstone the dead
+entry and the live name are the same defect with two names: the entry says the
+name is gone and the name is in the tree. So `reserved_check` fails when a
+reserved path **exists**, and is silent otherwise. Two entries, both from kit-20.

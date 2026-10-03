@@ -1,0 +1,94 @@
+# RESERVED — names kit has retired, and will not use again.
+#
+# ONE file, in kit, for the whole fleet, in the same dialect as
+# `templates/tier/skip-allowlist` and `templates/parity-allowlist`: the same four
+# rules, the same words, one entry per line. Two dialects of "record why" is how
+# one of them goes stale.
+#
+# WHAT THIS IS
+#
+# A tombstone. When kit retires something a service may hold — a template path,
+# a copied file, a name — the removal records the name here so that name can
+# never be used for something else.
+#
+# WHY, WHEN KIT HAS NO WIRE FORMAT
+#
+# buf's `reserved` and Kubernetes' `+k8s:deprecated=width,protobuf=3` are the two
+# references, and **they are not the same mechanism**, which is worth more than
+# a merge of the two would be:
+#
+#   * buf's `reserved: 3, 7;` is a WIRE tombstone. The field number is what
+#     travels in the bytes, so the rule is that a retired number may not be
+#     reused by a new field — otherwise an old message and a new one decode the
+#     same bytes into two different meanings. Its unit is an identifier in an
+#     encoding, and its whole purpose is to make DELETION non-breaking.
+#   * Kubernetes' is a LIFECYCLE marker on a field that is still there. k8s does
+#     not delete an API; it deprecates it, names the replacement and the version,
+#     and leaves the type in place. `reserved: 3` appears in the generated Go as
+#     the *matching* tombstone, but the mechanism it carries is "deprecated, not
+#     removed".
+#
+# kit has no encoding, so buf's justification does not transfer — there is no
+# byte whose meaning a reused name would corrupt. What DOES transfer, and what
+# both references actually enforce, is the weaker and the real half: **a retired
+# name stays retired.** It is not about the wire. It is about the fact that kit
+# is consumed by COPY, so a service's copy of a retired path outlives the
+# decision, and a path that comes back under the same name is read by that
+# service as "kit restored it" when in fact it is a different thing entirely.
+#
+# So this file adopts the tombstone, and says plainly that it is NOT the
+# deprecation-instead-of-removal mechanism. Two reasons that one does not port:
+# a comment in a copied YAML file is a comment in a copy — the adopter's file
+# never learns it — and kit has no registry a deprecation could live in, since
+# the artefact is fetched by ref or copied by hand. `templates/parity-allowlist`
+# already carries the deprecation half for the fleet: it says which copies have
+# diverged from kit's bytes and why, and the entry has to keep matching.
+#
+# ---------------------------------------------------------------------------
+# THE FOUR HYGIENE RULES, AND WHERE THE FOURTH ONE IS INVERTED
+#
+# 1. EVERY ENTRY NAMES A REASON.
+#    Without one, "we removed it" becomes the reason for everything, and a
+#    reason that means nothing cannot be reviewed, expired, or argued with.
+#
+# 2. EVERY ENTRY NAMES AN OWNER.
+#    A tombstone nobody owns is a tombstone that gets deleted by whoever next
+#    tidies the tree. The owner is a person or a team, not a distribution list.
+#
+# 3. EVERY ENTRY NAMES THE VERSION IT DIED IN.
+#    `retired_in` is the version at which the name was already gone, which is
+#    what makes the entry checkable: an entry retiring a name in a version
+#    LATER than VERSION is asserting a removal that has not happened yet.
+#
+#    THERE IS NO `until`, and that is the one deliberate difference from the
+#    other two allowlists. There, an entry that cannot expire has stopped being
+#    a decision and become a fact. Here that is the POINT: a tombstone does not
+#    expire. Deleting the entry is the only thing that ends it, and that is a
+#    different act — reintroducing the name — which is what the fourth rule
+#    catches.
+#
+# 4. AN ENTRY THAT MATCHES NOTHING IS A FAILURE — INVERTED.
+#    For a skip allowlist, an entry that matches nothing is a ratchet that only
+#    turns one way. For a tombstone the dead entry and the live name are the
+#    same defect with two names: **the entry says the name is gone and the name
+#    is in the tree.** So `reserved_check` fails when a reserved path EXISTS.
+#    That is the whole check, and it is the direction a reader would not
+#    guess: nothing here permits anything. The gate is red when a retired name
+#    comes back, and silent otherwise.
+#
+# THE TOTAL IS PRINTED, PROMENENTLY, ON EVERY RUN.
+#
+# Two entries, which is a good number — the honest measure of a mechanism nobody
+# has needed yet.
+#
+# ---------------------------------------------------------------------------
+# THE `kind` COLUMN
+#
+# `path` today, and it is checked: the named path must not exist in the tree.
+# An unknown kind is a FAILURE rather than a shrug, because a kind nobody
+# implements is an entry that reads as protection and provides none. Adding a
+# kind means adding its check in the same commit — the same rule the rest of
+# this repository follows for a new file type.
+
+reserved path templates/backup/ retired_in=1.0.0 reason="kit-20 built a backup distribution and then deleted it because kamal-backup is that tool; the directory is retired so it cannot come back as a second implementation of a command surface that already exists" owner=kit since=2026-10-03
+reserved path templates/bin/backup.sh retired_in=1.0.0 reason="the copied entry point of the same removed distribution; a file at this path is a service that adopted the build that was withdrawn, and the tombstone is what says the path was never empty" owner=kit since=2026-10-03

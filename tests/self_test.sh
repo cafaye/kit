@@ -521,6 +521,15 @@
 #   94. the shard key is 0-based again         -> `shard_test` goes red, naming shard n/n
 #   95. an over-provisioned shard stops being refused at the door -> red
 #
+# 96-100 are THE VERSION STRING'S OWN GATE, and each one names a single check and
+# mutates a single thing — the rule breakage 75 exists for, since a fixture that
+# can go red two ways proves the gate bites and says nothing about which half.
+#   96. a MAJOR bump with no MIGRATION.md      -> the migration the tier owes
+#   97. a MINOR bump declaring `### Breaking`   -> additive, and it breaks something
+#   98. `### Breaking` under Unreleased         -> no version covers it at all
+#   99. VERSION `1.0.0-rc1`                     -> the string cannot be placed
+#   100. a reserved path back in the tree       -> the tombstone means nothing
+#
 # Both are `expect_red_script` against `tests/shard_test.sh`, which is a proof
 # rather than a gate over a tree for the same reason `classify_test.sh` is: the
 # property is about the suite's own arithmetic, so there is nothing for a check
@@ -756,8 +765,13 @@ fresh_copy() {
   # (23b, 59) would report a red for a reason that has nothing to do with the
   # defect under test. kit-21 is what exposed this: the file did not exist at all
   # until that packet, so nothing had ever needed it here.
+  # `VERSION` and `RESERVED` are here for the same reason as `LICENSE` and
+  # `DECISIONS.md`, and their absence is the same FALSE GREEN: `stability_gate`
+  # and `reserved_check` read both by path, so a copy without them fails those
+  # checks on every breakage — and the two green-expecting proofs (23b, 59) would
+  # report a red for a reason that has nothing to do with the defect under test.
   for entry in .gitleaks.toml .github AGENTS.md README.md CHANGELOG.md LICENSE \
-    DECISIONS.md core docker lint templates tests; do
+    DECISIONS.md RESERVED VERSION core docker lint templates tests; do
     [ -e "$ROOT/$entry" ] && cp -R "$ROOT/$entry" "$dst/"
   done
   # KIT_GITLEAKS, unlike the other two, must ALSO be resolved before the first
@@ -4110,6 +4124,112 @@ edit "$base95/tests/self_test.sh" \
   'if [ "$_shard_n" -gt "$_shard_suite_max" ]; then' 'if false; then'
 expect_red_script 'breakage 95: an over-provisioned shard is no longer refused at the door' \
   "$base95" tests/shard_test.sh '' 'an over-provisioned shard count'
+
+# ---------------------------------------------------------------------------
+# THE VERSION STRING'S OWN GATE, and the four properties that make it a promise
+# rather than a paragraph. Each one names ONE check and mutates ONE thing, which
+# is the rule 75 exists for: a fixture that can go red two ways proves the gate
+# can go red and says nothing about which half fired.
+# ---------------------------------------------------------------------------
+
+# 96. A MAJOR bump that owes a MIGRATION and does not pay.
+#
+# VERSION is moved 1.0.0 -> 2.0.0 and the changelog grows a matching
+# `## 2.0.0` section that says it is breaking — so everything the tier DOES
+# require is present except the one artefact it is named after. No MIGRATIONS.md
+# exists in this repository, which is the point: a consumer who adopts kit by
+# copy cannot apply a sentence, and a MAJOR that ships without the migration is
+# exactly the "read the diff" answer this packet exists to delete.
+base96="$(fresh_copy kit-96)"
+edit "$base96/VERSION" '1.0.0' '2.0.0'
+edit "$base96/CHANGELOG.md" '## 1.0.0
+
+### Added' '## 2.0.0
+
+### Breaking
+
+- the tier is `breaking` and this says so.
+
+### Added
+
+## 1.0.0
+
+### Added'
+expect_red_check 'breakage 96: a MAJOR bump ships without the MIGRATION the tier owes' \
+  "$base96" 'stability gate' --static-only
+
+# 97. A MINOR that declares a breaking change.
+#
+# This is the rule the whole mechanism turns on, and it is the one that needs NO
+# predecessor to check: a `### Breaking` heading is legal only under a version
+# whose MAJOR actually moved. Here 1.1.0 is a MINOR and its section claims a
+# breaking change, so the promise "a MINOR takes nothing away" is falsified by
+# the repository's own changelog.
+base97="$(fresh_copy kit-97)"
+edit "$base97/VERSION" '1.0.0' '1.1.0'
+edit "$base97/CHANGELOG.md" '## 1.0.0
+
+### Added' '## 1.1.0
+
+### Breaking
+
+- a MINOR bump that says it breaks something.
+
+### Added
+
+## 1.0.0
+
+### Added'
+expect_red_check 'breakage 97: a MINOR bump declares a breaking change' \
+  "$base97" 'stability gate' --static-only
+
+# 98. A `### Breaking` heading parked under `## Unreleased`.
+#
+# The subtler half of 97, and it is a different failure: nothing has been
+# released, so there is no version to check the bump against, and a breaking
+# change covered by no version at all is a consumer reading a promise that no
+# number carries. The version file is untouched — this mutation is entirely in
+# the changelog — which is what proves the rule reads the whole history rather
+# than only the bump being proposed.
+base98="$(fresh_copy kit-98)"
+edit "$base98/CHANGELOG.md" '## Unreleased
+
+_(nothing yet' '## Unreleased
+
+### Breaking
+
+- parked here, where no version covers it.
+
+_(nothing yet'
+expect_red_check 'breakage 98: a breaking change sits under Unreleased, where no version covers it' \
+  "$base98" 'stability gate' --static-only
+
+# 99. A version string that cannot be placed.
+#
+# `1.0.0-rc1` is the interesting one, and refusing it is a decision rather than
+# a strictness reflex: a prerelease suffix makes the derived tier change meaning
+# when the suffix is dropped, so the string stops being the source of truth for
+# its own promise. The check must fail closed rather than tier it, and it must
+# fail at the DOOR — before anything is derived from a string that means two
+# things.
+base99="$(fresh_copy kit-99)"
+edit "$base99/VERSION" '1.0.0' '1.0.0-rc1'
+expect_red_check 'breakage 99: a prerelease version string is tiered instead of refused' \
+  "$base99" 'stability gate' --static-only
+
+# 100. A reserved name comes back.
+#
+# RESERVED exists for exactly one thing — a retired template path that must
+# never come back, because the services that copied it outlive the decision —
+# so the proof that it is load-bearing is that the path can be restored and the
+# gate notices. Without this the file is a note, and a note in the same dialect
+# as two allowlists reads exactly like the two allowlists' checks.
+base100="$(fresh_copy kit-100)"
+mkdir -p "$base100/templates/backup"
+printf 'the withdrawn distribution, back again under the same name\n' \
+  >"$base100/templates/backup/README.md"
+expect_red_check 'breakage 100: a reserved name is back in the tree' \
+  "$base100" 'reserved tombstones' --static-only
 
 printf '\n'
 # TWO skip kinds, counted apart, because they are two different problems and one
