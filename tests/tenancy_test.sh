@@ -91,6 +91,51 @@ ISOLATION="$ROOT/templates/database/tenancy/isolation.sql"
 MANIFEST="$ROOT/templates/database/tenancy/assertions.txt"
 ADVISOR="$ROOT/templates/database/tenancy/advisor.sql"
 
+# ONE NAME FOR THE WHOLE RUN. This was `kit-tenancy`, written out at both
+# compose sites, and a compose project name namespaces that stack's containers,
+# networks and volumes — so two concurrent runs were one stack with two owners.
+# Observed rather than argued, and the tenancy shape is the worst of the two:
+# the second run cannot bring up a cluster ("removal of container … is already in
+# progress"), and the FIRST run — already mid-assertion — then dies part way
+# through assertion 5 with psql's exit code and no FAIL line of its own, because
+# the other run's teardown took the project volume out from under it. Through
+# validate.sh's FAIL summary that reads as a database-boundary violation, which
+# is precisely the claim this tier exists to make trustworthy.
+#
+# `$$` is the convention the four other docker tiers already use, and it is unique
+# among live processes on one machine — which is the scope that has to hold, since
+# CI gives every job its own daemon. DECISIONS.md records why not `mktemp`.
+PROJECT="kit-tenancy-$$"
+
+# THE HOST PORT is a fixed name of the same class in a different hat, and it is
+# WORSE than the project name, because it collides with the developer's own running
+# stack rather than only with another test run. `KIT_POSTGRES_PORT=15531` was
+# hardcoded; deriving only the project name would still leave two concurrent runs
+# of this tier fighting over one port, and the second red on `port is already
+# allocated` — the collision not fixed, merely relocated to the next namespace.
+#
+# This suite never reaches postgres from the host: every query goes through
+# `docker exec`. The port is published only because the shipped compose file
+# publishes it, and moving it is enough to keep two runs apart.
+#
+# The probe is the dependency-free one stack_live_test.sh uses (`/dev/tcp`, not
+# `nc` or python), for the reason it gives: nothing in a tier may assume a tool is
+# installed. Seeded from `$$` and walked forward, so two concurrent runs do not
+# begin their search in the same place — the port belongs to the run using it,
+# like every other name here.
+PGPORT_BASE=$(( 15500 + ($$ % 400) ))
+PGPORT=""
+_p=0
+while [ "$_p" -lt 400 ]; do
+  _cand=$(( PGPORT_BASE + _p ))
+  if ! (exec 3<>"/dev/tcp/127.0.0.1/$_cand") 2>/dev/null; then
+    PGPORT="$_cand"
+    break
+  fi
+  _p=$(( _p + 1 ))
+done
+[ -n "$PGPORT" ] || fail "no free host port in this run's 400-port slice; the tier cannot start without colliding with something"
+
 WORK="${TMPDIR:-/tmp}/kit-tenancy.$$"
 IMAGE_TAG="17"
 # The pgvector layer pin, matching templates/compose/postgres/Dockerfile. It is
@@ -111,12 +156,19 @@ cleanup() {
   # ONLY on a fresh volume, so a leaked volume makes the next run reuse an
   # already-provisioned cluster and the suite fails on an assertion about state the
   # previous run created — which reads exactly like a broken boundary.
+  #
+  # `docker rm -f kit-tenancy-control` and `docker volume rm
+  # kit-tenancy-control-vol` were REMOVED rather than derived, which is a claim
+  # worth making loudly because it is the opposite of what this file did. Nothing
+  # here ever creates either object: every control in this suite is a SQL mutation
+  # against THIS cluster, not a second container. So those two lines were reaching
+  # outside their own namespace to delete objects belonging to a different tier —
+  # `docker rm` takes a bare name and does not care who made it. Deleting a name
+  # this run never created is a teardown that removes something it does not own.
   if [ -f "$WORK/compose/docker-compose.yml" ]; then
-    docker compose --project-name kit-tenancy -f "$WORK/compose/docker-compose.yml" \
+    docker compose --project-name "$PROJECT" -f "$WORK/compose/docker-compose.yml" \
       down -v --remove-orphans >/dev/null 2>&1 || true
   fi
-  docker rm -f kit-tenancy-control >/dev/null 2>&1 || true
-  docker volume rm kit-tenancy-control-vol >/dev/null 2>&1 || true
   rm -rf "$WORK"
 }
 trap cleanup EXIT
@@ -139,7 +191,11 @@ fi
 
 mkdir -p "$WORK"
 
-C="kit-tenancy-postgres-1"
+# Derived from `$PROJECT`, which is the whole point. Spelled out, it addressed
+# ONE cluster shared by every run of this suite, so every `psql_in` and
+# `run_script` below could be answered by whichever run won the race — a proof
+# that asserts against a cluster it did not start.
+C="$PROJECT-postgres-1"
 
 psql_in() { # psql_in <role> <db> <sql>
   docker exec -e PGPASSWORD=cafaye "$C" psql -U "$1" -d "$2" -tAX -c "$3"
@@ -191,11 +247,11 @@ fi
 
 cp "$ROOT/templates/compose/.env.example" "$WORK/compose/.env"
 {
-  echo "KIT_POSTGRES_PORT=15531"
+  echo "KIT_POSTGRES_PORT=$PGPORT"
   echo "KIT_POSTGRES_DATABASES=$ALPHA,$BETA"
 } >>"$WORK/compose/.env"
 
-if ! docker compose --project-name kit-tenancy -f "$WORK/compose/docker-compose.yml" \
+if ! docker compose --project-name "$PROJECT" -f "$WORK/compose/docker-compose.yml" \
   up -d --wait postgres >"$WORK/up.log" 2>&1; then
   say "FAIL: the shared cluster did not come up. Last lines:"
   tail -20 "$WORK/up.log" | sed 's/^/       /'
