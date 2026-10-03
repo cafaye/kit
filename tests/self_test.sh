@@ -535,6 +535,11 @@
 #        cache can be CAUGHT failing. A skip that has never been caught lying is
 #        a skip nobody should trust, and the mutation deletes the clause that
 #        turns "the fingerprint matches" into "do nothing".
+#   102. the correlated-subquery test deleted from the advisor rule -> the slow
+#        policy shape goes unreported. The rule is proved on a real cluster, and
+#        the mutation is paren-balanced on purpose: the unbalanced spelling
+#        fails the function to install and takes EVERY rule silent at once, which
+#        is a red from the wrong cause wearing this breakage's name.
 #
 # Both are `expect_red_script` against `tests/shard_test.sh`, which is a proof
 # rather than a gate over a tree for the same reason `classify_test.sh` is: the
@@ -4375,6 +4380,57 @@ if [ "$skips" -ne 0 ] || [ "$env_skips" -ne 0 ]; then
   [ "$env_skips" -eq 0 ] || echo "FAIL: self_test — $env_skips breakage(s) could not be evaluated (the gate exited without reporting a finding). An unevaluated proof is not a proof, and this one is an environment failure rather than a gate defect."
   exit 1
 fi
+# 101. The skip stops requiring the work to still be there.
+#
+# The single most expensive thing a cache can do is hand back a green for work
+# it never did, and the clause that prevents it is the cheapest one in the file:
+# the record stored the SET of paths its output globs matched, and the lookup
+# re-checks that set before answering. Delete that comparison and the cache
+# keeps working perfectly on every case it can still see -- a cold cache is still
+# a miss, a changed input is still a miss, a corrupt record is still refused --
+# and it goes wrong in exactly one case, which is the case that matters: a tree
+# whose outputs were deleted while its inputs did not change.
+#
+# So the mutation is invisible to everything else in this file, and it is caught
+# by `tests/fingerprint_test.sh` proofs 1a and 1b, which assert that a matching
+# fingerprint over a tree with no outputs is NOT a hit. The assertion is written
+# as an exit CODE rather than as a sentence so that a recipe that stopped
+# applying would go red on itself instead of passing on a mutation it no longer
+# reaches -- the defect breakage 2 and 4 already paid for once.
+base101="$(fresh_copy kit-101)"
+edit "$base101/tests/fingerprint.py" \
+  '    if now_paths != record["output_paths"]:' '    if False:  # the clause this breakage deletes'
+expect_red_check 'breakage 101: the outputs conjunct is deleted from the skip, so a cache with no work on disk still answers HIT' \
+  "$base101" 'tests/fingerprint_test.sh' --static-only
+
+
+# 102. The advisor rule that reads a policy's own correlated subquery, with the
+#     test that reads it deleted.
+#
+# The mutation replaces the `(m[2] ~ ...)` half of `qual_hit` with
+# `where (false)`. Two details make it the RIGHT mutation and not merely a red
+# one:
+#
+#   - It is PAREN-BALANCED. The tempting spelling -- prefixing the condition with
+#     `false and (` -- leaves an unclosed paren, the function fails to install,
+#     and EVERY rule goes silent at once. That is a different red from the one
+#     this breakage claims to prove, and a breakage that proves the wrong thing
+#     is worse than no breakage: it looks like coverage.
+#   - It is the `qual_hit` half only. The text ends at `as qual_hit,` so the
+#     match is unambiguous and `edit`'s single replacement cannot reach the
+#     check_hit copy. Killing both would prove less precisely.
+#
+# What it proves: the rule is load-bearing against a real cluster, and the trip
+# pair `rls_policy_correlated_membership:correlated_membership` goes red BY NAME
+# rather than the suite merely noticing that something changed.
+base102="$(fresh_copy kit-102)"
+edit "$base102/templates/database/tenancy/advisor.sql" \
+  "                      where (m[2] ~ ('(^|[^a-z0-9_\$])' || po.relname || '\\.')
+                          or m[2] ~ ('(^|[^a-z0-9_\$])' || po.nspname || '\\.' || po.relname || '\\.'))), false) as qual_hit," \
+  '                      where (false)), false) as qual_hit,'
+expect_red_check 'breakage 102: the correlated-subquery test is deleted from the advisor rule, so the slow policy shape goes unreported' \
+  "$base102" 'tests/tenancy_test.sh'
+
 # The count is COUNTED, not written down. Every breakage above calls exactly one
 # of the four red-expecting helpers, so this cannot drift from the recipes the
 # way a hardcoded "all N breakages" does — and the header's list is checked
@@ -4418,6 +4474,28 @@ if [ -n "$_shard_i" ]; then
     echo "FAIL: self_test — shard $_shard_i/$_shard_n ran ZERO of the suite's $total breakages."
     echo "       A shard that evaluates nothing agrees with a suite that evaluates nothing."
     echo "       A mis-sharded run reporting PASS is worse than no run at all."
+    exit 1
+  fi
+  # A SHARD THAT FAILED MUST NOT PRINT "EVERY ONE IT RAN HELD".
+  #
+  # This block exited 0 without reading `failures` at all, so a breakage that
+  # genuinely failed inside a sharded run printed its own FAIL line and then had
+  # the shard summarised as PASS — the sentence asserting the opposite of what
+  # the line above it said. The un-sharded path below has always checked it; the
+  # shard path was written as if counting the recipes were the same as judging
+  # them, which is the exact conflation the count-vs-declared check further down
+  # exists to prevent.
+  #
+  # It was found by running breakage 101, which had been unreachable: it sat
+  # BELOW this block, so no shard ever claimed it and the suite counted it as
+  # declared. Moving it above the summary is what exposed the missing check —
+  # one unreachable recipe hid a red exit code for every other recipe too.
+  if [ "$failures" -ne 0 ]; then
+    echo "FAIL: self_test — shard $_shard_i/$_shard_n ran $_shard_ran of $total breakages and $failures of them did NOT hold."
+    echo "       The FAIL lines above name them. This shard is RED: a proof that"
+    echo "       failed is not a proof, and 'every one it ran held' would be the"
+    echo "       one sentence here that is untrue."
+    echo "       Skipped for a missing toolchain: $skips"
     exit 1
   fi
   echo "PASS: self_test — shard $_shard_i/$_shard_n ran $_shard_ran of $total breakages and every one it ran held."
@@ -4488,25 +4566,3 @@ fi
 echo "PASS: self_test — all $total breakages hold ($counted assert red, $((total - counted - green_check)) assert a green gate with a named skip, $green_check assert a green gate with a named finding), and the unbroken tree is green."
 echo "       Every recipe above was EVALUATED — $_shard_ran ran against $declared declared ($total breakages and the unbroken-tree control), and the two are compared rather than assumed: 0 environment failures, 0 skipped for a missing toolchain."
 
-# 101. The skip stops requiring the work to still be there.
-#
-# The single most expensive thing a cache can do is hand back a green for work
-# it never did, and the clause that prevents it is the cheapest one in the file:
-# the record stored the SET of paths its output globs matched, and the lookup
-# re-checks that set before answering. Delete that comparison and the cache
-# keeps working perfectly on every case it can still see -- a cold cache is still
-# a miss, a changed input is still a miss, a corrupt record is still refused --
-# and it goes wrong in exactly one case, which is the case that matters: a tree
-# whose outputs were deleted while its inputs did not change.
-#
-# So the mutation is invisible to everything else in this file, and it is caught
-# by `tests/fingerprint_test.sh` proofs 1a and 1b, which assert that a matching
-# fingerprint over a tree with no outputs is NOT a hit. The assertion is written
-# as an exit CODE rather than as a sentence so that a recipe that stopped
-# applying would go red on itself instead of passing on a mutation it no longer
-# reaches -- the defect breakage 2 and 4 already paid for once.
-base101="$(fresh_copy kit-101)"
-edit "$base101/tests/fingerprint.py" \
-  '    if now_paths != record["output_paths"]:' '    if False:  # the clause this breakage deletes'
-expect_red_check 'breakage 101: the outputs conjunct is deleted from the skip, so a cache with no work on disk still answers HIT' \
-  "$base101" 'fingerprint_test' --static-only
