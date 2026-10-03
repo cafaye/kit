@@ -723,3 +723,68 @@ matching nothing is a ratchet that only turns one way. For a tombstone the dead
 entry and the live name are the same defect with two names: the entry says the
 name is gone and the name is in the tree. So `reserved_check` fails when a
 reserved path **exists**, and is silent otherwise. Two entries, both from kit-20.
+
+## MD28 — **the 94 copies share ONE cache directory, and the two GREEN-expecting proofs do not use it**
+
+`tests/self_test.sh` runs 94 throwaway copies of the whole tree, one per
+breakage, and each copy inherits `KIT_CACHE_DIR`. One line points it at
+`$WORK/cache` — a **sibling** of every copy, inside the directory the existing
+`trap` already sweeps — and that is the whole mechanism: a record written inside
+copy 23 is deleted with copy 23, so without this line every breakage pays full
+price for a verdict an earlier breakage already earned.
+
+**The placement is the decision.** A cache *inside* a copy dies with the copy (the
+bug). A cache in the real tree is neither shared with the copies nor swept by the
+`trap`. `$WORK/cache` is shared for exactly the lifetime of the suite and leaves
+nothing behind.
+
+**The two GREEN-expecting helpers run their copies with `KIT_FINGERPRINT=0`.**
+`expect_green_check` (breakage 59) and `expect_skip_check` (breakage 23b) assert
+that the gate **stays** green and that a named verdict is still printed. A
+replayed cache hit is a green that no check ran to produce, so under a shared
+directory those two proofs could be satisfied by a record an *earlier* copy wrote,
+on a tree the recipe had not yet mutated. That is a control that goes green for a
+reason it did not introduce — the same defect as a control that goes red for one,
+and the one AGENTS.md refuses in both directions. Two tokens on one line each;
+the 92 red-expecting helpers deliberately keep the cache, because for them a
+stale green is a **loud** failure ("the gate went red, but NOT via `<check>`"),
+never a silent one.
+
+**What this does NOT decide, and what it costs.** No check is wired by this
+commit, so the line changes no verdict until a declaration is traced input by
+input — a green light with nothing connected to it is not a saving. The cost of
+the choice is that the two uncached proofs pay their full gate forever; measured
+at one recipe each, that is the right side of the trade.
+
+## MD29 — **a rollout is sized against a MEASUREMENT, and a measurement the last packet made stale is not a measurement**
+
+`REPORT-kit-fingerprint-01.md` §5 handed the successor a rollout "as a list of
+declarations", and the brief behind it sized the prize at *"94 throwaway COPIES
+of the whole static phase, one per breakage"*.
+
+**Counted on this tree, that is nine copies, not ninety-four.** 103 recipes:
+86 `expect_red_check` (each runs `validate.sh --only=<ONE check>`), 8
+`expect_red_script` (the script alone, no gate at all), 6 `expect_red_lang`,
+1 `expect_red`, and the 2 green-expecting controls. `PROFILE-gate.md` had
+already found this in its §4 and its own header says its table should be
+re-derived — `kit-gate-speed-02` then converted 73 recipes to `expect_red_check`
+and **took the whole static phase out of three quarters of the suite**. The
+premise outlived the change that falsified it.
+
+**The measurement it needed is `PROFILE-child-gate.md`**, because a child gate's
+rows are attributed by breakage and the outer profile cannot see them. Measured,
+one whole-gate copy: the **top seven checks are 69.3 s of 103.2 s (67%)**, and a
+gate that runs **zero** checks still takes **11.07 s**.
+
+**What the choice costs, stated plainly.** Sizing the rollout against the stale
+premise overstates the prize by roughly 2×, and it misdirects the ORDER as well as
+the total: 96 of 118 checks are under 0.1 s and worth ~4 s together, so
+"cheapest-value first" spends a whole declaration budget on a tenth of a copy.
+A successor that reads the brief and not the profile will write thirty correct
+declarations for eleven seconds and call it a rollout.
+
+**The rule.** `DECISIONS.md` (MD21) already holds the line that kit's numbers are
+measured rather than argued. This is the same rule one packet downstream: a
+number that a later commit made false is a **stale premise**, not a conservative
+estimate, and the cost of carrying it is paid in declarations nobody needed to
+write.

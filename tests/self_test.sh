@@ -569,6 +569,38 @@ export KIT_PYTHON="$PY"
 WORK="$(mktemp -d "${TMPDIR:-/tmp}/kit-self-test.XXXXXX")"
 trap 'rm -rf "$WORK"' EXIT
 
+# ONE CACHE DIRECTORY FOR ALL THE COPIES. One line, and it is the precondition
+# for the whole rollout: `tests/validate.sh` keeps its fingerprint records in
+# `$KIT_CACHE_DIR` if set and in `.kit/cache/gate` under the tree otherwise, and
+# every copy here is a throwaway tree that is deleted with the breakage that made
+# it. A record written inside copy 23 therefore dies with copy 23, so copy 57 —
+# which mutated a file copy 23 never touched — pays full price for a verdict
+# copy 23 already earned.
+#
+# `$WORK/cache` is a SIBLING of every copy (`$WORK/<name>/kit`), not a child of
+# one, and that is the whole placement decision: a cache inside a copy is deleted
+# with the copy, and a cache in the real tree is neither shared with the copies
+# nor thrown away by the trap. `$WORK` is created once and swept by the `trap`, so
+# the directory is shared for exactly the lifetime of this suite and leaves
+# nothing behind.
+#
+# WHAT IT DOES AND DOES NOT CHANGE. It makes a skip POSSIBLE; it does not make
+# one happen. No check is wired to the cache in this commit, so with the tree as
+# it stands this line changes no verdict at all — it is the switch, and the
+# declarations are what connect it. `KIT_FINGERPRINT=0` still disables the skip
+# outright, and a caller's own `KIT_CACHE_DIR` is respected rather than
+# overwritten, because a developer pointing the suite at a warm directory is
+# asking a question this line has no business answering.
+#
+# THE ONE HAZARD, and it is proof 7a rather than a guess. A shared cache across
+# the copies is sound only because every breakage changes some file's CONTENT and
+# therefore some wired check's fingerprint — which holds only if the mutation
+# lands on a file that check's DECLARATION names. Omit one input and a cache hit
+# is a green for work nobody did. So a check is wired here only with a
+# declaration traced input by input, and the two helpers below run their copies
+# with `KIT_FINGERPRINT=0` for the same reason.
+export KIT_CACHE_DIR="${KIT_CACHE_DIR:-$WORK/cache}"
+
 failures=0
 skips=0
 # Distinct from `skips`, and the reason is in `expect_red_check`: a missing
@@ -1217,7 +1249,22 @@ expect_green_check() {
   # the verdict being asserted is a `report` — a decoration on the command line
   # that proves nothing about the thing the recipe is about, which is the
   # weakened gate this file exists to refuse.
-  out=$(cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" 2>&1) || ec=$?
+  #
+  # `KIT_FINGERPRINT=0` is the OTHER HALF of the shared cache directory set at the
+  # top of this file, and it is the half that protects this helper specifically.
+  # This proof asserts that the gate STAYS GREEN and names what it said — and a
+  # cache hit is a green that no check ran to produce. With one cache shared
+  # across the copies, the verdict this recipe exists to establish ("an
+  # UNADOPTED service copies the stack: green, and the debt is still named")
+  # could be satisfied by a record an EARLIER copy wrote, on a tree this recipe
+  # had not yet mutated. That is a control that goes green for a reason it did
+  # not introduce — the same shape as a control that goes red for one, and
+  # AGENTS.md is explicit that both are the defect. Two tokens, one recipe's
+  # worth of cache, and it is the difference between this recipe running the gate
+  # and reading its verdict, and this recipe reading a verdict off disk.
+  # `expect_skip_check` is the only other helper that asserts GREEN, and it
+  # carries the same two tokens for the same reason.
+  out=$(cd "$dir" && KIT_PYTHON="$PY" KIT_FINGERPRINT=0 bash tests/validate.sh "$@" 2>&1) || ec=$?
   if [ "$ec" -ne 0 ]; then
     printf 'FAIL self_test: %s — the gate went RED (exit %s), so the ceiling is not in force\n' \
       "$label" "$ec"
@@ -1421,7 +1468,13 @@ expect_skip_check() {
   # the correct trade here: it costs ~35 s on one recipe out of 94, and the
   # alternative is a filter whose correctness depends on a string that is not the
   # label.
-  out=$(cd "$dir" && KIT_PYTHON="$PY" bash tests/validate.sh "$@" 2>&1) || ec=$?
+  #
+  # `KIT_FINGERPRINT=0`, for the reason `expect_green_check` above spells out: this
+  # is a green-expecting proof, and a replayed cache hit is a green no check ran
+  # to produce. The interpreter floor is what is under test here, so a skip
+  # answered off disk would be exactly the silent pass this recipe exists to
+  # distinguish from a named one.
+  out=$(cd "$dir" && KIT_PYTHON="$PY" KIT_FINGERPRINT=0 bash tests/validate.sh "$@" 2>&1) || ec=$?
   if [ "$ec" -ne 0 ]; then
     printf 'FAIL self_test: %s — the gate exited %s, so the skip was not clean\n' "$label" "$ec"
     printf '%s\n' "$out" | grep '^FAIL' | sed 's/^/       /'

@@ -66,6 +66,15 @@ without a copy (see kit-12 below).
   does not move with machine load), and the boundary case still resolves once.
   SKIP(3) without docker, naming what is missing. **Not yet wired into
   `validate.sh`** — it needs a home in the observability phase, sequentially.
+- **The self-test's 94 copies share ONE cache directory.** `tests/self_test.sh`
+  points `KIT_CACHE_DIR` at `$WORK/cache`, a sibling of every copy inside the
+  directory the existing `trap` already sweeps, so a verdict one breakage earned
+  is available to the next instead of being deleted with the copy that earned it.
+  The two GREEN-expecting proofs (`expect_green_check`, `expect_skip_check`) run
+  their copies with `KIT_FINGERPRINT=0`, because a replayed cache hit is a green
+  no check ran to produce. **No check is wired by this change**, so it moves no
+  number yet: the switch is on and the declarations are what connect it. See
+  `DECISIONS.md` (MD28).
 - **The provenance stamp (P3-18 + the reader half of P3-19).** A pulled
   `:e2e` image could not say which commit was in it — a tag is a mutable name,
   and every e2e tier now pulls one. `docker/provenance.sh` stamps five fields
