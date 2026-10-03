@@ -515,6 +515,18 @@
 #   alphabet that quietly grows a second case, a limit raised until it never
 #   fires. One mutant per language proves the suite bites; it does not prove the
 #   suite is complete, and nothing here should be read as claiming that is.
+#
+# 94 and 95 are the only two that break THIS FILE rather than the gate, and they
+# are here because the harness is the one component no other recipe can reach.
+#   94. the shard key is 0-based again         -> `shard_test` goes red, naming shard n/n
+#   95. an over-provisioned shard stops being refused at the door -> red
+#
+# Both are `expect_red_script` against `tests/shard_test.sh`, which is a proof
+# rather than a gate over a tree for the same reason `classify_test.sh` is: the
+# property is about the suite's own arithmetic, so there is nothing for a check
+# over the tree to look at. The mutation is the defect that shipped — a 0-based
+# residue compared against a 1-based shard index — and it is why a four-shard merge
+# gate once reported all four green with the fourth having verified nothing.
 
 set -euo pipefail
 
@@ -589,10 +601,10 @@ copy_name=""
 # and independent. That is the single reason this file was described as taking
 # "hours", and it was never the assertions -- it is 76 sequential subprocesses.
 #
-# WHAT THIS IS. `KIT_SELF_TEST_SHARD=i/n` runs only the breakages where
-# `i % n == index`. Every other breakage's helper becomes a no-op that returns 0
-# WITHOUT running the gate, and the summary says so rather than silently
-# reporting a fraction of the suite as if it were all of it.
+# WHAT THIS IS. `KIT_SELF_TEST_SHARD=i/n` runs only the breakages whose NUMBER
+# is congruent to i modulo n, over the range 1..n. Every other breakage's helper
+# becomes a no-op that returns 0 WITHOUT running the gate, and the summary says so
+# rather than silently reporting a fraction of the suite as if it were all of it.
 #
 # WHAT THIS IS NOT. It does not weaken any assertion. A sharded run asserts
 # exactly the assertions it would have run unsharded, on the same copies, with
@@ -604,13 +616,68 @@ copy_name=""
 # summary line says which shard it was, and the count it prints is the count it
 # actually ran. A suite that quietly reported 1/8th of itself as a pass is the
 # exact failure this file exists to prevent, and it applies to the harness too.
+# THE SENTENCE ABOVE WAS WRONG IN A WAY THAT PRODUCED A FALSE GREEN, and the
+# arithmetic is the whole defect: it said `i % n == index` while the code asked
+# `num % n == i`. `num % n` lands in 0..n-1 and a caller passes i in 1..n, so the
+# residue class n is one nobody asks for -- shard n/n matched NOTHING, ever. Four
+# shards run as a merge gate with 1/4, 2/4, 3/4, 4/4 covered three quarters of the
+# suite and the fourth verified nothing and said PASS. The `ran ZERO of the
+# suite's N breakages` guard below is what made it loud instead of silent, and it
+# was added after the fact: it reports the consequence, not the cause.
+#
+# So `i` is 1-BASED ON BOTH SIDES and the range is CLOSED at both ends. Shard
+# n/n is the LAST shard, not a sentinel past the end; `tests/shard_test.sh` proves
+# the partition property against the real function on every run of the gate, and
+# breakages 94 and 95 are the two ways this comes back.
+#
+# THE SUITE'S HIGHEST BREAKAGE NUMBER, counted here once, for the
+# over-provisioning refusal. Not the suite's SIZE: the labels are sparse (they run
+# 1..93 with lettered siblings and gaps where packets were renumbered), so `n`
+# shards are all non-empty whenever n is at most the highest NUMBER, and
+# over-provisioning is `n` above that number rather than above the count. Sizing
+# the refusal on the count is what made the first version of this refuse
+# correctly by accident and then let `n = 97` through with nine empty shards.
 _shard_i="${KIT_SELF_TEST_SHARD:-}"
 _shard_n=""
+_shard_suite_max=0
 if [ -n "$_shard_i" ]; then
   _shard_n="${_shard_i#*/}"
   _shard_i="${_shard_i%%/*}"
   if ! printf '%s\n' "$_shard_n" | grep -qE '^[1-9][0-9]*$'; then
     printf 'self_test: KIT_SELF_TEST_SHARD must look like i/n with n >= 1, got %s\n' "$KIT_SELF_TEST_SHARD" >&2
+    exit 2
+  fi
+  if ! printf '%s\n' "$_shard_i" | grep -qE '^[0-9]+$'; then
+    printf 'self_test: KIT_SELF_TEST_SHARD must look like i/n with i a whole number, got %s\n' "$KIT_SELF_TEST_SHARD" >&2
+    exit 2
+  fi
+  # i IS 1..n AND NOTHING ELSE. Zero is refused rather than treated as the
+  # unnumbered-label shard it used to be: `0/23` asked for a residue class that
+  # exists and is empty of controls in most shapes, so it answered "ran 4 of 97"
+  # and read like a shard. A refused shard is a loud misconfiguration; a shard that
+  # quietly covers a different set than the caller asked for is the false green.
+  if [ "$_shard_i" -lt 1 ] || [ "$_shard_i" -gt "$_shard_n" ]; then
+    printf 'self_test: shard i must be 1..n (1-based, both ends), got i=%s n=%s\n' "$_shard_i" "$_shard_n" >&2
+    exit 2
+  fi
+  # OVER-PROVISIONING IS REFUSED, BEFORE ANY RECIPE RUNS. n above the suite's
+  # highest number means some shard MUST be empty, and an empty shard is
+  # indistinguishable from one the arithmetic emptied by mistake -- which is
+  # precisely the ambiguity that made 4/4 a false green. So the one case where
+  # "ran zero" is the honest answer is refused at the door with both numbers,
+  # rather than discovered at the end of a run that verified nothing.
+  #
+  # `tail -1` rather than `head -1`, so nothing downstream closes the pipe and
+  # promotes a SIGPIPE into a wrong answer -- the rule this suite keeps having to
+  # relearn.
+  _shard_suite_max=$(grep -oE '^ *expect_(red|green)(_check|_lang|_script)? +.breakage +[0-9]+[a-z]*:|^ *expect_skip_check +.breakage +[0-9]+[a-z]*:' "$0" |
+    sed -E 's/.*breakage ([0-9]+)[a-z]*:.*/\1/' | sort -n | tail -1)
+  _shard_suite_max="${_shard_suite_max:-0}"
+  if [ "$_shard_n" -gt "$_shard_suite_max" ]; then
+    printf 'self_test: %s shards cannot partition a suite numbered up to %s.\n' "$_shard_n" "$_shard_suite_max" >&2
+    printf '       Some shard would run nothing, and an empty shard is\n' >&2
+    printf '       indistinguishable from one the arithmetic emptied by mistake.\n' >&2
+    printf '       Run 1..%s.\n' "$_shard_suite_max" >&2
     exit 2
   fi
 fi
@@ -627,14 +694,21 @@ _shard_claims() {
   num=$(printf '%s' "$label" | sed -n 's/.*breakage \([0-9][0-9]*[a-z]*\):.*/\1/p')
   if [ -z "$num" ]; then
     # A label with no number in it is not a numbered breakage; it cannot be
-    # assigned to a shard, so it runs on shard 0/n only -- which is where the
-    # unsharded run puts it, and where a green control belongs so that shard is
-    # never the one that is quietly empty.
-    [ "$_shard_i" = "0" ] && return 0
+    # assigned to a shard by congruence, so it runs on shard 1/n only. That is
+    # where the unsharded run puts it, and shard 1 is the one shard that is never
+    # empty while n <= the suite's size -- so the green controls are exercised by
+    # every four-way gate rather than only by a run that asked for all of them.
+    # It WAS shard 0/n, which is not a shard at all; see the refusal above.
+    [ "$_shard_i" = "1" ] && return 0
     return 1
   fi
   num="${num%%[a-z]}"
-  idx=$(( num % _shard_n ))
+  # 1-BASED ON BOTH SIDES, and this one line is the defect the packet is about.
+  # `(num - 1) % n + 1` lands in 1..n, so every shard in 1..n is asked for a
+  # residue class that exists and the n shards partition 1..N exactly once.
+  # `num % n` lands in 0..n-1 and the caller passes 1..n, which is why shard n/n
+  # asked for a class nobody is in and matched nothing.
+  idx=$(( (num - 1) % _shard_n + 1 ))
   [ "$idx" -eq "$_shard_i" ]
 }
 
@@ -4002,6 +4076,40 @@ printf -- '---\nname: image\non:\n  workflow_call:\njobs:\n  build:\n    runs-on
 rm "$base79/.github/workflows/image.reusable.yml"
 expect_red_check 'breakage 79: a callable workflow ships at a path kit does not declare, so nothing polls it' \
   "$base79" "$CALLABLE" --static-only
+
+# 94 and 95. THE HARNESS'S OWN SHARDING, in the two directions it can be wrong.
+#
+# Neither is reachable by an `expect_red_check`, and that is the whole reason they
+# exist: every other recipe in this file proves that the GATE goes red, and the
+# gate is not what shards. What went wrong was arithmetic in this file — a 0-based
+# residue compared against a 1-based shard index — so shard `n/n` asked for a
+# class nobody is in, ran nothing, and reported PASS. Four shards as a merge gate
+# covered three quarters of the suite and said all four were green. A recipe that
+# mutated a check could not have found it; there was no check.
+#
+# `tests/shard_test.sh` is the check, and it evaluates the real `_shard_claims`
+# out of this file rather than restating it — a second copy of the modulo would be
+# a second thing to be wrong, which is the shape of defect this pair is about.
+#
+# 94 is the defect itself, in one line. 95 is the half that is easy to delete by
+# accident: the refusal that makes an OVER-PROVISIONED shard loud. It is a
+# separate recipe because a check proved able to catch the arithmetic and unable
+# to notice that the safety net was gone would still have shipped a shard that
+# silently verified nothing.
+base94="$(fresh_copy kit-94)"
+edit "$base94/tests/self_test.sh" \
+  'idx=$(( (num - 1) % _shard_n + 1 ))' 'idx=$(( num % _shard_n ))'
+# The needle is the sentence that names shard n/n, not the word FAIL: this check
+# reports the empty shards it found, and a recipe that asserted only "went red"
+# would pass on a mutation that emptied a DIFFERENT shard.
+expect_red_script 'breakage 94: the shard key is 0-based again, so shard n/n verifies nothing' \
+  "$base94" tests/shard_test.sh '' 'THE SHIPPED DEFECT'
+
+base95="$(fresh_copy kit-95)"
+edit "$base95/tests/self_test.sh" \
+  'if [ "$_shard_n" -gt "$_shard_suite_max" ]; then' 'if false; then'
+expect_red_script 'breakage 95: an over-provisioned shard is no longer refused at the door' \
+  "$base95" tests/shard_test.sh '' 'an over-provisioned shard count'
 
 printf '\n'
 # TWO skip kinds, counted apart, because they are two different problems and one

@@ -8495,6 +8495,11 @@ for path in (
     # adding the path back to satisfy a stale README is the one edit that would
     # make this whole list worthless.
     "tests/canary_test.sh",
+    # The harness's own sharding. The README describes `KIT_SELF_TEST_SHARD=i/n`
+    # as a way to split the suite, and the way that description was WRONG is the
+    # reason this path is listed rather than left implicit: shard n/n verified
+    # nothing and reported green.
+    "tests/shard_test.sh",
     "tests/no_telemetry_in_readiness.sh",
     # The two files the staleness templates half is made of. Both are the kind
     # of thing a reader would never know to look for: the reporter is
@@ -10519,6 +10524,22 @@ fi
 kit_phase "40 classifier + staleness + fetch + tenancy, executed"
 check 'tests/classify_test.sh  (19 cases, incl. the fail-closed property)' \
   bash "$ROOT/tests/classify_test.sh"
+
+# THE HARNESS'S OWN SHARDING, and it is here rather than in a comment because the
+# property is about the arithmetic in tests/self_test.sh and nothing else in the
+# gate can see it. `self_test` runs its recipes in shards when asked to, and it
+# shipped computing a 0-based residue against a 1-based shard index -- so shard
+# n/n matched nothing, ran nothing, and reported PASS. Four shards as a merge gate
+# covered three quarters of the suite and said all four were green.
+#
+# `tests/shard_test.sh` evaluates the real `_shard_claims` out of self_test.sh
+# rather than restating it, so this cannot pass while the function it proves has
+# drifted; a second copy of the modulo would be a second thing to be wrong.
+#
+# Bounded, like the other executed proofs, because it forks once per shard index
+# and the largest safe n (62) is 62 of them. Measured ~23s.
+bounded_check 'tests/shard_test.sh  (the n shards partition the suite, shard n/n included)' \
+  300 bash "$ROOT/tests/shard_test.sh"
 
 # The fetch is a claim about a REAL SUBPROCESS talking to a REAL REMOTE, and it is
 # the only proof that `bin/dev` can obtain the stack it runs at all. A check that
