@@ -822,6 +822,57 @@ alter table kit_advisor_fixture.bare_call enable row level security;
 create policy fixture_bare on kit_advisor_fixture.bare_call for select to public
   using (account_id = cafaye.current_account_id());
 
+-- (7b) rls_policy_correlated_membership. The subquery inside the IN references
+-- this table's own row, so the membership lookup runs once per candidate row
+-- rather than once per statement. `tests/rls_perf_test.sh` MEASURES the cost of
+-- exactly this shape (2000 ms against 18 ms for the inverted one), so this fixture
+-- is not a shape somebody imagines: it is the one the number came from.
+create table kit_advisor_fixture.correlated_membership (
+  id int primary key, account_id uuid not null, member_of_account uuid not null);
+alter table kit_advisor_fixture.correlated_membership enable row level security;
+alter table kit_advisor_fixture.correlated_membership force row level security;
+create table kit_advisor_fixture.membership (
+  account_id uuid not null, member_of_account uuid not null);
+create policy fixture_correlated on kit_advisor_fixture.correlated_membership
+  for select to public
+  using ((select cafaye.current_account_id()) in
+         (select m.account_id from kit_advisor_fixture.membership m
+           where m.member_of_account = correlated_membership.member_of_account));
+
+-- THE CONTROL, and it is the half that makes the rule trustworthy. The same
+-- membership table, the same IN, and NO reference to the policy's own table
+-- inside the subquery: the direction is inverted, so the lookup is evaluated once.
+-- A rule that fired here would fire on the shape `tests/rls_perf_test.sh` measures
+-- at 18 ms, which is the same thing as being a rule nobody reads.
+create table kit_advisor_fixture.inverted_membership (
+  id int primary key, account_id uuid not null, member_of_account uuid not null);
+alter table kit_advisor_fixture.inverted_membership enable row level security;
+alter table kit_advisor_fixture.inverted_membership force row level security;
+create policy fixture_inverted on kit_advisor_fixture.inverted_membership
+  for select to public
+  using (inverted_membership.member_of_account in
+         (select m.member_of_account from kit_advisor_fixture.membership m
+           where m.account_id = (select cafaye.current_account_id())));
+
+-- THE OTHER NEGATIVE, and the reason the rule does not fire on correlation in
+-- general. An EXISTS whose OUTER hop is correlated and cannot be inverted — this
+-- table carries no membership column of its own — measured at 56 ms against the
+-- correlated IN's 2000 ms, because with the inner hop inverted the planner
+-- re-associates it into a semi-join. The boundary is per HOP.
+create table kit_advisor_fixture.linked_only (
+  id int primary key, account_id uuid not null);
+alter table kit_advisor_fixture.linked_only enable row level security;
+alter table kit_advisor_fixture.linked_only force row level security;
+create table kit_advisor_fixture.linked_membership (
+  linked_id int not null, member_of_account uuid not null);
+create policy fixture_linked on kit_advisor_fixture.linked_only
+  for select to public
+  using (exists (select 1 from kit_advisor_fixture.linked_membership l
+                  where l.linked_id = linked_only.id
+                    and l.member_of_account in
+                        (select m.member_of_account from kit_advisor_fixture.membership m
+                          where m.account_id = (select cafaye.current_account_id()))));
+
 -- (8) rls_enabled_no_policy: RLS on, no policy, every row hidden. INFO and not a
 -- breach — a fail-closed outage is still an outage, and the catalog is where it
 -- shows up first.
@@ -1023,6 +1074,7 @@ for pair in \
   'multiple_permissive_policies:always_true' \
   'login_role_security_definer_executable:escalate' \
   'auth_rls_initplan:bare_call' \
+  'rls_policy_correlated_membership:correlated_membership' \
   'rls_enabled_no_policy:silent' \
   'security_definer_view:definer_view' \
   'security_definer_view:nested_definer_view'; do
@@ -1039,7 +1091,7 @@ for pair in \
     fail "an advisor rule cannot fire"
   fi
 done
-say "   9 rules, 10 fixtures, every rule naming itself and the object it fired on."
+say "   10 rules, 11 fixtures, every rule naming itself and the object it fired on."
 say "   scoped to kit_advisor_fixture alone, so each one is proven specific and not"
 say "   satisfied by whichever other rule happened to return a row."
 
@@ -1232,6 +1284,6 @@ say "      an adopter's fixture schema present: 0 of 2 of its tables named."
 say "      an unprotected table in the substrate's own schema: named, proof red."
 say "      the database's own advisor on the substrate's own two tables: 0 ERROR, 0 WARN."
 say "      a hand-written permissive policy on api_keys: the exemption released it."
-say "      all 9 rules, each fired on a fixture built to trip it, each naming its object."
+say "      all 10 rules, each fired on a fixture built to trip it, each naming its object."
 say "      security_definer_view's 6 negatives: silent, for 6 different reasons."
 say "      the credential audit, read as three roles: one answer, and not an empty one."
