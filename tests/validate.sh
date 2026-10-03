@@ -11603,6 +11603,41 @@ scripts = sorted(
 # the line misses them.
 BRING_UP = re.compile(r"\bdocker\s+(?:compose\b.*\bup\b|run\b)")
 
+# …OR BRINGS ONE UP THROUGH A LOCAL WRAPPER, and that second arm is not an
+# optimisation. The first version of this rule was BRING_UP alone and it was
+# green on a tree carrying the exact defect the check exists to catch:
+#
+#     tests/canary_test.sh:82  compose() { docker compose -p "$PROJECT" -f "$WORK/compose.yml" "$@"; }
+#     tests/canary_test.sh:419 if compose up -d --wait --wait-timeout 120 sender …; then
+#
+# No single LOGICAL LINE contains both halves. `docker compose` is in the
+# wrapper's body; `up` arrives at the call site through `"$@"`. So the file was
+# dropped from `tiers` before any of the four rules ran, and nothing in the
+# output said so — not even the emptiness finding, which counts tiers and so
+# cannot see a tier that was never counted. Measured with the mutation asserted
+# BY TEXT: `PROJECT="kit-canary-$$"` → `PROJECT="kit-canary"`, guard exit 0,
+# zero findings. reports/wrapper-tier-scope/mutations.sh is the recipe; it
+# extracts this guard's own source out of validate.sh on every run, so it cannot
+# outlive it.
+#
+# THE DEFINITION, not the call sites, and that is not a matter of taste. A
+# call-site pattern has to know every spelling a pass-through can take
+# (`compose up`, `"$COMPOSE" up`, `dc -f x up`, a wrapper three files away), and
+# the sixth such idiom in a tree it has never seen is another blind spot. The
+# DEFINITION has exactly one shape — a function whose body invokes
+# `docker compose` — and it is on the same line as the `docker compose` it is
+# hiding. `stack_live_test.sh` is covered by the same arm for the same reason:
+# its `tempo_port() { docker compose -p "$PROJECT" port tempo 3200 …; }` is a
+# wrapper too.
+#
+# `[^{}]*` rather than `.*` so the body cannot run past this function's closing
+# brace and borrow the next one's `docker`. A wrapper pattern that swallows the
+# rest of the file is a pattern that matches more than it means to, and the tier
+# it invents is then a tier the four rules will report emptiness findings about.
+WRAPPER = re.compile(
+    r"^\s*(?:function\s+)?[A-Za-z_][A-Za-z0-9_]*\s*\(\s*\)\s*\{[^{}]*\bdocker\s+compose\b"
+)
+
 # A line whose first non-blank character is `#` is a comment. Everything read
 # here is CODE: these files explain the rule at length, and a check that fires on
 # a comment explaining why a literal is wrong is a check that fires on its own
@@ -11632,6 +11667,101 @@ def code_lines(path):
 # own examples, and a check that fires on the sentence explaining the rule is a
 # check that fires on its own documentation.
 DOCKER_USE = re.compile(r"\bdocker\s+(?:compose|run|rm|volume|network)\b")
+
+# WHAT A SCRIPT *TOUCHES*, which is a WIDER question than what it brings up, and
+# it has to be wider or the emptiness finding below is dead code — a rule whose
+# predicate is the tier predicate cannot fire, and a rule that cannot fire is the
+# defect this whole packet chain exists to kill wearing a new hat.
+#
+# The five subcommands DOCKER_USE leaves out are `build`, `image`, `rmi`, `create`
+# and `tag`, and every one of them takes a name in a namespace that is shared by
+# every concurrent run on the machine. They are here because `tests/
+# provenance_test.sh` builds `-t kit-provenance-test:good` and tears it down with
+# `docker rmi -f`, and before this rule nothing named that file at all.
+#
+# `cp` is in the list for the same reason and is the one that costs nothing: it
+# names nothing, but a script that reads out of a container is a script whose
+# result depends on which run created it.
+TOUCHES_DOCKER = re.compile(
+    r"\bdocker\s+(?:compose|run|rm|volume|network|build|image|rmi|create|tag|cp)\b"
+)
+
+# `docker build -t NAME` / `--tag NAME` names an IMAGE, which is a fifth shared
+# namespace and not a sixth spelling of the first four: `docker rmi -f NAME` takes
+# a bare name, will delete an image another run is still building against, and
+# leaves that run's next assertion failing on a missing image rather than on
+# anything it did.
+#
+# SCOPED TO `docker build` ON PURPOSE. `-t` is also `--tty` to `docker run` and
+# `docker exec`, where the value is `true`/`false` and there is no image at all —
+# `tests/tenancy_test.sh:211` carries `psql -A -t -F'@'` on a line that also runs
+# `docker exec`. A flag taken across every docker subcommand would read that as a
+# literal image name, and a check that fires on correct code teaches a reader to
+# ignore it.
+IMAGE_TAG = re.compile(r"\bdocker\s+build\b[^\n]*?(?:\s-t\s+|\s--tag[=\s]+)(\S+)")
+
+# A COMMAND INSIDE A STRING IS NOT A COMMAND, and this rule is the only one here
+# whose pattern can match a whole one.
+#
+# `tests/deploy_test.sh:456` is `note "  docker build -t cafaye-kit16/courier:35c6a27
+# /path/to/courier"` — an example printed to a reader who has no image to hand. It
+# is not a comment, so `code_lines` keeps it, and IMAGE_TAG matched the whole
+# command inside the string and reported a hardcoded image tag that does not exist
+# anywhere. A check that fires on correct code teaches a reader to ignore it, which
+# is this repository's own recorded rule about `Naming/PredicateName` and about
+# keyword scans over comments, and it is the mistake `self_test_live_tier`
+# documents making and then backing out of.
+#
+# SCOPED TO THIS RULE RATHER THAN APPLIED TO EVERY LOGICAL LINE, and the reason is
+# a measurement rather than a preference: DOCKER_USE is a SEARCH whose result feeds
+# the `examined` emptiness finding, so destringing the lines it reads would change
+# how many use sites a tier appears to have, and that count is itself a check.
+# `docker` ITSELF has to lie outside the quoted run — not the command's arguments.
+# Blanking the quoted runs first, which was the first attempt, breaks the two lines
+# that matter most: `docker build --tag "$IMAGE_BAD"` becomes `docker build --tag
+#    ` and the pattern captures the NEXT flag as the image name (`-f`), and a
+# `\` continuation swallowed whole reports `-t` with the value `\` on its back. Both
+# are findings with a name in them, so both read as real defects and neither is.
+# The mask below answers the question the comment actually asks, and the captured
+# value is then taken from the UNTOUCHED body, where it is still `"$IMAGE_BAD"`.
+QUOTED = re.compile(r'"(?:\\.|[^"\\])*"|\'[^\']*\'')
+
+def outside_quotes(body):
+    """One character per character of `body`: '0' inside a quoted run, '1' outside."""
+    mask = ["1"] * len(body)
+    for m in QUOTED.finditer(body):
+        for i in range(m.start(), m.end()):
+            mask[i] = "0"
+    return "".join(mask)
+
+
+def command_positions(pattern, body):
+    """Every match of `pattern` in `body` whose first character is not inside a
+    quoted run. Yielded as the match objects so the caller still reads the value
+    out of the original body."""
+    mask = outside_quotes(body)
+    return [m for m in pattern.finditer(body) if mask[m.start()] == "1"]
+
+# (1c) A SCRIPT THAT NAMES A SHARED NAMESPACE IS A TIER EVEN IF IT STARTS
+# NOTHING.
+#
+# `tests/provenance_test.sh` builds `-t kit-provenance-test:good`, reads labels
+# back out of it, and tears it down with `docker rmi -f kit-provenance-test:good
+# kit-provenance-test:plain`. It never runs a container, so neither of the two
+# arms above sees it — and it is exactly the defect this check exists to catch, in
+# a namespace (the local image store) that `docker rmi -f` reaches by bare name
+# and that no `-p` has any say over. Two concurrent runs build over each other and
+# one run's teardown removes the image the other is still asserting against.
+#
+# This arm is why the tier set is a TIER SET and not a bring-up list. It also keeps
+# the emptiness finding below non-vacuous: `TAKES_A_SHARED_NAME` is a subset of
+# `TOUCHES_DOCKER`, so a script that runs docker without naming anything — `docker
+# ps`, `docker info` — is still outside the tier set and still has to be named by
+# the finding rather than silently dropped.
+TAKES_A_SHARED_NAME = re.compile(
+    r"\bdocker\s+(?:compose|run|volume|network|build|image|rmi|tag)\b[^\n]*?"
+    r"(?:\s(?:" + r"--project-name|--name|-p|-t|--tag|-v)[=\s])"
+)
 
 # The namespace-taking flags. `-p` and `--project-name` name a project, `--name`
 # names a container. `-v` is NOT here and the distinction is load-bearing: `docker
@@ -11693,6 +11823,10 @@ def is_derived(word):
 
 problems = []
 tiers = []
+# Scripts that invoke docker and were not counted as a tier. Collected rather
+# than decided inline, because the finding that names them is about the tier SET
+# and is raised below the loop with the whole set in hand.
+uncovered = []
 
 for name in scripts:
     path = os.path.join(tests_dir, name)
@@ -11708,7 +11842,12 @@ for name in scripts:
     # excluded that way while a literal sat in it, and the mutation suite is what
     # said so.
     logical = logical_lines(pairs)
-    if not any(BRING_UP.search(body) for _, body in logical):
+    if not any(
+        BRING_UP.search(b) or WRAPPER.search(b) or command_positions(TAKES_A_SHARED_NAME, b)
+        for _, b in logical
+    ):
+        if any(TOUCHES_DOCKER.search(b) for _, b in logical):
+            uncovered.append(name)
         continue
     tiers.append(name)
 
@@ -11716,6 +11855,28 @@ for name in scripts:
     # to names that LOOK like namespaces — they carry a `kit-` prefix, or a name
     # ending in -control — so the rule does not trip over `failures=0` and the
     # other ordinary counters these files are full of.
+    #
+    # AND ONLY THE ONES DOCKER ACTUALLY READS, which is a narrowing this packet
+    # forced rather than chose. Widening the tier set to wrapper tiers put
+    # `tests/stack_live_test.sh` in scope for the first time, and it immediately
+    # reported `KIT_POSTGRES_DATABASES="kit_probe"` as a literal namespace — a
+    # database name created INSIDE the stack this same file brings up under
+    # `PROJECT="kit-stack-$$"`. Two runs cannot collide on it, because the
+    # databases live in the container and the container is already per-run: the
+    # finding's own sentence, "every run of this tier shares it", is false there.
+    # A check whose message is false is worse than one that is absent, so the rule
+    # now asks the question the message asserts — does this variable reach a docker
+    # invocation in this file — and derives that from the file rather than from a
+    # list. `PROJECT` and every other real namespace is read by a `docker compose
+    # -p "$PROJECT"` line, so the load-bearing case is untouched; the measurement
+    # that says so is reports/wrapper-tier-scope/mutations.sh, whose six cases all
+    # still bite.
+    fed_to_docker = set()
+    for n, body in logical:
+        if not DOCKER_USE.search(body):
+            continue
+        for var in re.findall(r"\$\{?([A-Za-z_][A-Za-z0-9_]*)", body):
+            fed_to_docker.add(var)
     owned = {}
     for n, ln in pairs:
         m = ASSIGN.match(ln)
@@ -11725,6 +11886,8 @@ for name in scripts:
         if re.fullmatch(r"[0-9]+", rhs):
             continue
         if not (re.match(r"\s*[\"']?kit[-_]", rhs) or re.search(r"-control", rhs)):
+            continue
+        if var not in fed_to_docker:
             continue
         owned[var] = (n, rhs)
         # A literal in the ASSIGNMENT is the same defect as a literal at the use
@@ -11823,7 +11986,24 @@ for name in scripts:
             "names has stopped matching this file, so the rule is passing by not looking."
         )
 
-# (3) EMPTINESS IS A FINDING, four ways, each of which can fail alone.
+# The IMAGE TAG, in the shape `docker build` actually takes it. A separate
+    # rule from the use-site scan above because `-t` means --tty to every other
+    # docker subcommand, and a flag that is only a namespace in one of them has to
+    # be matched only there.
+    for n, body in logical:
+        for m in command_positions(IMAGE_TAG, body):
+            word = m.group(1).strip("\"'")
+            if is_derived(word):
+                continue
+            problems.append(
+                f"{name}:{n}: `docker build -t {word}` names an IMAGE LITERALLY. An image "
+                "tag is a shared namespace in the same sense a project name is, and "
+                "`docker rmi -f` takes a bare one: two concurrent runs then build over "
+                "each other and one run's teardown removes the image the other is still "
+                "asserting against. Derive it from the run's own name."
+            )
+
+# (3) EMPTINESS IS A FINDING, five ways, each of which can fail alone.
 if not tiers:
     problems.append(
         "no docker tier found under tests/ — this check is asserting over nothing. Either the "
@@ -11848,13 +12028,43 @@ else:
             "looking."
         )
 
+# …AND THE FIFTH IS THE TIER SET ITSELF, which is the one that could not have been
+# written before the mutation suite existed.
+#
+# The four above are all "a tier was found and nothing could be read inside it". This
+# one is "a script uses docker and NO rule here was ever pointed at it" — and it is
+# the one that was load-bearing while being absent, because a file dropped from
+# `tiers` is invisible to a rule that counts tiers. Three such files sat under
+# tests/ carrying the exact defect this check exists to catch and the output said
+# `5 docker tier(s), 0 hardcoded … name` in the same breath.
+#
+# SCOPE IS DERIVED, not listed, and from a predicate WIDER than the tier set on
+# purpose. Deriving it from `tiers` would be a tautology that can never fire; the
+# predicate here is "invokes a docker subcommand", which is a different question
+# from "brings a container up" and is true of `provenance_test.sh`. That file is
+# named by this finding and is not a tier, and the reason it is not is that it
+# builds an image rather than starting a container — which is exactly the shape a
+# rule scoped to `… up` cannot see.
+for name in uncovered:
+    problems.append(
+        f"{name}: invokes docker but was not counted as a docker tier, so none of the rules "
+        "above were pointed at it — this is a gap, not a pass. It brings no stack up in a form "
+        "this check recognises, so either it names a shared namespace somewhere else (an image "
+        "tag, a container name, a `docker volume rm`) and that name is unchecked, or it does "
+        "not and the gap is worth knowing about anyway: a check that covers less than a reader "
+        "believes is worse than no check, because it costs its trust in the findings it does "
+        "report."
+    )
+
 if problems:
     for p in problems:
         print("  -", p)
     sys.exit(1)
 print(
-    f"{len(tiers)} docker tier(s), 0 hardcoded container/volume/project name and 0 fixed "
-    f"host port; the sixth tier is covered on the day it lands, not the day this file is edited"
+    f"{len(tiers)} docker tier(s), 0 hardcoded container/volume/project/image name and 0 "
+    f"fixed host port; {len(uncovered)} script(s) under tests/ invoke docker without being a "
+    f"tier, so a stack brought up through a wrapper is a tier too — covered on the day it "
+    f"lands, not the day this file is edited"
 )
 PY
   }
