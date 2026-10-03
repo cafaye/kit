@@ -8949,18 +8949,34 @@ PY
       return 1
     fi
 
-    # WHERE THE PREVIOUS VERSION COMES FROM, AND WHY AN OVERRIDE EXISTS
+    # WHERE THE PREVIOUS VERSION COMES FROM, AND WHY IT IS NOT GIT
     #
-    # `git show HEAD:VERSION` is the honest answer: the version that was
-    # committed is the version consumers have, and the working tree is the one
-    # being proposed. KIT_STABILITY_FROM overrides it so that a throwaway copy
-    # with no git history — and a release rehearsal — can say what it is
-    # pretending to be. An override that disagrees with the file is still gated
-    # on, because the rule being checked does not depend on where the number
-    # came from.
+    # The first version of this read the predecessor out of git — `git show
+    # HEAD:VERSION`, the version consumers have versus the working tree's. It is
+    # the intuitive answer and it is the wrong one, measured rather than
+    # argued: it resolves to NOTHING in a throwaway copy with no repository, so
+    # every version bump in a release rehearsal or an unpacked tarball derived
+    # `initial`, and both MAJOR and MINOR breakages stayed GREEN. A gate whose
+    # verdict depends on having a `.git` beside it is a gate that verifies
+    # nothing on the machines that consume kit the same way services do.
+    #
+    # So the predecessor is read from the TREE: the highest version section in
+    # CHANGELOG.md below the one naming VERSION. That is better than a fallback
+    # rather than only more robust — it is the version a consumer can actually
+    # see, which is the same fact the promise is about, so the two cannot
+    # disagree without the check (2) below going red.
     from="${KIT_STABILITY_FROM:-}"
     if [ -z "$from" ]; then
-      from="$(git -C "$ROOT" show HEAD:VERSION 2>/dev/null | head -1 || true)"
+      local seen_current=0
+      while IFS= read -r v; do
+        if [ "$v" = "$version" ]; then
+          seen_current=1
+          continue
+        fi
+        if [ "$seen_current" -eq 1 ] && [ -z "$from" ]; then
+          from="$v"
+        fi
+      done < <(grep '^## ' "$ROOT/CHANGELOG.md" | sed 's/^## //' | grep -E '^[0-9]+\.[0-9]+\.[0-9]+$' || true)
     fi
     if [ -z "$from" ]; then
       # The first version under the contract. Nothing is compatible with
