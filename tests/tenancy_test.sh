@@ -120,21 +120,7 @@ PROJECT="kit-tenancy-$$"
 #
 # The probe is the dependency-free one stack_live_test.sh uses (`/dev/tcp`, not
 # `nc` or python), for the reason it gives: nothing in a tier may assume a tool is
-# installed. Seeded from `$$` and walked forward, so two concurrent runs do not
-# begin their search in the same place — the port belongs to the run using it,
-# like every other name here.
-PGPORT_BASE=$(( 15500 + ($$ % 400) ))
-PGPORT=""
-_p=0
-while [ "$_p" -lt 400 ]; do
-  _cand=$(( PGPORT_BASE + _p ))
-  if ! (exec 3<>"/dev/tcp/127.0.0.1/$_cand") 2>/dev/null; then
-    PGPORT="$_cand"
-    break
-  fi
-  _p=$(( _p + 1 ))
-done
-[ -n "$PGPORT" ] || fail "no free host port in this run's 400-port slice; the tier cannot start without colliding with something"
+# installed. The SEARCH is below `fail`'s definition — see the comment there.
 
 WORK="${TMPDIR:-/tmp}/kit-tenancy.$$"
 IMAGE_TAG="17"
@@ -172,6 +158,23 @@ cleanup() {
   rm -rf "$WORK"
 }
 trap cleanup EXIT
+
+# THE HOST PORT, searched here rather than at the top of the file because it calls
+# `fail`, and shellcheck (correctly) reports a function used before it is defined.
+# Being the first thing to fail means a machine with no free port says so by name
+# instead of exiting 127 on a missing function.
+PGPORT_BASE=$(( 15500 + ($$ % 400) ))
+PGPORT=""
+_p=0
+while [ "$_p" -lt 400 ]; do
+  _cand=$(( PGPORT_BASE + _p ))
+  if ! (exec 3<>"/dev/tcp/127.0.0.1/$_cand") 2>/dev/null; then
+    PGPORT="$_cand"
+    break
+  fi
+  _p=$(( _p + 1 ))
+done
+[ -n "$PGPORT" ] || fail "no free host port in this run's 400-port slice; the tier cannot start without colliding with something"
 
 for f in "$SUBSTRATE" "$ISOLATION" "$MANIFEST" "$ADVISOR"; do
   [ -r "$f" ] || fail "$(basename "$f") is not readable, so there is nothing to prove"

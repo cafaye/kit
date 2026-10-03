@@ -92,20 +92,10 @@ CONTROL_V="$PROJECT-control-vol"
 # the same dependency-free one stack_live_test.sh uses (`/dev/tcp`, no `nc`, no
 # python), for the same reason: nothing here may assume a tool is installed.
 #
-# Derived per run rather than a fixed block: the port is part of what a run owns,
-# so it belongs under `$PROJECT` like everything else.
-PGPORT_BASE=$(( 15500 + ($$ % 400) ))
-PGPORT=""
-_p=0
-while [ "$_p" -lt 400 ]; do
-  _cand=$(( PGPORT_BASE + _p ))
-  if ! (exec 3<>"/dev/tcp/127.0.0.1/$_cand") 2>/dev/null; then
-    PGPORT="$_cand"
-    break
-  fi
-  _p=$(( _p + 1 ))
-done
-[ -n "$PGPORT" ] || fail "no free host port in this run's 400-port slice; the tier cannot start without colliding with something"
+# The SEARCH itself is below `fail`'s definition, which shellcheck is right to
+# insist on: a function used before it is defined is a function that does not
+# exist yet, and under `set -e` that turns into a confusing exit 127 rather than
+# the named failure it is meant to be.
 
 # Where the state goes. A named container and a named volume rather than
 # `docker run --rm`, because assertion 4 needs a SECOND cluster that survives
@@ -156,6 +146,27 @@ cleanup() {
   rm -rf "$WORK"
 }
 trap cleanup EXIT
+
+# THE HOST PORT, searched here rather than at the top of the file because it calls
+# `fail`, and shellcheck (correctly) reports a function used before it is defined.
+# Being the first thing to fail means a machine with no free port says so by name
+# instead of exiting 127 on a missing function.
+#
+# The seed comes from `$$` so two concurrent runs do not begin their search in the
+# same place, and the walk is bounded so an occupied slice is a named failure
+# rather than a loop.
+PGPORT_BASE=$(( 15500 + ($$ % 400) ))
+PGPORT=""
+_p=0
+while [ "$_p" -lt 400 ]; do
+  _cand=$(( PGPORT_BASE + _p ))
+  if ! (exec 3<>"/dev/tcp/127.0.0.1/$_cand") 2>/dev/null; then
+    PGPORT="$_cand"
+    break
+  fi
+  _p=$(( _p + 1 ))
+done
+[ -n "$PGPORT" ] || fail "no free host port in this run's 400-port slice; the tier cannot start without colliding with something"
 
 # ---------------------------------------------------------------------------
 # Environment. Everything missing is named, because "SKIP (docker)" tells a
