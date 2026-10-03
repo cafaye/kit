@@ -30,6 +30,64 @@ without a copy (see kit-12 below).
 
 ## Unreleased
 
+### Breaking — `docker/provenance.sh --verify` fails on images it used to accept
+
+**This changes the meaning of an exit code's neighbour, so it is not a silent
+patch.** Six cases in this repository were accepted a moment ago and are now
+refused, and the reason in every one of them is the same:
+`org.opencontainers.image.*` are **standard OCI labels that every published base
+image sets**, so an image built `FROM` a stamped one inherits them without
+anybody stamping it. Measured against real images, in
+`measurement-provenance-ownership-01.out`.
+
+| what | before | after |
+| --- | --- | --- |
+| `cafaye/guard:e2e` (built `FROM oven/bun`) | exit **0**, printing `https://github.com/oven-sh/bun` as our source | exit **6**, naming `oven-sh/bun` |
+| `cafaye/e2e-parlor:local`, `cafaye/e2e-site:local` (compose labels only) | exit **0**, printing five `<absent>` lines | exit **6** |
+| a source that is a URL, or has three segments | exit **0** | exit **6**, with the `expect_source` line |
+| a well-formed **foreign** source, no `--expect-source` | exit **0**, silently | exit **0**, plus a `WARN` that repository ownership was **not** established |
+| a well-formed **foreign** source, **with** `--expect-source owner/repo` | not expressible | exit **5** |
+| `cafaye/identity:e2e` (no labels at all) | exit 4 | exit **4** — unchanged |
+
+**The exit codes, and what a caller should do about each.**
+
+- **4 — unchanged and load-bearing.** "This image carries no labels at all."
+  Something upstream depends on telling this apart from "this image carries
+  somebody else's", so **4 and 6 are not collapsed** and must not be. A caller
+  testing `== 4` still means *predates the stamp*; a caller testing `!= 0` is
+  unaffected.
+- **5 — unchanged in meaning, wider in reach.** "An expectation you gave was not
+  met." The new `--expect-source` assertion lands here.
+- **6 — new.** "The labels are present and are not a valid cafaye stamp": a
+  field violates its own grammar, an identity field is absent, or the stamp
+  carries nothing in kit's own namespace. Code written before this release only
+  ever saw 4 and 5, so a caller branching on either is still correct, and a
+  caller treating *any* non-zero as "unverifiable" now correctly includes the
+  inherited-stamp case — which is the case it was blind to.
+- **2 — new use.** `--expect-source` is grammar-checked before it judges
+  anything, so a URL written as the expectation is refused rather than reported
+  as a mismatch against a correctly stamped image.
+
+**What to do if `--verify` goes red on you.** One of three things, all real,
+none a false alarm: the image was built `FROM` something already stamped and
+inherits its labels (make the Dockerfile emit all five, which every
+`docker/Dockerfile.<lang>` already does); the image predates the stamp (exit
+**4**, meaning the tag is old rather than untrustworthy); or a base image sets
+`source` to a URL — real, because Bun's publisher does exactly that, and Bun's
+`created` carries milliseconds where the grammar requires RFC3339 to the second.
+
+**Adopting without changing anything.** The printing form still exits 0 on a
+correctly stamped image, so `provenance.sh --verify IMG || true` is unaffected.
+What is new is that the *default* is no longer silent: an inherited stamp now
+fails with no flag at all. Add `--expect-source owner/repo` to assert the
+repository as well.
+
+**What is deliberately not here.** `parlor` and `site` each carry a copy of this
+script and are mid-packet with the consumer wiring; copying the fixed script
+into them is a separate, later change. `identity` and `guard` do not stamp
+themselves — `identity:e2e` has `null` labels and `guard:e2e` has Bun's — and
+that debt is named in the handoff rather than paid here.
+
 ### Changed
 
 - **`tests/kamal_test.sh` now answers `--only`.** It was invoked by a bare

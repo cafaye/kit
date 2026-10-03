@@ -540,6 +540,13 @@
 #        the mutation is paren-balanced on purpose: the unbalanced spelling
 #        fails the function to install and takes EVERY rule silent at once, which
 #        is a red from the wrong cause wearing this breakage's name.
+#   103. the OWNERSHIP-BY-NAMESPACE check deleted from `--verify` -> a base
+#        image's own OCI labels satisfy a stamp that is ours. The one that
+#        shipped: `--verify cafaye/guard:e2e` printed `oven-sh/bun`'s source and
+#        exited 0, and the suite written to prevent it could not see the case
+#        because every `--verify` fixture it built came from a kit Dockerfile --
+#        and a foreign base image's labels are precisely the labels kit's
+#        Dockerfile did not write.
 #
 # Both are `expect_red_script` against `tests/shard_test.sh`, which is a proof
 # rather than a gate over a tree for the same reason `classify_test.sh` is: the
@@ -4483,6 +4490,51 @@ edit "$base102/templates/database/tenancy/advisor.sql" \
   '                      where (false)), false) as qual_hit,'
 expect_red_check 'breakage 102: the correlated-subquery test is deleted from the advisor rule, so the slow policy shape goes unreported' \
   "$base102" 'tests/tenancy_test.sh'
+
+# ---------------------------------------------------------------------------
+# 103: THE OWNERSHIP CHECK IS LOAD-BEARING.
+#
+# WHAT IT PROVES, and what it is the second recipe for. `HANDOFF-kit-provenance-01`
+# scoped a breakage to prove the REDACTION grammar (widen `shape_source` to
+# accept anything); that claim is now carried by part A of
+# `tests/provenance_test.sh`, which asserts all eleven refusals. This one is the
+# packet's other half and it was previously unprovable, which is why the defect
+# survived: `--verify` had NO ownership check, so there was nothing to mutate.
+#
+# THE MUTATION DELETES THE NAMESPACE OWNERSHIP BLOCK — the `if [ -z "$got_dirty" ]
+# && [ -z "$got_tv" ]` test and its body — from `emit_verify`. Nothing else. The
+# grammar is untouched, the exit codes are untouched, `docker/provenance.sh`
+# still parses, still prints all five fields, and every part A refusal still
+# passes: this is not a script that broke, it is a script with one decision
+# removed.
+#
+# ONE MUTATION, ONE CAUSE. Two other mutations would have been available and
+# both are the trap this repo's own header warns about:
+#   - deleting the SHAPE loop instead also reds part A, so the recipe could
+#     report red for a reason it did not introduce and the needle would prove
+#     nothing about ownership;
+#   - deleting the `--expect-source` mismatch branch instead leaves D1/D2 GREEN,
+#     because those two cases carry no `--expect-source` and the namespace block
+#     is what catches them. A control satisfiable by two different checks proves
+#     the gate can go red and says nothing about either.
+# So the mutation is chosen to be reachable by exactly one assertion group, and
+# the needle below names that group.
+#
+# WHY IT MUST SIT ABOVE THE SUMMARY BLOCK. Breakage 101 sat below it and no
+# shard ever claimed it, so a run that could fail counted it as evaluated; that
+# hidden exit code is the reason this placement is commented at all.
+base103="$(fresh_copy kit-103)"
+edit "$base103/docker/provenance.sh" '  if [ -z "$got_dirty" ] && [ -z "$got_tv" ]; then' '# 103: ownership-by-namespace removed
+  if false; then'
+edit "$base103/docker/provenance.sh" '    return 6
+  fi
+
+  # --- OWNERSHIP, HALF TWO' '    return 0
+  fi
+
+  # --- OWNERSHIP, HALF TWO'
+expect_red_check 'breakage 103: the ownership-by-namespace check is removed, so a base image inherits a stamp that satisfies ours' \
+  "$base103" 'tests/provenance_test.sh  (11 leak shapes refused'
 
 # The count is COUNTED, not written down. Every breakage above calls exactly one
 # of the four red-expecting helpers, so this cannot drift from the recipes the
