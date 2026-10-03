@@ -19,6 +19,8 @@ kit/
 ├── README.md                             # what kit is, how a repo adopts it
 ├── LICENSE                               # MIT. The whole grant, and nothing can disagree
 ├── DECISIONS.md                          # the trades this repo has NOT made
+├── VERSION                               # the version, and the ONLY place it is written
+├── RESERVED                              # tombstones: a retired name stays dead
 ├── .gitleaks.toml                        # the allowlist, and nothing else
 ├── .github/
 │   ├── workflows/
@@ -315,7 +317,8 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
   is the one that tells a working config from a valid one, and — unlike every
   other phase — it is **fatal on a skip**, because the claim under test is "kit's
   configs work" and a run in which no linter executed has not tested it.
-- **self_test** — ninety-four breakages of a throwaway copy. Ninety-two assert
+- **self_test** — one hundred and four breakages of a throwaway copy. One
+  hundred and two assert
   the gate goes red; two assert it stays **green** while naming what it said —
   23b a SKIP, because a check that turns a red into an honest skip is
   load-bearing precisely by not going red, and 59 a FINDING, because kit-13's
@@ -364,6 +367,16 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
     existing, and they fail differently — the command gone, and the *subcommand*
     gone. 77 is the harder one: a check that only asks "is `db` dispatched" is
     green on it.
+  - **96-100 are the VERSION STRING'S OWN GATE**, one property each: a MAJOR with
+    no `MIGRATIONS.md` (96), a MINOR declaring `### Breaking` (97), that same
+    heading parked under `## Unreleased` where no version covers it (98), a
+    `1.0.0-rc1` the derivation refuses rather than tiers (99), and a reserved name
+    back in the tree (100). **96 and 97 found a defect in the check itself**: it
+    read its predecessor from `git show HEAD:VERSION`, which resolves to nothing
+    in a throwaway copy, so both derived `initial` and stayed green — a gate
+    whose verdict depends on a `.git` beside it verifies nothing on the machines
+    that consume kit the way services do. The predecessor now comes from the
+    changelog section below the current one. See `DECISIONS.md` (MD26).
 - **A toolchain's floor is checked against the floor the ARTIFACT declares.**
   `KitOtel::RUBY_FLOOR` says what `templates/otel/ruby` needs and the gate reads
   that constant rather than restating the number. Below the floor is a loud,
@@ -881,6 +894,68 @@ that is usually true:
 `README.md` carries the override rules, and one of them is a trap worth knowing
 before you write a service compose file: **a second file's `ports:` list is
 appended, not substituted.** Move a port in `.env`; never in the override.
+
+## The version is `VERSION`, and the tier is derived from it
+
+One line, one number, and the **only** place the version is written. Three tiers
+derived by `stability_tier` from two version strings and asserted against a
+published table of ten pairs, so a change to the rule that is not a change to
+the table is a red gate:
+
+| the bump | the tier | what a consumer may do |
+| --- | --- | --- |
+| MAJOR | `breaking` | read `MIGRATIONS.md` for that version — a MAJOR without one is a red build |
+| MINOR | `additive` | take it; nothing a consumer holds went away |
+| PATCH | `invisible` | take it without reading anything |
+
+Five rules, each of which is a thing that has to be true:
+
+- **The predecessor comes from the CHANGELOG, not from git.** The first version
+  read `git show HEAD:VERSION`, which resolves to nothing in a throwaway copy,
+  so a bump in an unpacked tarball derived `initial` and breakages 96 and 97
+  stayed green. It is the version section below the current one — a version a
+  consumer can SEE, and therefore the same fact the promise is about.
+- **A string this cannot place is a red build**, not a guess: `1.0.0-rc1` (a
+  suffix makes the tier change meaning when it is dropped), `v1.4.0` (that is
+  the TAG spelling), `01.4.0` (a leading zero is one string and two numbers), and
+  a backwards move. All fail closed.
+- **The tier owes a FILE, not a sentence.** A MAJOR owes a `MIGRATIONS.md`
+  section, because a consumer who adopted kit by copy cannot apply a sentence.
+- **`### Breaking` is legal only under a version whose MAJOR moved**, and never
+  under `## Unreleased`, where no version covers it. That rule needs no
+  predecessor, so it holds for the whole history rather than only for the bump
+  being released — which is what makes the promise checkable rather than
+  documented.
+- **`VERSION` is not a service manifest's job.** Nine services carry no `version`
+  key on purpose and `identity` says why; that key describes the service, and
+  "how safe is kit to take" is a different question. `1.0.0`, not `0.x`: in
+  semver `0.x` *means* unstable, which is the sentence this removes.
+
+## `RESERVED` is the tombstone, not the deprecation
+
+Two references adopted "reserved" independently, and reading them closely is the
+finding: **they are not the same mechanism.**
+
+- **buf's `reserved: 3, 7;` is a WIRE tombstone.** The field *number* is what
+  travels, so a retired number may never be reused — otherwise an old message and
+  a new one decode the same bytes two ways. Its purpose is to make DELETION
+  non-breaking.
+- **Kubernetes' `+k8s:deprecated=width,protobuf=3` is a LIFECYCLE marker on a
+  field that is still there.** k8s does not delete an API; it deprecates, names
+  the replacement, and leaves the type in place.
+
+**kit has no encoding, so buf's justification does not transfer.** What transfers
+is the weaker half both enforce, which is the one that matters when a service's
+copy outlives the decision: **a retired name stays retired.** The deprecation
+half does not port either — a comment in a copied YAML file is a comment in the
+copy, and kit has no registry to hold one (`templates/parity-allowlist` already
+carries that half).
+
+**The fourth hygiene rule is INVERTED here.** In a skip allowlist, an entry
+matching nothing is a ratchet that only turns one way. For a tombstone the dead
+entry and the live name are one defect with two names, so `reserved_check` fails
+when a reserved path **exists**. It is silent otherwise, and it permits nothing.
+See `DECISIONS.md` (MD26, MD27).
 
 ## Rules
 
