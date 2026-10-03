@@ -263,6 +263,31 @@ printf '%s\n' "$PIN" >"$SERVICE/kit.ref"
 # A consumer declares what it wants. `kit_probe` is named for this test and
 # nothing else, which also means the init script runs — so this file now proves
 # one more thing than it used to: that a declared tenant is really created.
+#
+# AND IT DECLARES THE BACKEND, BUT NOT HERE. `KIT_DEV_PROFILES` is deliberately
+# NOT read from `.env` — see the note on it in `bin/dev`: `stack_setting` cannot
+# tell "unset" from "set to empty", so a `.env` saying `observability` would
+# silently re-impose the four-backend tax on every command that starts a stack.
+# It is read from the process environment, and the consumer therefore declares it
+# on the `bin/dev up` line, where it is visible.
+#
+# It was declared NOWHERE until this, and the cost of that absence was a silent
+# exit rather than a red. `a0415ba` flipped `KIT_DEV_PROFILES` from a default of
+# `observability` to a default of nothing — correctly, because a dev loop should
+# not pay for four backends nobody asked to look at — and this file went on
+# reading Tempo exactly as before. `docker compose port tempo 3200` then exits
+# nonzero on a stack with no Tempo in it, that nonzero status rode out of a
+# command substitution, and `set -e` killed the script with no message and no
+# line number. Two full gate runs produced 61 passing checks and a FAIL with no
+# failing assertion in it, because the file died between two passes.
+#
+# There is no cheaper spelling. Tempo, Loki and Grafana all carry the SAME
+# `profiles: [observability]`, so `observability` is the only value that turns
+# Tempo on — `--profile tempo` enables a profile named tempo, which does not
+# exist, and compose accepts it without complaint. That is worth writing down
+# because the first attempt at this fix used it and got a stack with no Tempo in
+# it and no error to say so. What this file reads back is Tempo's search API and
+# the collector's own `debug` exporter; Grafana comes along and is not read.
 cat >"$SERVICE/.env" <<ENV
 KIT_STACK_URL=file://$REMOTE
 KIT_STACK_HOME=$WORK/cache
@@ -306,7 +331,7 @@ step_up() {
   # fires, and this test uses it for a stated reason rather than raising the
   # shipped default.
   #
-  # `bin/dev`'s 180s is a LAPTOP figure for a cold start on a machine doing
+# `bin/dev`'s 180s is a LAPTOP figure for a cold start on a machine doing
   # nothing else — measured here at 76s with all eight containers coming up.
   # This is a shared machine: other cafaye workers were running their own stacks
   # (a darkroom isolation postgres, an identity gate postgres, a deploy test)
@@ -317,9 +342,15 @@ step_up() {
   # one of them is right. Raising the shipped default would make every developer
   # wait longer for a stack that starts in 76s on their machine; raising the
   # deadline HERE changes nothing for anyone but this test. A gate that widens a
-  # shipped number to accommodate the machine it runs on has stopped measuring
-  # the thing it was written to measure.
-  KIT_DEV_TIMEOUT=420 bash ./bin/dev up >"$WORK/up.log" 2>&1 || true
+  # shipped number to accommodate the machine it runs on has stopped measuring the
+  # thing it was written to measure.
+  #
+  # `KIT_DEV_PROFILES=observability` is on THIS line and not in the `.env`
+  # because that is the only place `bin/dev` reads it from. It is the consumer
+  # declaring the backend sections 4 and 5 assert against, and the full
+  # reasoning — including why there is no cheaper spelling of it — is at the
+  # `.env` heredoc above.
+  KIT_DEV_TIMEOUT=420 KIT_DEV_PROFILES=observability bash ./bin/dev up >"$WORK/up.log" 2>&1 || true
 }
 
 if ! wait_for "bin/dev up to finish its stack phase" 300 step_up; then
@@ -612,7 +643,19 @@ done
 # arrived.
 tempo_port() { docker compose -p "$PROJECT" port tempo 3200 2>/dev/null | sed 's/.*://'; }
 
-TP="$(tempo_port)"
+# Asked for, and checked, rather than assumed. This is the second half of the
+# `KIT_DEV_PROFILES` note above: a stack with no Tempo in it answers this
+# question with an empty string and a nonzero exit, and under `set -e` that
+# nonzero exit propagates out of the command substitution and ends the script
+# between two PASSes. A test that dies where it meant to assert is worse than
+# one that goes red, because the log looks like a pass that ran out of checks.
+# So an unanswerable question is an answer, and this one is the wrong one.
+if ! TP="$(tempo_port)" || [ -z "$TP" ]; then
+  fail "tempo is not running, so nothing in section 4 can be read off it"
+  note "is KIT_DEV_PROFILES=tempo set in this file's .env above?"
+  docker compose -p "$PROJECT" ps --services 2>/dev/null | sed 's/^/        running: /' || true
+  exit 1
+fi
 note "tempo on $TP (read from compose, not assumed)"
 
 # The canary is in the payload and must not be in the store. Asserted as an
@@ -671,6 +714,17 @@ fi
 # `collector_logs` reads the container rather than a file, because a file
 # exporter standing in for the fan-out is exactly what `canary_test.sh` already
 # substitutes and what this test exists not to do.
+#
+# And it is a FUNCTION, which is a trap the first version of this assertion fell
+# into. `wait_for` takes a COMMAND and runs it through `sh -c`, and `sh -c` is a
+# new shell: it does not inherit this file's functions. The probe therefore ran
+# `collector_logs`, got `sh: collector_logs: command not found`, and exited
+# nonzero on the FIRST attempt and on all ninety after it — so the assertion
+# reported that the spanmetrics connector had minted nothing while the very log
+# lines it printed on failure showed `Name: cafaye.calls_total` sitting right
+# there. A probe that cannot run and a system that is broken look identical from
+# the outside, which is why this is a function AND why the command form is
+# spelled out where `sh` can see it.
 collector_logs() { docker compose -p "$PROJECT" logs --no-color otel-collector 2>/dev/null; }
 
 # The connector. `duration` is the shape `spanmetrics` mints for an
@@ -678,8 +732,10 @@ collector_logs() { docker compose -p "$PROJECT" logs --no-color otel-collector 2
 # `KIT_OTEL_METRIC_NAMESPACE` the collector was configured with — so finding it
 # is a proof that the CONFIG reached the container and that the connector is
 # wired, not only that the collector is printing something.
+#
+# Spelled as a command `sh` can execute, not as a call to the function above.
 if wait_for "the spanmetrics connector mints a metric" 90 sh -c \
-  "collector_logs | grep -qE 'cafaye[_.]duration'"; then
+  "docker compose -p '$PROJECT' logs --no-color otel-collector 2>/dev/null | grep -qE 'cafaye[_.]duration'"; then
   pass "the spanmetrics connector exported cafaye_duration — the fleet dashboard's source"
 else
   fail "the spanmetrics connector minted nothing: the error view would be empty"
