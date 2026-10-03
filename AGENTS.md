@@ -391,6 +391,15 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
     and green after, both measured. The general rule this earns: a control
     satisfiable by two different checks proves the gate can go red and says
     nothing about either.
+  - **23b now asserts THREE things, and the third is the one that makes
+    `--no-live` honest.** Exit 0, the interpreter skip named — which is what it
+    always asserted — and a `SKIP` row that **names `--no-live`**. Deleting the
+    three `bounded_check` calls satisfies the first two perfectly: the gate is
+    greener than ever and still names the ruby floor, and it has proved nothing
+    about the live tier. The assertion is on the ROW, not on the exit status,
+    because that is the whole difference between a skip and a deletion, and 23b
+    is the only helper in the suite that runs a whole unfiltered gate — so it is
+    the only place the property can be watched failing.
   - **76 and 77** are the two ways a documented `bin/dev` command can stop
     existing, and they fail differently — the command gone, and the *subcommand*
     gone. 77 is the harder one: a check that only asks "is `db` dispatched" is

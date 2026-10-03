@@ -929,6 +929,35 @@ $2"*) return 0 ;;
   esac
 }
 
+# skip_row_naming <text> <needle> — does any `SKIP` row MENTION <needle>?
+#
+# A third reader, and the narrowest of the three. `contains` answers "is this
+# string anywhere in the output"; `starts_with_line` answers "does a line begin
+# with this". What `--no-live` has to be proved by is the conjunction: a line
+# that BEGINS with `SKIP ` and NAMES the opt-out.
+#
+# Why the conjunction and not either half. `contains "$out" '--no-live'` is
+# answered by the gate's own summary note — which is a second, independent line
+# naming it, and fine on its own — and would be answered just as well by the
+# usage block if a future `--help` dump ever reached a child's stdout. And
+# `starts_with_line "$out" 'SKIP'` is answered by any skip at all, of which the
+# interpreter floor already provides one. So the test a reader wants is: is there
+# a row that says "this tier did not run, and here is the flag that says so".
+#
+# Same reason as the other two for not piping: the output is already in a
+# variable, and `grep -q` closes the pipe on the first match, `printf` dies of
+# SIGPIPE, and this file's `set -o pipefail` promotes 141 to the status of a
+# pipeline that succeeded.
+skip_row_naming() {
+  local rest
+  while IFS= read -r rest; do
+    case "$rest" in
+      SKIP\ *"$2"*) return 0 ;;
+    esac
+  done <<<"$1"
+  return 1
+}
+
 # _stale_edit accumulates the recipes whose `edit` found nothing to replace. It
 # is emptied by every shard guard that declines a recipe, so it can only ever be
 # read by the check that owns the breakage which set it.
@@ -1505,9 +1534,11 @@ expect_green_script() {
 # red" says nothing about whether it did, and "the gate went green" is
 # satisfied just as well by a check that was deleted entirely.
 #
-# So this asserts BOTH halves of the honest-reporting claim: the gate exited 0,
-# and the named check is what said so. A gate that passed by running nothing and
-# mentioning nothing fails here; a gate that failed fails here too.
+# So this asserts BOTH halves of the honest-reporting claim — the gate exited 0,
+# and the named check is what said so — and, because this helper is also the one
+# that runs a whole UNFILTERED gate (and therefore a child that opted out of
+# the observability live tier), a THIRD: that a `SKIP` row names `--no-live`.
+# The three are listed, and why, at the assertion itself.
 #
 # `contains`, for the reason given at `expect_green_check`: the output is already
 # in a variable, and piping it into `grep -q` makes the answer depend on how much
@@ -1571,17 +1602,43 @@ expect_skip_check() {
   # to produce. The interpreter floor is what is under test here, so a skip
   # answered off disk would be exactly the silent pass this recipe exists to
   # distinguish from a named one.
+  # A child gate runs with `--no-live`, so THIS recipe's own child is one of the
+  # gates that opts out — and this is where that becomes a proof rather than a
+  # claim. Three assertions, in order:
+  #
+  #   1. the gate exited 0, so the interpreter skip was clean;
+  #   2. the interpreter skip was NAMED, which is what this recipe has always
+  #      asserted; and
+  #   3. a `SKIP` ROW names `--no-live`.
+  #
+  # (3) is the asymmetry the whole opt-out lives or dies on, and it is a
+  # different failure from (1). Deleting the three `bounded_check` calls outright
+  # satisfies (1) and (2) perfectly — the gate is greener than ever, and it
+  # still names the ruby floor — while proving nothing at all about the live
+  # tier. A patch that turns the opt-out into silence passes every exit-status
+  # assertion in this file. So the assertion is on the ROW, not on the status,
+  # and it is asserted here in the one helper that runs a whole unfiltered gate
+  # rather than in a comment in `validate.sh` where nobody would watch it fail.
   out=$(export KIT_FINGERPRINT=0; kit_child_gate "$dir" "$@" 2>&1) || ec=$?
   if [ "$ec" -ne 0 ]; then
     printf 'FAIL self_test: %s — the gate exited %s, so the skip was not clean\n' "$label" "$ec"
     printf '%s\n' "$out" | grep '^FAIL' | sed 's/^/       /'
     failures=$((failures + 1))
-  elif contains "$out" "SKIP $want"; then
-    printf 'PASS self_test: %s — reported as `%s`\n' "$label" "$want"
-  else
+  elif ! contains "$out" "SKIP $want"; then
     printf 'FAIL self_test: %s — the gate stayed green but never said `%s`\n' "$label" "$want"
     printf '%s\n' "$out" | grep '^SKIP' | sed 's/^/       /'
     failures=$((failures + 1))
+  elif ! skip_row_naming "$out" '--no-live'; then
+    printf 'FAIL self_test: %s — green, and the floor was named, but NO `SKIP` row names\n' "$label"
+    printf '       `--no-live`. The exit status alone cannot tell that apart from a patch\n'
+    printf '       that deleted the observability live tiers outright, which is a gate that\n'
+    printf '       runs less and reports less and is therefore green for a worse reason.\n'
+    printf '       Every SKIP the child did report:\n'
+    printf '%s\n' "$out" | grep '^SKIP' | sed 's/^/       /'
+    failures=$((failures + 1))
+  else
+    printf 'PASS self_test: %s — reported as `%s`, and named the --no-live skips too\n' \
+      "$label" "$want"
   fi
 }
 

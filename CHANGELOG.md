@@ -29,6 +29,13 @@
     `kit_child_gate`, and a new check fails if a second `bash tests/validate.sh`
     spawn appears outside it, if that spawn loses `KIT_NO_LIVE=1`, or if any
     recipe ever names a live tier.
+  - **Breakage 23b now asserts a third thing**, and the third is the one that
+    makes the opt-out honest: that a `SKIP` **row** names `--no-live`. Deleting
+    the three `bounded_check` calls satisfies 23b's first two assertions
+    perfectly — the gate is greener than ever and still names the ruby floor —
+    and proves nothing about the live tier. The assertion is on the row, not on
+    the exit status. 23b is the only helper in the suite that runs a whole
+    unfiltered gate, so it is the only place the property can be watched failing.
 - **`bash tests/validate.sh --help` no longer prints
   `kit_phase: command not found`.** The `EXIT` trap is armed ~120 lines before
   `kit_phase` is *defined*, so the `--help` path ran a trap made of three
