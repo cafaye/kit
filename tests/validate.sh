@@ -1278,8 +1278,9 @@ live_check() {
   # applies the filter itself; applying it here as well would count every
   # selected tier twice in `ONLY_RAN`. When the tier does NOT run there is no
   # `bounded_check` call to filter, and a filtered run must not report three
-  # skips for checks it was told not to run: 98 of the 104 self-test recipes are
-  # `--only`-filtered, and `ONLY_SKIPPED` is a count a reader uses.
+  # skips for checks it was told not to run: of the 93 self-test recipes that run
+  # the gate, 84 are `--static-only` and 8 more are narrowed by `--only`, and
+  # `ONLY_SKIPPED` is a count a reader uses.
   if [ -n "$ONLY_MATCH" ]; then
     case "$label" in
       *"$ONLY_MATCH"*) ONLY_RAN=$((ONLY_RAN + 1)) ;;
