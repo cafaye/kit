@@ -70,7 +70,10 @@ expect_red() {
     return
   fi
   printf 'BITTEN      %s\n' "$label"
-  printf '            %s\n' "$(printf '%s\n' "$out" | grep -F "$file:" | head -2 | sed 's/^ *- //' | tr '\n' ' ')"
+  # The finding, trimmed to the clause that says what is wrong and where. The
+  # full message repeats its reasoning on every case, which would bury the one
+  # thing a reader wants from this script: WHICH site the guard named.
+  printf '            %s\n' "$(printf '%s\n' "$out" | grep -F "$base:" | head -1 | sed 's/^ *- //' | cut -c1-160)"
   passes=$((passes + 1))
   restore
 }
