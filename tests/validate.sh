@@ -11204,7 +11204,7 @@ section 'provenance: the stamp a pulled image carries, and what it refuses to ca
 #
 # Outside the `RUN_STATIC` guard: a security claim that a static-analysis skip
 # drops is a security claim nobody ran.
-check 'tests/provenance_test.sh  (11 leak shapes refused; both sinks agree; --verify goes red on a wrong commit)' \
+check 'tests/provenance_test.sh  (11 leak shapes refused; both sinks agree; --verify refuses a foreign or ill-shaped stamp; 4/5/6 stay distinct)' \
   bash "$ROOT/tests/provenance_test.sh"
 
 section 'fetch: the pinned kit ref resolves, and a moving one is refused'

@@ -336,11 +336,48 @@ write_stamp() {
 # means by "provable able to fail": a tag that resolves to a different commit
 # is a non-zero exit, not a log line somebody reads.
 #
+# The consumer side's read of the five extracted values, by FIELD name, so the
+# checks below iterate `$FIELDS` rather than repeating five `sed` results. It is
+# a `case` and not `${!var}` indirection because this file is POSIX `sh`.
+_verify_got() {
+  case "$1" in
+    source) printf '%s' "${got_src:-}" ;;
+    revision) printf '%s' "${got_rev:-}" ;;
+    built_at) printf '%s' "${got_at:-}" ;;
+    source_dirty) printf '%s' "${got_dirty:-}" ;;
+    template_version) printf '%s' "${got_tv:-}" ;;
+  esac
+}
+
 # `unknown` is a FAILURE here, deliberately, and that asymmetry is the whole
 # design: an unstamped build is fine to CREATE and is not fine to ASSERT ABOUT.
+#
+# ---------------------------------------------------------------------------
+# THE FOUR VERDICTS, and why they are four and not two
+# ---------------------------------------------------------------------------
+# Before this revision `--verify` had exactly one failure mode that mattered:
+# `[ -n "$expect_rev" ] || return 0`, so with no expectation it returned 0 for
+# whatever the labels said — including Bun's, inherited from a base image. The
+# codes are now four DISTINCT answers and none of them is 0 by accident:
+#
+#   0  the stamp is well-shaped, it is OURS, and every expectation given was met
+#   4  the image carries NO labels at all. Unchanged, and LOAD-BEARING.
+#   5  an expectation the CALLER GAVE was not met (`--expect-revision`,
+#      `--expect-source`, or an `unknown`/absent answer to one)
+#   6  the labels are present and are NOT a valid cafaye stamp: a field violates
+#      its own grammar, a field that identifies the build is absent, or the
+#      stamp carries nothing in kit's own namespace
+#
+# 4 AND 6 ARE NOT COLLAPSED, and a successor must not collapse them: something
+# upstream depends on telling "this image was built without the stamp" (an image
+# from before the packet) apart from "this image carries somebody else's stamp"
+# (an image whose provenance is unknown and must not be trusted as ours). A
+# caller that only tests `!= 0` still works; a caller that tests `== 4` still
+# means "predates the stamp".
 emit_verify() {
   image="$1"
   expect_rev="${2:-}"
+  expect_src="${3:-}"
   command -v docker >/dev/null 2>&1 || {
     printf '%s: docker is not on PATH, so a pulled image cannot be asked what it is\n' "$PROG" >&2
     exit 3
@@ -365,6 +402,139 @@ emit_verify() {
   printf '  built_at:         %s\n' "${got_at:-<absent>}"
   printf '  source_dirty:     %s\n' "${got_dirty:-<absent>}"
   printf '  template_version: %s\n' "${got_tv:-<absent>}"
+
+  # --- THE SHAPE, on the consumer side --------------------------------------
+  #
+  # THE SAME `shape_*` functions `validate` uses, and deliberately not a second
+  # grammar. `validate` applied all five to a BUILD ARG, and `--verify` applied
+  # none to a LABEL, which is how `oven-sh/bun`'s
+  # `https://github.com/oven-sh/bun` — two slashes over a budget of exactly one,
+  # a scheme, a host, a port, five separate violations of a grammar this file
+  # already wrote down — came to be printed here as though it were our own.
+  #
+  # A redaction rule that exists only at stamp time is not a rule about the
+  # stamp; it is a rule about the moment of writing, and a PULLED image does not
+  # pass through that moment.
+  bad_shape=''
+  absent_hard=''
+  absent_soft=''
+  for f in $FIELDS; do
+    v="$(_verify_got "$f")"
+    if [ -z "$v" ]; then
+      # WHAT AN ABSENT FIELD MEANS HERE, decided rather than inherited.
+      #
+      # `validate` maps an absent field to `unknown`, because a developer's
+      # unset build arg must not be refused. On the verify path that leniency is
+      # withdrawn for the two fields that carry IDENTITY — `source` and
+      # `revision`, the two a caller can `--expect`, and the two that answer
+      # "what IS this?" — and ABSENCE IS A REFUSAL rather than a pass. Absent
+      # and `unknown` mean the same thing to a reader ("nobody told me"), and
+      # accepting one while failing the other is an inconsistency with no
+      # defensible basis: the script already says `unknown` is "the honest 'I do
+      # not know what this is'" and that in an ASSERTION it is a failure.
+      #
+      # The other three carry METADATA rather than identity, so an absent one is
+      # a NOTE, not a refusal: refusing an image because it predates
+      # `template_version` would be refusing it for being old, which is what
+      # exit 4 already says and says better. `source_dirty: <absent>` was
+      # printed and ignored for the whole life of the packet, and that is now
+      # said out loud on every run rather than left to the reader's inference.
+      case "$f" in
+        source | revision) absent_hard="$absent_hard $f" ;;
+        *) absent_soft="$absent_soft $f" ;;
+      esac
+      continue
+    fi
+    "shape_$f" "$v" || bad_shape="$bad_shape $f"
+  done
+
+  if [ -n "$bad_shape" ] || [ -n "$absent_hard" ]; then
+    printf '%s: FAIL %s carries labels, and they are not a cafaye provenance stamp.\n' "$PROG" "$image" >&2
+    for f in $bad_shape; do
+      printf '%s:   %-16s = "%s" — it must be %s\n' "$PROG" "$f" "$(_verify_got "$f")" "$(expect_$f)" >&2
+    done
+    for f in $absent_hard; do
+      printf '%s:   %-16s is absent, and on --verify an absent identity field is a REFUSAL, not a pass.\n' "$PROG" "$f" >&2
+    done
+    printf '%s:   org.opencontainers.image.* are STANDARD OCI labels that every base image sets,\n' "$PROG" >&2
+    printf '%s:   and an image built FROM a stamped one INHERITS them. This stamp names "%s",\n' "$PROG" "${got_src:-nothing at all}" >&2
+    printf '%s:   which is not us. A verifier a third party'"'"'s labels can satisfy is not a verifier.\n' "$PROG" >&2
+    return 6
+  fi
+
+  if [ -n "$absent_soft" ]; then
+    printf '%s: note: %s absent — metadata rather than identity, so an old image is not refused for it.\n' "$PROG" "$absent_soft" >&2
+  fi
+
+  # --- OWNERSHIP, HALF ONE: is this stamp OURS AT ALL? ----------------------
+  #
+  # Asked ALWAYS, and it needs no flag, and that is the point: this half is what
+  # makes the defect impossible by default rather than by a caller remembering.
+  #
+  # `org.opencontainers.image.*` is the STANDARD half of the format and every
+  # published base image sets it — `oven/bun` sets source, revision and created,
+  # and an image built `FROM oven/bun` carries them whether or not anybody built
+  # it. `com.cafaye.kit.*` is kit's OWN namespace, and a base image cannot supply
+  # it by accident. So the ABSENCE of kit's namespace is evidence of
+  # non-authorship, and its presence is evidence of nothing in particular: anyone
+  # who wants to forge a label can, and a format cannot defend against that. The
+  # honest claim is the negative one, and it is the one that is load-bearing —
+  # the defect this packet fixes is INHERITANCE, which this cannot miss.
+  #
+  # AT LEAST ONE kit key, not both. The question is "did kit's build write
+  # this?", and one value in the private namespace answers it; requiring both
+  # would be a second copy of `tests/provenance_test.sh` part B's five-key
+  # agreement check, and a check that is a copy of another check goes red twice
+  # for one cause. Measured: this is the branch `cafaye/guard:e2e` takes.
+  if [ -z "$got_dirty" ] && [ -z "$got_tv" ]; then
+    printf '%s: FAIL %s carries only org.opencontainers.image.*, so those labels came from the BASE\n' "$PROG" "$image" >&2
+    printf '%s:   IMAGE it was built FROM and not from a kit Dockerfile: nothing here set\n' "$PROG" >&2
+    printf '%s:   com.cafaye.kit.*, and that namespace is the one part of a stamp a third-party\n' "$PROG" >&2
+    printf '%s:   base image cannot supply by accident.\n' "$PROG" >&2
+    printf '%s:   source reads "%s" — whoever built that base image, it is not us.\n' "$PROG" "${got_src:-<absent>}" >&2
+    printf '%s:   Pass --expect-source owner/repo to assert the repository as well.\n' "$PROG" >&2
+    return 6
+  fi
+
+  # --- OWNERSHIP, HALF TWO: is it the repository the caller named? -----------
+  #
+  # `--expect-source` mirrors `--expect-revision` exactly: given, it is an
+  # ASSERTION and a mismatch is exit 5; that is the case a perfectly well-formed
+  # foreign source (`oven-sh/bun`, no scheme, two clean segments — which passes
+  # every grammar in this file) can only be caught by.
+  #
+  # NOT GIVEN IS A WARNING AND NOT A FAILURE, and this overrules the packet's
+  # recommendation to fail loudly. The reason is exit-code cost, stated plainly
+  # rather than assumed: exit 4 is already load-bearing for "no labels at all",
+  # so the cost of a new mandatory failure here is that every printing-form
+  # caller written by kit's own FIRST MOVE — `provenance.sh --verify IMG || true`
+  # in `parlor/bin/e2e-stack` and `site/bin/e2e-stack` — would print a FAIL and
+  # continue, which is WORSE than a warning: it teaches a reader that this line
+  # is noisy. A check that cries wolf on a green tree is not obeyed on a red one.
+  #
+  # What the recommendation asked for is not lost, only made impossible to
+  # ignore: the warning names the source, says in words that ownership was NOT
+  # established, and names the flag that would establish it. Half one above still
+  # fails the run without the flag, so the defect that motivated the
+  # recommendation — a silent default — is closed by the namespace check rather
+  # than by breaking every caller at once.
+  if [ -n "$expect_src" ]; then
+    if [ -z "$got_src" ] || [ "$got_src" = 'unknown' ]; then
+      printf '%s: FAIL %s is stamped "%s" for source and %s was expected — an image that cannot name itself cannot be asserted about.\n' \
+        "$PROG" "$image" "${got_src:-<absent>}" "$expect_src" >&2
+      return 5
+    fi
+    if [ "$got_src" != "$expect_src" ]; then
+      printf '%s: FAIL %s is built from %s, and %s was expected.\n' "$PROG" "$image" "$got_src" "$expect_src" >&2
+      printf '%s:   a stamp that satisfies the grammar is not a stamp that is OURS. %s is a\n' "$PROG" "$got_src" >&2
+      printf '%s:   well-formed and entirely foreign, which is the case shape cannot see.\n' "$PROG" >&2
+      return 5
+    fi
+  else
+    printf '%s: WARN no --expect-source was given, so OWNERSHIP OF THE REPOSITORY WAS NOT ESTABLISHED.\n' "$PROG" >&2
+    printf '%s:      the source reads "%s", and every grammar in this file accepts it. Only\n' "$PROG" "$got_src" >&2
+    printf '%s:      --expect-source owner/repo turns "it is shaped like ours" into "it IS ours".\n' "$PROG" >&2
+  fi
 
   [ -n "$expect_rev" ] || return 0
 
@@ -393,15 +563,17 @@ case "$cmd" in
   --args) emit_args ;;
   --write) write_stamp "${1:-/app/kit-provenance.json}" ;;
   --verify)
-    # `--verify IMAGE [--expect-revision SHA]`. The flag is PARSED rather than
-    # read positionally, and that is not tidiness: the first version took $2 as
-    # the expectation, so `--verify IMG --expect-revision SHA` compared the
-    # revision against the literal string "--expect-revision" and reported a
-    # mismatch on an image that was correct. A check whose flag form is wrong
-    # fails in the direction that looks like the bug it was written to catch.
+    # `--verify IMAGE [--expect-revision SHA] [--expect-source owner/repo]`. The
+    # flags are PARSED rather than read positionally, and that is not tidiness:
+    # the first version took $2 as the expectation, so
+    # `--verify IMG --expect-revision SHA` compared the revision against the
+    # literal string "--expect-revision" and reported a mismatch on an image
+    # that was correct. A check whose flag form is wrong fails in the direction
+    # that looks like the bug it was written to catch.
     shift 0 2>/dev/null || true
     v_image=''
     v_expect=''
+    v_expect_src=''
     while [ "$#" -gt 0 ]; do
       case "$1" in
         --expect-revision)
@@ -410,6 +582,12 @@ case "$cmd" in
           shift 2
           ;;
         --expect-revision=*) v_expect="${1#*=}"; shift ;;
+        --expect-source)
+          [ "$#" -ge 2 ] || { printf '%s: --expect-source needs a value\n' "$PROG" >&2; exit 64; }
+          v_expect_src="$2"
+          shift 2
+          ;;
+        --expect-source=*) v_expect_src="${1#*=}"; shift ;;
         -*) printf '%s: unknown flag %s\n' "$PROG" "$1" >&2; exit 64 ;;
         *)
           [ -z "$v_image" ] || { printf '%s: --verify takes one image reference\n' "$PROG" >&2; exit 64; }
@@ -419,7 +597,24 @@ case "$cmd" in
       esac
     done
     [ -n "$v_image" ] || { printf '%s: --verify needs an image reference\n' "$PROG" >&2; exit 64; }
-    emit_verify "$v_image" "$v_expect"
+    # `--expect-source` is itself a stamp value, so it is checked against the
+    # SOURCE GRAMMAR before it is used to judge anything. A caller that writes
+    # `--expect-source https://github.com/cafaye/kit` would otherwise get a
+    # mismatch against a correctly stamped image and read it as tampering.
+    if [ -n "$v_expect_src" ]; then
+      _es="$v_expect_src"
+      case "$_es" in
+        unknown) ;;
+        *)
+          if ! shape_source "$_es"; then
+            printf '%s: refusing to ASSERT source=%s\n' "$PROG" "$_es" >&2
+            printf '%s:   --expect-source must be %s\n' "$PROG" "$(expect_source)" >&2
+            exit 2
+          fi
+          ;;
+      esac
+    fi
+    emit_verify "$v_image" "$v_expect" "$v_expect_src"
     ;;
   --fields) printf '%s\n' $FIELDS ;;
   -h | --help)
