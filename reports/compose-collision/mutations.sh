@@ -44,19 +44,27 @@ trap 'restore' EXIT
 # The mutation is applied by the caller BEFORE this is called and restored by this
 # function once the verdict is in. Two arguments rather than three because a
 # mutation is a multi-line edit that does not belong in an argument list.
+#
+# `basename "$file"` because the guard reports a bare filename — its findings name
+# the tier, and the tier is identified inside tests/. Asking for `tests/foo.sh:`
+# here when the guard prints `foo.sh:` is a harness bug that reads exactly like a
+# guard that bites for the wrong reason, which is why this distinguishes the two
+# cases rather than lumping them into NOT BITTEN.
 expect_red() {
-  local label="$1" file="$2" out ec
+  local label="$1" file="$2" base out ec
+  base="$(basename "$file")"
   out="$(bash tests/validate.sh --only="$LABEL" 2>&1)"; ec=$?
   if [ "$ec" -eq 0 ]; then
     printf 'NOT BITTEN  %s\n' "$label"
-    printf '            the gate stayed green on a tree with %s hardcoded\n' "$(basename "$file")"
+    printf '            the gate stayed green on a tree with %s hardcoded\n' "$base"
     failures=$((failures + 1))
     restore
     return
   fi
-  if ! printf '%s\n' "$out" | grep -qF "$file:"; then
+  if ! printf '%s\n' "$out" | grep -qF "$base:"; then
     printf 'WRONG REASON  %s\n' "$label"
-    printf '            red, but did not name %s; a red for the wrong cause is not a proof\n' "$file"
+    printf '            red, but did not name %s; a red for the wrong cause is not a proof\n' "$base"
+    printf '            it named: %s\n' "$(printf '%s\n' "$out" | grep -E '^ *- ' | head -1 | cut -c1-140)"
     failures=$((failures + 1))
     restore
     return
