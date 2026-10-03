@@ -191,6 +191,38 @@ test suite — kit has no other tests, because kit has no code.
 bash tests/validate.sh
 ```
 
+**`--no-live` skips only the observability LIVE tier** — the three docker stacks
+the collector platform is proven by — and turns each of them into a `SKIP` naming
+the flag. `--no-observability` skips the whole phase, including the two cluster
+tiers. They are separate flags because they are separate claims: "the collector
+works" and "a service cannot read another service's rows", measured at 128.8s and
+23.9s respectively on this machine.
+
+**The one thing that sets `--no-live` is `tests/self_test.sh`**, because its 104
+whole gates each used to bring up three docker stacks to learn one fact about
+one named check. Measured: **0 of the 107 recipe invocations name a live tier**,
+and only ONE recipe reached it at all — breakage 23b, whose helper is the one
+that cannot be `--only`-filtered, because the string it must find is a SKIP's
+verdict text rather than a check's label. Every other recipe is either
+`--static-only` or narrowed to the single check it asserts, and `bounded_check`
+honours `--only`. So contention, not a defect, is what made 23b red at position
+23 of 104 in a full suite run while it was green standalone — **reported, not
+reproduced**: 23b's gate run is green on this machine, standalone and inside a
+full suite run, and the claim being made here is about the *exposure* (one whole
+gate, half of it docker, asserting nothing about any of it) rather than about a
+failure someone watched.
+
+**A skip that cannot be seen is a silent pass**, so the opt-out is three printed
+`SKIP` rows, three in the skip tally, and a summary line naming the claims the
+run did not exercise. A patch that deleted the three tiers outright would satisfy
+23b's exit-status assertion and fail its name-the-skip one; that asymmetry is the
+whole reason this is a `report SKIP` and not an absence. A check derives the live
+set from the gate's own `live_check` calls and fails if any recipe names one, if
+a second `bash tests/validate.sh` spawn appears outside `kit_child_gate`, or if
+that spawn stops carrying `KIT_NO_LIVE=1`. See `live_check` in
+`tests/validate.sh`, `kit_child_gate` in `tests/self_test.sh`, and `DECISIONS.md`
+(MD30).
+
 **One command, on a clean clone, is the whole procedure.** The gate installs its
 own dependencies into the gitignored `.venv/` on first run and prints a `note:`
 line saying so. There is no prerequisite step, and a prerequisite step that is
@@ -363,6 +395,15 @@ a test asserts on it. **The rule stays: assemble the canary, do not commit it.**
     and green after, both measured. The general rule this earns: a control
     satisfiable by two different checks proves the gate can go red and says
     nothing about either.
+  - **23b now asserts THREE things, and the third is the one that makes
+    `--no-live` honest.** Exit 0, the interpreter skip named — which is what it
+    always asserted — and a `SKIP` row that **names `--no-live`**. Deleting the
+    three `bounded_check` calls satisfies the first two perfectly: the gate is
+    greener than ever and still names the ruby floor, and it has proved nothing
+    about the live tier. The assertion is on the ROW, not on the exit status,
+    because that is the whole difference between a skip and a deletion, and 23b
+    is the only helper in the suite that runs a whole unfiltered gate — so it is
+    the only place the property can be watched failing.
   - **76 and 77** are the two ways a documented `bin/dev` command can stop
     existing, and they fail differently — the command gone, and the *subcommand*
     gone. 77 is the harder one: a check that only asks "is `db` dispatched" is

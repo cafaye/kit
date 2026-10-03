@@ -9,8 +9,33 @@
 #   bash tests/validate.sh --static-only       # parse/semantic checks only (fast)
 #   bash tests/validate.sh --language=go       # one telemetry language (CI matrix)
 #   bash tests/validate.sh --no-self-test      # skip the "can this go red" proof
-#   bash tests/validate.sh --no-observability  # skip the two docker-requiring proofs
+#   bash tests/validate.sh --no-observability  # skip the whole observability phase
+#   bash tests/validate.sh --no-live           # skip ONLY the observability live tier
 #   bash tests/validate.sh --no-lint           # skip running the linters themselves
+#
+# --no-live, and why it exists and why it is not --no-observability:
+#   `--no-observability` drops the whole phase, INCLUDING the two database
+#   boundary tiers. `--no-live` drops the three docker stacks the observability
+#   PLATFORM is proven by, and leaves the cluster tiers alone. The distinction
+#   matters because the two sets of claims are not the same: one is "the
+#   collector works", the other is "a service cannot read another service's
+#   rows". A child gate that asserts a file-level defect needs neither, and
+#   `tests/self_test.sh` is 104 whole gates — each of which used to bring up
+#   three docker stacks to learn one fact about one named check, on a machine
+#   that may also be running five other workers' gates. That is contention, and
+#   contention is what turned breakage 23b — a green-expecting proof about the
+#   ruby interpreter floor — red at recipe 23 of 104 in a full suite run while
+#   it was green standalone. (REPORTED, not reproduced: 23b's gate run is green
+#   on this machine, standalone and in a full suite run. The claim is the
+#   EXPOSURE — one whole gate, half of it docker, asserting nothing about any of
+#   it — and REPORT-kit-selftest-live-tier-01.md §2 keeps the two apart.)
+#   The opt-out is the fix and the bound is not: a bound widened to accommodate
+#   the machine it runs on has stopped measuring the thing it was written for.
+#
+#   WHAT IT IS NOT: silence. Each of the three tiers becomes a `SKIP` naming the
+#   flag, counted in the skip tally and printed in the summary, because a skip
+#   that cannot be seen is a silent pass. Nothing sets this flag on a gate a
+#   human or CI runs; see `live_check` for the shape and `AGENTS.md`.
 #
 # Six phases, all of which must pass:
 #   static         every artifact parses, and the strictness decisions are still
@@ -112,6 +137,16 @@ RUN_TELEMETRY=1
 RUN_SELF_TEST=1
 RUN_OBSERVABILITY=1
 RUN_LINT=1
+# The observability LIVE tier, which is a SUBSET of `RUN_OBSERVABILITY`: three
+# docker stacks (the canary, the collector-killed service, the fetched stack)
+# out of the five bounded tiers in that phase. Split out because the other two —
+# the cluster isolation and the account boundary — are different claims with
+# different costs, and a caller that wants one almost never wants the other.
+# Measured on this branch: the three cost 128.8s of a 255.2s gate run (50.5%);
+# `isolation_test.sh` + `tenancy_test.sh` cost 23.9s between them. So the live
+# tier is the whole of the contention problem and the cluster tiers are not, and
+# `--no-live` is scoped to the three rather than to the phase.
+RUN_LIVE=1
 LANGS=()
 
 # ONLY_MATCH, when set, runs only the checks whose LABEL contains this substring.
@@ -148,6 +183,7 @@ while [ "$#" -gt 0 ]; do
       ;;
     --no-self-test) RUN_SELF_TEST=0 ;;
     --no-observability) RUN_OBSERVABILITY=0 ;;
+    --no-live) RUN_LIVE=0 ;;
     --no-lint) RUN_LINT=0 ;;
     --language=*)
       LANGS+=("${1#*=}")
@@ -156,7 +192,21 @@ while [ "$#" -gt 0 ]; do
       ONLY_MATCH="${1#*=}"
       ;;
     -h | --help)
-      sed -n '2,35p' "$0"
+      # The whole leading comment block, up to the first line of code. This used
+      # to be `sed -n '2,35p'`, a hand-counted range: it already cut a sentence
+      # in half, and it moved by one line the day a flag was added, which is
+      # exactly the kind of coupling a new flag must not arrive with. Anchored
+      # on `set -euo pipefail` instead, which is the first line of code in this
+      # file and cannot be renumbered by editing the comment above it.
+      sed -n '2,/^set -euo pipefail$/p' "$0" | sed '$d'
+      # The EXIT trap is armed above `kit_phase` is DEFINED — the profiler's
+      # functions are hundreds of lines further down — so `exit 0` from here ran
+      # a trap whose body was three unknown commands and printed
+      # `kit_phase: command not found` on a successful `--help`. The temp dir is
+      # removed here instead of by the trap, and the trap is then disarmed
+      # rather than left to fail on the way out.
+      rm -rf "$TMP"
+      trap - EXIT
       exit 0
       ;;
     *)
@@ -166,6 +216,15 @@ while [ "$#" -gt 0 ]; do
   esac
   shift
 done
+
+# `KIT_NO_LIVE` is the same opt-out as `--no-live`, for the caller that cannot
+# put a flag on the command line — `tests/self_test.sh`, which runs the gate in
+# 105 labelled copies and would otherwise have to thread the flag through five
+# helpers. Truthy values only, and `--no-live` above cannot be undone from here:
+# an opt-out that a later assignment could turn back on is not an opt-out.
+case "${KIT_NO_LIVE:-}" in
+  1 | true | TRUE | yes | on) RUN_LIVE=0 ;;
+esac
 
 # ---------------------------------------------------------------------------
 # profiling — where the run's seconds actually went
@@ -1165,6 +1224,83 @@ bounded_check() {
     report FAIL "$label"
     printf '%s\n' "$out" | sed 's/^/       /'
   fi
+}
+
+# live_check <label> <bound> <command...> — the observability LIVE tier, behind
+# ONE opt-out.
+#
+# WHAT IT IS. The three docker stacks that prove the observability platform is
+# usable at all: a canary secret in ten attributes reaching no exporter, a
+# service still serving with the collector killed, and the FETCHED stack coming
+# up with a trace landing in Tempo and a metric in Mimir. Those are the three
+# `live_check` calls in phase 30, and this wrapper is the only thing that
+# decides whether they run.
+#
+# WHY IT IS NOT A `--only` FILTER AND NOT A WIDER BOUND. `--only` is a filter on
+# a LABEL, and a breakage that wants "the gate went red" cannot use one: the
+# verdict it asserts is about a check it names, and a filter broad enough to
+# reach the live tier would also reach everything else. A wider bound is the
+# response this repository refuses, for a reason stated in its own words further
+# down: "a bound set at the observed quiet duration is a bound that fires on any
+# contention at all, and a bound that fires is a tier that proved nothing" —
+# and a bound widened until it stops firing on a loaded machine is a number that
+# has stopped measuring the thing it was written to measure.
+#
+# WHY IT IS NOT `--no-observability`. That flag drops the whole phase, including
+# the two cluster tiers, which are a different claim (a service cannot read
+# another service's rows) at a different cost (23.9s between them, measured,
+# against 128.8s for these three). A caller that wants the boundary proofs and
+# not the collector proofs — or the reverse — needs both halves to be separable.
+#
+# WHAT THE SKIP IS, and why it is not silence. A SKIP, printed, counted in the
+# tally and repeated in the summary: the rule this file keeps restating is that
+# a skip nobody can see is a silent pass, and a patch that deleted the three
+# `bounded_check` calls outright would satisfy every exit-status assertion while
+# proving nothing. So the skip line is the whole contract.
+#
+# NOT FATAL, and that is a decision rather than an omission. The lint phase is
+# fatal on a skip, because "kit's configs work" is unproved by a run in which no
+# linter executed. `--no-live` cannot be fatal for the same reason, and the
+# reason is 23b: that recipe asserts the gate is GREEN while naming a skip, so a
+# fatal `--no-live` skip would red the one proof this exists to keep green. The
+# honesty is carried by the count and the summary line instead — which is enough
+# here because the flag is set by exactly one caller, in `tests/self_test.sh`,
+# and a top-level gate never sets it.
+live_check() {
+  local label="$1" bound="$2"
+  shift 2
+  if [ "$RUN_LIVE" -eq 1 ]; then
+    bounded_check "$label" "$bound" "$@"
+    return $?
+  fi
+  # `--only` IS APPLIED HERE, FIRST, and only on this branch — and that asymmetry
+  # is the point rather than an oversight. When the tier runs, `bounded_check`
+  # applies the filter itself; applying it here as well would count every
+  # selected tier twice in `ONLY_RAN`. When the tier does NOT run there is no
+  # `bounded_check` call to filter, and a filtered run must not report three
+  # skips for checks it was told not to run: of the 93 self-test recipes that run
+  # the gate, 84 are `--static-only` and 8 more are narrowed by `--only`, and
+  # `ONLY_SKIPPED` is a count a reader uses.
+  if [ -n "$ONLY_MATCH" ]; then
+    case "$label" in
+      *"$ONLY_MATCH"*) ONLY_RAN=$((ONLY_RAN + 1)) ;;
+      *)
+        ONLY_SKIPPED=$((ONLY_SKIPPED + 1))
+        return 0
+        ;;
+    esac
+  fi
+  # `SKIP_EXIT` and NOT 0, deliberately. `bounded_check` publishes these two
+  # unconditionally so a caller cannot read the previous tier's verdict, and this
+  # is that publication. A tier that did not run has no verdict, and 0 would be a
+  # green for a run that never happened — the exact hazard the unconditional
+  # publish exists to prevent, reachable again through this branch. `SKIP_EXIT`
+  # is already this file's name for "could not run", and `kit_cached_check`'s
+  # `lookup` refuses any record whose exit is not 0, so a skipped live tier can
+  # never come back as a cache HIT either.
+  KIT_CACHE_LAST_EXIT="$SKIP_EXIT"
+  KIT_CACHE_LAST_OUT="$label  (not run: --no-live)"
+  report SKIP "$label  (NOT RUN — --no-live, or KIT_NO_LIVE=1: the observability live tier was opted out and this claim is UNEXERCISED)"
 }
 
 # ===========================================================================
@@ -11080,15 +11216,25 @@ if [ "$RUN_OBSERVABILITY" -eq 1 ]; then
   # The numbers are ~3x the quiet-machine durations recorded in REPORT-kit-13.md
   # §7, not a guess: a bound set at the observed quiet duration is a bound that
   # fires on any contention at all, and a bound that fires is a tier that proved
-  # nothing.
+  # nothing. That sentence is also why the fix for contention here was NOT to
+  # widen these three: a number widened until it stops firing on a loaded box is
+  # a number that has stopped measuring the thing it was written to measure.
+  #
+  # THE THREE BELOW GO THROUGH `live_check`, and the two cluster tiers after them
+  # do not. Measured on this branch (KIT_PROFILE, `--language=ruby
+  # --no-self-test`, an otherwise green run): canary 19.1s +
+  # no_telemetry_in_readiness 63.6s + stack_live 46.1s = 128.8s of a 255.2s run,
+  # against isolation_test 13.5s + tenancy_test 10.4s = 23.9s. So the live tier
+  # is 50.5% of that gate run and the cluster tiers are 9.4% of it, which is
+  # what makes `--no-live` a subset rather than `--no-observability` a synonym.
   if ! have docker; then
     report SKIP 'observability proofs (docker not installed)'
   elif ! docker info >/dev/null 2>&1; then
     report SKIP 'observability proofs (docker daemon not reachable)'
   else
-    bounded_check 'tests/canary_test.sh  (a canary secret reaches no exporter)' \
+    live_check 'tests/canary_test.sh  (a canary secret reaches no exporter)' \
       900 bash "$ROOT/tests/canary_test.sh"
-    bounded_check 'tests/no_telemetry_in_readiness.sh  (collector killed, service still serves)' \
+    live_check 'tests/no_telemetry_in_readiness.sh  (collector killed, service still serves)' \
       900 bash "$ROOT/tests/no_telemetry_in_readiness.sh"
     # THE STACK, RUN. Every claim in this file about the observability platform
     # being usable is a claim about YAML until this one runs: that the FETCHED
@@ -11097,7 +11243,7 @@ if [ "$RUN_OBSERVABILITY" -eq 1 ]; then
     # neither. `docker compose config` proved a stack that could not start, twice,
     # in this repository's own history — once because the collector's environment
     # block was missing and once because Mimir's healthcheck named a directory.
-    bounded_check 'tests/stack_live_test.sh  (the fetched stack runs; a trace and a metric land)' \
+    live_check 'tests/stack_live_test.sh  (the fetched stack runs; a trace and a metric land)' \
       900 bash "$ROOT/tests/stack_live_test.sh"
 
     # THE CLUSTER, RUN, AND THE ANSWER IN THE OUTPUT.
@@ -11377,6 +11523,170 @@ if [ "$RUN_SELF_TEST" -eq 1 ]; then
   # `str` at every point of entry is the whole fix, and the reason it is worth
   # stating: a set difference over two representations of the same number is
   # never empty, so the failure mode is a permanently red check, not a missed one.
+  #
+  # ---------------------------------------------------------------------------
+  # AND THE SECOND PROPERTY ABOUT THE SAME FILE: no recipe needs the live tier,
+  # and every child gate opts out of it through ONE wrapper. Both are derived
+  # here rather than asserted in `self_test.sh`'s header, because the header is
+  # exactly the kind of claim this repository stops believing: a comment saying
+  # "the child gates do not run docker" is a comment, and the thing that failed
+  # was a docker tier that ran anyway for twenty-odd whole gates.
+  #
+  # THREE THINGS ARE CHECKED, and each answers a way this can rot:
+  #
+  #   1. `bash tests/validate.sh` appears EXACTLY ONCE in `self_test.sh`, in a
+  #      non-comment line. Five helpers spawn child gates; a sixth added without
+  #      the opt-out is a whole gate that quietly brings up three docker stacks
+  #      again, and the suite gets slower and flakier with nothing to read.
+  #   2. That one line sets `KIT_NO_LIVE=1` and lives inside `kit_child_gate`, so
+  #      the single place is also the place that knows what the opt-out is.
+  #   3. ZERO recipe invocations mention a live tier. The live set is READ from
+  #      this file's own `live_check` calls rather than written out here, so a
+  #      fourth live tier is covered by the same check on the day it lands, and
+  #      the list can never name a script that has been renamed.
+  #
+  # (3) is the count this packet asked for, as a check rather than as a claim:
+  # today it is 0, and it is 0 because every recipe asserts a verdict about ONE
+  # named check — a collector config, a workflow, a linter, a reporter — and the
+  # observability live tier is not one of them. It is 0 for a second reason the
+  # count cannot see. Counted on this tree: of the 107 recipe invocations, 93 run
+  # the gate at all (6 `expect_red_lang` and 8 `_script` invocations never do),
+  # **84 of the 93 pass `--static-only`**, and the other 9 are all narrowed to
+  # the single check they assert by `expect_red_check`'s `--only` — except 23b,
+  # whose helper cannot be filtered because the string it must find is a SKIP's
+  # verdict text rather than a check's label. So the opt-out changes the output
+  # of exactly ONE recipe in the suite.
+  self_test_live_tier() {
+    "$PY" - "$ROOT/tests/validate.sh" "$ROOT/tests/self_test.sh" <<'PY'
+import re
+import sys
+
+gate, suite = sys.argv[1], sys.argv[2]
+src = open(gate, encoding="utf-8").read()
+self_src = open(suite, encoding="utf-8").read()
+
+# (3) The live set, DERIVED. `live_check '<label>' … bash "$ROOT/tests/<script>"`
+# is the only shape a live tier has, because `live_check` is the only wrapper
+# that honours RUN_LIVE — and requiring the `live_check` spelling is the point:
+# a new tier added straight to `bounded_check` would be invisible here, so the
+# rule is that anything behind the opt-out is spelled `live_check`.
+live = re.findall(r"^[ \t]*live_check[^\n]*\n[ \t]*\d+ bash \"\$ROOT/tests/([^\"]+)\"", src, re.M)
+if not live:
+    print("  - no `live_check` invocation found: the observability live tier is not")
+    print("    behind --no-live any more, so `KIT_NO_LIVE=1` would opt out of nothing")
+    print("    and the opt-out in tests/self_test.sh would be a decoration.")
+    sys.exit(1)
+
+lines = self_src.splitlines()
+# A line whose first non-blank character is `#` is a comment. Everything this
+# check reads is CODE, and the file is full of prose that legitimately names
+# `canary_test.sh` — including the wrapper's own comment, which explains why the
+# count is zero.
+code = [(n, ln) for n, ln in enumerate(lines, 1) if ln.strip() and not ln.lstrip().startswith("#")]
+
+problems = []
+
+# (1) One spawn, and it is the gate rather than a path to it. The pattern is
+# deliberately loose about the path -- `bash "$dir/tests/validate.sh"` is the same
+# spawn as `bash tests/validate.sh` and opts out of nothing -- and deliberately
+# excludes `bash -n`, which this file already uses to syntax-check a script and
+# which runs no gate.
+spawns = [
+    (n, ln)
+    for n, ln in code
+    if re.search(r"\bbash\b(?! +-n\b)[^|;&\n]*tests/validate\.sh", ln)
+]
+if len(spawns) != 1:
+    where = ", ".join("line %d" % n for n, _ in spawns) or "nowhere"
+    problems.append(
+        f"a `bash … tests/validate.sh` spawn appears {len(spawns)} time(s) outside "
+        f"comments in tests/self_test.sh ({where}); expected exactly 1. Every child gate "
+        "must go through kit_child_gate, or it does not get KIT_NO_LIVE=1."
+    )
+
+# (2) The one spawn opts out, and it lives in a wrapper that exists.
+#
+# CONTAINMENT IS DELIBERATELY NOT ASSERTED, and the reason is a mutation that
+# made this check red on correct work while it was being written. Locating the
+# spawn "inside `kit_child_gate`" needs either brace counting or "the nearest
+# function definition above it", and both are wrong the moment a definition is
+# written inside another definition's body — which bash accepts, which no linter
+# here flags, and which a reader can do by accident. The span version reported
+# the nested function as the enclosing one and blamed a function that spawns
+# nothing; a check that fires on a correct edit teaches the reader to ignore it,
+# which is this repository's own rule about `Naming/PredicateName` and about
+# keyword scans over comments. So the property here is the one that matters —
+# one spawn, and it carries the opt-out — plus the fact that the wrapper is
+# still there to carry the reasoning.
+if len(spawns) == 1:
+    n, ln = spawns[0]
+    if "KIT_NO_LIVE=1" not in ln:
+        problems.append(
+            f"line {n} spawns the gate without KIT_NO_LIVE=1, so that child gate runs "
+            "the observability live tier — three docker stacks — for a recipe that "
+            "asserts one named check."
+        )
+    if not any(re.match(r"^kit_child_gate\(\)\s*\{\s*$", ln) for ln in lines):
+        problems.append(
+            "tests/self_test.sh defines no `kit_child_gate()`. One spawn of the gate is "
+            "not enough on its own: the wrapper is the single place that says what the "
+            "opt-out is and why, and a bare spawn in five helpers is a promise repeated "
+            "five times with nothing to check it."
+        )
+
+# (3) No recipe names a live tier. Statements are joined on a trailing `\` because
+# every recipe in this file is written across two or three lines. `cur` holds the
+# line NUMBER and the lines, in that order, because the failure message has to be
+# able to point at the recipe rather than at "somewhere in the file".
+stmts, cur = [], None
+for n, ln in code:
+    if cur is None:
+        # Anchored on the NAME and required NOT to be a definition. `expect_red()
+        # {` matches a name-only pattern exactly as well as a call does — which
+        # is the mistake this repository has already made once, in both the
+        # `_st_breakages` count and the header/recipe agreement check, and which
+        # printed 28 over 23 recipes on a run that was fine. The `()` is what
+        # tells the two apart.
+        if re.match(
+            r"^[ \t]*expect_(?:red(?:_check|_lang|_script)?|green_check|skip_check|green)\b",
+            ln,
+        ) and not re.match(r"^[ \t]*expect_[A-Za-z0-9_]*\(\)\s*\{", ln):
+            cur = (n, [ln])
+    else:
+        cur[1].append(ln)
+    if cur is not None and not ln.rstrip().endswith("\\"):
+        stmts.append(cur)
+        cur = None
+if cur is not None:
+    stmts.append(cur)
+
+offenders = []
+for start, body_lines in stmts:
+    body = " ".join(body_lines)
+    for script in live:
+        if script in body:
+            offenders.append(f"line {start} names `{script}`")
+if offenders:
+    problems.append(
+        f"{len(offenders)} recipe invocation(s) name a live tier out of "
+        f"{', '.join(live)}: " + "; ".join(offenders) + ". A recipe that asserts a "
+        "live docker tier can only be evaluated on a quiet machine, which is the "
+        "condition that made breakage 23b red at position 23 of 104 and green "
+        "standalone. Prove that tier from the top-level gate instead."
+    )
+
+if problems:
+    for p in problems:
+        print("  -", p)
+    sys.exit(1)
+print(
+    f"0 of {len(stmts)} recipe invocations name a live tier; "
+    f"{len(spawns)} child-gate spawn, opted out of all {len(live)}"
+)
+PY
+  }
+  check 'tests/self_test.sh  (0 of the recipes name a live tier; every child gate opts out through one wrapper)' \
+    self_test_live_tier
   self_test_claims() {
     "$PY" - "$ROOT/tests/self_test.sh" <<'PY'
 import re
@@ -11551,6 +11861,20 @@ fi
 if [ -n "$ONLY_MATCH" ]; then
   echo "note: FILTERED run -- $ONLY_RAN check(s) ran, $ONLY_SKIPPED excluded by --only='$ONLY_MATCH'."
   echo "       This is NOT a claim about the $ONLY_SKIPPED excluded check(s). Run without --only for that."
+fi
+# `--no-live` GETS ITS OWN SUMMARY LINE, on both exit paths, and this is the
+# second half of the honesty argument `live_check` starts. The three SKIP rows
+# above are the first half; without a line here, a reader who reads only the
+# summary sees `PASS: every check passed.` and `note: 9 check(s) skipped` with
+# nothing telling them WHICH nine, which is the same shape as a check that
+# quietly stopped running. So the opt-out is named at the point where a verdict
+# is announced, in the past tense and with the consequence in it: those three
+# claims were not exercised by this run, whoever asked for the skip.
+if [ "$RUN_LIVE" -eq 0 ]; then
+  echo "note: --no-live: the observability live tier (canary, collector-killed, fetched stack)"
+  echo "       did NOT run. Three claims are UNEXERCISED by this run and no gate that a"
+  echo "       human or CI runs sets this flag; it exists for the throwaway gates in"
+  echo "       tests/self_test.sh, none of which asserts anything about those three."
 fi
 if [ "$fails" -ne 0 ]; then
   echo "FAIL: $fails check(s) failed."

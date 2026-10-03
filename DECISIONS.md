@@ -788,3 +788,77 @@ measured rather than argued. This is the same rule one packet downstream: a
 number that a later commit made false is a **stale premise**, not a conservative
 estimate, and the cost of carrying it is paid in declarations nobody needed to
 write.
+
+---
+
+## MD30 — **the self-test's child gates opt OUT of the observability live tier, and no bound was widened**
+
+`REPORT-kit-selftest-live-tier-01.md`, §6. This is a decision about **what the
+105 labelled recipes are allowed to run**, and the four available responses were
+all worse than the one taken.
+
+**Not made: raising the 900s bounds** on `canary_test.sh`,
+`no_telemetry_in_readiness.sh` and `stack_live_test.sh`, or `bin/dev`'s deadline.
+
+**What it costs:** nothing, which is exactly why it is wrong. A bound exists to
+answer "did this tier finish on a loaded machine", and `tests/validate.sh` says
+of its own numbers: *"a bound set at the observed quiet duration is a bound that
+fires on any contention at all, and a bound that fires is a tier that proved
+nothing."* The same sentence read the other way is the reason not to widen: a
+bound widened until it stops firing on the busiest machine stops answering the
+question it was written to answer, and it does so invisibly — the tier still
+prints PASS. **Widening a bound is a comment, not a fix.**
+
+**Not made: making the live tier contention-proof.** Three docker stacks tuned
+against a machine kit does not control, with `KIT_DEV_PROFILES=observability`
+carrying tempo + loki + grafana together — eight containers apiece. The result
+would be a 23b that is a coin flip rather than a green, and a coin flip in a
+proof is worse than a red because it trains the reader to re-run.
+
+**Not made: running the recipes concurrently.** The recipes share the docker
+daemon and kit's 15000-15999 port block, so two shards collide; and a collision
+is indistinguishable from a real failure, which is the one thing a self-test
+must never be.
+
+**Not made: dropping breakage 23b.** It is the assertion that a green gate can
+still be an honest one — the suite is not run, and the gate names why. Removing
+it removes the only proof that a skip is named.
+
+**Taken instead, and this is the part that makes the trade reversible.** The
+count nobody had asked for: **0 of the 107 recipe invocations name a live tier.**
+Every recipe asserts a verdict about one named check — a collector config, a
+workflow, a linter, a reporter — and `canary_test.sh` /
+`no_telemetry_in_readiness.sh` / `stack_live_test.sh` are not among them. So
+`tests/validate.sh` grew `--no-live` (and `KIT_NO_LIVE=1`), which turns those
+three into `report SKIP` lines naming the flag, and `tests/self_test.sh` sets it
+for every child gate through one wrapper.
+
+**Why the skip and not the deletion.** A patch that deleted the three
+`bounded_check` calls would satisfy every exit-status assertion — 23b's included
+— while proving nothing. The skip line is printed, counted in the tally and
+repeated in the summary, because a skip nobody can see is a silent pass. This is
+the same rule as the `reportUnusedDisableDirectives` entry above, applied to an
+allowlist of *tiers* rather than of checks.
+
+**What it costs, stated plainly.** The self-test no longer exercises the live
+tier at all, so a defect in those three suites can no longer be caught by
+`self_test` — it is caught by the top-level gate, which still runs all three and
+whose green is the claim. That is a real reduction in what the suite proves and
+it is the right reduction: those three tiers are integration tests against a
+docker daemon, and a suite that runs 104 copies of them is asserting that the
+machine is quiet, which is a property of the machine. The flag is set in exactly
+one place, `kit_child_gate`, and a check fails if a second spawn appears without
+it or if any recipe ever names a live tier.
+
+**And the honest limit of the evidence.** The red at position 23 of 104 was
+*reported*; it did not reproduce on the machine this was built on, where 23b's
+gate run is green standalone and inside a full suite run. So the argument above
+rests on the **exposure** — measured: one whole gate out of the suite, 128.8 s
+of its 255.2 s in three docker stacks, asserting nothing about any of them —
+and not on a failure that was watched. The trade stands on the measurement; the
+anecdote is the thing that made somebody go and take it.
+
+**The rule.** *Ask what the expensive thing is being run FOR.* Nobody had, and
+the answer was "for nothing, 104 times" — which is a different defect from "the
+expensive thing is slow", and the only response to the second one that does not
+stop measuring is the one that removes the work.
