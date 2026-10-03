@@ -244,6 +244,17 @@ if ! command -v docker >/dev/null 2>&1 || ! docker info >/dev/null 2>&1; then
   skip "build: no docker, so the two sinks were not compared on a real image and --verify was not exercised"
 else
   GO=0123456789abcdef0123456789abcdef01234567
+  # The IMAGE TAGS are names in a shared namespace too, and they were two
+  # literals for the whole life of this file. An image tag is namespaced by
+  # nothing: `docker rmi -f NAME` at the bottom of this block takes a bare
+  # name and will delete an image a concurrent run is still asserting
+  # against, and `docker build -t NAME` writes over it. Two runs of this
+  # suite on one machine therefore shared both tags, and one run's teardown
+  # is what makes the other run's `docker image inspect` and `docker create`
+  # come back empty - which reads as "the stamp disagrees with itself", the
+  # one failure this section exists to rule out. The pid makes them ours.
+  GOOD_IMAGE="kit-provenance-test-$$:good"
+  PLAIN_IMAGE="kit-provenance-test-$$:plain"
   BAD=deadbeefdeadbeefdeadbeefdeadbeefdeadbeef
   fixture="$TMP/svc"
   mkdir -p "$fixture/docker" "$fixture/cmd/service"
@@ -254,7 +265,7 @@ else
 
   # `-f` gets an ABSOLUTE path: `docker build -f docker/Dockerfile` resolved
   # against something other than the context and read a 2-byte file on this box.
-  if docker build -q -f "$fixture/docker/Dockerfile.go" -t kit-provenance-test:good \
+  if docker build -q -f "$fixture/docker/Dockerfile.go" -t "$GOOD_IMAGE" \
     --build-arg KIT_PROVENANCE_SOURCE=cafaye/identity \
     --build-arg KIT_PROVENANCE_REVISION="$GO" \
     --build-arg KIT_PROVENANCE_BUILT_AT=2026-10-03T09:20:00Z \
@@ -270,9 +281,9 @@ else
 
   # THE TWO SINKS MUST AGREE. A stamp that disagrees with itself is worse than no
   # stamp, because a reader trusts whichever one they happened to look at.
-  l_rev="$(docker image inspect kit-provenance-test:good \
+  l_rev="$(docker image inspect "$GOOD_IMAGE" \
     --format '{{index .Config.Labels "org.opencontainers.image.revision"}}' 2>/dev/null)"
-  cid="$(docker create kit-provenance-test:good 2>/dev/null)"
+  cid="$(docker create "$GOOD_IMAGE" 2>/dev/null)"
   f_rev=""
   if [ -n "$cid" ]; then
     f_rev="$(docker cp "$cid:/app/kit-provenance.json" - 2>/dev/null | tar -xO kit-provenance.json 2>/dev/null |
@@ -288,10 +299,10 @@ else
   # THE RED PROOFS. Three different exit codes, and each one is asserted
   # separately because a check that returns the same code for "wrong commit" and
   # for "no labels" cannot tell a consumer which of the two happened.
-  sh "$STAMP" --verify kit-provenance-test:good --expect-revision "$GO" >/dev/null 2>&1
+  sh "$STAMP" --verify "$GOOD_IMAGE" --expect-revision "$GO" >/dev/null 2>&1
   [ $? -eq 0 ] && pass "verify: the expected commit exits 0" || fail "verify: the expected commit did NOT exit 0"
 
-  red="$(sh "$STAMP" --verify kit-provenance-test:good --expect-revision "$BAD" 2>&1)"
+  red="$(sh "$STAMP" --verify "$GOOD_IMAGE" --expect-revision "$BAD" 2>&1)"
   ec=$?
   if [ "$ec" -ne 0 ] && contains "$red" "$BAD"; then
     pass "verify: a WRONG commit exits $ec and names both commits — this is the check being able to fail"
@@ -302,8 +313,8 @@ else
   # An unstamped image. Built from a Dockerfile with no block, so this is a real
   # pre-stamp image rather than a missing one.
   printf 'FROM debian:12-slim\nCMD ["true"]\n' >"$TMP/plain.Dockerfile"
-  docker build -q -f "$TMP/plain.Dockerfile" -t kit-provenance-test:plain "$TMP" >/dev/null 2>&1
-  red2="$(sh "$STAMP" --verify kit-provenance-test:plain 2>&1)"
+  docker build -q -f "$TMP/plain.Dockerfile" -t "$PLAIN_IMAGE" "$TMP" >/dev/null 2>&1
+  red2="$(sh "$STAMP" --verify "$PLAIN_IMAGE" 2>&1)"
   ec2=$?
   if [ "$ec2" -ne 0 ] && contains "$red2" "no labels"; then
     pass "verify: an image with no stamp exits $ec2 and says so — distinct from the wrong-commit answer"
@@ -313,7 +324,7 @@ else
 
   # The leniency boundary: `unknown` must fail an ASSERTION even though it is
   # accepted at build time. That asymmetry is the design.
-  red3="$(sh "$STAMP" --verify kit-provenance-test:good --expect-revision unknown 2>&1)"
+  red3="$(sh "$STAMP" --verify "$GOOD_IMAGE" --expect-revision unknown 2>&1)"
   ec3=$?
   if [ "$ec3" -ne 0 ] && contains "$red3" "unknown"; then
     pass "verify: an image stamped unknown FAILS an assertion — unstamped is fine to create and not fine to assert about"
@@ -321,7 +332,7 @@ else
     fail "verify: asserting `unknown` exited $ec3 with [$red3]"
   fi
 
-  docker rmi -f kit-provenance-test:good kit-provenance-test:plain >/dev/null 2>&1
+  docker rmi -f "$GOOD_IMAGE" "$PLAIN_IMAGE" >/dev/null 2>&1
 fi
 
 # --- D. the consumer side, WITHOUT docker -------------------------------------

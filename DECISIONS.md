@@ -1056,3 +1056,61 @@ written, in every tier, on the day the tier lands.
 fact about the day the tier was typed.* Anything that decides which cluster a run
 talks to — project, container, volume, published port — is derived from the run's
 own identity, and a check over the tiers says so before CI does.
+
+### A TIER REACHED THROUGH A WRAPPER WAS NOT A TIER AT ALL
+
+`docker_tier_project_name` printed, in its own success line, that *the sixth tier
+is covered on the day it lands*. Three tiers under `tests/` bring a compose stack
+up and were not in scope, so the sentence was false while the gate was green.
+
+**What the pattern could not see, and why.** `BRING_UP` was
+`r"\bdocker\s+(?:compose\b.*\bup\b|run\b)"`, and it needs both halves of a
+command on one logical line. `canary_test.sh` and `no_telemetry_in_readiness.sh`
+each put `docker compose` in a `compose()` wrapper's body and pass the subcommand
+at the call site through `"$@"`, so the two halves are in different places.
+`stack_live_test.sh` writes `bash ./bin/dev up` and names the shared project only
+from `ps`, `exec`, `port` and `logs`. All three were dropped from `tiers` before any
+of the four rules ran. Measured with the mutation asserted by text:
+`PROJECT="kit-canary-$$"` → `PROJECT="kit-canary"`, guard exit 0, **zero
+findings**.
+
+**The tier set is now three arms, and none of them is an enumeration.** Bring-up
+direct, bring-up through a local `compose()`-style wrapper, and — the arm that
+widened the count past the number this packet predicted — a script that **names a
+shared namespace at all**. The wrapper arm matches the function **definition**
+rather than the call sites, because a call-site pattern must know every spelling a
+pass-through can take and the sixth idiom is another blind spot, while a definition
+has exactly one shape and keeps the docker command on the same line it is hiding.
+
+**The real fix is the emptiness finding one level up.** Widening `BRING_UP` alone
+is a one-line patch that regresses silently the next time someone adds a wrapper
+idiom. So: *a script under `tests/` that invokes docker but was not counted as a
+docker tier is a finding*, named. Its predicate is **deliberately wider** than the
+tier set — deriving it from `tiers` would be a tautology that can never fire, which
+is the defect this chain exists to kill wearing a new hat. Both halves matter: a
+rule that cannot fire is a green that costs its reader trust in the red ones, and a
+rule whose scope is written down separately from the code goes stale silently.
+
+**Two consequences the widening forced, both kept rather than tolerated.**
+`provenance_test.sh` builds `-t kit-provenance-test:good`, reads labels back out of
+it and tears it down with `docker rmi -f` — a bare name no `-p` has any say over,
+so an image tag is a **fifth** shared namespace and the file was invisible to a
+rule scoped to `… up`. Its two tags are now derived from the pid. And
+`deploy_test.sh:456` is a `note` printing an example command, which the new image
+rule read as a hardcoded tag; matches are now ignored when the `docker` itself sits
+inside a quoted run. `-t` is matched only after `docker build`, because `-t` is
+`--tty` to `run` and `exec`.
+
+**The limit this closes, stated separately from the one above.** The entry before
+this one records the limit that a *name* reached through a helper is invisible at
+the use site (`compose_up kit-isolation` → green). That is unchanged. What changed
+is one level up and it is worth not blurring: **before, the whole tier was out of
+scope; now the tier is in scope and only indirection inside it remains invisible.**
+A wrapper that brings a stack up is a tier. A name the wrapper builds before
+passing it is still not something a text scan can read.
+
+**The count is 9, not the 8 this packet predicted**, and the difference is
+`provenance_test.sh` — named by the new emptiness finding, closed rather than tuned
+away. A guard whose number was adjusted to a target is a guard measuring the
+target. Recipe and measurements: `reports/wrapper-tier-scope/mutations.sh`,
+8 cases, all bit.

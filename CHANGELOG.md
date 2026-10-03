@@ -2,6 +2,34 @@
 
 ### Fixed
 
+- **The docker-tier guard counted five tiers and three more were bringing a stack
+  up, so it was green on a tree carrying the exact defect it exists to catch.**
+  `docker_tier_project_name`'s success line claimed *the sixth tier is covered on
+  the day it lands*. `tests/canary_test.sh`, `tests/no_telemetry_in_readiness.sh`
+  and `tests/stack_live_test.sh` were all out of scope: the first two bring the
+  stack up through a `compose()` wrapper that forwards `"$@"`, so no logical line
+  contains both `docker compose` and `up`; the third writes `bash ./bin/dev up` and
+  names the project only from `ps`/`exec`/`port`/`logs`. A file dropped from the
+  tier set is invisible to a rule that counts tiers, so **no finding named them** —
+  not even the emptiness finding. Measured with the mutation asserted by text:
+  `PROJECT="kit-canary-$$"` → `PROJECT="kit-canary"`, guard exit 0, **0 findings**.
+  - The tier set is now three derived arms — direct bring-up, bring-up through a
+    local wrapper **definition**, and any script naming a shared namespace — and a
+    **fifth emptiness finding** reports a script under `tests/` that invokes docker
+    without being a tier, from a predicate deliberately wider than the tier set so
+    it is not a tautology.
+  - That finding named **`tests/provenance_test.sh`**, which builds
+    `-t kit-provenance-test:good` and tears it down with `docker rmi -f`: an image
+    tag is a **fifth** shared namespace, reached by bare name, and no `-p` has any
+    say over it. Both tags now derive from the pid.
+  - **`tests/deploy_test.sh:456` is a `note` printing an example command**, which
+    the new image rule first read as a hardcoded tag; matches are now ignored when
+    the `docker` itself lies inside a quoted run. `-t` is matched only after
+    `docker build`, because `-t` is `--tty` to `run` and `exec`.
+  - Recipe: `reports/wrapper-tier-scope/mutations.sh`, **8 cases, all bit**, guard
+    extracted from `tests/validate.sh` on every run so it cannot outlive it. Text
+    scan only — no image, no container, no docker.
+
 - **Two of this repository's docker tiers hardcoded their compose project name, so
   two concurrent runs were one stack with two owners — and the failure read as a
   database-boundary violation.** `tests/isolation_test.sh` and
