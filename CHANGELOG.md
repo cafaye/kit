@@ -2,6 +2,77 @@
 
 ### Fixed
 
+- **Two of this repository's docker tiers hardcoded their compose project name, so
+  two concurrent runs were one stack with two owners — and the failure read as a
+  database-boundary violation.** `tests/isolation_test.sh` and
+  `tests/tenancy_test.sh` each wrote `--project-name kit-isolation` /
+  `kit-tenancy` at two sites apiece. A compose project name is the namespace for
+  that stack's containers, networks and volumes, so a fixed one means one run's
+  teardown destroys the other's cluster mid-assertion. Observed on this box, not
+  argued from the source (`reports/compose-collision/`):
+  - **isolation**, two concurrent runs: `A exit=0 B exit=1`. The second run
+    replaced the first's running container (`kit-isolation-postgres-1 Recreate`)
+    and could not bring up a cluster of its own.
+  - **tenancy**, two concurrent runs: `A exit=2 B exit=1`. The second could not
+    bring up a cluster (`removal of container … is already in progress`), and the
+    **first died part way through assertion 5 with no `FAIL:` line of its own**,
+    exiting 2 — psql's code, propagating out of the `docker exec` under `set -e`,
+    because the other run's teardown had taken the project volume out from under
+    it. Through `validate.sh`'s `FAIL:` summary that reads as an account-boundary
+    violation, which is precisely the claim that tier exists to make trustworthy.
+
+  After the fix, both pairs are green, with two distinct projects, two distinct
+  host ports and two live clusters counted while both were up — because "both
+  green" is also what two runs sharing ONE stack look like, which is the false
+  pass worth fearing most here.
+
+- **The host port was hardcoded too, which is the same defect in a worse hat, and
+  fixing only the project name would have moved the collision rather than fixed
+  it.** `KIT_POSTGRES_PORT=15521` / `15531` are fixed **host ports**: they
+  collide with a developer's own running stack, not merely with another test run.
+  Measured: with only the project name derived, two concurrent runs were still
+  red on `port is already allocated`. Each tier now takes a free port found by
+  the same dependency-free probe `tests/stack_live_test.sh` uses, seeded from `$$`
+  so two concurrent runs do not begin their search in the same place.
+
+- **`tests/tenancy_test.sh`'s teardown was deleting objects the tier never
+  created.** It ran `docker rm -f kit-tenancy-control` and `docker volume rm
+  kit-tenancy-control-vol`; nothing in that file creates either, because every
+  control there is a SQL mutation against its own cluster rather than a second
+  container. `docker rm` takes a bare name and does not care who made it, so those
+  two lines reached outside the run's own namespace. Removed rather than derived —
+  the honest version of that line is no line.
+
+- **`tests/rls_perf_test.sh` had the same defect and was on nobody's list.**
+  `C="kit-rlsperf-pg"` is a fixed container name, so two concurrent runs were one
+  container with two owners. Found by the new guard, whose scope is derived from
+  the directory rather than from a list of the two files already known to be
+  broken — which is the argument for deriving that scope, made concrete.
+
+### Added
+
+- **`tests/validate.sh` gained `docker_tier_project_name`: a docker tier may not
+  hardcode a name in a shared namespace.** Covers four — project, container,
+  volume and published host port — and a copy-paste reintroducing any of them is
+  a red gate at authoring time rather than an interference in CI. The set of
+  tiers is derived from `tests/` rather than enumerated, so a sixth tier is
+  covered on the day it lands; within a tier the rule is applied at both
+  declaration and use site, so a tier that derives its project but writes its
+  control container literally is caught by the same rule. Emptiness is a finding,
+  as in `self_test_no_version_literal`: a guard that covers nothing says so
+  rather than reporting nothing.
+  - **The guard was wrong three times before it was right, and the mutation
+    suite is what said so** (`reports/compose-collision/mutations.sh`, which
+    breaks each property in turn, requires the gate to go red *and name the
+    site*, then restores and re-asserts green): bring-up was detected per line,
+    so the `if ! docker compose …` / `up -d` pair that is one command matched
+    neither half and `tenancy_test.sh` dropped out of scope entirely; a literal
+    could hide in an *assignment*, where every use site reads a derived `$VAR`;
+    and an inline `$$` was called a literal, which fired on `deploy_test.sh`'s
+    correctly-unique decoy volume.
+
+### Fixed (continued)
+
 - **The VERSION gate's own gate: a `### Breaking` heading was compared against
   the wrong section of the changelog, and the comparison was vacuous.** Rule (4)
   resolves the version a breaking heading is checked against with `grep -B1`,

@@ -960,3 +960,99 @@ airtight: it catches the class as it was actually written.
 about the day the recipe was typed.* Anything a routine repository change moves —
 a version, a changelog heading — is derived from the tree being mutated, and a
 check over the recipes says so before the release rather than after it.
+
+---
+
+## MD32 — **a docker tier's shared names are DERIVED from the run, and the guard reads the directory rather than a list**
+
+The trade this packet was dispatched to make. Four namespaces are now derived in
+every tier that brings a container up, and `tests/validate.sh` fails when one is
+not. What was **not** made: a stronger uniqueness token, a per-run docker network,
+and a guard that follows a name through a helper function.
+
+**What it costs:** `$$` is unique among live processes **on one machine** and no
+further. Two CI jobs sharing one docker daemon would still collide. That is
+accepted rather than overlooked — every job in this repository's workflows runs on
+`ubuntu-latest` with its own daemon, so the property that has to hold is
+uniqueness among processes on one machine, and `$$` delivers exactly that and
+nothing more. The stronger option is real and is discussed below.
+
+**Why `$$` and not `mktemp`.** Three reasons, in order of weight.
+
+1. *It is the convention already here.* Four tiers already derive their project
+   name with `$$` (`canary_test.sh`, `stack_live_test.sh`,
+   `no_telemetry_in_readiness.sh`, `deploy_test.sh`). Choosing `mktemp` for two
+   tiers would leave **two idioms in one directory**, and the reader who has to
+   know both is the reader this repository keeps writing checks for. The packet
+   asked directly whether the other four should move too: **no**, because `$$`
+   is the weaker-but-sufficient option and moving four working files to a
+   stronger one is a change with no failure behind it. One idiom, sufficient.
+2. *Sufficiency is a property of the threat model, not of the token.* The
+   collision to survive is two runs on one machine. `$$` is exactly unique there.
+3. *`$$` is what the reader already believes.* `WORK="${TMPDIR:-/tmp}/kit-x.$$"`
+   appears throughout these files. A project name derived some other way would
+   need its own argument.
+
+**The two claims `$$` does NOT make**, recorded because a decision document that
+records only the trade's benefits is a preference:
+
+- it is not unique across machines sharing a docker daemon;
+- it is not stable across a re-exec *within* one run, which is why no tier here
+  re-execs. A future tier that retries itself by re-running under a new pid would
+  leak its first cluster — the fix for that is `mktemp`, and the guard will not
+  notice, because the guard checks that a name is derived and not how well.
+
+**Why the HOST PORT is in scope, which the packet did not ask for.** Fixing the
+project name alone does not fix the collision; it relocates it. Measured, not
+assumed: with only `--project-name` derived, two concurrent runs of
+`isolation_test.sh` were still red on `port is already allocated`, because both
+bound the hardcoded `KIT_POSTGRES_PORT=15521`. A fixed host port is also *worse*
+than a fixed project name, because it collides with **the developer's own running
+stack** rather than only with another test run. So the port is derived by the
+same dependency-free probe `stack_live_test.sh` uses (`/dev/tcp`, not `nc`, not
+python — no tier may assume a tool is installed), seeded from `$$` so two
+concurrent runs do not begin their search in the same place.
+
+**Why the guard derives its scope instead of listing the offenders.** A list is a
+list that goes stale, and the argument was made concrete by what happened while
+this was written: deriving the scope from `tests/` found a **fourth** tier with
+the same defect that was on nobody's list and is not in the packet —
+`tests/rls_perf_test.sh`, whose container was `C="kit-rlsperf-pg"`. It was fixed
+rather than reported, because a guard that reports a defect nobody fixes teaches
+everyone to ignore the guard.
+
+**Why an inlined `$$` is accepted at a use site.** The rule as first written
+required a namespace flag to carry a bare variable reference, and fired on
+`deploy_test.sh`'s `docker volume rm "kit16-not-ours-v-$$"` — a decoy volume that
+*is* unique to the run, because it inlines the pid rather than naming a variable
+holding it. What actually breaks is two sites **disagreeing**: one deriving
+`kit-isolation-$$` and one spelling `kit-isolation`, so the tier queries a
+namespace it did not create. Two sites inlining the same `$$` agree, and two
+stacks do not collide. Spelling a name twice is untidy; spelling two *different*
+names is the defect. A check that fires on correct code teaches a reader to
+ignore it, which is this repository's own recorded rule and the mistake
+`self_test_live_tier` documents making and then backing out of.
+
+**Why the guard checks declarations as well as call sites.** `CONTROL_C=
+"kit-isolation-control"` makes every *use* read `"$CONTROL_C"`, which is derived —
+so a rule reading call sites alone passes on a tier whose control container is
+shared by every run on the machine. Found by the mutation suite saying NOT
+BITTEN on a mutation that had demonstrably been applied.
+
+**The limit, stated rather than caveated.** The guard reads flags at the point of
+use. A name reached through a helper function, or built by string concatenation
+before being passed, is invisible to it:
+
+    compose_up() { docker compose --project-name "$1" -f "$f" up -d; }
+    compose_up kit-isolation                                            -> GREEN
+
+Closing that means re-implementing bash's expansion or interposing a shell parser,
+and this repository has already removed one containment assertion (`self_test_
+live_tier`'s, over brace counting) precisely because it fired on correct code. The
+rule is worth more honest than airtight: it catches the class as it was actually
+written, in every tier, on the day the tier lands.
+
+**The rule.** *A name in a shared docker namespace is a fact about the run, not a
+fact about the day the tier was typed.* Anything that decides which cluster a run
+talks to — project, container, volume, published port — is derived from the run's
+own identity, and a check over the tiers says so before CI does.
