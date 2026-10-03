@@ -12039,12 +12039,11 @@ scripts = sorted(
     if f.endswith(".sh") and not f.startswith("_") and f != "validate.sh"
 )
 
-# (1) THE DOCKER TIERS, derived: a script that brings a container up. Four ways a
-# tier does that, and all four are here so a tier written with only one of them
-# is still in scope.
-BRING_UP = re.compile(
-    r"docker\s+(?:compose\b[^\n]*\bup\b|run\b)|docker\s+compose\s+(?!.*--project-name.*\bup\b).*\bup\b"
-)
+# (1) THE DOCKER TIERS, derived: a script that brings a container up. A SEARCH
+# rather than an anchored match, for the same reason DOCKER_USE is one — the
+# bring-up sites are `if ! docker compose … up`, and anchoring at the start of
+# the line misses them.
+BRING_UP = re.compile(r"\bdocker\s+(?:compose\b.*\bup\b|run\b)")
 
 # A line whose first non-blank character is `#` is a comment. Everything read
 # here is CODE: these files explain the rule at length, and a check that fires on
@@ -12060,25 +12059,44 @@ def code_lines(path):
     ]
 
 
-def joined_statements(pairs, starter):
-    """Statements begun by `starter`, joined on a trailing `\\`.
+# A line that INVOKES a docker command, anywhere in it.
+#
+# Deliberately a SEARCH and not a statement starter. The first version of this
+# rule matched `^[ \t]*docker`, and that is wrong in the most expensive way
+# available here: the bring-up sites are `if ! docker compose … up`, so the
+# anchor never matched them and the guard was blind to precisely the line this
+# packet exists to protect. It passed on a tree with `--project-name
+# kit-isolation` hardcoded at the bring-up site, and the mutation suite is what
+# said so rather than the reading of the code.
+#
+# The price of searching instead of anchoring is that prose can match, which is
+# why COMMENTS ARE STRIPPED FIRST — the comments in these files quote this rule's
+# own examples, and a check that fires on the sentence explaining the rule is a
+# check that fires on its own documentation.
+DOCKER_USE = re.compile(r"\bdocker\s+(?:compose|run|rm|volume|network)\b")
 
-    Every multi-line invocation in these files is written across two or three
-    lines, so a per-line scan sees half a command and matches nothing.
-    """
-    stmts, cur = [], None
+# The namespace-taking flags. `-p` and `--project-name` name a project, `--name`
+# names a container. `-v` is NOT here and the distinction is load-bearing: `docker
+# run -v host:container` publishes a PORT (a namespace) while `-v name:/path` is a
+# bind mount whose source is a path on this machine. Both spell `-v`, and
+# separating them by shape is cheaper than being wrong about one of them.
+NAMESPACE_FLAGS = r"(?:--project-name|--name|-p)"
+
+# Continuations are joined before scanning, so a flag on one line and its value on
+# the next are read together — `--name \` + newline + `  foo` is one command.
+def logical_lines(pairs):
+    out, cur = [], None
     for n, ln in pairs:
         if cur is None:
-            if re.match(r"^[ \t]*" + starter + r"\b", ln):
-                cur = (n, [ln])
+            cur = (n, [ln])
         else:
             cur[1].append(ln)
         if cur is not None and not ln.rstrip().endswith("\\"):
-            stmts.append(cur)
+            out.append(cur)
             cur = None
     if cur is not None:
-        stmts.append(cur)
-    return stmts
+        out.append(cur)
+    return [(n, " ".join(b)) for n, b in out]
 
 
 # The assignment forms a derived name takes. `PROJECT="kit-x-$$"` and
@@ -12144,63 +12162,31 @@ for name in scripts:
             continue
         owned[var] = (n, rhs)
 
-    # Every `docker compose` / `docker run` / `docker rm` / `docker volume rm`
-    # invocation, joined across continuations, so the project-name flag and the
-    # value it carries are read together.
-    invocations = []
-    for n, ln in pairs:
-        if re.match(r"^\s*docker\s+(compose|run|rm|volume)\b", ln):
-            invocations.append((n, ln))
-
-    # Which owned names are actually EXERCISED. A derived name that no site uses
-    # is a name that has stopped protecting anything, and is reported.
-    used = set()
-    for n, ln in invocations:
-        for m in re.finditer(r"(?:^|\s)(-[a-zA-Z])\s|(--[a-z-]+)", ln):
-            tok = (m.group(1) or m.group(2)).lstrip("-").replace("-", "_")
-            if tok in ("project_name", "p", "name", "volumes"):
-                # The value word is the one after the flag on THIS line. A
-                # continued line cannot be resolved without the whole statement,
-                # so the joined statement is what is read; see below.
-                pass
-    for n, body_lines in joined_statements(pairs, r"docker\b"):
-        body = " ".join(body_lines)
-        if not re.search(r"\bdocker\s+(compose|run|rm|volume)\b", body):
-            continue
-        for m in re.finditer(
-            r"(?:^|\s)(?:-p|--project-name|--name|-v)\s+(\S+)", body
-        ):
-            word = m.group(1).strip("\"'")
-            used.add(word)
-
     # The rule itself, over USE SITES rather than over declarations. A tier is
     # allowed to derive its names anywhere it likes; what it may not do is hand
     # `docker` a literal in a shared namespace.
-    for n, body_lines in joined_statements(pairs, r"docker\b"):
-        body = " ".join(body_lines)
-        if not re.search(r"\bdocker\s+(compose|run|rm|volume)\b", body):
+    examined = 0
+    for n, body in logical_lines(pairs):
+        if not DOCKER_USE.search(body):
             continue
-        for m in re.finditer(r"(?:^|\s)(?:-p|--project-name|--name)\s+(\S+)", body):
-            word = m.group(1).strip("\"'")
+        examined += 1
+        for m in re.finditer(r"(?:^|\s)(" + NAMESPACE_FLAGS + r")\s+(\S+)", body):
+            flag, word = m.group(1), m.group(2).strip("\"'")
             if is_derived(word):
                 continue
-            # `-v` is NOT in this set on purpose, and the distinction is worth
-            # stating: `-v host:container` publishes a PORT and is a namespace; a
-            # bare `-v name:/path` is a bind mount whose source is a path on this
-            # machine. Both spell `-v`. Ports are checked below against the one
-            # shape a compose tier uses, which is the `.env` override.
             problems.append(
-                f"{name}:{n}: `docker … {m.group(0).strip()} {word}` names a container, "
-                f"volume or project LITERALLY. Every run of this tier then shares one "
-                f"namespace, so two concurrent runs are one stack with two owners. "
-                f"Derive it from the run's own name — this file already derives "
-                f"{', '.join(sorted(owned)) or 'nothing yet'}."
+                f"{name}:{n}: `docker … {flag} {word}` names a project or container "
+                f"LITERALLY. Every run of this tier then shares one namespace, so two "
+                f"concurrent runs are one stack with two owners — and one run's teardown "
+                f"lands mid-assertion in the other, which reads as a failure of the thing "
+                f"this tier proves. Derive it from the run's own name; this file already "
+                f"derives {', '.join(sorted(owned)) or 'nothing yet'}."
             )
 
     # `docker volume rm X` takes a bare name and does not care which project made
     # it, so a literal there is a teardown reaching outside its own namespace.
-    for n, ln in pairs:
-        m = re.match(r"^\s*docker\s+volume\s+rm\s+(\S+)", ln)
+    for n, body in logical_lines(pairs):
+        m = re.search(r"\bdocker\s+volume\s+rm\s+(\S+)", body)
         if not m:
             continue
         word = m.group(1).strip("\"'")
@@ -12213,28 +12199,33 @@ for name in scripts:
 
     # THE HOST PORT, in the shape a compose tier actually moves it: the `.env`
     # override. Checked on the code that writes it, not on the `.env.example` it
-    # overrides.
-    for n, ln in pairs:
-        m = re.search(r"KIT_POSTGRES_PORT=(\d+)", ln)
-        if m:
-            problems.append(
-                f"{name}:{n}: `KIT_POSTGRES_PORT={m.group(1)}` is a FIXED HOST PORT, and a "
-                "fixed host port is worse than a fixed project name — it collides with the "
-                "developer's own running stack, not merely with another test run. Derive a "
-                "free port the way tests/stack_live_test.sh does."
-            )
+    # overrides, and only when the value is a bare literal — a tier that writes
+    # `KIT_POSTGRES_PORT=$PGPORT` has derived it.
+    for n, body in logical_lines(pairs):
+        m = re.search(r"KIT_POSTGRES_PORT=\"?\$?\{?([A-Za-z0-9_$-]+)\"?", body)
+        if not m:
+            continue
+        if not re.fullmatch(r"[0-9]+", m.group(1)):
+            continue
+        problems.append(
+            f"{name}:{n}: `KIT_POSTGRES_PORT={m.group(1)}` is a FIXED HOST PORT, and a "
+            "fixed host port is worse than a fixed project name — it collides with the "
+            "developer's own running stack, not merely with another test run. Measured "
+            "while fixing this: deriving the project name alone still left two concurrent "
+            "runs red on `port is already allocated`. Derive a free port the way "
+            "tests/stack_live_test.sh does."
+        )
 
     # A tier that brings a stack up must NAME its project. Compose otherwise
-    # derives one from the working directory, which two runs sharing a checkout
-    # also share.
+    # derives one from the working directory, which two runs in one checkout also
+    # share.
     brings_up = any(
-        re.search(r"docker\s+compose\b[^\n]*\bup\b", ln) for _, ln in pairs
+        re.search(r"docker\s+compose\b.*\bup\b", body) for _, body in logical_lines(pairs)
     )
     if brings_up:
         names_a_project = any(
-            re.search(r"docker\s+compose\b[^\n]*(?:-p|--project-name)", body)
-            for _, body_lines in joined_statements(pairs, r"docker\b")
-            for body in [" ".join(body_lines)]
+            re.search(r"docker\s+compose\b.*" + NAMESPACE_FLAGS, body)
+            for _, body in logical_lines(pairs)
         )
         if not names_a_project:
             problems.append(
@@ -12242,6 +12233,12 @@ for name in scripts:
                 "project. Compose derives one from the working directory, so two runs in one "
                 "checkout share it."
             )
+    if examined == 0:
+        problems.append(
+            f"{name}: was counted as a docker tier because it brings a container up, but no "
+            "docker invocation could be read as a logical line. The pattern that finds the "
+            "names has stopped matching this file, so the rule is passing by not looking."
+        )
 
 # (3) EMPTINESS IS A FINDING, four ways, each of which can fail alone.
 if not tiers:
