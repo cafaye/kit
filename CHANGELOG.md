@@ -32,6 +32,40 @@ without a copy (see kit-12 below).
 
 ### Added
 
+- **Rule 10 of the advisor: `rls_policy_correlated_membership` (WARN,
+  PERFORMANCE).** A policy whose `IN (SELECT …)` subquery references the policy's
+  own table is correlated, so the membership lookup runs once per candidate row
+  instead of once per statement. Measured on this kit by the new
+  `tests/rls_perf_test.sh`, through the real `cafaye.begin_account` seam with
+  `FORCE ROW LEVEL SECURITY` on every policy table, 200,000 rows and a
+  membership table indexed in **both** directions: **2000 ms against 18 ms — the
+  plan's own loop counter reads `loops=200000` against `loops=1`.**
+  - **111x here, and the reference's 450x was never a promise about this
+    substrate.** The ratio is set by the membership table's size (the slow plan
+    seq-scans a 200-row table 200,000 times, which is the entire cost) and by the
+    row count. The direction and the mechanism are what transfer, and the
+    mechanism is what the rule reads.
+  - **`protect_table` cannot emit the shape.** It writes
+    `account_id = (select cafaye.current_account_id())` — no membership table, so
+    no join to invert. The slow form is only reachable by a hand-written policy.
+  - **Deliberately silent on a correlated `EXISTS`**, because it measured 56 ms:
+    with the *inner* hop inverted the planner re-associates it into a semi-join and
+    resolves the membership once. **The boundary is per HOP, not per policy**, and a
+    rule firing on correlation in general would fire on the shape that is already
+    fast.
+  - Proven against its fixture and against two negatives — the inverted direction,
+    and the correlated `EXISTS` — all in `tests/tenancy_test.sh`, all with FORCE on.
+    `tenancy_contract_check` compares rule names to the trip list both ways and
+    still agrees: 10 rules, 11 trip pairs.
+- **`tests/rls_perf_test.sh` — the measurement, as a gate.** Four shapes (correlated,
+  inverted, `protect_table`, and the boundary case where the outer hop cannot be
+  inverted) and four assertions: every shape returns the **same rows** (a timing
+  measured against a predicate that returns nothing is not a speed claim), the slow
+  form is at least 10x slower (the constant is not the claim, the sign is), the
+  membership subquery's **loop count** differs per row against once (a loop counter
+  does not move with machine load), and the boundary case still resolves once.
+  SKIP(3) without docker, naming what is missing. **Not yet wired into
+  `validate.sh`** — it needs a home in the observability phase, sequentially.
 - **The provenance stamp (P3-18 + the reader half of P3-19).** A pulled
   `:e2e` image could not say which commit was in it — a tag is a mutable name,
   and every e2e tier now pulls one. `docker/provenance.sh` stamps five fields

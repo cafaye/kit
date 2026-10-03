@@ -17,7 +17,8 @@
 -- (table, role, command) combine with OR. This file grades the LIVE DATABASE, and
 -- that is the only layer that can see either.
 --
--- TEN RULES, AND WHERE THE TENTH CAME FROM. The shape is taken from Supabase's
+-- TEN RULES, numbered 1-9 plus a 7b, and the numbering is where the ORDER of
+-- the findings is and not anything else. The shape is taken from Supabase's
 -- database advisor (`pg-meta`'s `studio/advisor/lints.ts`), which is where the
 -- row-per-rule union-all query and the nine-column output come from. NOTHING is
 -- copied from it: it is MIT-licensed and its own rule is that an adopter must not
@@ -32,6 +33,7 @@
 --   5. `multiple_permissive_policies`             WARN    >1 permissive policy per (table, role, command)
 --   6. `login_role_security_definer_executable`   WARN    SECURITY DEFINER the login role can run
 --   7. `auth_rls_initplan`                        WARN    an identity call not wrapped for the InitPlan
+--   7b. `rls_policy_correlated_membership`         WARN    an IN (SELECT) correlated to the policy's row
 --   8. `rls_enabled_no_policy`                    INFO    RLS on, no policy: the table is unreadable
 --   9. `security_definer_view`                    ERROR   a view that enforces its owner's RLS
 --
@@ -838,6 +840,124 @@ rule_security_definer as (
 ),
 
 -- ===========================================================================
+-- 7b. `rls_policy_correlated_membership` — an `IN (SELECT …)` whose subquery
+--     is CORRELATED to the policy's own row, so Postgres evaluates the membership
+--     lookup once per candidate row instead of once per statement.
+--
+--    MEASURED, ON THIS KIT, BY `tests/rls_perf_test.sh` — and the number is the
+--    packet's, re-measured rather than repeated. 200,000 rows, a membership table
+--    of 200 rows indexed in BOTH directions, run as a `<service>_app` login with
+--    `FORCE ROW LEVEL SECURITY` on every policy table, through
+--    `cafaye.begin_account` / `cafaye.current_account_id()`:
+--
+--        correlated  `X in (select … where m.s = slow_doc.subject_account_id)`
+--                    2000 ms, and the plan's own loop counter reads
+--                    `loops=200000` on the membership scan.
+--
+--        inverted    `slow_doc.subject_account_id in (select … where m.c =
+--                    (select cafaye.current_account_id()))`
+--                    18 ms, and the loop counter reads `loops=1`.
+--
+--        i.e. 111x on this fixture, where the reference reports 450x on its own
+--        data. THE NUMBER IS NOT THE CLAIM AND NEITHER IS THE RATIO: the ratio is
+--        set by the membership table's size — a per-row probe of a 200-row table
+--        is cheap per row and ruinous in aggregate — and by the row count. What
+--        transfers is the direction and the mechanism, and the mechanism is what
+--        this rule reads off the catalog.
+--
+--    WHY `protect_table` CANNOT EMIT THIS SHAPE, which is the finding that makes
+--    the rule cheap rather than noisy. `protect_table` writes
+--    `account_id = (select cafaye.current_account_id())` — a column comparison
+--    against a function, with no membership table anywhere in the predicate. There
+--    is no join to invert because there is no join. The slow shape is only
+--    reachable by a service HAND-WRITING a policy, which is the same population
+--    rule 3, 5 and 7 already watch.
+--
+--    WHAT IT MATCHES, EXACTLY, because a rule that matches correlation in general
+--    matches the whole fleet and is a report nobody reads:
+--
+--      * An `in (select …)` or `= any (select …)` — and an `IN (SELECT …)`
+--        subquery contains a reference to the POLICY'S OWN TABLE. Inside a
+--        subquery, a reference to the outer relation IS the definition of
+--        correlation, so this is not a heuristic about shape: it is the property.
+--        The subquery text is EXTRACTED (`regexp_matches`) and the reference is
+--        looked for inside it, because a regexp cannot see past its own closing
+--        paren — and the self-reference sits inside one, so a single regexp over
+--        the whole qualifier misses the very case it was written for. That is
+--        measured, not assumed: the correlated predicate deparsed to
+--        `…in(select m.caller_account from perf.member_of m where
+--        (m.subject_account = slow_doc.subject_account_id))`, where the
+--        self-reference is inside the nested `WHERE (…)` group.
+--
+--      * BOTH deparse spellings of the relation, for the `search_path` reason
+--        recorded above: `slow_doc.subject_account_id` to a reader who cannot
+--        resolve `perf`, and `perf.slow_doc.subject_account_id` to one who can.
+--        Measured on this fixture, the reader's `search_path` decided which one
+--        the catalog returned, so requiring the qualified form would make this
+--        rule blind to exactly the reader least likely to know why.
+--
+--    WHAT IT DELIBERATELY DOES NOT MATCH, and the measurement is the reason:
+--
+--      * `exists (select 1 from link l where l.doc_id = doc.id and …)`. The
+--        outer hop of that shape is correlated and CANNOT be inverted — `doc` has
+--        no membership column of its own, so there is no row column to `IN`
+--        against — and yet it measured 56 ms against the correlated form's 2000 ms,
+--        because with the INNER hop inverted Postgres re-associates the `EXISTS`
+--        into a semi-join and resolves the membership ONCE. The plan showed
+--        `Filter: (ANY (id = (hashed SubPlan 4).col1))` over a nested loop with
+--        `loops=4`. So the boundary is PER HOP, not per policy, and a rule that
+--        fired on correlation in general would fire on the shape that is already
+--        fast — which is how a performance rule gets switched off.
+--
+--      * A correlated subquery in any other position. `and other.x = doc.y`
+--        outside the `IN` is not this rule, and neither is a hand-rolled
+--        `join`-shaped `WITH CHECK`.
+--
+--    THE RESIDUAL LIMITS, in the file's usual place rather than left to be
+--    inferred: this reads the deparsed TEXT, for the same reason every other rule
+--    here does and for the same recorded cost (`(cafaye\.)?`-style blindness under
+--    one `search_path`); the `([^()]|\([^()]*\))*` arity is ONE level of nesting
+--    inside the `IN`, so a membership subquery nested two deep is missed rather
+--    than misreported; and it cannot tell a membership check from any other
+--    correlated lookup, because `doc.row` inside an `IN (SELECT …)` is the same
+--    text either way. All three are false NEGATIVES, chosen over false positives
+--    on purpose.
+-- ===========================================================================
+rule_correlated_membership as (
+  select 'rls_policy_correlated_membership'::text as name,
+         'WARN'::text as level,
+         array['PERFORMANCE']::text[] as categories,
+         'A policy qualifier puts an IN (SELECT …) around a subquery that references the policy''s own table, so the membership check is CORRELATED: Postgres re-evaluates it once per candidate row rather than once per statement. Measured on this kit (tests/rls_perf_test.sh): 2000 ms with the loop counter at one evaluation per candidate row, against 18 ms and a single evaluation for the same predicate with the join direction inverted — 111x, on a fixture whose membership table was indexed in both directions. Correct and slow, and invisible until the table is large.'::text as description,
+         format('Policy %I on %I.%I has a correlated IN (%s%s%s). The subquery reads the policy''s own row, so it runs once per candidate row. Rendered qualifier: %s',
+                polname, nspname, relname,
+                case when qual_hit then 'USING' else 'WITH CHECK' end,
+                case when qual_hit and check_hit then ' and WITH CHECK' else '' end,
+                '',
+                coalesce(qual, with_check))::text as detail,
+         format('Invert which side is correlated: put the membership in the subquery''s WHERE on the CALLER, and IN the row''s own column against the result — `using (account_id in (select m.account_id from <membership> m where m.user_id = (select cafaye.current_account_id())))`. That is only expressible when this table carries the membership column locally; where it does not, filter the INNER hop instead — measured on this kit, a correlated EXISTS with its inner hop inverted ran 56 ms against the correlated IN''s 2000 ms, because the planner re-associates it into a semi-join. If the column does not exist anywhere on the path, the shape is not fixable by a rewrite: index the correlated column.', polname)::text as remediation,
+         jsonb_build_object('schema', nspname, 'name', relname, 'type', 'policy',
+                            'policy_name', polname, 'qual', qual, 'with_check', with_check,
+                            'measured_ratio', '111x on tests/rls_perf_test.sh') as metadata,
+         format('rls_policy_correlated_membership_%s_%s_%s', nspname, relname, polname)::text as cache_key
+  from (
+    select po.*,
+           coalesce(
+             exists (select 1
+                       from regexp_matches(po.n_qual, '(in|=\s*any)\(([^()]|\([^()]*\))*\)', 'g') m
+                      where (m[2] ~ ('(^|[^a-z0-9_$])' || po.relname || '\.')
+                          or m[2] ~ ('(^|[^a-z0-9_$])' || po.nspname || '\.' || po.relname || '\.'))), false) as qual_hit,
+           coalesce(
+             exists (select 1
+                       from regexp_matches(po.n_check, '(in|=\s*any)\(([^()]|\([^()]*\))*\)', 'g') m
+                      where (m[2] ~ ('(^|[^a-z0-9_$])' || po.relname || '\.')
+                          or m[2] ~ ('(^|[^a-z0-9_$])' || po.nspname || '\.' || po.relname || '\.'))), false) as check_hit
+    from normalized po
+  ) f
+  where relrowsecurity
+    and (qual_hit or check_hit)
+),
+
+-- ===========================================================================
 -- 7. `auth_rls_initplan` — an identity call that is not wrapped in
 --    `(select …)`, so the planner evaluates it once per candidate ROW instead of
 --    once per statement.
@@ -1072,6 +1192,7 @@ from (
   union all select * from rule_multiple_permissive
   union all select * from rule_security_definer
   union all select * from rule_initplan
+  union all select * from rule_correlated_membership
   union all select * from rule_rls_no_policy
   union all select * from rule_security_definer_view
 ) f
