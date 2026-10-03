@@ -32,6 +32,39 @@ without a copy (see kit-12 below).
 
 ### Added
 
+- **Rule 4 can now see through a function a policy calls.** `pg_depend` on a
+  policy records the FUNCTION its qualifier calls and never the relation inside
+  that function's body, so a `SECURITY DEFINER` helper made rule 4 — "an
+  authorization input the caller can edit" — go silent on exactly the defect it
+  exists for. `policy_reaches` is `security_definer_view`'s transitive
+  `pg_depend`/`pg_class` walk applied to rule 4's subject, so there is one walk
+  in the file rather than two, and the finding reports `via_functions` so a
+  reader can tell **which route** a policy took. Same rule name, same
+  `cache_key`, same ERROR level: one more join on one rule.
+  - **Measured, and the answer is a split, which is the point.** Against a real
+    `postgres:17` (17.11), three body kinds and their `pg_depend`: a
+    `BEGIN ATOMIC` body **is** recorded (`pg_proc → pg_class → <relation>`,
+    `deptype 'n'`, because PG14+ parses it at `CREATE FUNCTION`), while a
+    `language sql` **string** body (`as $$ … $$`) records one `pg_namespace` row
+    and nothing else, and a `plpgsql` helper records only `pg_language` and
+    `pg_namespace`. `prosrc` is empty for the ATOMIC body, so `probin IS NOT
+    NULL` and `prosrc <> ''` partition the two cases exactly, in the catalog.
+    Script and rows: `measure-advisor-pgproc.sql`,
+    `measurement-pgproc.out`, `measurement2-pgproc.out`.
+  - **So the hop ships and a `prosrc` scan does not.** The unrecorded edge
+    exists only as SQL **text**, and a substring match fires on a table named in
+    a comment, on a name inside a string literal, and on a table that has since
+    been dropped. The gap is stated in `advisor.sql`'s **first screen** ("what
+    this does not find") rather than left for a reader to infer from a rule's
+    silence, and rule 6 is named as the thing that does still see the helper
+    (`login_role_security_definer_executable`).
+  - The fixture is **one caller-writable table and three routes**: a policy
+    reaching it directly (the control), one reaching it through a `BEGIN
+    ATOMIC` `SECURITY DEFINER` helper (fires, and names the helper), and one
+    through a string-body helper (**must stay silent**, and does). Without the
+    control, "rule 4 fires on a helper-routed policy" and "rule 4 fires on
+    everything" are the same observation.
+
 - **Rule 10 of the advisor: `rls_policy_correlated_membership` (WARN,
   PERFORMANCE).** A policy whose `IN (SELECT …)` subquery references the policy's
   own table is correlated, so the membership lookup runs once per candidate row

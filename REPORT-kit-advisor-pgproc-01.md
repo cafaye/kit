@@ -223,3 +223,67 @@ against the file: ten rules, **no stray pairs**.
 | `21ab701` | the measurement: three body kinds, three `pg_depend` dumps, and the rule-4 blind spot (Q11) |
 | `a354a8a` | `policy_reaches` + rule 4's `pg_proc` hop; the residual named in the file's first screen |
 | `b39bd8f` | the fixture — one writable table, three routes — and assertion 7c |
+---
+
+## 5. The red proof, and the check proven able to go red
+
+`bash tests/tenancy_test.sh`, green on this branch:
+
+```
+   rls_references_user_metadata -> direct_policy
+   rls_references_user_metadata -> helper_routed
+   10 rules, 13 fixtures, every rule naming itself and the object it fired on.
+   helper_routed -> via_functions may_read_admin on the SAME table
+   direct_policy -> via_functions '(empty, the control)' on the SAME table
+   helper_opaque -> silent, and that is the rule's measured limit: the catalog
+      does not carry a string body, so no rule reads one.
+EXIT=0
+```
+
+Then the same command in a throwaway `git archive` copy of this branch with the
+detection clause deleted — **the recursive `union` arm of `policy_reaches`, 18
+lines, and nothing else**:
+
+```
+   rls_references_user_metadata -> direct_policy
+FAIL: rls_references_user_metadata did NOT fire on the fixture built to trip it (helper_routed).
+      A rule that has never fired is a rule nobody can trust, and this one is
+      indistinguishable from a rule that does not work.
+       reported instead: login_role_security_definer_executable on may_read_admin
+       reported instead: login_role_security_definer_executable on may_read_admin_opaque
+       …
+FAIL: an advisor rule cannot fire
+EXIT=1
+```
+
+Three things are measured there, and none of them is the first one:
+
+1. **`direct_policy` fires and `helper_routed` does not.** The control is green
+   while the defect is red. That asymmetry is what makes it a control rather
+   than a second positive.
+2. **The mutation deletes a clause and nothing else.** The CTE, the join, the
+   `via_functions` column and both new assertions all survive, so the run fails
+   *on the assertion about the defect* and not on a syntax error — the
+   discipline AGENTS.md records for breakage 90 (`delete`, not `sed`) and for
+   breakage 75 (a fixture that mutates one thing).
+3. **The honest half, observed rather than asserted.** With the hop gone, rule 4
+   is silent on the helper-routed policy while **rule 6 still reports
+   `login_role_security_definer_executable` on `may_read_admin`** — the very
+   helper whose body rule 4 can no longer follow. That is the position the rest
+   of this report argues in prose: something sees the helper, and rule 4 does
+   not claim to be the thing that does. A helper written the ordinary way is
+   invisible to rule 4 and visible to rule 6, and the suite now asserts both
+   halves rather than only the one that flatters the new code.
+
+## 6. For the packet that writes the helper
+
+**Write it `BEGIN ATOMIC`, and record why.** Not to satisfy a lint — because a
+parsed body is a body the account boundary can see, and an unparsed one is text.
+The measurement table above is the argument, and the two fixtures
+(`may_read_admin`, `may_read_admin_opaque`) are the two outcomes, differing in
+one keyword of the `CREATE FUNCTION` and nothing else.
+
+If the helper has to be a string body, the mitigation does not depend on the
+catalog carrying anything: **deny `INSERT`/`UPDATE` on the flags table from the
+login role**, so there is no writable input for the policy to decide from. That
+is the same remedy rule 4's `remediation` column prints.
