@@ -146,6 +146,13 @@ reader does not inherit it as part of this packet.
 
 ## 3. The fix
 
+The design is the packet's, with three deliberate differences, each argued in
+place: `--no-live` is **scoped to the three** rather than reusing
+`--no-observability` (§1, measured 127.1 s vs 23.7 s); it is set through **one
+wrapper** that every helper goes through rather than in each helper, so a check
+can enforce it (§3, §3-mutations); and `expect_skip_check` gained a **third
+assertion** (§4.2). Nothing else was changed, and **no bound was touched**.
+
 ### `tests/validate.sh`
 
 * `--no-live`, and `KIT_NO_LIVE=1` (truthy values only; `--no-live` cannot be
