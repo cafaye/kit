@@ -195,6 +195,36 @@ mutate 'stack_live: direct docker compose -p hardcoded' \
   "docker compose -p kit-stack ps --format '{{.Service}}|{{.Health}}'"
 
 echo
+echo "--- THE FIFTH EMPTINESS FINDING: a docker script outside the tier set ---"
+echo
+
+# A rule that fires on nothing is not yet proven to be able to fire, and that is
+# the whole subject of this packet: four emptiness findings were unreachable for
+# the same reason the tiers were invisible. No script under tests/ is uncovered
+# today, so this case BUILDS one — it drops a bare `docker volume rm` into a script
+# that is not a tier and asserts the guard names it rather than dropping it.
+#
+# `docker volume rm` rather than `docker compose` because the inserted line must
+# not become a tier by the bring-up arms: it names a bare volume, which is exactly
+# a shared namespace reached with no `-p` at all. The finding has to arrive from
+# the TIERSET rule, so the case fails if that rule is deleted and passes if it is
+# there.
+mutate 'lint_test: a bare docker volume rm makes it uncovered' \
+  tests/lint_test.sh \
+  'set -euo pipefail' \
+  $'set -euo pipefail\ndocker volume rm shared-vol'
+
+# The fifth namespace, mutated at the declaration. The tag this fixes was a
+# literal in the tree before this packet and no rule could see it, because the
+# file brought no stack up; it is asserted here so a future widening that drops
+# TAKES_A_SHARED_NAME takes this red with it rather than silently reaching 8 tiers
+# and reporting green.
+mutate 'provenance: image tag loses its $$' \
+  tests/provenance_test.sh \
+  'GOOD_IMAGE="kit-provenance-test-$$:good"' \
+  'GOOD_IMAGE="kit-provenance-test:good"'
+
+echo
 echo "--- BASELINE: the clean tree ---"
 restore
 scan
