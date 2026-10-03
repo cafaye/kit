@@ -290,6 +290,66 @@ wrong commit" — true, and now the narrowest of four things it does.
 
 ---
 
+## Two regressions this packet introduced, and the shard run caught both
+
+The full `self_test` shard run is slower than the hour, so it ran twice — and
+the second run was worth more than the fix, because it caught two defects that
+were **mine** and that nothing else in the tree could see.
+
+**1. `### Breaking` under `## Unreleased`, which is a hard gate failure.** The
+`CHANGELOG.md` entry was filed as a breaking change with no version attached, and
+`stability_gate_check` refuses that by name:
+
+> CHANGELOG.md declares a breaking change under `## Unreleased`, which is
+> covered by no version at all. Until the release that carries it is a MAJOR, it
+> is a breaking change with no version attached to it.
+
+It cascaded into **three breakages I would not have predicted and could not have
+read as related** — 31b (*a service config that AGREES with kit must not fail*,
+so the gate was red on an unbroken tree), 23b (*a clean SKIP reported as the
+gate exiting 1*) and 59. Three unrelated-looking red proofs, one cause, and the
+run only reported the **count** — which is precisely the argument for
+`_shard_ran` and the reason that check exists.
+
+The fix is the one the gate names, and it is a release rather than an edit:
+**VERSION 1.0.0 → 2.0.0**, the section moved to `## 2.0.0`, and
+**`MIGRATIONS.md` created** with a `## 2.0.0` section. A MAJOR owes a *file*,
+because a consumer who adopted kit by copy cannot apply a sentence. The
+predecessor is read from the CHANGELOG section below the current one rather than
+from git, so the derivation still works with no `.git` beside it.
+
+**2. `fresh_copy` did not copy `MIGRATIONS.md`.** This is the subtler one and
+the more valuable. Its file list is an **allowlist**, and it carried `VERSION`,
+`RESERVED` and `DECISIONS.md` but not the new file — so every one of the ~107
+throwaway copies became a tree whose `VERSION` derives tier `breaking` and owes
+a migration that is not there. The suite reported it as:
+
+```
+FAIL self_test: unbroken tree — the gate is RED on an unbroken tree (exit 1)
+```
+
+while `bash tests/validate.sh --static-only` on the real tree measured **EXIT=0**.
+**The tree was not red. The copy was** — and that is the control this file runs
+*first*, whose failure makes every proof below it meaningless.
+
+The list's own comment had predicted this exactly, naming the proofs that would
+take the blame: *"`stability_gate` and `reserved_check` read both by path, so a
+copy without them fails those checks on every breakage — and the two
+green-expecting proofs (23b, 59) would report a red for a reason that has
+nothing to do with the defect under test."* A reader could have substituted
+`MIGRATIONS.md` into that sentence before this packet shipped.
+
+**The rule this earns:** when a packet adds a file the gate reads by path,
+`fresh_copy`'s list is **part of that packet**. Note the direction — a false RED
+masquerading as a false green. That is worse in one respect and better in
+another: it cannot ship silently, because the very first thing the suite does is
+go red.
+
+Measured both arms: the copy without the file exits 1; with it,
+`CONTROL EXIT=0 / PASS: every check passed`.
+
+---
+
 ## Not this packet
 
 - **`parlor` and `site` are untouched.** Each carries a copy of this script and

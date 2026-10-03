@@ -149,6 +149,45 @@ security claim's coverage does not depend on the machine.
 
 ---
 
+## TWO REDS A SUCCESSOR INHERITS, and only one of them is mine to fix
+
+**`self_test` breakage 98 is RED and it is NOT this packet's.** Its anchor is
+`## Unreleased\n\n### Added`, and that string has not existed since an earlier
+packet replaced `### Added` with `### Changed` — verified **absent at the base
+commit `b72a3c2`**, so this branch did not cause it. It reports as its own
+distinct verdict (`the recipe no longer applies to its copy`) rather than as a
+caught defect, which is the correct behaviour for a stale recipe, and it is
+enforced by the suite rather than by anyone reading.
+
+**Giving it a live anchor is a separate change** and was deliberately not done
+here: editing a recipe for the version gate while landing a MAJOR bump would put
+two unrelated claims in one commit, and the anchor's correct text depends on
+which heading the next packet wants under `## Unreleased`. A successor should
+pick an anchor that exists and is stable — `## Unreleased\n\n### Changed` is the
+obvious candidate, since that is what the section is actually called now.
+
+So a `self_test` run on this branch reports **1 red** until that happens, and
+this report does not claim otherwise. Everything else holds.
+
+---
+
+## The version bump is a decision a manager may want to revisit
+
+This packet bumped **VERSION 1.0.0 → 2.0.0** and created `MIGRATIONS.md`,
+because a `### Breaking` heading under `## Unreleased` is a hard gate failure
+and the gate's message says the fix is a MAJOR release. The change *is*
+breaking by this repo's own definition: a consumer who copied the script into a
+service repository gets a red result on an image that used to verify clean, and
+kit is adopted **by copy**, so an old copy is an old verifier.
+
+If the manager would rather version at merge time, the revert is mechanical and
+the content is already written to be moved: put the section back under
+`## Unreleased` and retitle the heading something other than `### Breaking`.
+**Do not do both** — the gate refuses `### Breaking` there, and a `CHANGELOG.md`
+that declares a breaking change under no version is a red build by design.
+
+---
+
 ## Open questions (resolve, do not ask)
 
 1. **`template_version` can still be stamped inaccurately** — carried forward
