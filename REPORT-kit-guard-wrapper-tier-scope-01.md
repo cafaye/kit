@@ -315,8 +315,22 @@ variable was fed to docker using `DOCKER_USE`, and `docker build` is not one of 
 five subcommands. The declaration was invisible to the rule whose subject is
 declarations. Fixed with `NAMES_IN_DOCKER`, scoped so `examined` does not widen.
 
-**6. Emptiness findings 1–4 have no recipe in this branch** (§3). Named rather than
+**6. A finding's remedy was wrong on the variable it names.** The literal-assignment
+message ended *Put the run's own name in it (`PROJECT="$PROJECT-…"`)* — an
+instruction to assign a variable from itself, on the line a reader is trying to
+fix. Unreachable while only the five original tiers were in scope, because none of
+them names its project variable `PROJECT`. It now reads `$RUN-…` when the variable
+*is* `PROJECT`. A finding whose remedy is wrong is half a finding.
+
+**7. Emptiness findings 1–4 have no recipe in this branch** (§3). Named rather than
 absent.
+
+**The pattern across 4, 5 and 6 is worth stating separately: every one of them was
+exposed by widening the tier set, and none was caused by it.** `stack_live`'s
+`KIT_POSTGRES_DATABASES`, the recipe's advice, and the `NAMES_IN_DOCKER` hole were
+all invisible because the tier set was wrong, and all three were found by the same
+act of making it right. A scope fix in a guard is not only a widening; it is also a
+searchlight.
 
 ---
 
