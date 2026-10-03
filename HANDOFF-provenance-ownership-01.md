@@ -91,6 +91,13 @@ When that copy happens, three things travel with it:
 - **Exit 4 and exit 6 must stay distinct.** Something upstream depends on telling
   "built before the stamp" from "carries somebody else's". Collapsing them into
   one code is not a simplification.
+- **The `inheritshape` fixture is the only one that proves the ownership check.**
+  Do not "simplify" it back into the real `guard:e2e` label set, which is a URL
+  and therefore gets caught by shape first — that change silently un-proves
+  breakage 103 while every assertion still passes. Measured, in
+  `measurement-breakage-103.out`: the URL fixture leaves the suite GREEN on the
+  ownership mutation. This is the trap `AGENTS.md` calls out, and this packet
+  paid it rather than just citing it.
 - **`verify_says` in part D takes the exit code as a parameter** because one
   assertion (D4) checks a warning at exit 0. Do not "simplify" that back to a
   hardcoded non-zero; it makes the ownership warning unassertable, which is how

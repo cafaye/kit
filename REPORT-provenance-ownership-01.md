@@ -182,6 +182,52 @@ and reports success. Both are now exit 6, naming the absent `source` and
 
 ---
 
+## The breakage recipe was green on its own mutation
+
+Worth its own section because it is the most instructive thing that happened.
+
+Applying 103 by hand — `AGENTS.md`'s rule that a `BOUND` self_test is a gate to
+run **by hand**, not to report — deleted the namespace block and the check
+stayed green: 44 passed, 0 failed.
+
+The reason is this repo's own documented trap, one layer down. My ownership
+fixture was `inherit` — byte-for-byte the label set of the real `guard:e2e`,
+whose source is `https://github.com/oven-sh/bun`. **That is a URL**, so it is
+refused by the *shape* check before the namespace block is ever reached.
+Deleting the namespace block changed nothing those assertions could see.
+
+**And that is worse than a useless recipe.** `_shard_ran` counts invocations,
+not verdicts, so the recipe would have been EVALUATED and counted toward "all
+103 breakages hold". A red gate would have gone out with a load-bearing
+security check silently unproved and nothing but a PASS to show for it.
+
+What actually catches inheritance took a second fixture to find: a base image
+stamping its OCI labels **in kit's own grammar** — `owner/repo`, 40 hex,
+RFC3339 to the second, nothing in `com.cafaye.kit.*`. Every field passes shape.
+That is not hypothetical: **the grammar kit chose is the grammar a publisher's
+labels use whenever they are not a URL**, which is exactly why shape cannot be
+the thing that catches them.
+
+Re-measured, same copy, both arms:
+
+```
+mutated   -> FAIL D2a ... exited 0, want 6 / FAIL D2b ... / 44 passed, 2 failed
+unmutated -> 46 passed, 0 failed, 0 skipped
+```
+
+`D2b` asserts the refusal is the **namespace** one (`names "BASE"`) rather than
+shape or the warning, because `D2a` alone is satisfied by a verifier that
+refuses everything — and a refusal for the wrong reason is this packet's
+original defect wearing a new hat.
+
+**The general rule this earns:** a recipe is only as good as the *reachability*
+of its mutation. The mutation must be reachable by the check it names and by
+nothing else, and that is a property of the **fixture** as much as of the
+mutation. "Break the thing" is half a proof; breaking it and showing **this
+assertion** is what reacted is the other half.
+
+---
+
 ## Why the existing suite could not see this
 
 Every `--verify` case in part C of `tests/provenance_test.sh` builds an image
@@ -229,9 +275,14 @@ no ownership check to mutate.
 One mutation, one cause. Deleting the shape loop would also red part A, so the
 recipe would report red for a cause it did not introduce. Deleting the
 `--expect-source` branch would leave D1/D2 **green**, because those cases carry
-no `--expect-source`. Both are the trap this repo's header warns about: a
-control satisfiable by two checks proves the gate can go red and says nothing
-about either.
+no `--expect-source`.
+
+**And the first version of this recipe failed exactly that test in the other
+direction** — it stayed *green* on its own mutation, because its fixture's URL
+source was caught by shape before the ownership code was reached. That is
+recorded above because it is the same lesson from the other side, and because a
+recipe that reports PASS while proving nothing is the failure mode this repo's
+header calls out twice.
 
 `tests/validate.sh`'s check label now names what the check covers. A label a
 self-test asserts is a contract, and the old one said `--verify` "goes red on a
