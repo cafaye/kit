@@ -723,3 +723,35 @@ matching nothing is a ratchet that only turns one way. For a tombstone the dead
 entry and the live name are the same defect with two names: the entry says the
 name is gone and the name is in the tree. So `reserved_check` fails when a
 reserved path **exists**, and is silent otherwise. Two entries, both from kit-20.
+
+## MD28 — **the 94 copies share ONE cache directory, and the two GREEN-expecting proofs do not use it**
+
+`tests/self_test.sh` runs 94 throwaway copies of the whole tree, one per
+breakage, and each copy inherits `KIT_CACHE_DIR`. One line points it at
+`$WORK/cache` — a **sibling** of every copy, inside the directory the existing
+`trap` already sweeps — and that is the whole mechanism: a record written inside
+copy 23 is deleted with copy 23, so without this line every breakage pays full
+price for a verdict an earlier breakage already earned.
+
+**The placement is the decision.** A cache *inside* a copy dies with the copy (the
+bug). A cache in the real tree is neither shared with the copies nor swept by the
+`trap`. `$WORK/cache` is shared for exactly the lifetime of the suite and leaves
+nothing behind.
+
+**The two GREEN-expecting helpers run their copies with `KIT_FINGERPRINT=0`.**
+`expect_green_check` (breakage 59) and `expect_skip_check` (breakage 23b) assert
+that the gate **stays** green and that a named verdict is still printed. A
+replayed cache hit is a green that no check ran to produce, so under a shared
+directory those two proofs could be satisfied by a record an *earlier* copy wrote,
+on a tree the recipe had not yet mutated. That is a control that goes green for a
+reason it did not introduce — the same defect as a control that goes red for one,
+and the one AGENTS.md refuses in both directions. Two tokens on one line each;
+the 92 red-expecting helpers deliberately keep the cache, because for them a
+stale green is a **loud** failure ("the gate went red, but NOT via `<check>`"),
+never a silent one.
+
+**What this does NOT decide, and what it costs.** No check is wired by this
+commit, so the line changes no verdict until a declaration is traced input by
+input — a green light with nothing connected to it is not a saving. The cost of
+the choice is that the two uncached proofs pay their full gate forever; measured
+at one recipe each, that is the right side of the trade.
