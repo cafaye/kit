@@ -225,6 +225,28 @@ exercises five production-looking names and one legitimate default.
   `self_test.sh`), so there was nothing to re-measure. The new counts are
   reported below with the command that produced each.
 
+## A process note, because it is the same defect twice
+
+**This machine deleted my worktree twice, mid-run.** `wt-sell-backup` was removed
+from the filesystem *and* deregistered from `git worktree list` on two separate
+occasions while `tests/validate.sh` was running inside it. The first produced a
+run that reported `command not found` at two comment lines — a throwaway copy
+read while the file was mid-write, which is why the reported line numbers pointed
+at prose. The second produced 12 FAILs and a `no such file or directory` on a
+glob of `templates/otel/go/*.go`, because the tree was gone.
+
+Two consequences, and both are why this section exists rather than a passing
+grade:
+
+- **No single end-to-end green run of `tests/validate.sh` exists.** The run
+  reported above reached the end and its only failures are the two pre-existing
+  self_test recipes, but it is not green, and I am not going to describe a run
+  with two FAILs as green.
+- **The work was never at risk, because it was committed first.** The branch
+  `worker/kit-20-kamal` in `/Users/kaka/Code/any/moon/cafaye/kit` carries both
+  commits; the worktree was recreated from it and re-verified. That is the one
+  thing I did right early enough.
+
 ## Things found wrong in code I did not write
 
 1. **`anymark/config/kamal-backup.yml` does not set retention at all.** The
@@ -255,4 +277,84 @@ exercises five production-looking names and one legitimate default.
 
 ## The numbers, and the commands that produced them
 
-See the final commit message and the run below.
+**No `minimum:` was moved**, so there was nothing to re-measure. Every count in
+this packet is derived by counting invocations, never written down — the same
+expression in `validate.sh` and in `self_test.sh` — and the new counts are:
+
+| what | before | after | how it is counted |
+|---|---|---|---|
+| self_test breakages | 65 | **70** | `grep -cE '^expect_(red\|red_check\|red_lang\|red_script\|green_check\|skip_check)' tests/self_test.sh` |
+| of which red-expecting | 63 | **68** | the same count minus the green-expecting recipes |
+| green-expecting | 2 | **2** | 23b (a named SKIP) and 59 (a named FINDING), unchanged — plus 61b, which is deliberately NOT numbered because `self_test_claims` counts only the red-expecting helpers |
+| `tests/kamal_test.sh` cases | — | **22** | counted by the script itself and printed on its last line |
+| removed | — | **3,012** | `wc -l` over the seven files, before removal |
+
+### What the gate actually reported
+
+`bash tests/validate.sh` on `worker/kit-20-kamal`, run to completion on a quiet
+machine: **207 PASS, 2 FAIL, 2 SKIP, 0 BOUND.** The two SKIPs are pre-existing
+and unrelated (`node --check` cannot read TypeScript, for `tier/bun` and
+`tier/node`).
+
+Every Kamal check passed:
+
+    PASS templates/kamal/drill.sh  (bash -n)
+    PASS tests/kamal_test.sh  (bash -n)
+    PASS templates/kamal/drill.sh  (executable)
+    PASS templates/kamal/drill.sh  (shellcheck -S warning)
+    PASS tests/kamal_test.sh  (shellcheck -S warning)
+    PASS templates/kamal/  (4 artifacts present, the set is whole)
+    PASS the superseded custom backup toolchain  (it must be gone — kamal-backup is the standard)
+    PASS kamal_test — 22 case(s), every one against the real binaries.
+
+### The two FAILs are NOT mine, and I did not absorb them
+
+`FAIL tests/self_test.sh (70 breakages: 68 red, 2 green-expecting)` — the suite
+itself, and inside it:
+
+1. **breakage 23b** ("an interpreter below the floor is a named skip"). Its stub
+   old-ruby run exited 1 because `tests/canary_test.sh` and
+   `tests/no_telemetry_in_readiness.sh` — both docker-dependent — failed, not
+   because the ruby floor was mishandled. 23b is a pre-existing recipe about a
+   pre-existing check, and I touched neither.
+2. **breakage 52** ("a service carries its own copy of the shared stack"). The
+   recipe died with
+   `cd: /var/folders/.../kit-self-test.aRpUpa/language-mutants/kit: No such file
+   or directory` — its throwaway work directory was **removed from under the
+   run**. The gate then went red for a reason the recipe did not create, which is
+   the exact failure mode `AGENTS.md` warns about ("a control that goes red for a
+   reason another test created reads as evidence and is worse than no control").
+
+I could not establish that 23b and 52 fail identically on clean `origin/master`:
+that requires the full suite, which needs ~70 sequential gate runs, and its
+temporary directory was being deleted mid-run on this machine. **So that is
+reported as unverified rather than asserted**, and it is the one item in the
+brief's done-means list I have not been able to close.
+
+### Consequence: breakages 53-65 did not run, so they were run directly
+
+`self_test` stops at the first crash, and it crashed at 52. The five Kamal
+breakages were therefore unexercised, which is not a state to hand over — "the
+recipes are written" is a claim, and this repository treats an unexercised claim
+as a defect.
+
+They were run directly instead, with the same mutations and the same
+named-check needles, from a directory the harness controls:
+
+    -- kit-20: the Kamal breakages, run directly
+    PASS breakage 61b: the UNMODIFIED generated config satisfies kamal and kamal-backup
+    PASS breakage 61: the generated deploy.yml is invalid for kamal — red, via kamal_test
+    PASS breakage 62: the image name carries the registry host twice — red, via kamal_test
+    PASS breakage 63: one half of the kamal config set is deleted — red, via templates/kamal/  (4 artifacts present, the set is whole)
+    PASS breakage 64: the superseded custom backup toolchain is BACK — red, via the superseded custom backup toolchain
+    PASS breakage 65: the drill stops refusing a production-looking scratch name — red, via kamal_test
+
+    PASS: all 6 Kamal assertions hold (61b green, 61-65 red via the named check).
+
+**This is a verification, not a substitution.** The recipes live in
+`tests/self_test.sh`, the suite still runs them, and `validate.sh`'s
+header/recipe agreement check still reads them from there and passes. The
+harness that ran them exists only because the suite could not be made to finish
+on a machine that was deleting its own temporary directories, and it is not
+committed.
+
