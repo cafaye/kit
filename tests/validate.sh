@@ -11965,6 +11965,322 @@ PY
   check 'tests/self_test.sh  (no recipe anchors on a bare version literal; every version a recipe writes is derived from its copy)' \
     self_test_no_version_literal
 
+  # A DOCKER TIER MAY NOT HARDCODE A NAME IN A SHARED NAMESPACE.
+  #
+  # WHY THIS IS A CHECK AND NOT A CONVENTION. A compose project name is the
+  # namespace for a stack's containers, networks and volumes; a fixed one means
+  # two concurrent runs of kit's own tests are not two stacks but one stack with
+  # two owners. `tests/isolation_test.sh` and `tests/tenancy_test.sh` each wrote
+  # `kit-isolation` / `kit-tenancy` at two sites apiece and it survived review
+  # because nothing about either file looks wrong. Observed on this box rather
+  # than argued (reports/compose-collision/): the second run could not bring up a
+  # cluster at all, and the first died part way through its assertions with psql's
+  # exit code and NO FAIL LINE OF ITS OWN, because the other run's teardown took
+  # the project volume out from under it. Through this file's FAIL summary that
+  # reads as a database-boundary violation — which is the one claim those two
+  # tiers exist to make trustworthy. A copy-paste reintroduces it in one line, and
+  # the failure it causes is a red that blames the wrong subsystem, so it is
+  # worth a gate rather than a review habit.
+  #
+  # FOUR NAMESPACES, not one. The packet names only the project name, and fixing
+  # only that would have left the same defect wearing three other hats, so each
+  # is checked for the same reason and none is checked because it was named:
+  #
+  #   project    `docker compose -p X` / `--project-name X` — containers,
+  #              networks, volumes.
+  #   container  `docker run --name X` — `docker rm -f X` takes a bare name and
+  #              will delete a container belonging to a different run.
+  #   volume     `docker volume rm X` — same, and a leaked volume makes the NEXT
+  #              run reuse an already-provisioned cluster, which then fails on an
+  #              assertion about state a previous run created.
+  #   host port  `KIT_POSTGRES_PORT=N` — worse than the rest, because it collides
+  #              with the DEVELOPER'S OWN running stack, not merely with another
+  #              test run. Measured while fixing this: deriving the project name
+  #              alone left two concurrent runs red on `port is already
+  #              allocated`, so the collision had been relocated rather than
+  #              fixed.
+  #
+  # DERIVED, NOT LISTED, twice over — which is the whole design and the reason a
+  # sixth tier is covered on the day it lands. (1) The set of docker tiers is
+  # every script under tests/ that brings a container up, not an enumeration that
+  # can name a script that was renamed. (2) Within a tier, the set of names it
+  # OWNS is read out of the assignments that exist, and each is checked against
+  # its use sites — so a tier that derives its project but writes its control
+  # container literally is caught by the same rule that caught the project.
+  # This is the same move as `self_test_live_tier` reading the live set out of
+  # `live_check` calls and `self_test_no_version_literal` reading its file set
+  # out of the recipes, and for the same reason: a list written down separately
+  # is a list that goes stale.
+  #
+  # EMPTINESS IS A FINDING, as `self_test_no_version_literal` does it. A guard
+  # that covers nothing must say so rather than report nothing — a check that
+  # silently passes because its pattern stopped matching is worse than no check,
+  # because it is a green that costs a reader their trust in the red ones. Four
+  # separate emptiness findings, because the four can each fail alone: no tiers
+  # found, no names derived, no use sites examined, or a tier that brings a stack
+  # up without naming a project at all (compose would then derive one from the
+  # working directory, which is its own kind of collision).
+  docker_tier_project_name() {
+    "$PY" - "$ROOT/tests" <<'PY'
+import os
+import re
+import sys
+
+tests_dir = sys.argv[1]
+# `validate.sh` is excluded, and not by an accident of naming: it is this check's
+# own source, and this check's rule text contains `docker compose … up` written
+# out in prose. Without the exclusion the guard reads its own documentation as a
+# tier that brings a stack up without naming a project, and fails itself. A guard
+# that trips over the sentence explaining the guard is worse than useless — it
+# teaches the reader that the message is noise.
+scripts = sorted(
+    f
+    for f in os.listdir(tests_dir)
+    if f.endswith(".sh") and not f.startswith("_") and f != "validate.sh"
+)
+
+# (1) THE DOCKER TIERS, derived: a script that brings a container up. Four ways a
+# tier does that, and all four are here so a tier written with only one of them
+# is still in scope.
+BRING_UP = re.compile(
+    r"docker\s+(?:compose\b[^\n]*\bup\b|run\b)|docker\s+compose\s+(?!.*--project-name.*\bup\b).*\bup\b"
+)
+
+# A line whose first non-blank character is `#` is a comment. Everything read
+# here is CODE: these files explain the rule at length, and a check that fires on
+# a comment explaining why a literal is wrong is a check that fires on its own
+# documentation — the mistake `self_test_live_tier` records about itself.
+def code_lines(path):
+    with open(path, encoding="utf-8") as fh:
+        raw = fh.read().splitlines()
+    return [
+        (n, ln)
+        for n, ln in enumerate(raw, 1)
+        if ln.strip() and not ln.lstrip().startswith("#")
+    ]
+
+
+def joined_statements(pairs, starter):
+    """Statements begun by `starter`, joined on a trailing `\\`.
+
+    Every multi-line invocation in these files is written across two or three
+    lines, so a per-line scan sees half a command and matches nothing.
+    """
+    stmts, cur = [], None
+    for n, ln in pairs:
+        if cur is None:
+            if re.match(r"^[ \t]*" + starter + r"\b", ln):
+                cur = (n, [ln])
+        else:
+            cur[1].append(ln)
+        if cur is not None and not ln.rstrip().endswith("\\"):
+            stmts.append(cur)
+            cur = None
+    if cur is not None:
+        stmts.append(cur)
+    return stmts
+
+
+# The assignment forms a derived name takes. `PROJECT="kit-x-$$"` and
+# `PROJECT=kit-x-$$` are the same declaration; `readonly PROJECT=...` is a third
+# and is included because a name that cannot be reassigned is a name a later
+# literal cannot quietly disagree with.
+ASSIGN = re.compile(
+    r"^\s*(?:readonly\s+|export\s+|local\s+)*"
+    r"(?P<var>[A-Za-z_][A-Za-z0-9_]*)\s*=\s*"
+    r'"?(?P<rhs>[^"\s][^"]*)"?\s*$'
+)
+
+# IS THIS WORD DERIVED PER RUN? The test is that it contains shell expansion of
+# ANY kind — `$PROJECT`, `${PROJECT}`, or an inline `$$`.
+#
+# `$$` counts, and an earlier version of this rule required the word to be
+# nothing BUT a variable reference. That was wrong in a way worth recording: it
+# fired on `tests/deploy_test.sh`'s `docker volume rm "kit16-not-ours-v-$$"`,
+# which is a decoy volume that IS unique to the run, because it inlines the pid
+# rather than naming a variable holding it. A check that fires on correct code
+# teaches a reader to ignore it, which is this repository's own recorded rule
+# about `Naming/PredicateName` and about keyword scans over comments — and it is
+# the mistake `self_test_live_tier` documents making and then backing out of.
+#
+# INLINING IS ACCEPTED DELIBERATELY, and the boundary is worth being exact about,
+# because "bind the name once" is the rule the fix was written to and this is the
+# place that could have quietly relaxed it. What actually breaks is two sites
+# DISAGREEING: one deriving `kit-isolation-$$` and one spelling `kit-isolation`
+# literal, so the tier queries a namespace it did not create. Two sites that both
+# inline the same `$$` agree, and two stacks do not collide. Spelling a name twice
+# is untidy; spelling two DIFFERENT names is the defect, and only the second is
+# this check's business.
+def is_derived(word):
+    return "$" in word
+
+
+problems = []
+tiers = []
+
+for name in scripts:
+    path = os.path.join(tests_dir, name)
+    try:
+        pairs = code_lines(path)
+    except OSError:
+        continue
+    if not any(BRING_UP.search(ln) for _, ln in pairs):
+        continue
+    tiers.append(name)
+
+    # (2) THE NAMES THIS TIER OWNS, derived from its own assignments. Restricted
+    # to names that LOOK like namespaces — they carry a `kit-` prefix or a name
+    # ending in -control — so the rule does not trip over `failures=0` and the
+    # other ordinary counters these files are full of.
+    owned = {}
+    for n, ln in pairs:
+        m = ASSIGN.match(ln)
+        if not m:
+            continue
+        var, rhs = m.group("var"), m.group("rhs")
+        if re.fullmatch(r"[0-9]+", rhs):
+            continue
+        if not (re.match(r"\s*[\"']?kit[-_]", rhs) or re.search(r"-control", rhs)):
+            continue
+        owned[var] = (n, rhs)
+
+    # Every `docker compose` / `docker run` / `docker rm` / `docker volume rm`
+    # invocation, joined across continuations, so the project-name flag and the
+    # value it carries are read together.
+    invocations = []
+    for n, ln in pairs:
+        if re.match(r"^\s*docker\s+(compose|run|rm|volume)\b", ln):
+            invocations.append((n, ln))
+
+    # Which owned names are actually EXERCISED. A derived name that no site uses
+    # is a name that has stopped protecting anything, and is reported.
+    used = set()
+    for n, ln in invocations:
+        for m in re.finditer(r"(?:^|\s)(-[a-zA-Z])\s|(--[a-z-]+)", ln):
+            tok = (m.group(1) or m.group(2)).lstrip("-").replace("-", "_")
+            if tok in ("project_name", "p", "name", "volumes"):
+                # The value word is the one after the flag on THIS line. A
+                # continued line cannot be resolved without the whole statement,
+                # so the joined statement is what is read; see below.
+                pass
+    for n, body_lines in joined_statements(pairs, r"docker\b"):
+        body = " ".join(body_lines)
+        if not re.search(r"\bdocker\s+(compose|run|rm|volume)\b", body):
+            continue
+        for m in re.finditer(
+            r"(?:^|\s)(?:-p|--project-name|--name|-v)\s+(\S+)", body
+        ):
+            word = m.group(1).strip("\"'")
+            used.add(word)
+
+    # The rule itself, over USE SITES rather than over declarations. A tier is
+    # allowed to derive its names anywhere it likes; what it may not do is hand
+    # `docker` a literal in a shared namespace.
+    for n, body_lines in joined_statements(pairs, r"docker\b"):
+        body = " ".join(body_lines)
+        if not re.search(r"\bdocker\s+(compose|run|rm|volume)\b", body):
+            continue
+        for m in re.finditer(r"(?:^|\s)(?:-p|--project-name|--name)\s+(\S+)", body):
+            word = m.group(1).strip("\"'")
+            if is_derived(word):
+                continue
+            # `-v` is NOT in this set on purpose, and the distinction is worth
+            # stating: `-v host:container` publishes a PORT and is a namespace; a
+            # bare `-v name:/path` is a bind mount whose source is a path on this
+            # machine. Both spell `-v`. Ports are checked below against the one
+            # shape a compose tier uses, which is the `.env` override.
+            problems.append(
+                f"{name}:{n}: `docker … {m.group(0).strip()} {word}` names a container, "
+                f"volume or project LITERALLY. Every run of this tier then shares one "
+                f"namespace, so two concurrent runs are one stack with two owners. "
+                f"Derive it from the run's own name — this file already derives "
+                f"{', '.join(sorted(owned)) or 'nothing yet'}."
+            )
+
+    # `docker volume rm X` takes a bare name and does not care which project made
+    # it, so a literal there is a teardown reaching outside its own namespace.
+    for n, ln in pairs:
+        m = re.match(r"^\s*docker\s+volume\s+rm\s+(\S+)", ln)
+        if not m:
+            continue
+        word = m.group(1).strip("\"'")
+        if is_derived(word) or word.startswith("--"):
+            continue
+        problems.append(
+            f"{name}:{n}: `docker volume rm {word}` removes a volume this run may not own. "
+            "Derive it, or delete the line if nothing in the tier creates that volume."
+        )
+
+    # THE HOST PORT, in the shape a compose tier actually moves it: the `.env`
+    # override. Checked on the code that writes it, not on the `.env.example` it
+    # overrides.
+    for n, ln in pairs:
+        m = re.search(r"KIT_POSTGRES_PORT=(\d+)", ln)
+        if m:
+            problems.append(
+                f"{name}:{n}: `KIT_POSTGRES_PORT={m.group(1)}` is a FIXED HOST PORT, and a "
+                "fixed host port is worse than a fixed project name — it collides with the "
+                "developer's own running stack, not merely with another test run. Derive a "
+                "free port the way tests/stack_live_test.sh does."
+            )
+
+    # A tier that brings a stack up must NAME its project. Compose otherwise
+    # derives one from the working directory, which two runs sharing a checkout
+    # also share.
+    brings_up = any(
+        re.search(r"docker\s+compose\b[^\n]*\bup\b", ln) for _, ln in pairs
+    )
+    if brings_up:
+        names_a_project = any(
+            re.search(r"docker\s+compose\b[^\n]*(?:-p|--project-name)", body)
+            for _, body_lines in joined_statements(pairs, r"docker\b")
+            for body in [" ".join(body_lines)]
+        )
+        if not names_a_project:
+            problems.append(
+                f"{name}: brings a stack up with `docker compose … up` and never names a "
+                "project. Compose derives one from the working directory, so two runs in one "
+                "checkout share it."
+            )
+
+# (3) EMPTINESS IS A FINDING, four ways, each of which can fail alone.
+if not tiers:
+    problems.append(
+        "no docker tier found under tests/ — this check is asserting over nothing. Either the "
+        "tiers moved or the pattern has stopped matching them; both mean the rule is no longer "
+        "covering what it was written for."
+    )
+else:
+    derived = sum(
+        1
+        for name in tiers
+        for n, ln in code_lines(os.path.join(tests_dir, name))
+        if ASSIGN.match(ln)
+        and (
+            re.match(r"\s*[\"']?kit[-_]", ASSIGN.match(ln).group("rhs"))
+            or re.search(r"-control", ASSIGN.match(ln).group("rhs"))
+        )
+    )
+    if derived == 0:
+        problems.append(
+            f"{len(tiers)} docker tier(s) found and none derives a namespaced name, so this "
+            "check cannot tell a derived name from a literal. It is passing because it is not "
+            "looking."
+        )
+
+if problems:
+    for p in problems:
+        print("  -", p)
+    sys.exit(1)
+print(
+    f"{len(tiers)} docker tier(s), 0 hardcoded container/volume/project name and 0 fixed "
+    f"host port; the sixth tier is covered on the day it lands, not the day this file is edited"
+)
+PY
+  }
+  check 'tests/  (no docker tier hardcodes a project, container, volume or host port name; every shared namespace is derived from the run)' \
+    docker_tier_project_name
+
   # The label carries both numbers and, deliberately, does not sum them into
   # "N breakages, N reds" the way it did while every recipe was red-expecting.
   # Sixty-seven breakages of which sixty-five must go red and two must stay green
