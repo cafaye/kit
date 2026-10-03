@@ -275,11 +275,11 @@ KIT_NATS_MONITOR_PORT=$((PORT_BASE + 700))
 KIT_REDIS_PORT=$((PORT_BASE + 800))
 KIT_TEMPO_PORT=$((PORT_BASE + 900))
 KIT_LOKI_PORT=$((PORT_BASE + 901))
-# `detailed`, and deliberately NOT the shipped default. The metric assertions
-# below read the `debug` exporter's own output, and at `normal` it prints each
+# 'detailed', and deliberately NOT the shipped default. The metric assertions
+# below read the 'debug' exporter's own output, and at 'normal' it prints each
 # metric's data point WITHOUT its attribute map — so the "the high-cardinality
 # dimensions are not there" assertion would be satisfied by the exporter being
-# quiet rather than by the dimensions being gone. `detailed` prints attributes,
+# quiet rather than by the dimensions being gone. 'detailed' prints attributes,
 # which is what makes the absence mean something.
 KIT_OTEL_DEBUG_VERBOSITY=detailed
 ENV

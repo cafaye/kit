@@ -57,7 +57,7 @@
 #   79. a callable workflow at a path kit does not DECLARE -> red. The new one:
 #        the widening must exempt declared paths and nothing else, or it has
 #        stopped being a check.
-#   90-92. from the account boundary. 90 removes `FORCE ROW LEVEL SECURITY` from
+#   90-93. from the account boundary. 90 removes `FORCE ROW LEVEL SECURITY` from
 #        the substrate — the setting that is in no guide and that no lint in this
 #        fleet checked for before `templates/database/tenancy/` existed, and the
 #        one whose absence leaves a service with policies, `relrowsecurity = true`
@@ -67,6 +67,13 @@
 #        now asserts "no red rows" about an unknown number of assertions. 92 makes
 #        the manifest and the proof disagree, which is the whole reason the
 #        manifest exists as a SET rather than a count.
+#        93 makes `advisor.sql` and the fixtures that trip its rules stop
+#        agreeing, and it is the only breakage whose subject is a LIVE
+#        database, which `--static-only` never runs. Its recipe existed while
+#        this header did not mention it, and `self_test_claims` is what said so:
+#        "recipe proves breakage 93 but the header does not document it". A
+#        header that drifts from the recipes is a second, unchecked copy of the
+#        truth.
 #   2. add a collector exporter    -> the privacy check goes red
 #   2b. DELETE the tempo exporter   -> the same check goes red from the other
 #        side. A set difference only catches the extra; this catches the
